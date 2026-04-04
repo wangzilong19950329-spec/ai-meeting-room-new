@@ -138,13 +138,13 @@ public class ConfigController {
     }
 
     private String providerToModel(String provider) {
-        return switch (provider) {
-            case "openai" -> "gpt-3.5-turbo";
-            case "claude" -> "claude-3-5-sonnet-20241022";
-            case "tongyi" -> "qwen-plus";
-            case "wenxin" -> "ernie-bot";
-            default -> provider;
-        };
+        switch (provider) {
+            case "openai": return "gpt-3.5-turbo";
+            case "claude": return "claude-3-5-sonnet-20241022";
+            case "tongyi": return "qwen-plus";
+            case "wenxin": return "ernie-bot";
+            default: return provider;
+        }
     }
 
     private String maskKey(String key) {

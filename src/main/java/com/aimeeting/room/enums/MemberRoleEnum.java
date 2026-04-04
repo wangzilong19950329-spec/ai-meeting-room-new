@@ -13,6 +13,6 @@ public enum MemberRoleEnum {
         this.desc = desc;
     }
 
-    public int getCode() { return code; }
+    public Integer getCode() { return code; }
     public String getDesc() { return desc; }
 }

@@ -14,7 +14,7 @@ public enum OpinionTypeEnum {
         this.desc = desc;
     }
 
-    public int getCode() { return code; }
+    public Integer getCode() { return code; }
     public String getDesc() { return desc; }
 
     public static OpinionTypeEnum of(int code) {

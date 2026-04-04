@@ -17,7 +17,7 @@ public enum MeetingStatusEnum {
         this.desc = desc;
     }
 
-    public int getCode() { return code; }
+    public Integer getCode() { return code; }
     public String getDesc() { return desc; }
 
     public static MeetingStatusEnum of(int code) {
