@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMeetingMemberMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiMeetingMember">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="member_name" property="memberName"/>
+        <result column="model_type" property="modelType"/>
+        <result column="persona" property="persona"/>
+        <result column="role" property="role"/>
+        <result column="total_score" property="totalScore"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.aimeeting.room.entity.AiMeetingMember"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_member (meeting_id, member_name, model_type, persona, role, total_score)
+        VALUES (#{meetingId}, #{memberName}, #{modelType}, #{persona}, #{role}, #{totalScore})
+    </insert>
+
+    <insert id="batchInsert" parameterType="java.util.List">
+        INSERT INTO ai_meeting_member (meeting_id, member_name, model_type, persona, role, total_score) VALUES
+        <foreach collection="list" item="item" separator=",">
+            (#{item.meetingId}, #{item.memberName}, #{item.modelType}, #{item.persona}, #{item.role}, #{item.totalScore})
+        </foreach>
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_member WHERE id = #{id}
+    </select>
+
+    <select id="selectByMeetingId" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_member WHERE meeting_id = #{meetingId}
+    </select>
+
+    <select id="countByMeetingId" resultType="int">
+        SELECT COUNT(*) FROM ai_meeting_member WHERE meeting_id = #{meetingId}
+    </select>
+
+    <update id="updateTotalScore">
+        UPDATE ai_meeting_member SET total_score = #{totalScore}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+</mapper>

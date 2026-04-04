@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMeetingConclusionClusterMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiMeetingConclusionCluster">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="round_number" property="roundNumber"/>
+        <result column="cluster_label" property="clusterLabel"/>
+        <result column="member_count" property="memberCount"/>
+        <result column="member_ids" property="memberIds"/>
+        <result column="agreement_ratio" property="agreementRatio"/>
+        <result column="is_consensus" property="isConsensus"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.aimeeting.room.entity.AiMeetingConclusionCluster"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_conclusion_cluster
+            (meeting_id, round_number, cluster_label, member_count, member_ids, agreement_ratio, is_consensus)
+        VALUES
+            (#{meetingId}, #{roundNumber}, #{clusterLabel}, #{memberCount}, #{memberIds}, #{agreementRatio}, #{isConsensus})
+    </insert>
+
+    <insert id="batchInsert" parameterType="java.util.List">
+        INSERT INTO ai_meeting_conclusion_cluster
+            (meeting_id, round_number, cluster_label, member_count, member_ids, agreement_ratio, is_consensus)
+        VALUES
+        <foreach collection="list" item="item" separator=",">
+            (#{item.meetingId}, #{item.roundNumber}, #{item.clusterLabel}, #{item.memberCount},
+             #{item.memberIds}, #{item.agreementRatio}, #{item.isConsensus})
+        </foreach>
+    </insert>
+
+    <select id="selectByMeetingIdAndRound" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_conclusion_cluster
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
+        ORDER BY member_count DESC
+    </select>
+
+    <select id="selectConsensusCluster" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_conclusion_cluster
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber} AND is_consensus = 1
+        LIMIT 1
+    </select>
+
+</mapper>

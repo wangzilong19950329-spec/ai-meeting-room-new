@@ -1,0 +1,62 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/ai_meeting?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
+    username: root
+    password: your_password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.aimeeting.room.entity
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+logging:
+  level:
+    com.aimeeting.room: DEBUG
+
+# AI 模型配置
+ai:
+  # 默认模型（未指定时使用）
+  default-model: gpt-4
+
+  models:
+    # OpenAI / 兼容 OpenAI 格式的接口（Azure, 本地 Ollama 等）
+    openai:
+      api-url: https://api.openai.com/v1/chat/completions
+      api-key: sk-your-openai-key
+      enabled: true
+
+    # Anthropic Claude
+    claude:
+      api-url: https://api.anthropic.com/v1/messages
+      api-key: sk-ant-your-claude-key
+      api-version: "2023-06-01"
+      enabled: false
+
+    # 通义千问
+    tongyi:
+      api-url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+      api-key: your-dashscope-key
+      enabled: false
+
+    # 文心一言
+    wenxin:
+      api-url: https://aip.baidubce.com/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/completions_pro
+      api-key: your-wenxin-key
+      secret-key: your-wenxin-secret
+      enabled: false
+
+  # 会议配置
+  meeting:
+    async-thread-pool-size: 5
+    max-rounds-default: 10
+    consensus-threshold: 0.70
+    min-agreement-count: 2
+    base-reward: 100
+    base-penalty: 50
+    dissent-penalty-factor: 0.3

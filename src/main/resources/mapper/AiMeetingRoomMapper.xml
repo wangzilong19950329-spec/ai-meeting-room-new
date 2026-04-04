@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMeetingRoomMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiMeetingRoom">
+        <id column="id" property="id"/>
+        <result column="title" property="title"/>
+        <result column="description" property="description"/>
+        <result column="creator_id" property="creatorId"/>
+        <result column="status" property="status"/>
+        <result column="max_rounds" property="maxRounds"/>
+        <result column="current_round" property="currentRound"/>
+        <result column="final_conclusion" property="finalConclusion"/>
+        <result column="conclusion_time" property="conclusionTime"/>
+        <result column="summary" property="summary"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" parameterType="com.aimeeting.room.entity.AiMeetingRoom"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_room (title, description, creator_id, status, max_rounds, current_round)
+        VALUES (#{title}, #{description}, #{creatorId}, #{status}, #{maxRounds}, #{currentRound})
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_room WHERE id = #{id}
+    </select>
+
+    <update id="updateStatus">
+        UPDATE ai_meeting_room SET status = #{status}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateConclusion" parameterType="com.aimeeting.room.entity.AiMeetingRoom">
+        UPDATE ai_meeting_room
+        SET final_conclusion = #{finalConclusion},
+            conclusion_time  = #{conclusionTime},
+            status           = #{status},
+            gmt_modify       = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateCurrentRound">
+        UPDATE ai_meeting_room SET current_round = #{currentRound}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateSummary">
+        UPDATE ai_meeting_room SET summary = #{summary}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <select id="selectByCreatorId" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_room WHERE creator_id = #{creatorId} ORDER BY gmt_create DESC
+    </select>
+
+</mapper>
