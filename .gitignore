@@ -7,18 +7,12 @@ target/
 # IDE
 .idea/
 *.iml
-.vscode/
+.DS_Store
 
-# Node
+# Frontend
 frontend/node_modules/
 frontend/dist/
-frontend/.vite/
 
 # Env
-.env
+*.env
 application-local.yml
-application-prod.yml
-
-# OS
-.DS_Store
-Thumbs.db
