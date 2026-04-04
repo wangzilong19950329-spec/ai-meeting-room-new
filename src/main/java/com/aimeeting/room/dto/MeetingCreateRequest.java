@@ -1,9 +1,10 @@
 package com.aimeeting.room.dto;
 
 import lombok.Data;
+import javax.validation.constraints.Max;
+import javax.validation.constraints.Min;
 import javax.validation.constraints.NotBlank;
 import javax.validation.constraints.NotEmpty;
-import javax.validation.constraints.Size;
 import java.util.List;
 
 @Data
@@ -17,7 +18,8 @@ public class MeetingCreateRequest {
     private Long creatorId;
 
     /** 最大轮数，默认10 */
-    @Size(min = 1, max = 20)
+    @Min(value = 1, message = "最大轮数至少为1")
+    @Max(value = 20, message = "最大轮数不超过20")
     private Integer maxRounds;
 
     @NotEmpty(message = "至少需要一个成员")
