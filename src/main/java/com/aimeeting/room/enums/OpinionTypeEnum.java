@@ -4,7 +4,10 @@ public enum OpinionTypeEnum {
 
     STATEMENT(0, "陈述"),
     REBUTTAL(1, "反驳"),
-    CONCESSION(2, "让步");
+    CONCESSION(2, "让步"),
+    HUMAN(3, "人类发言"),
+    HUMAN_DIRECTIVE(4, "主持人指令"),
+    HUMAN_TARGETED(5, "定向追问");
 
     private final int code;
     private final String desc;

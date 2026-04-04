@@ -42,8 +42,8 @@ public class WenxinClient implements AiModelClient {
     public String chat(String modelType, String systemPrompt, String userPrompt) {
         AiModelProperties.ModelConfig cfg = properties.getModels().get("wenxin");
         if (cfg == null || !cfg.isEnabled()) {
-            log.warn("Wenxin config not enabled for modelType={}", modelType);
-            return mockResponse(modelType, userPrompt);
+            log.warn("Wenxin config not enabled for modelType={}, using mock", modelType);
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         }
 
         String accessToken = getAccessToken(cfg);
@@ -79,8 +79,8 @@ public class WenxinClient implements AiModelClient {
             JSONObject resp = JSON.parseObject(responseBody);
             return resp.getString("result");
         } catch (Exception e) {
-            log.error("Wenxin call failed, model={}", modelType, e);
-            return null;
+            log.warn("Wenxin call failed ({}), using mock for model={}", e.getMessage(), modelType);
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         }
     }
 

@@ -34,4 +34,8 @@
         SELECT COUNT(*) FROM ai_meeting_opinion WHERE meeting_id = #{meetingId} AND member_id = #{memberId}
     </select>
 
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_opinion WHERE meeting_id = #{meetingId}
+    </delete>
+
 </mapper>

@@ -7,7 +7,9 @@ public enum MeetingStatusEnum {
     CONCLUDED(2, "已达成结论"),
     VERIFIED_VALID(3, "结论已验证有效"),
     VERIFIED_INVALID(4, "结论已验证无效"),
-    CANCELLED(5, "已取消");
+    PAUSED(5, "已暂停"),
+    REOPENED(6, "结论修订中"),
+    CANCELLED(7, "已取消");
 
     private final int code;
     private final String desc;

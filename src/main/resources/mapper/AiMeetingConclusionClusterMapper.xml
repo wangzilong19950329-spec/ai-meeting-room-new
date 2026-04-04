@@ -44,4 +44,8 @@
         LIMIT 1
     </select>
 
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_conclusion_cluster WHERE meeting_id = #{meetingId}
+    </delete>
+
 </mapper>

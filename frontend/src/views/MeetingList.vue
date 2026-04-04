@@ -64,9 +64,10 @@
             <el-text v-else type="info">进行中...</el-text>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="160" align="center" fixed="right">
+        <el-table-column label="操作" width="200" align="center" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click.stop="$router.push(`/meetings/${row.meetingId}`)">详情</el-button>
+            <el-button link type="info" @click.stop="handleClone(row)">复制</el-button>
             <el-button v-if="row.status === 2" link type="success" @click.stop="handleVerify(row, true)">有效</el-button>
             <el-button v-if="row.status === 2" link type="danger" @click.stop="handleVerify(row, false)">无效</el-button>
           </template>
@@ -100,10 +101,12 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { meetingApi } from '@/api/meeting'
 import { useUserStore } from '@/stores/user'
 
+const router = useRouter()
 const userStore = useUserStore()
 const CREATOR_ID = computed(() => userStore.userId || 1)
 const meetings = ref([])
@@ -139,6 +142,21 @@ async function handleVerify(row, valid) {
   await meetingApi.verify(row.meetingId, valid)
   ElMessage.success('验证成功，积分已结算')
   loadMeetings()
+}
+
+async function handleClone(row) {
+  try {
+    const { value: newTitle } = await ElMessageBox.prompt(
+      '可修改主题，留空则在原主题后加"（副本）"',
+      `复制会议：${row.title}`,
+      { confirmButtonText: '复制', cancelButtonText: '取消', inputPlaceholder: '新会议主题（可选）' }
+    )
+    const res = await meetingApi.clone(row.meetingId, newTitle || '')
+    ElMessage.success('复制成功，已创建新会议')
+    router.push(`/meetings/${res.data}`)
+  } catch (e) {
+    if (e !== 'cancel') ElMessage.error('复制失败')
+  }
 }
 
 onMounted(loadMeetings)

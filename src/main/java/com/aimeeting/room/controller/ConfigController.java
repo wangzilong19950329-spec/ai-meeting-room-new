@@ -2,14 +2,15 @@ package com.aimeeting.room.controller;
 
 import com.aimeeting.room.common.ApiResponse;
 import com.aimeeting.room.config.AiModelProperties;
+import com.aimeeting.room.config.ModelEntry;
+import com.aimeeting.room.config.ModelRegistryStore;
 import com.aimeeting.room.dto.ModelConfigRequest;
-import com.aimeeting.room.service.ai.AiModelRouter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @RestController
@@ -18,138 +19,132 @@ import java.util.Map;
 public class ConfigController {
 
     private final AiModelProperties aiModelProperties;
-    private final AiModelRouter aiModelRouter;
+    private final ModelRegistryStore registry;
 
-    /**
-     * 获取当前模型配置（API Key 脱敏返回）
-     */
-    @GetMapping("/models")
-    public ApiResponse<Map<String, Object>> getModelConfig() {
-        Map<String, Object> result = new HashMap<>();
+    // ============================================================
+    // 模型注册表 CRUD
+    // ============================================================
 
-        Map<String, Object> modelsView = new HashMap<>();
-        aiModelProperties.getModels().forEach((key, cfg) -> {
-            Map<String, Object> entry = new HashMap<>();
-            entry.put("apiUrl", cfg.getApiUrl());
-            entry.put("apiKey", maskKey(cfg.getApiKey()));
-            entry.put("secretKey", maskKey(cfg.getSecretKey()));
-            entry.put("apiVersion", cfg.getApiVersion());
-            entry.put("enabled", cfg.isEnabled());
-            modelsView.put(key, entry);
-        });
-        result.put("models", modelsView);
-
-        AiModelProperties.MeetingConfig m = aiModelProperties.getMeeting();
-        Map<String, Object> meeting = new HashMap<>();
-        meeting.put("consensusThreshold", m.getConsensusThreshold());
-        meeting.put("minAgreementCount", m.getMinAgreementCount());
-        meeting.put("maxRoundsDefault", m.getMaxRoundsDefault());
-        meeting.put("baseReward", m.getBaseReward());
-        meeting.put("basePenalty", m.getBasePenalty());
-        meeting.put("dissentPenaltyFactor", m.getDissentPenaltyFactor());
-        result.put("meeting", meeting);
-
+    /** 获取所有已配置模型（API Key 脱敏） */
+    @GetMapping("/registry")
+    public ApiResponse<List<Map<String, Object>>> listRegistry() {
+        List<Map<String, Object>> result = registry.getAll().stream().map(e -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id",          e.getId());
+            m.put("displayName", e.getDisplayName());
+            m.put("modelId",     e.getModelId());
+            m.put("apiUrl",      e.getApiUrl());
+            m.put("apiKey",      ModelRegistryStore.maskKey(e.getApiKey()));
+            m.put("apiFormat",   e.getApiFormat());
+            m.put("enabled",     e.isEnabled());
+            return m;
+        }).collect(Collectors.toList());
         return ApiResponse.ok(result);
     }
 
-    /**
-     * 保存模型配置（运行时热更新内存配置，需重启才能持久化到配置文件）
-     */
-    @PostMapping("/models")
-    public ApiResponse<Void> saveModelConfig(@RequestBody ModelConfigRequest req) {
-        if (req.getModels() != null) {
-            req.getModels().forEach((key, entry) -> {
-                AiModelProperties.ModelConfig cfg = aiModelProperties.getModels()
-                        .computeIfAbsent(key, k -> new AiModelProperties.ModelConfig());
-                if (entry.getApiUrl() != null && !entry.getApiUrl().isBlank()) {
-                    cfg.setApiUrl(entry.getApiUrl());
-                }
-                // 只有传入非脱敏值（不含 ***）才更新
-                if (entry.getApiKey() != null && !entry.getApiKey().contains("***")) {
-                    cfg.setApiKey(entry.getApiKey());
-                }
-                if (entry.getSecretKey() != null && !entry.getSecretKey().contains("***")) {
-                    cfg.setSecretKey(entry.getSecretKey());
-                }
-                if (entry.getApiVersion() != null) {
-                    cfg.setApiVersion(entry.getApiVersion());
-                }
-                cfg.setEnabled(entry.isEnabled());
-            });
+    /** 新增模型 */
+    @PostMapping("/registry")
+    public ApiResponse<ModelEntry> addModel(@RequestBody ModelEntry entry) {
+        if (entry.getDisplayName() == null || entry.getDisplayName().isBlank())
+            return ApiResponse.fail("displayName 不能为空");
+        if (entry.getModelId() == null || entry.getModelId().isBlank())
+            return ApiResponse.fail("modelId 不能为空");
+        if (entry.getApiUrl() == null || entry.getApiUrl().isBlank())
+            return ApiResponse.fail("apiUrl 不能为空");
+        if (entry.getApiFormat() == null) entry.setApiFormat("openai");
+
+        ModelEntry saved = registry.add(entry);
+        log.info("Model added: {} ({})", saved.getDisplayName(), saved.getModelId());
+        return ApiResponse.ok(saved);
+    }
+
+    /** 更新模型（apiKey 含 *** 则不修改） */
+    @PutMapping("/registry/{id}")
+    public ApiResponse<Void> updateModel(@PathVariable String id, @RequestBody ModelEntry entry) {
+        ModelEntry existing = registry.getById(id);
+        if (existing == null) return ApiResponse.fail(404, "模型不存在");
+
+        // 未传入真实 key 时保留原 key
+        if (entry.getApiKey() == null || entry.getApiKey().contains("***")) {
+            entry.setApiKey(existing.getApiKey());
         }
-        if (req.getMeeting() != null) {
-            ModelConfigRequest.MeetingParams mp = req.getMeeting();
-            AiModelProperties.MeetingConfig mc = aiModelProperties.getMeeting();
-            if (mp.getConsensusThreshold() != null) mc.setConsensusThreshold(mp.getConsensusThreshold());
-            if (mp.getMinAgreementCount() != null) mc.setMinAgreementCount(mp.getMinAgreementCount());
-            if (mp.getMaxRoundsDefault() != null) mc.setMaxRoundsDefault(mp.getMaxRoundsDefault());
-            if (mp.getBaseReward() != null) mc.setBaseReward(mp.getBaseReward());
-            if (mp.getBasePenalty() != null) mc.setBasePenalty(mp.getBasePenalty());
-            if (mp.getDissentPenaltyFactor() != null) mc.setDissentPenaltyFactor(mp.getDissentPenaltyFactor());
-        }
-        log.info("Model config updated in memory");
+        registry.update(id, entry);
+        log.info("Model updated: {}", id);
         return ApiResponse.ok(null);
     }
 
-    /**
-     * 测试指定 provider 的连通性
-     */
-    @PostMapping("/models/test/{provider}")
-    public ApiResponse<Map<String, Object>> testConnection(
-            @PathVariable String provider,
-            @RequestBody ModelConfigRequest.ModelEntry entry) {
+    /** 删除模型 */
+    @DeleteMapping("/registry/{id}")
+    public ApiResponse<Void> deleteModel(@PathVariable String id) {
+        if (!registry.delete(id)) return ApiResponse.fail(404, "模型不存在");
+        log.info("Model deleted: {}", id);
+        return ApiResponse.ok(null);
+    }
 
-        Map<String, Object> result = new HashMap<>();
-        try {
-            // 临时用传入的 key 构造配置测试
-            String testModel = providerToModel(provider);
-            AiModelProperties.ModelConfig original = aiModelProperties.getModels().get(provider);
+    /** 供创建会议时使用：返回所有已启用的模型列表 */
+    @GetMapping("/available-models")
+    public ApiResponse<List<Map<String, Object>>> availableModels() {
+        List<Map<String, Object>> list = registry.getEnabled().stream().map(e -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("modelKey",    e.getId());
+            m.put("modelId",     e.getModelId());
+            m.put("displayName", e.getDisplayName());
+            m.putAll(buildVerificationMeta(e.getId()));
+            return m;
+        }).collect(Collectors.toList());
+        return ApiResponse.ok(list);
+    }
 
-            // 如果传入了非脱敏 key，则临时替换
-            AiModelProperties.ModelConfig tmp = new AiModelProperties.ModelConfig();
-            tmp.setApiUrl(entry.getApiUrl() != null ? entry.getApiUrl() : (original != null ? original.getApiUrl() : ""));
-            tmp.setApiKey(entry.getApiKey() != null && !entry.getApiKey().contains("***")
-                    ? entry.getApiKey() : (original != null ? original.getApiKey() : ""));
-            tmp.setSecretKey(entry.getSecretKey() != null && !entry.getSecretKey().contains("***")
-                    ? entry.getSecretKey() : (original != null ? original.getSecretKey() : ""));
-            tmp.setApiVersion(entry.getApiVersion() != null ? entry.getApiVersion() : (original != null ? original.getApiVersion() : ""));
-            tmp.setEnabled(true);
-
-            // 临时注入配置
-            aiModelProperties.getModels().put(provider, tmp);
-            try {
-                String reply = aiModelRouter.chat(testModel, "You are a test assistant.", "Reply with OK");
-                result.put("success", reply != null && !reply.isBlank());
-                result.put("message", "连接成功，模型响应正常");
-            } finally {
-                // 恢复原配置
-                if (original != null) {
-                    aiModelProperties.getModels().put(provider, original);
-                } else {
-                    aiModelProperties.getModels().remove(provider);
-                }
-            }
-        } catch (Exception e) {
-            log.warn("Connection test failed for provider {}: {}", provider, e.getMessage());
-            result.put("success", false);
-            result.put("message", e.getMessage());
+    private Map<String, Object> buildVerificationMeta(String modelKey) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        if ("b6465a2d".equals(modelKey)) {
+            meta.put("verificationStatus", "verified_stable");
+            meta.put("verificationLabel", "已验证稳定");
+            meta.put("verificationNote", "已完成本地会议主链路回归，适合作为稳定会议模型。");
+            meta.put("recommended", true);
+            return meta;
         }
+        if ("9fb32460".equals(modelKey)) {
+            meta.put("verificationStatus", "verified_search_experimental");
+            meta.put("verificationLabel", "已验证搜索实验");
+            meta.put("verificationNote", "已验证可用，但会先尝试实验性内置搜索，超时后再降级到稳定链路。");
+            meta.put("recommended", true);
+            return meta;
+        }
+        meta.put("verificationStatus", "unverified");
+        meta.put("verificationLabel", "未验证");
+        meta.put("verificationNote", "当前本地未完成完整会议回归，可能出现超时、兜底发言或总结缺失。");
+        meta.put("recommended", false);
+        return meta;
+    }
+
+    // ============================================================
+    // 会议引擎参数（保持不变）
+    // ============================================================
+
+    @GetMapping("/meeting")
+    public ApiResponse<Map<String, Object>> getMeetingConfig() {
+        AiModelProperties.MeetingConfig m = aiModelProperties.getMeeting();
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("consensusThreshold",   m.getConsensusThreshold());
+        result.put("minAgreementCount",    m.getMinAgreementCount());
+        result.put("maxRoundsDefault",     m.getMaxRoundsDefault());
+        result.put("baseReward",           m.getBaseReward());
+        result.put("basePenalty",          m.getBasePenalty());
+        result.put("dissentPenaltyFactor", m.getDissentPenaltyFactor());
         return ApiResponse.ok(result);
     }
 
-    private String providerToModel(String provider) {
-        switch (provider) {
-            case "openai": return "gpt-3.5-turbo";
-            case "claude": return "claude-3-5-sonnet-20241022";
-            case "tongyi": return "qwen-plus";
-            case "wenxin": return "ernie-bot";
-            default: return provider;
-        }
-    }
-
-    private String maskKey(String key) {
-        if (key == null || key.isBlank()) return "";
-        if (key.length() <= 8) return "***";
-        return key.substring(0, 4) + "***" + key.substring(key.length() - 4);
+    @PostMapping("/meeting")
+    public ApiResponse<Void> saveMeetingConfig(@RequestBody ModelConfigRequest.MeetingParams mp) {
+        AiModelProperties.MeetingConfig mc = aiModelProperties.getMeeting();
+        if (mp.getConsensusThreshold()   != null) mc.setConsensusThreshold(mp.getConsensusThreshold());
+        if (mp.getMinAgreementCount()    != null) mc.setMinAgreementCount(mp.getMinAgreementCount());
+        if (mp.getMaxRoundsDefault()     != null) mc.setMaxRoundsDefault(mp.getMaxRoundsDefault());
+        if (mp.getBaseReward()           != null) mc.setBaseReward(mp.getBaseReward());
+        if (mp.getBasePenalty()          != null) mc.setBasePenalty(mp.getBasePenalty());
+        if (mp.getDissentPenaltyFactor() != null) mc.setDissentPenaltyFactor(mp.getDissentPenaltyFactor());
+        log.info("Meeting config updated");
+        return ApiResponse.ok(null);
     }
 }

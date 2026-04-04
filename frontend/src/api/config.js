@@ -1,15 +1,15 @@
-import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { createHttp } from '@/api/http'
 
-const http = axios.create({ baseURL: '/api', timeout: 15000 })
-
-http.interceptors.response.use(
-  res => res.data.code === 200 ? res.data : Promise.reject(new Error(res.data.msg || '请求失败')),
-  err => { ElMessage.error(err.message); return Promise.reject(err) }
-)
+const http = createHttp(15000)
 
 export const configApi = {
-  getModelConfig: () => http.get('/config/models'),
-  saveModelConfig: (data) => http.post('/config/models', data),
-  testConnection: (provider, data) => http.post(`/config/models/test/${provider}`, data),
+  // 模型注册表
+  listRegistry:      ()           => http.get('/config/registry'),
+  addModel:          (data)       => http.post('/config/registry', data),
+  updateModel:       (id, data)   => http.put(`/config/registry/${id}`, data),
+  deleteModel:       (id)         => http.delete(`/config/registry/${id}`),
+  availableModels:   ()           => http.get('/config/available-models'),
+  // 会议引擎参数
+  getMeetingConfig:  ()           => http.get('/config/meeting'),
+  saveMeetingConfig: (data)       => http.post('/config/meeting', data),
 }

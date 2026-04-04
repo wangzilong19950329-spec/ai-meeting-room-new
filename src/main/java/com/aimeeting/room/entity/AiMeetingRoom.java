@@ -8,6 +8,9 @@ public class AiMeetingRoom {
     private Long id;
     private String title;
     private String description;
+    private String projectKey;
+    private String projectContext;
+    private String inheritedContext;
     private Long creatorId;
     private Integer status;
     private Integer maxRounds;
@@ -15,6 +18,9 @@ public class AiMeetingRoom {
     private String finalConclusion;
     private Date conclusionTime;
     private String summary;
+    private String decisionArtifact;
+    private String roundSummaries;  // JSON array: [{"round":1,"summary":"..."}]
+    private String conclusionHistory;
     private Date gmtCreate;
     private Date gmtModify;
 }

@@ -10,6 +10,9 @@
         background-color="#1a1f2e" text-color="#a0aec0" active-text-color="#ffffff">
         <el-menu-item index="/meetings"><el-icon><Grid /></el-icon><span>会议列表</span></el-menu-item>
         <el-menu-item index="/meetings/create"><el-icon><Plus /></el-icon><span>发起会议</span></el-menu-item>
+        <el-menu-item index="/tracking"><el-icon><Clock /></el-icon><span>追踪中心</span></el-menu-item>
+        <el-menu-item index="/member-templates"><el-icon><User /></el-icon><span>议员模版</span></el-menu-item>
+        <el-menu-item index="/workflow-templates"><el-icon><Switch /></el-icon><span>流程模板</span></el-menu-item>
         <el-menu-item index="/scores"><el-icon><TrophyBase /></el-icon><span>积分排行</span></el-menu-item>
         <el-menu-item index="/config"><el-icon><Setting /></el-icon><span>模型配置</span></el-menu-item>
       </el-menu>
@@ -27,6 +30,9 @@
         style="border-right:none; height:100%">
         <el-menu-item index="/meetings"><el-icon><Grid /></el-icon><span>会议列表</span></el-menu-item>
         <el-menu-item index="/meetings/create"><el-icon><Plus /></el-icon><span>发起会议</span></el-menu-item>
+        <el-menu-item index="/tracking"><el-icon><Clock /></el-icon><span>追踪中心</span></el-menu-item>
+        <el-menu-item index="/member-templates"><el-icon><User /></el-icon><span>议员模版</span></el-menu-item>
+        <el-menu-item index="/workflow-templates"><el-icon><Switch /></el-icon><span>流程模板</span></el-menu-item>
         <el-menu-item index="/scores"><el-icon><TrophyBase /></el-icon><span>积分排行</span></el-menu-item>
         <el-menu-item index="/config"><el-icon><Setting /></el-icon><span>模型配置</span></el-menu-item>
       </el-menu>
@@ -75,7 +81,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Expand, ArrowDown, SwitchButton } from '@element-plus/icons-vue'
+import { Expand, ArrowDown, SwitchButton, User, Clock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useUserStore } from '@/stores/user'
 import { authApi } from '@/api/auth'
@@ -104,6 +110,9 @@ const currentTitle = computed(() => {
   const map = {
     '/meetings': '会议列表',
     '/meetings/create': '发起会议',
+    '/tracking': '追踪中心',
+    '/member-templates': '议员模版',
+    '/workflow-templates': '流程模板',
     '/scores': '积分排行',
     '/config': '模型配置',
   }

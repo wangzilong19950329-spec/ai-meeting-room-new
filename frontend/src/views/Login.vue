@@ -9,13 +9,15 @@
 
       <el-tabs v-model="activeTab" class="login-tabs">
         <el-tab-pane label="登录" name="login">
-          <el-form :model="loginForm" ref="loginRef" @keyup.enter="handleLogin">
+          <el-form :model="loginForm" ref="loginRef" @keyup.enter="handleLogin" autocomplete="off">
             <el-form-item prop="username" :rules="[{required:true,message:'请输入用户名'}]">
-              <el-input v-model="loginForm.username" placeholder="用户名" size="large" :prefix-icon="User" />
+              <el-input v-model="loginForm.username" placeholder="用户名" size="large" :prefix-icon="User"
+                        name="login-username" autocomplete="username" />
             </el-form-item>
             <el-form-item prop="password" :rules="[{required:true,message:'请输入密码'}]">
               <el-input v-model="loginForm.password" type="password" placeholder="密码"
-                        size="large" :prefix-icon="Lock" show-password />
+                        size="large" :prefix-icon="Lock" show-password
+                        name="login-password" autocomplete="current-password" />
             </el-form-item>
             <el-button type="primary" size="large" :loading="loading" @click="handleLogin" style="width:100%">
               登 录
@@ -24,13 +26,15 @@
         </el-tab-pane>
 
         <el-tab-pane label="注册" name="register">
-          <el-form :model="regForm" ref="regRef" @keyup.enter="handleRegister">
+          <el-form :model="regForm" ref="regRef" @keyup.enter="handleRegister" autocomplete="off">
             <el-form-item prop="username" :rules="[{required:true,message:'请输入用户名'},{min:3,max:20,message:'3-20个字符'}]">
-              <el-input v-model="regForm.username" placeholder="用户名（3-20字符）" size="large" :prefix-icon="User" />
+              <el-input v-model="regForm.username" placeholder="用户名（3-20字符）" size="large" :prefix-icon="User"
+                        name="reg-username" autocomplete="username" />
             </el-form-item>
             <el-form-item prop="password" :rules="[{required:true,message:'请输入密码'},{min:6,message:'至少6位'}]">
               <el-input v-model="regForm.password" type="password" placeholder="密码（至少6位）"
-                        size="large" :prefix-icon="Lock" show-password />
+                        size="large" :prefix-icon="Lock" show-password
+                        name="reg-password" autocomplete="new-password" />
             </el-form-item>
             <el-button type="primary" size="large" :loading="loading" @click="handleRegister" style="width:100%">
               注 册

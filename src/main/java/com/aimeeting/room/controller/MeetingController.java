@@ -4,15 +4,31 @@ import com.aimeeting.room.common.ApiResponse;
 import com.aimeeting.room.dto.ContributionResult;
 import com.aimeeting.room.dto.MeetingCreateRequest;
 import com.aimeeting.room.dto.MeetingDetailVO;
+import com.aimeeting.room.dto.SkillFileVO;
+import com.aimeeting.room.dto.TrackingItemCreateRequest;
+import com.aimeeting.room.dto.TrackingItemUpdateRequest;
+import com.aimeeting.room.dto.TrackingOverviewVO;
+import com.aimeeting.room.dto.WorkflowStageReviewRequest;
+import com.aimeeting.room.dto.WorkflowStageSubmitRequest;
+import com.aimeeting.room.dto.WorkflowTemplateRequest;
+import com.aimeeting.room.dto.WorkflowTemplateVO;
 import com.aimeeting.room.entity.AiMeetingScoreLog;
+import com.aimeeting.room.entity.AiWorkflowTemplate;
 import com.aimeeting.room.service.MeetingRoomService;
 import com.aimeeting.room.service.MeetingScoreService;
+import com.aimeeting.room.service.SkillFileService;
+import com.aimeeting.room.service.TrackingCenterService;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.Resource;
+import org.springframework.http.ResponseEntity;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
+import javax.servlet.http.HttpServletRequest;
 import java.util.List;
+import java.util.Map;
 
 /**
  * AI会议室 REST API
@@ -37,10 +53,21 @@ public class MeetingController {
     @Autowired
     private MeetingScoreService meetingScoreService;
 
+    @Autowired
+    private SkillFileService skillFileService;
+
+    @Autowired
+    private TrackingCenterService trackingCenterService;
+
     /** 创建会议 */
     @PostMapping("/meetings")
-    public ApiResponse<Long> createMeeting(@RequestBody @Validated MeetingCreateRequest request) {
+    public ApiResponse<Long> createMeeting(@RequestBody @Validated MeetingCreateRequest request,
+                                            HttpServletRequest httpRequest) {
         try {
+            Long currentUserId = (Long) httpRequest.getAttribute("currentUserId");
+            if (request.getCreatorId() == null) {
+                request.setCreatorId(currentUserId);
+            }
             Long meetingId = meetingRoomService.createMeeting(request);
             return ApiResponse.ok(meetingId);
         } catch (Exception e) {
@@ -75,8 +102,86 @@ public class MeetingController {
         return ApiResponse.ok(meetingRoomService.listByCreator(creatorId));
     }
 
-    /** 取消会议 */
-    @PostMapping("/meetings/{id}/cancel")
+    /** 查询可用会议流程模板 */
+    @GetMapping("/workflow-templates")
+    public ApiResponse<List<AiWorkflowTemplate>> listWorkflowTemplates() {
+        return ApiResponse.ok(meetingRoomService.listWorkflowTemplates());
+    }
+
+    /** 查询流程模板详情（含阶段定义） */
+    @GetMapping("/workflow-templates/detail")
+    public ApiResponse<List<WorkflowTemplateVO>> listWorkflowTemplateDetails() {
+        return ApiResponse.ok(meetingRoomService.listWorkflowTemplateDetails());
+    }
+
+    /** 创建自定义流程模板 */
+    @PostMapping("/workflow-templates")
+    public ApiResponse<WorkflowTemplateVO> createWorkflowTemplate(@RequestBody @Validated WorkflowTemplateRequest request) {
+        try {
+            return ApiResponse.ok(meetingRoomService.createWorkflowTemplate(request));
+        } catch (Exception e) {
+            log.error("createWorkflowTemplate error", e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 更新自定义流程模板 */
+    @PutMapping("/workflow-templates/{id}")
+    public ApiResponse<WorkflowTemplateVO> updateWorkflowTemplate(@PathVariable Long id,
+                                                                  @RequestBody @Validated WorkflowTemplateRequest request) {
+        try {
+            return ApiResponse.ok(meetingRoomService.updateWorkflowTemplate(id, request));
+        } catch (Exception e) {
+            log.error("updateWorkflowTemplate error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 删除自定义流程模板 */
+    @DeleteMapping("/workflow-templates/{id}")
+    public ApiResponse<Void> deleteWorkflowTemplate(@PathVariable Long id) {
+        try {
+            meetingRoomService.deleteWorkflowTemplate(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("deleteWorkflowTemplate error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    @GetMapping("/skill-files")
+    public ApiResponse<List<SkillFileVO>> listSkillFiles() {
+        return ApiResponse.ok(skillFileService.list());
+    }
+
+    @PostMapping("/skill-files/upload")
+    public ApiResponse<SkillFileVO> uploadSkillFile(@RequestParam("file") MultipartFile file) {
+        try {
+            return ApiResponse.ok(skillFileService.upload(file));
+        } catch (Exception e) {
+            log.error("uploadSkillFile error", e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    @DeleteMapping("/skill-files/{id}")
+    public ApiResponse<Void> deleteSkillFile(@PathVariable Long id) {
+        try {
+            skillFileService.delete(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("deleteSkillFile error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    @GetMapping("/skill-files/{id}/download")
+    public ResponseEntity<Resource> downloadSkillFile(@PathVariable Long id) {
+        return skillFileService.download(id);
+    }
+
+    /** 暂停会议 */
+    @PostMapping({"/meetings/{id}/cancel", "/meetings/{id}/pause"})
     public ApiResponse<Void> cancelMeeting(@PathVariable Long id) {
         try {
             meetingRoomService.cancelMeeting(id);
@@ -109,5 +214,153 @@ public class MeetingController {
     @GetMapping("/members/{memberId}/scores")
     public ApiResponse<List<AiMeetingScoreLog>> getMemberScores(@PathVariable Long memberId) {
         return ApiResponse.ok(meetingScoreService.getMemberScoreHistory(memberId));
+    }
+
+    /** 复制会议（复用成员配置，清空讨论记录，可修改主题） */
+    @PostMapping("/meetings/{id}/clone")
+    public ApiResponse<Long> cloneMeeting(@PathVariable Long id,
+                                           @RequestBody(required = false) Map<String, String> body,
+                                           HttpServletRequest httpRequest) {
+        try {
+            Long currentUserId = (Long) httpRequest.getAttribute("currentUserId");
+            String newTitle = body != null ? body.get("title") : null;
+            Long newId = meetingRoomService.cloneMeeting(id, newTitle, currentUserId);
+            return ApiResponse.ok(newId);
+        } catch (Exception e) {
+            log.error("cloneMeeting error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 强制终止并生成结论（进行中的会议） */
+    @PostMapping("/meetings/{id}/terminate")
+    public ApiResponse<Void> terminateMeeting(@PathVariable Long id) {
+        try {
+            meetingRoomService.terminateMeeting(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("terminateMeeting error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 重启会议（清空记录，重置为待启动状态） */
+    @PostMapping("/meetings/{id}/restart")
+    public ApiResponse<Void> restartMeeting(@PathVariable Long id) {
+        try {
+            meetingRoomService.restartMeeting(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("restartMeeting error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 人类用户向会议发送消息 */
+    @PostMapping("/meetings/{id}/human-message")
+    public ApiResponse<Void> sendHumanMessage(@PathVariable Long id,
+                                               @RequestBody Map<String, String> body) {
+        try {
+            String content = body.get("content");
+            if (content == null || content.trim().isEmpty()) return ApiResponse.fail("消息不能为空");
+            boolean asDirective = "directive".equalsIgnoreCase(body.get("mode"));
+            Long targetMemberId = null;
+            if (body.get("targetMemberId") != null && !body.get("targetMemberId").trim().isEmpty()) {
+                targetMemberId = Long.valueOf(body.get("targetMemberId").trim());
+            }
+            meetingRoomService.addHumanMessage(id, content.trim(), asDirective, targetMemberId);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("sendHumanMessage error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 更新追踪项状态/备注 */
+    @PostMapping("/tracking-items/{id}/status")
+    public ApiResponse<Void> updateTrackingItem(@PathVariable Long id,
+                                                @RequestBody @Validated TrackingItemUpdateRequest request) {
+        try {
+            meetingRoomService.updateTrackingItem(id, request);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("updateTrackingItem error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    @GetMapping("/tracking-items/overview")
+    public ApiResponse<TrackingOverviewVO> trackingOverview() {
+        return ApiResponse.ok(trackingCenterService.overview());
+    }
+
+    @PostMapping("/tracking-items/custom")
+    public ApiResponse<TrackingOverviewVO.TrackingItemVO> createCustomTrackingItem(
+            @RequestBody @Validated TrackingItemCreateRequest request) {
+        try {
+            return ApiResponse.ok(trackingCenterService.createCustomItem(request));
+        } catch (Exception e) {
+            log.error("createCustomTrackingItem error", e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    @PostMapping("/tracking-items/{id}/refresh")
+    public ApiResponse<TrackingOverviewVO.TrackingItemVO> refreshTrackingItem(@PathVariable Long id) {
+        try {
+            return ApiResponse.ok(trackingCenterService.refreshItemNow(id));
+        } catch (Exception e) {
+            log.error("refreshTrackingItem error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    @PostMapping("/tracking-items/{id}/reopen-meeting")
+    public ApiResponse<Void> reopenMeetingFromTracking(@PathVariable Long id) {
+        try {
+            trackingCenterService.reopenMeeting(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("reopenMeetingFromTracking error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 提交当前工作流阶段内容 */
+    @PostMapping("/meetings/{id}/workflow/submit")
+    public ApiResponse<Void> submitWorkflowStage(@PathVariable Long id,
+                                                 @RequestBody @Validated WorkflowStageSubmitRequest request) {
+        try {
+            meetingRoomService.submitWorkflowStage(id, request);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("submitWorkflowStage error, meetingId={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 审核当前工作流阶段 */
+    @PostMapping("/meetings/{id}/workflow/review")
+    public ApiResponse<Void> reviewWorkflowStage(@PathVariable Long id,
+                                                 @RequestBody @Validated WorkflowStageReviewRequest request) {
+        try {
+            meetingRoomService.reviewWorkflowStage(id, request);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("reviewWorkflowStage error, meetingId={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 重试当前自动执行节点 */
+    @PostMapping("/meetings/{id}/workflow/retry-auto")
+    public ApiResponse<Void> retryWorkflowAutoStage(@PathVariable Long id) {
+        try {
+            meetingRoomService.retryWorkflowAutoStage(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("retryWorkflowAutoStage error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
     }
 }
