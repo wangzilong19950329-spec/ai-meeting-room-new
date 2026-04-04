@@ -25,6 +25,10 @@
           <el-icon><TrophyBase /></el-icon>
           <span>积分排行</span>
         </el-menu-item>
+        <el-menu-item index="/config">
+          <el-icon><Setting /></el-icon>
+          <span>模型配置</span>
+        </el-menu-item>
       </el-menu>
     </el-aside>
 
@@ -65,9 +69,10 @@ const currentTitle = computed(() => {
     '/meetings': '会议列表',
     '/meetings/create': '发起会议',
     '/scores': '积分排行',
+    '/config': '模型配置',
   }
   if (route.path.startsWith('/meetings/') && route.params.id) return '会议详情'
-  return map[route.path] || ''
+  return map[route.path] || route.path.replace('/', '') || ''
 })
 </script>
 
