@@ -3,6 +3,12 @@ import { ElMessage } from 'element-plus'
 
 const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
+http.interceptors.request.use(config => {
+  const token = localStorage.getItem('token')
+  if (token) config.headers['X-Token'] = token
+  return config
+})
+
 http.interceptors.response.use(
   res => {
     if (res.data.code !== 200) {

@@ -2,6 +2,12 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 const routes = [
   {
+    path: '/login',
+    name: 'Login',
+    component: () => import('@/views/Login.vue'),
+    meta: { public: true }
+  },
+  {
     path: '/',
     component: () => import('@/views/Layout.vue'),
     children: [
@@ -15,7 +21,20 @@ const routes = [
   }
 ]
 
-export default createRouter({
+const router = createRouter({
   history: createWebHistory(),
   routes
 })
+
+// 路由守卫：未登录跳转到登录页
+router.beforeEach((to) => {
+  const token = localStorage.getItem('token')
+  if (!to.meta.public && !token) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+  if (to.path === '/login' && token) {
+    return { path: '/meetings' }
+  }
+})
+
+export default router

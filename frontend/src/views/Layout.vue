@@ -47,6 +47,22 @@
           <el-tag type="success" effect="dark" size="small" class="status-tag">
             <el-icon><Connection /></el-icon> <span class="tag-text">多模型协作</span>
           </el-tag>
+          <el-dropdown @command="handleCommand" style="margin-left:12px">
+            <span class="user-info">
+              <el-avatar size="small" :style="{ background: '#409eff', fontSize: '13px' }">
+                {{ userStore.nickname?.charAt(0)?.toUpperCase() }}
+              </el-avatar>
+              <span class="username-text">{{ userStore.nickname }}</span>
+              <el-icon><ArrowDown /></el-icon>
+            </span>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="logout">
+                  <el-icon><SwitchButton /></el-icon> 退出登录
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
         </div>
       </el-header>
       <el-main class="main-content">
@@ -58,11 +74,26 @@
 
 <script setup>
 import { ref, computed } from 'vue'
-import { useRoute } from 'vue-router'
-import { Expand } from '@element-plus/icons-vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Expand, ArrowDown, SwitchButton } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { useUserStore } from '@/stores/user'
+import { authApi } from '@/api/auth'
 
 const route = useRoute()
+const router = useRouter()
+const userStore = useUserStore()
 const drawerOpen = ref(false)
+
+async function handleCommand(cmd) {
+  if (cmd === 'logout') {
+    await ElMessageBox.confirm('确认退出登录？', '提示', { type: 'warning' })
+    try { await authApi.logout() } catch {}
+    userStore.logout()
+    ElMessage.success('已退出登录')
+    router.push('/login')
+  }
+}
 
 const activeMenu = computed(() => {
   if (route.path.startsWith('/meetings/create')) return '/meetings/create'
@@ -92,6 +123,8 @@ const currentTitle = computed(() => {
 .header-left { display: flex; align-items: center; gap: 8px; }
 .main-content { background: #f5f7fa; padding: 16px; }
 .hamburger { display: none; font-size: 20px; }
+.user-info { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.username-text { font-size: 13px; color: #303133; max-width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 768px) {
   .desktop-sidebar { display: none !important; }

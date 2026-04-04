@@ -102,8 +102,10 @@
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { meetingApi } from '@/api/meeting'
+import { useUserStore } from '@/stores/user'
 
-const CREATOR_ID = 1
+const userStore = useUserStore()
+const CREATOR_ID = computed(() => userStore.userId || 1)
 const meetings = ref([])
 const loading = ref(false)
 const search = ref('')
@@ -124,7 +126,7 @@ const statusType = (s) => ({0:'info',1:'warning',2:'primary',3:'success',4:'dang
 async function loadMeetings() {
   loading.value = true
   try {
-    const res = await meetingApi.list(CREATOR_ID)
+    const res = await meetingApi.list(CREATOR_ID.value)
     meetings.value = res.data || []
   } finally { loading.value = false }
 }

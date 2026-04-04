@@ -103,8 +103,10 @@ import { ref, reactive } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { meetingApi } from '@/api/meeting'
+import { useUserStore } from '@/stores/user'
 
 const router = useRouter()
+const userStore = useUserStore()
 const formRef = ref()
 const submitting = ref(false)
 
@@ -112,7 +114,7 @@ const COLORS = ['#409eff','#67c23a','#e6a23c','#f56c6c','#909399','#9b59b6','#1a
 const memberColor = (idx) => COLORS[idx % COLORS.length]
 
 const form = reactive({
-  title: '', description: '', maxRounds: 5, creatorId: 1,
+  title: '', description: '', maxRounds: 5, creatorId: userStore.userId || 1,
   members: [
     { memberName: '理性分析者', modelType: 'gpt-4o', persona: '你擅长逻辑推理和数据分析，注重事实依据，观点客观中立，不轻易受情感影响。', role: 0 },
     { memberName: '批判性思维者', modelType: 'claude-3-5-sonnet-20241022', persona: '你善于发现论点中的漏洞和假设，提出尖锐的反问，但始终基于逻辑而非情感。', role: 0 },
