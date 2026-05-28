@@ -18,4 +18,6 @@ public interface AiMeetingConclusionClusterMapper {
 
     AiMeetingConclusionCluster selectConsensusCluster(@Param("meetingId") Long meetingId,
                                                        @Param("roundNumber") int roundNumber);
+
+    int deleteByMeetingId(Long meetingId);
 }

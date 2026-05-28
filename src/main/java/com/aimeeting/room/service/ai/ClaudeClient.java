@@ -39,8 +39,8 @@ public class ClaudeClient implements AiModelClient {
     public String chat(String modelType, String systemPrompt, String userPrompt) {
         AiModelProperties.ModelConfig cfg = properties.getModels().get("claude");
         if (cfg == null || !cfg.isEnabled()) {
-            log.warn("Claude config not enabled for modelType={}", modelType);
-            return mockResponse(modelType, userPrompt);
+            log.warn("Claude config not enabled for modelType={}, using mock", modelType);
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         }
 
         JSONObject body = new JSONObject();
@@ -74,14 +74,10 @@ public class ClaudeClient implements AiModelClient {
                 return content.getJSONObject(0).getString("text");
             }
             log.warn("No content in Claude response: {}", responseBody);
-            return null;
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         } catch (Exception e) {
-            log.error("Claude call failed, model={}", modelType, e);
-            return null;
+            log.warn("Claude call failed ({}), using mock for model={}", e.getMessage(), modelType);
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         }
-    }
-
-    private String mockResponse(String modelType, String prompt) {
-        return String.format("[Mock-%s] 经过深入思考，我对该议题有以下见解。\n【观点】问题的核心在于如何平衡多方利益。\n【论据】从理性分析的角度出发，需要考虑短期和长期影响。\n【结论】推荐采用系统性思维框架来分析和解决此问题。", modelType);
     }
 }

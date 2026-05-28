@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiWorkflowStageSubmissionMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiWorkflowStageSubmission">
+        <id column="id" property="id"/>
+        <result column="workflow_run_id" property="workflowRunId"/>
+        <result column="stage_run_id" property="stageRunId"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="stage_key" property="stageKey"/>
+        <result column="attempt_no" property="attemptNo"/>
+        <result column="action_type" property="actionType"/>
+        <result column="actor_ref" property="actorRef"/>
+        <result column="content" property="content"/>
+        <result column="payload_json" property="payloadJson"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_workflow_stage_submission
+        (workflow_run_id, stage_run_id, meeting_id, stage_key, attempt_no, action_type, actor_ref, content, payload_json)
+        VALUES
+        (#{workflowRunId}, #{stageRunId}, #{meetingId}, #{stageKey}, #{attemptNo}, #{actionType}, #{actorRef}, #{content}, #{payloadJson})
+    </insert>
+
+    <select id="selectByMeetingId" resultMap="BaseResultMap">
+        SELECT * FROM ai_workflow_stage_submission WHERE meeting_id = #{meetingId} ORDER BY id ASC
+    </select>
+
+    <select id="selectLatestByStageRunId" resultMap="BaseResultMap">
+        SELECT * FROM ai_workflow_stage_submission WHERE stage_run_id = #{stageRunId} ORDER BY id DESC LIMIT 1
+    </select>
+</mapper>

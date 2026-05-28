@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMeetingTrackingUpdateMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiMeetingTrackingUpdate">
+        <id column="id" property="id"/>
+        <result column="tracking_item_id" property="trackingItemId"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="update_type" property="updateType"/>
+        <result column="status_before" property="statusBefore"/>
+        <result column="status_after" property="statusAfter"/>
+        <result column="content" property="content"/>
+        <result column="evidence_ref" property="evidenceRef"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_tracking_update
+        (tracking_item_id, meeting_id, update_type, status_before, status_after, content, evidence_ref)
+        VALUES
+        (#{trackingItemId}, #{meetingId}, #{updateType}, #{statusBefore}, #{statusAfter}, #{content}, #{evidenceRef})
+    </insert>
+
+    <select id="selectByTrackingItemId" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_tracking_update WHERE tracking_item_id = #{trackingItemId} ORDER BY id DESC
+    </select>
+</mapper>

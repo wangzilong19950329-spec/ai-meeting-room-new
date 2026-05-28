@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiWorkflowStageTemplateMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiWorkflowStageTemplate">
+        <id column="id" property="id"/>
+        <result column="template_id" property="templateId"/>
+        <result column="stage_key" property="stageKey"/>
+        <result column="stage_name" property="stageName"/>
+        <result column="stage_order" property="stageOrder"/>
+        <result column="stage_type" property="stageType"/>
+        <result column="actor_type" property="actorType"/>
+        <result column="actor_binding_mode" property="actorBindingMode"/>
+        <result column="actor_slot_key" property="actorSlotKey"/>
+        <result column="completion_rule" property="completionRule"/>
+        <result column="skill_key" property="skillKey"/>
+        <result column="skill_prompt" property="skillPrompt"/>
+        <result column="skill_file_ids" property="skillFileIds"/>
+        <result column="search_strategy" property="searchStrategy"/>
+        <result column="pass_target" property="passTarget"/>
+        <result column="reject_target" property="rejectTarget"/>
+        <result column="reopen_target" property="reopenTarget"/>
+        <result column="auto_start" property="autoStart"/>
+        <result column="review_required" property="reviewRequired"/>
+        <result column="max_review_attempts" property="maxReviewAttempts"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_workflow_stage_template
+        (template_id, stage_key, stage_name, stage_order, stage_type, actor_type, actor_binding_mode, actor_slot_key,
+         completion_rule, skill_key, skill_prompt, skill_file_ids, search_strategy, pass_target, reject_target, reopen_target, auto_start, review_required, max_review_attempts)
+        VALUES
+        (#{templateId}, #{stageKey}, #{stageName}, #{stageOrder}, #{stageType}, #{actorType}, #{actorBindingMode}, #{actorSlotKey},
+         #{completionRule}, #{skillKey}, #{skillPrompt}, #{skillFileIds}, #{searchStrategy}, #{passTarget}, #{rejectTarget}, #{reopenTarget}, #{autoStart}, #{reviewRequired}, #{maxReviewAttempts})
+    </insert>
+
+    <insert id="batchInsert" parameterType="java.util.List">
+        INSERT INTO ai_workflow_stage_template
+        (template_id, stage_key, stage_name, stage_order, stage_type, actor_type, actor_binding_mode, actor_slot_key,
+         completion_rule, skill_key, skill_prompt, skill_file_ids, search_strategy, pass_target, reject_target, reopen_target, auto_start, review_required, max_review_attempts)
+        VALUES
+        <foreach collection="list" item="item" separator=",">
+            (#{item.templateId}, #{item.stageKey}, #{item.stageName}, #{item.stageOrder}, #{item.stageType},
+             #{item.actorType}, #{item.actorBindingMode}, #{item.actorSlotKey}, #{item.completionRule}, #{item.skillKey}, #{item.skillPrompt}, #{item.skillFileIds}, #{item.searchStrategy}, #{item.passTarget}, #{item.rejectTarget},
+             #{item.reopenTarget}, #{item.autoStart}, #{item.reviewRequired}, #{item.maxReviewAttempts})
+        </foreach>
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM ai_workflow_stage_template WHERE id = #{id}
+    </select>
+
+    <select id="selectByTemplateId" resultMap="BaseResultMap">
+        SELECT * FROM ai_workflow_stage_template WHERE template_id = #{templateId} ORDER BY stage_order ASC, id ASC
+    </select>
+
+    <delete id="deleteByTemplateId">
+        DELETE FROM ai_workflow_stage_template WHERE template_id = #{templateId}
+    </delete>
+</mapper>

@@ -6,6 +6,9 @@
         <id column="id" property="id"/>
         <result column="title" property="title"/>
         <result column="description" property="description"/>
+        <result column="project_key" property="projectKey"/>
+        <result column="project_context" property="projectContext"/>
+        <result column="inherited_context" property="inheritedContext"/>
         <result column="creator_id" property="creatorId"/>
         <result column="status" property="status"/>
         <result column="max_rounds" property="maxRounds"/>
@@ -13,14 +16,23 @@
         <result column="final_conclusion" property="finalConclusion"/>
         <result column="conclusion_time" property="conclusionTime"/>
         <result column="summary" property="summary"/>
+        <result column="decision_artifact" property="decisionArtifact"/>
+        <result column="round_summaries" property="roundSummaries"/>
+        <result column="conclusion_history" property="conclusionHistory"/>
         <result column="gmt_create" property="gmtCreate"/>
         <result column="gmt_modify" property="gmtModify"/>
     </resultMap>
 
     <insert id="insert" parameterType="com.aimeeting.room.entity.AiMeetingRoom"
             useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO ai_meeting_room (title, description, creator_id, status, max_rounds, current_round)
-        VALUES (#{title}, #{description}, #{creatorId}, #{status}, #{maxRounds}, #{currentRound})
+        INSERT INTO ai_meeting_room (
+            title, description, project_key, project_context, inherited_context,
+            creator_id, status, max_rounds, current_round
+        )
+        VALUES (
+            #{title}, #{description}, #{projectKey}, #{projectContext}, #{inheritedContext},
+            #{creatorId}, #{status}, #{maxRounds}, #{currentRound}
+        )
     </insert>
 
     <select id="selectById" resultMap="BaseResultMap">
@@ -48,8 +60,38 @@
         UPDATE ai_meeting_room SET summary = #{summary}, gmt_modify = NOW() WHERE id = #{id}
     </update>
 
+    <update id="updateDecisionArtifact">
+        UPDATE ai_meeting_room SET decision_artifact = #{decisionArtifact}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateRoundSummaries">
+        UPDATE ai_meeting_room SET round_summaries = #{roundSummaries}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateConclusionHistory">
+        UPDATE ai_meeting_room SET conclusion_history = #{conclusionHistory}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="resetForRestart">
+        UPDATE ai_meeting_room
+        SET status = 0, current_round = 0, final_conclusion = NULL,
+            conclusion_time = NULL, summary = NULL, decision_artifact = NULL, conclusion_history = NULL,
+            round_summaries = NULL, inherited_context = inherited_context, gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
     <select id="selectByCreatorId" resultMap="BaseResultMap">
         SELECT * FROM ai_meeting_room WHERE creator_id = #{creatorId} ORDER BY gmt_create DESC
+    </select>
+
+    <select id="selectRecentConcludedByProject" resultMap="BaseResultMap">
+        SELECT *
+        FROM ai_meeting_room
+        WHERE creator_id = #{creatorId}
+          AND project_key = #{projectKey}
+          AND status IN (2, 3, 4)
+        ORDER BY conclusion_time DESC, gmt_modify DESC
+        LIMIT 3
     </select>
 
 </mapper>

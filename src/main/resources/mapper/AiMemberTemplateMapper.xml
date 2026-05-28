@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMemberTemplateMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiMemberTemplate">
+        <id     column="id"          property="id"/>
+        <result column="name"        property="name"/>
+        <result column="persona"     property="persona"/>
+        <result column="skills"      property="skills"/>
+        <result column="personality" property="personality"/>
+        <result column="model_type"  property="modelType"/>
+        <result column="tags"        property="tags"/>
+        <result column="gmt_create"  property="gmtCreate"/>
+        <result column="gmt_modify"  property="gmtModify"/>
+    </resultMap>
+
+    <select id="selectAll" resultMap="BaseResultMap">
+        SELECT * FROM ai_member_template ORDER BY gmt_create DESC
+    </select>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM ai_member_template WHERE id = #{id}
+    </select>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_member_template (name, persona, skills, personality, model_type, tags)
+        VALUES (#{name}, #{persona}, #{skills}, #{personality}, #{modelType}, #{tags})
+    </insert>
+
+    <update id="update">
+        UPDATE ai_member_template
+        SET name=#{name}, persona=#{persona}, skills=#{skills},
+            personality=#{personality}, model_type=#{modelType}, tags=#{tags}
+        WHERE id=#{id}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM ai_member_template WHERE id=#{id}
+    </delete>
+
+</mapper>

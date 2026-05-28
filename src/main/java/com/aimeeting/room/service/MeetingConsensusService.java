@@ -46,8 +46,17 @@ public class MeetingConsensusService {
         for (AiMeetingMember member : members) {
             String prompt = orchestrator.buildVotePrompt(meetingId, member.getId());
             String systemPrompt = "你是会议成员「" + member.getMemberName() + "」，请表明你的最终立场。";
-            String response = orchestrator.callModel(member.getModelType(), systemPrompt, prompt);
-            if (response == null) continue;
+            String primaryModelType = orchestrator.resolveNonSearchModelType(member.getModelType());
+            String response = orchestrator.callModel(primaryModelType, systemPrompt, prompt);
+            if (response == null || response.isBlank()) {
+                String fallbackModelType = orchestrator.resolveOperationalModelType(member.getModelType());
+                if (fallbackModelType != null && !fallbackModelType.isBlank() && !fallbackModelType.equals(primaryModelType)) {
+                    log.warn("Vote generation fallback for member {} from {} to {}",
+                            member.getMemberName(), primaryModelType, fallbackModelType);
+                    response = orchestrator.callModel(fallbackModelType, systemPrompt, prompt);
+                }
+            }
+            if (response == null || response.isBlank()) continue;
 
             BigDecimal confidence = new BigDecimal("0.50");
             String position = response;
@@ -79,10 +88,11 @@ public class MeetingConsensusService {
         AiModelProperties.MeetingConfig cfg = aiModelProperties.getMeeting();
         int required = Math.max(cfg.getMinAgreementCount(),
                 (int) Math.ceil(totalMembers * cfg.getConsensusThreshold()));
+        String meetingModelType = orchestrator.resolveOperationalMeetingModelType(meetingId);
 
         String prompt = orchestrator.buildClusterPrompt(meetingId, roundNumber);
-        String response = orchestrator.callModel(null,
-                "你是文本聚类专家，请对以下投票立场进行语义聚类，相似观点归为同一组。", prompt);
+        String response = orchestrator.callModel(meetingModelType,
+                "你是文本聚类专家，请对以下投票立场进行语义聚类，相似观点归为同一组。", prompt, 800);
         if (response == null) return;
 
         try {
@@ -140,7 +150,19 @@ public class MeetingConsensusService {
         List<Long> allIds = memberMapper.selectByMeetingId(meetingId).stream()
                 .map(AiMeetingMember::getId).collect(Collectors.toList());
         List<Long> dissentIds = allIds.stream().filter(id -> !agreeIds.contains(id)).collect(Collectors.toList());
-        return ConsensusResult.reached(largest.getClusterLabel(), largest.getAgreementRatio(), agreeIds, dissentIds);
+        if (largest.getIsConsensus() != null && largest.getIsConsensus() == 1) {
+            return ConsensusResult.reached(largest.getClusterLabel(), largest.getAgreementRatio(), agreeIds, dissentIds);
+        }
+        String forcedConclusion = buildForcedConclusionLabel(largest);
+        return ConsensusResult.partial(forcedConclusion, largest.getAgreementRatio(), agreeIds, dissentIds);
+    }
+
+    private String buildForcedConclusionLabel(AiMeetingConclusionCluster largest) {
+        String label = largest.getClusterLabel() != null ? largest.getClusterLabel().trim() : "暂无主导观点";
+        String ratioText = largest.getAgreementRatio() != null
+                ? largest.getAgreementRatio().stripTrailingZeros().toPlainString()
+                : "0";
+        return "未达成一致，当前占优观点为：" + label + "（支持比例" + ratioText + "）";
     }
 
     private List<Long> parseIds(String memberIds) {

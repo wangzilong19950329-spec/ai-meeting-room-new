@@ -16,3 +16,9 @@ frontend/dist/
 # Env
 *.env
 application-local.yml
+
+# Local runtime artifacts
+*.log
+*.pid
+*.sql.gz
+uploads/

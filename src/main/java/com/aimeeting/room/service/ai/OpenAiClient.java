@@ -46,8 +46,8 @@ public class OpenAiClient implements AiModelClient {
                 : properties.getModels().get("openai");
 
         if (cfg == null || !cfg.isEnabled()) {
-            log.warn("OpenAI/Tongyi config not enabled for modelType={}", modelType);
-            return mockResponse(modelType, userPrompt);
+            log.warn("OpenAI/Tongyi config not enabled for modelType={}, using mock", modelType);
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         }
 
         JSONObject body = new JSONObject();
@@ -82,14 +82,10 @@ public class OpenAiClient implements AiModelClient {
                 return choices.getJSONObject(0).getJSONObject("message").getString("content");
             }
             log.warn("No choices in response: {}", responseBody);
-            return null;
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         } catch (Exception e) {
-            log.error("OpenAI call failed, model={}", modelType, e);
-            return null;
+            log.warn("OpenAI call failed ({}), using mock for model={}", e.getMessage(), modelType);
+            return MockResponseGenerator.generate(systemPrompt, userPrompt);
         }
-    }
-
-    private String mockResponse(String modelType, String prompt) {
-        return String.format("[Mock-%s] 基于对议题的分析，我认为该问题需要从多角度综合考量。\n【观点】议题涉及多个层面，需要权衡利弊。\n【论据】从历史经验和逻辑推导来看，单一视角往往不够全面。\n【结论】建议采取平衡、多元的解决方案。", modelType);
     }
 }

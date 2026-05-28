@@ -4,7 +4,6 @@ import lombok.Data;
 import javax.validation.constraints.Max;
 import javax.validation.constraints.Min;
 import javax.validation.constraints.NotBlank;
-import javax.validation.constraints.NotEmpty;
 import java.util.List;
 
 @Data
@@ -14,6 +13,9 @@ public class MeetingCreateRequest {
     private String title;
 
     private String description;
+    private String projectKey;
+    private String projectContext;
+    private String workflowTemplateKey;
 
     private Long creatorId;
 
@@ -22,7 +24,6 @@ public class MeetingCreateRequest {
     @Max(value = 20, message = "最大轮数不超过20")
     private Integer maxRounds;
 
-    @NotEmpty(message = "至少需要一个成员")
     private List<MemberRequest> members;
 
     @Data
@@ -35,6 +36,9 @@ public class MeetingCreateRequest {
 
         @NotBlank(message = "人设不能为空")
         private String persona;
+
+        private String actorSlotKey;
+        private String actorSlotName;
 
         /** 0-参与者 1-主持人 */
         private Integer role;

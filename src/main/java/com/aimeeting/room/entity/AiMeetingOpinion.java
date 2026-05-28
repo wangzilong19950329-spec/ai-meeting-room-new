@@ -12,7 +12,7 @@ public class AiMeetingOpinion {
     private Long parentOpinionId;
     private String content;
     private String evidence;
-    /** 0-陈述 1-反驳 2-让步 */
+    /** 0-陈述 1-反驳 2-让步 3-人类发言 4-主持人指令 */
     private Integer opinionType;
     private Date gmtCreate;
 }

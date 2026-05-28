@@ -11,10 +11,14 @@ public interface AiMeetingVoteMapper {
 
     int insert(AiMeetingVote record);
 
+    List<AiMeetingVote> selectByMeetingId(@Param("meetingId") Long meetingId);
+
     List<AiMeetingVote> selectByMeetingIdAndRound(@Param("meetingId") Long meetingId,
                                                    @Param("roundNumber") int roundNumber);
 
     AiMeetingVote selectByMeetingMemberRound(@Param("meetingId") Long meetingId,
                                               @Param("memberId") Long memberId,
                                               @Param("roundNumber") int roundNumber);
+
+    int deleteByMeetingId(Long meetingId);
 }

@@ -21,5 +21,16 @@ public interface AiMeetingRoomMapper {
 
     int updateSummary(@Param("id") Long id, @Param("summary") String summary);
 
+    int updateDecisionArtifact(@Param("id") Long id, @Param("decisionArtifact") String decisionArtifact);
+
+    int updateRoundSummaries(@Param("id") Long id, @Param("roundSummaries") String roundSummaries);
+
+    int updateConclusionHistory(@Param("id") Long id, @Param("conclusionHistory") String conclusionHistory);
+
+    int resetForRestart(Long id);
+
     List<AiMeetingRoom> selectByCreatorId(Long creatorId);
+
+    List<AiMeetingRoom> selectRecentConcludedByProject(@Param("creatorId") Long creatorId,
+                                                       @Param("projectKey") String projectKey);
 }

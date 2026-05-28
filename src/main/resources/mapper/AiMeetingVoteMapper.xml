@@ -19,6 +19,10 @@
         VALUES (#{meetingId}, #{memberId}, #{roundNumber}, #{votePosition}, #{confidence}, #{reasoning})
     </insert>
 
+    <select id="selectByMeetingId" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_vote WHERE meeting_id = #{meetingId} ORDER BY round_number ASC, gmt_create ASC
+    </select>
+
     <select id="selectByMeetingIdAndRound" resultMap="BaseResultMap">
         SELECT * FROM ai_meeting_vote WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
     </select>
@@ -28,5 +32,9 @@
         WHERE meeting_id = #{meetingId} AND member_id = #{memberId} AND round_number = #{roundNumber}
         LIMIT 1
     </select>
+
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_vote WHERE meeting_id = #{meetingId}
+    </delete>
 
 </mapper>

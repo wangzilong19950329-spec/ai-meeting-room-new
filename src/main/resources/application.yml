@@ -3,9 +3,9 @@ server:
 
 spring:
   datasource:
-    url: jdbc:mysql://localhost:3306/ai_meeting?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
-    username: root
-    password: your_password
+    url: ${AI_MEETING_DB_URL:jdbc:mysql://127.0.0.1:3306/ai_meeting?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai}
+    username: ${AI_MEETING_DB_USERNAME:ai_meeting}
+    password: ${AI_MEETING_DB_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
 
 mybatis:
@@ -21,8 +21,8 @@ logging:
 
 # AI 模型配置
 ai:
-  # 默认模型（未指定时使用）
-  default-model: gpt-4
+  # 默认模型（未指定时使用，集群分析/会议总结等内部调用）
+  default-model: deepseek-chat
 
   models:
     # OpenAI / 兼容 OpenAI 格式的接口（Azure, 本地 Ollama 等）
@@ -51,6 +51,35 @@ ai:
       secret-key: your-wenxin-secret
       enabled: false
 
+    # DeepSeek
+    deepseek:
+      api-url: https://api.deepseek.com/v1/chat/completions
+      api-key: ${DEEPSEEK_API_KEY:}
+      enabled: ${DEEPSEEK_ENABLED:false}
+
+  # 搜索配置（可选，配置后议员将联网获取实时资讯）
+  search:
+    provider-order: deepseek-web,zhipu,serper
+    serper-api-key: ${SERPER_API_KEY:}   # 从 https://serper.dev 免费获取，填入环境变量后启用真实搜索
+    zhipu:
+      api-key: ${ZHIPU_API_KEY:}
+      api-url: https://open.bigmodel.cn/api/paas/v4/web_search
+      digest-enabled: true
+      digest-api-url: https://open.bigmodel.cn/api/paas/v4/chat/completions
+      digest-model: glm-4-flash-250414
+      digest-timeout-seconds: 60
+      search-engine: search_std
+      recency-filter: noLimit
+      content-size: medium
+      timeout-seconds: 60
+    deepseek-web:
+      enabled: false
+      bridge-url: http://127.0.0.1:8789/search
+      node-command: node
+      script-path: scripts/deepseek-web-search.js
+      timeout-seconds: 150
+      read-timeout-seconds: 320
+
   # 会议配置
   meeting:
     async-thread-pool-size: 5
@@ -60,3 +89,13 @@ ai:
     base-reward: 100
     base-penalty: 50
     dissent-penalty-factor: 0.3
+  tracking:
+    refresh:
+      enabled: true
+      batch-size: 2
+      scan-interval-ms: 60000
+      initial-delay-ms: 20000
+
+# 通知配置
+notification:
+  serverchan-key: ""   # Server酱 key，从 https://sct.ftqq.com 获取，填入后启用微信推送

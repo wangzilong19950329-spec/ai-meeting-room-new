@@ -18,4 +18,6 @@ public interface AiMeetingOpinionMapper {
 
     int countByMeetingIdAndMemberId(@Param("meetingId") Long meetingId,
                                     @Param("memberId") Long memberId);
+
+    int deleteByMeetingId(Long meetingId);
 }

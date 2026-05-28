@@ -29,4 +29,15 @@ public class ConsensusResult {
         r.consensusReached = false;
         return r;
     }
+
+    public static ConsensusResult partial(String conclusion, BigDecimal ratio,
+                                          List<Long> agreeingIds, List<Long> dissentingIds) {
+        ConsensusResult r = new ConsensusResult();
+        r.consensusReached = false;
+        r.conclusion = conclusion;
+        r.agreementRatio = ratio;
+        r.agreeingMemberIds = agreeingIds;
+        r.dissentingMemberIds = dissentingIds;
+        return r;
+    }
 }

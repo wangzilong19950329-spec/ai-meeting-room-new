@@ -8,6 +8,8 @@
         <result column="member_name" property="memberName"/>
         <result column="model_type" property="modelType"/>
         <result column="persona" property="persona"/>
+        <result column="actor_slot_key" property="actorSlotKey"/>
+        <result column="actor_slot_name" property="actorSlotName"/>
         <result column="role" property="role"/>
         <result column="total_score" property="totalScore"/>
         <result column="gmt_create" property="gmtCreate"/>
@@ -16,14 +18,14 @@
 
     <insert id="insert" parameterType="com.aimeeting.room.entity.AiMeetingMember"
             useGeneratedKeys="true" keyProperty="id">
-        INSERT INTO ai_meeting_member (meeting_id, member_name, model_type, persona, role, total_score)
-        VALUES (#{meetingId}, #{memberName}, #{modelType}, #{persona}, #{role}, #{totalScore})
+        INSERT INTO ai_meeting_member (meeting_id, member_name, model_type, persona, actor_slot_key, actor_slot_name, role, total_score)
+        VALUES (#{meetingId}, #{memberName}, #{modelType}, #{persona}, #{actorSlotKey}, #{actorSlotName}, #{role}, #{totalScore})
     </insert>
 
     <insert id="batchInsert" parameterType="java.util.List">
-        INSERT INTO ai_meeting_member (meeting_id, member_name, model_type, persona, role, total_score) VALUES
+        INSERT INTO ai_meeting_member (meeting_id, member_name, model_type, persona, actor_slot_key, actor_slot_name, role, total_score) VALUES
         <foreach collection="list" item="item" separator=",">
-            (#{item.meetingId}, #{item.memberName}, #{item.modelType}, #{item.persona}, #{item.role}, #{item.totalScore})
+            (#{item.meetingId}, #{item.memberName}, #{item.modelType}, #{item.persona}, #{item.actorSlotKey}, #{item.actorSlotName}, #{item.role}, #{item.totalScore})
         </foreach>
     </insert>
 

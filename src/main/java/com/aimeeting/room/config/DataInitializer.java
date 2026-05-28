@@ -2,6 +2,7 @@ package com.aimeeting.room.config;
 
 import com.aimeeting.room.dao.AiUserMapper;
 import com.aimeeting.room.entity.AiUser;
+import com.aimeeting.room.service.MeetingWorkflowService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.ApplicationArguments;
@@ -19,9 +20,12 @@ public class DataInitializer implements ApplicationRunner {
 
     private final AiUserMapper userMapper;
     private final BCryptPasswordEncoder passwordEncoder;
+    private final MeetingWorkflowService meetingWorkflowService;
 
     @Override
     public void run(ApplicationArguments args) {
+        meetingWorkflowService.ensureDefaultTemplateExists();
+
         String defaultPassword = "admin123";
         String encodedPassword = passwordEncoder.encode(defaultPassword);
 
