@@ -1,0 +1,1136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 多成员会议室 — 项目全面分析报告</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        :root { --bg: #f6f8fa; --fg: #24292f; --border: #d0d7de; --accent: #0969da; --code-bg: #f6f8fa; }
+        body { font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; line-height: 1.6; max-width: 1200px; margin: 0 auto; padding: 2rem; background: var(--bg); color: var(--fg); }
+        h1 { border-bottom: 2px solid var(--border); padding-bottom: .5rem; }
+        h2 { margin-top: 2.5rem; border-bottom: 1px solid var(--border); padding-bottom: .3rem; }
+        h3 { margin-top: 2rem; color: #1f2328; }
+        h4 { margin-top: 1.5rem; color: #333; }
+        table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }
+        th, td { border: 1px solid var(--border); padding: .5rem .7rem; text-align: left; }
+        th { background: #f3f4f6; font-weight: 600; }
+        tr:nth-child(even) { background: #fafafa; }
+        code { background: var(--code-bg); padding: .15rem .4rem; border-radius: 4px; font-family: ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace; font-size: .85em; }
+        pre { background: var(--code-bg); padding: 1rem; border-radius: 6px; overflow-x: auto; border: 1px solid var(--border); }
+        pre code { background: none; padding: 0; }
+        .mermaid { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin: 1rem 0; text-align: center; }
+        blockquote { border-left: 4px solid var(--accent); margin: 1rem 0; padding-left: 1rem; color: #555; }
+        hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+        ul, ol { margin: .5rem 0; padding-left: 1.5rem; }
+        .toc { background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.5rem; margin: 1rem 0; }
+        .toc ul { list-style: none; padding-left: 0; }
+        .toc li { margin: .3rem 0; }
+        .toc a { color: var(--accent); text-decoration: none; }
+        .toc a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <h1>AI 多成员会议室 — 项目全面分析报告</h1>
+    <p><strong>生成时间：</strong>2026-05-25 | <strong>分析版本：</strong>v1.4.0 | <strong>项目路径：</strong><code>/Users/wangzilong/IdeaProjects/ai-meeting-room-new</code></p>
+
+    <div class="toc">
+        <h3>目录</h3>
+        <ul>
+            <li><a href="#s1">一、项目整体总结</a></li>
+            <li><a href="#s2">二、针对指定功能的深度分析（会议创建与启动）</a></li>
+            <li><a href="#s3">三、数据库表相关分析</a></li>
+        </ul>
+    </div>
+
+    <hr>
+
+    <h2 id="s1">一、项目整体总结</h2>
+
+    <h3>1. 项目概览</h3>
+    <table>
+        <tr><th>维度</th><th>内容</th></tr>
+        <tr><td><strong>一句话业务简介</strong></td><td>AI 多成员会议室系统，通过让多个不同 AI 模型（议员）围绕同一议题进行多轮辩论、投票、共识检查，利用多模型协作减少单一模型的认知偏差，最终输出结构化结论与决策卡片。支持人类用户介入追问、工作流编排、结论追踪与重开。</td></tr>
+        <tr><td><strong>Spring Boot 版本</strong></td><td>2.7.18</td></tr>
+        <tr><td><strong>JDK 版本</strong></td><td>11</td></tr>
+        <tr><td><strong>数据库</strong></td><td>MySQL 8.x（生产）/ H2（本地开发，runtime 依赖）</td></tr>
+        <tr><td><strong>ORM 框架</strong></td><td>MyBatis 2.3.1</td></tr>
+        <tr><td><strong>HTTP 客户端</strong></td><td>OkHttp 4.12.0</td></tr>
+        <tr><td><strong>JSON 处理</strong></td><td>Fastjson 1.2.83</td></tr>
+        <tr><td><strong>工具库</strong></td><td>Hutool 5.8.20</td></tr>
+        <tr><td><strong>安全</strong></td><td>Spring Security Crypto（BCrypt 密码加密）</td></tr>
+        <tr><td><strong>构建工具</strong></td><td>Maven</td></tr>
+        <tr><td><strong>前端</strong></td><td>Vue 3 + Vite（独立目录 <code>frontend/</code>）</td></tr>
+    </table>
+
+    <h3>2. 核心业务模型</h3>
+    <h4>核心实体类（Entity）</h4>
+    <table>
+        <tr><th>实体名</th><th>说明</th></tr>
+        <tr><td><code>AiMeetingRoom</code></td><td>会议主表，聚合根</td></tr>
+        <tr><td><code>AiMeetingMember</code></td><td>会议成员（AI 议员），归属于某次会议</td></tr>
+        <tr><td><code>AiMeetingOpinion</code></td><td>发言/意见记录，归属于会议和成员</td></tr>
+        <tr><td><code>AiMeetingVote</code></td><td>投票记录，每轮每位成员投一票</td></tr>
+        <tr><td><code>AiMeetingConclusionCluster</code></td><td>结论聚类，每轮投票后按语义聚类</td></tr>
+        <tr><td><code>AiMeetingScoreLog</code></td><td>积分变动日志</td></tr>
+        <tr><td><code>AiWorkflowTemplate</code></td><td>工作流模板定义</td></tr>
+        <tr><td><code>AiWorkflowStageTemplate</code></td><td>工作流阶段模板定义</td></tr>
+        <tr><td><code>AiWorkflowRun</code></td><td>工作流运行实例</td></tr>
+        <tr><td><code>AiWorkflowStageRun</code></td><td>工作流阶段运行实例</td></tr>
+        <tr><td><code>AiWorkflowStageSubmission</code></td><td>阶段提交与审核记录</td></tr>
+        <tr><td><code>AiMeetingTrackingItem</code></td><td>追踪项（待办/监控项）</td></tr>
+        <tr><td><code>AiMeetingTrackingUpdate</code></td><td>追踪项更新记录</td></tr>
+        <tr><td><code>AiSkillFile</code></td><td>Skill 文件库</td></tr>
+        <tr><td><code>AiUser</code></td><td>系统用户</td></tr>
+    </table>
+
+    <h4>主要数据表关系</h4>
+    <ul>
+        <li><strong>会议 1:N 成员</strong>：一次会议配置多个 AI 议员</li>
+        <li><strong>会议 1:N 发言</strong>：一次会议由多名成员进行多轮发言</li>
+        <li><strong>会议 1:N 投票</strong>：每轮每位成员产生一条投票记录</li>
+        <li><strong>会议 1:N 结论聚类</strong>：每轮投票后生成语义聚类结果</li>
+        <li><strong>会议 1:1 工作流运行</strong>：一次会议绑定一个工作流运行实例</li>
+        <li><strong>工作流运行 1:N 阶段运行</strong>：一个工作流实例包含多个阶段运行</li>
+        <li><strong>阶段运行 1:N 提交记录</strong>：每个阶段可有多条提交/审核记录</li>
+        <li><strong>会议/阶段 1:N 追踪项</strong>：会议或阶段可产生多个追踪项</li>
+        <li><strong>追踪项 1:N 更新记录</strong>：一个追踪项可有多条更新历史</li>
+        <li><strong>模板 1:N 阶段模板</strong>：一个工作流模板定义多个阶段模板</li>
+    </ul>
+
+    <h3>3. 领域对象与实体描述</h3>
+    <h4>主要领域对象</h4>
+    <table>
+        <tr><th>领域对象</th><th>类型</th><th>关键属性</th><th>职责</th></tr>
+        <tr><td><code>AiMeetingRoom</code></td><td>聚合根</td><td>status, currentRound, maxRounds, finalConclusion, decisionArtifact, roundSummaries, conclusionHistory</td><td>管理会议生命周期、结论与历史版本</td></tr>
+        <tr><td><code>AiMeetingMember</code></td><td>实体</td><td>modelType, persona, role, totalScore, actorSlotKey</td><td>代表一个 AI 议员，绑定特定大模型与人设</td></tr>
+        <tr><td><code>AiMeetingOpinion</code></td><td>值对象</td><td>opinionType, content, evidence, parentOpinionId</td><td>记录一次发言，含结构化论据（JSON）</td></tr>
+        <tr><td><code>AiMeetingVote</code></td><td>值对象</td><td>votePosition, confidence, reasoning</td><td>记录成员对本轮讨论的立场投票</td></tr>
+        <tr><td><code>AiMeetingConclusionCluster</code></td><td>值对象</td><td>clusterLabel, agreementRatio, isConsensus, memberIds</td><td>语义聚类结果，判断共识是否达成</td></tr>
+        <tr><td><code>AiWorkflowRun</code></td><td>聚合根</td><td>status, currentStageKey, blockedReason</td><td>工作流运行状态机</td></tr>
+        <tr><td><code>AiWorkflowStageRun</code></td><td>实体</td><td>stageType, status, outcome, handoffSummary</td><td>阶段运行状态与交付物</td></tr>
+        <tr><td><code>AiMeetingTrackingItem</code></td><td>实体</td><td>status, watchQuery, autoRefreshEnabled, reopenPolicy</td><td>追踪项，可自动刷新并触发会议重开</td></tr>
+    </table>
+
+    <h4>核心状态机 — 会议状态</h4>
+    <div class="mermaid">
+stateDiagram-v2
+    [*] --> CREATED : 创建会议
+    CREATED --> IN_PROGRESS : 启动会议
+    IN_PROGRESS --> CONCLUDED : 达成共识 / 强制结论
+    IN_PROGRESS --> PAUSED : 用户暂停
+    IN_PROGRESS --> CANCELLED : 异常/用户取消
+    PAUSED --> IN_PROGRESS : 恢复
+    CONCLUDED --> VERIFIED_VALID : 用户验证有效
+    CONCLUDED --> VERIFIED_INVALID : 用户验证无效
+    CONCLUDED --> REOPENED : 人类追问 / 追踪项触发
+    REOPENED --> IN_PROGRESS : 重开后自动继续
+    REOPENED --> CONCLUDED : 再次达成结论
+    VERIFIED_VALID --> REOPENED : 追问重开
+    VERIFIED_INVALID --> REOPENED : 追问重开
+    CANCELLED --> [*]
+    </div>
+
+    <h4>工作流运行状态</h4>
+    <table>
+        <tr><th>状态码</th><th>含义</th></tr>
+        <tr><td><code>PENDING</code></td><td>待开始</td></tr>
+        <tr><td><code>ACTIVE</code></td><td>执行中</td></tr>
+        <tr><td><code>WAITING_TRACKING</code></td><td>等待追踪</td></tr>
+        <tr><td><code>CONCLUDED</code></td><td>已收敛</td></tr>
+        <tr><td><code>REOPENED</code></td><td>已重开</td></tr>
+    </table>
+
+    <h4>追踪项状态</h4>
+    <table>
+        <tr><th>状态码</th><th>含义</th></tr>
+        <tr><td><code>OPEN</code></td><td>待处理</td></tr>
+        <tr><td><code>IN_PROGRESS</code></td><td>处理中</td></tr>
+        <tr><td><code>BLOCKED</code></td><td>已阻塞</td></tr>
+        <tr><td><code>READY_FOR_REVIEW</code></td><td>待复核</td></tr>
+        <tr><td><code>VERIFIED</code></td><td>已验证</td></tr>
+        <tr><td><code>REJECTED</code></td><td>已驳回</td></tr>
+        <tr><td><code>CLOSED</code></td><td>已关闭</td></tr>
+    </table>
+
+    <h3>4. 核心业务流程</h3>
+
+    <h4>功能一：会议创建</h4>
+    <pre><code>MeetingController.createMeeting
+  └─ MeetingRoomService.createMeeting
+       ├─ MeetingWorkflowService.validateMeetingMembers      // 校验成员与工作流模板匹配
+       ├─ AiMeetingRoomMapper.insert                         // 插入会议主表
+       ├─ AiMeetingMemberMapper.batchInsert                  // 批量插入成员
+       └─ MeetingWorkflowService.ensureWorkflowForMeeting    // 确保工作流实例存在</code></pre>
+    <p><strong>关键数据：</strong>会议初始状态 <code>status = 0 (CREATED)</code>，<code>currentRound = 0</code>。</p>
+
+    <h4>功能二：会议启动（异步执行）</h4>
+    <pre><code>MeetingController.startMeeting
+  └─ MeetingRoomService.startMeeting
+       ├─ AiMeetingRoomMapper.selectById
+       ├─ MeetingWorkflowService.ensureWorkflowForMeeting
+       ├─ AiMeetingRoomMapper.updateStatus -> IN_PROGRESS
+       ├─ MeetingWorkflowService.activateMeetingWorkflow     // 激活工作流
+       └─ ExecutorService.submit -> runMeetingFlow            // 提交异步任务</code></pre>
+    <p><strong>关键数据：</strong>状态由 <code>CREATED(0)</code> 变为 <code>IN_PROGRESS(1)</code>。</p>
+
+    <h4>功能三：单轮辩论与发言生成</h4>
+    <pre><code>runMeetingFlow (async)
+  └─ MeetingDebateService.executeDebateRound
+       ├─ MeetingWorkflowService.resolveMembersForCurrentStage
+       ├─ generateOpinionWithRetry -> generateOpinion
+       │    ├─ 阶段1：搜索决策（WebSearchService.isEnabled / search）
+       │    │    └─ 外部调用：Serper API / 智谱搜索 API / DeepSeek Web Bridge
+       │    ├─ 阶段2：调用 AI 模型生成发言
+       │    │    └─ MeetingOrchestratorService.callModel / callModelEx
+       │    │         └─ AiModelRouter.chat / chatEx
+       │    │              └─ GenericAiClient / OpenAiClient / ClaudeClient / WenxinClient
+       │    │                   └─ 外部调用：各 AI 模型 HTTP API
+       │    └─ AiMeetingOpinionMapper.insert                  // 持久化发言
+       └─ 返回本轮所有发言</code></pre>
+    <p><strong>关键外部依赖：</strong></p>
+    <ul>
+        <li><strong>联网搜索：</strong><code>WebSearchService.search(query)</code> → Serper.dev / 智谱 GLM-4-Flash / DeepSeek Web Bridge</li>
+        <li><strong>AI 模型调用：</strong><code>AiModelRouter.chat()</code> → DeepSeek API / OpenAI API / Claude API / 通义千问 API / 文心一言 API</li>
+    </ul>
+
+    <h4>功能四：投票与共识检查</h4>
+    <pre><code>runMeetingFlow (async)
+  ├─ MeetingConsensusService.conductVoting
+  │    ├─ 遍历成员：MeetingOrchestratorService.buildVotePrompt
+  │    ├─ 调用 AI 模型生成投票 JSON
+  │    └─ AiMeetingVoteMapper.insert
+  ├─ MeetingConsensusService.clusterVotePositions
+  │    ├─ MeetingOrchestratorService.buildClusterPrompt
+  │    ├─ 调用 AI 模型进行语义聚类
+  │    └─ AiMeetingConclusionClusterMapper.batchInsert
+  └─ MeetingConsensusService.checkConsensus
+       └─ AiMeetingConclusionClusterMapper.selectConsensusCluster</code></pre>
+
+    <h4>功能五：会议结论生成与归档</h4>
+    <pre><code>MeetingRoomService.finalizeMeeting
+  ├─ MeetingOrchestratorService.callModel -> 生成会议总结
+  ├─ MeetingOrchestratorService.callModel -> 生成决策卡片 JSON
+  ├─ AiMeetingRoomMapper.updateSummary
+  ├─ AiMeetingRoomMapper.updateDecisionArtifact
+  ├─ AiMeetingRoomMapper.updateConclusionHistory
+  ├─ MeetingWorkflowService.markMeetingConcluded
+  └─ NotificationService.sendMeetingConclusion -> Server酱微信通知（可选）</code></pre>
+
+    <h4>功能六：人类用户介入</h4>
+    <pre><code>MeetingController.sendHumanMessage
+  └─ MeetingRoomService.addHumanMessage
+       ├─ 状态判断：若已结束则触发 reopenMeetingForFollowUp
+       │    ├─ 插入人类追问意见（AiMeetingOpinionMapper.insert）
+       │    ├─ 更新会议状态为 REOPENED
+       │    ├─ MeetingWorkflowService.reopenMeetingWorkflow
+       │    └─ ExecutorService.submit -> runMeetingFlow
+       └─ 若进行中则直接插入意见</code></pre>
+
+    <h4>功能七：追踪中心自动刷新</h4>
+    <pre><code>TrackingCenterService.dispatchDueRefreshes (@Scheduled)
+  └─ TrackingCenterService.processDueRefreshBatch
+       └─ TrackingCenterService.refreshItemInternal
+            ├─ WebSearchService.search -> 外部搜索
+            ├─ WebSearchService.buildResearchDigest
+            ├─ 计算变化严重度（changeSeverity）
+            ├─ AiMeetingTrackingItemMapper.update
+            ├─ AiMeetingTrackingUpdateMapper.insert
+            └─ 若触发重开条件 -> MeetingRoomService.reopenMeetingFromTrackingSignal</code></pre>
+
+    <h4>功能八：工作流阶段提交与审核</h4>
+    <pre><code>MeetingController.submitWorkflowStage
+  └─ MeetingRoomService.submitWorkflowStage
+       └─ MeetingWorkflowService.submitCurrentStage
+            ├─ 根据 stageType 执行：AUTO / HUMAN_SUBMIT / REVIEW
+            ├─ AiWorkflowStageRunMapper.update
+            ├─ AiWorkflowStageSubmissionMapper.insert
+            └─ 推进到下一阶段或阻塞等待审核</code></pre>
+
+    <h3>5. 架构分层</h3>
+    <pre><code>frontend/                    Vue 3 前端应用
+src/main/java/com/aimeeting/room/
+├── common/                  通用封装（ApiResponse）
+├── config/                  配置类（AI模型、拦截器、Token、数据初始化等）
+├── controller/              REST API 控制器层
+├── dto/                     数据传输对象
+├── entity/                  领域实体/数据模型
+├── enums/                   枚举定义
+├── dao/                     数据访问层（Mapper 接口）
+└── service/                 业务服务层
+     ├── ai/                 AI 模型客户端与搜索服务
+     ├── MeetingRoomService.java          会议生命周期主服务
+     ├── MeetingDebateService.java        辩论/发言生成服务
+     ├── MeetingConsensusService.java     投票/共识/聚类服务
+     ├── MeetingOrchestratorService.java  AI 编排/提示词构建服务
+     ├── MeetingWorkflowService.java      工作流引擎服务
+     ├── MeetingScoreService.java         积分计算服务
+     ├── TrackingCenterService.java       追踪中心服务
+     ├── NotificationService.java         通知服务
+     └── SkillFileService.java            Skill 文件管理服务</code></pre>
+    <p><strong>模块间依赖关系：</strong></p>
+    <ul>
+        <li>Controller 层依赖 Service 层</li>
+        <li>Service 层依赖 DAO 层和外部 AI Client</li>
+        <li><code>MeetingRoomService</code> 是核心协调者，依赖几乎所有其他 Service</li>
+        <li><code>MeetingOrchestratorService</code> 负责提示词构建，是 AI 调用的统一入口</li>
+        <li><code>AiModelRouter</code> 负责按模型类型路由到具体 Client 实现</li>
+    </ul>
+
+    <h3>6. 外部依赖与上下游梳理</h3>
+    <table>
+        <tr><th>依赖类型</th><th>名称/组件</th><th>用途</th><th>交互模块</th><th>配置位置</th><th>影响的关键功能</th></tr>
+        <tr><td>AI 模型 API</td><td>DeepSeek API</td><td>默认对话模型、推理模型，发言生成、投票、总结</td><td>GenericAiClient, MeetingOrchestratorService</td><td>application.yml : ai.models.deepseek</td><td>辩论发言、投票、共识聚类、结论生成</td></tr>
+        <tr><td>AI 模型 API</td><td>OpenAI API</td><td>兼容 OpenAI 格式的第三方模型</td><td>GenericAiClient</td><td>application.yml : ai.models.openai</td><td>辩论发言、投票等</td></tr>
+        <tr><td>AI 模型 API</td><td>Claude API</td><td>Anthropic Claude 模型</td><td>ClaudeClient</td><td>application.yml : ai.models.claude</td><td>辩论发言等</td></tr>
+        <tr><td>AI 模型 API</td><td>通义千问 API</td><td>阿里云大模型</td><td>GenericAiClient</td><td>application.yml : ai.models.tongyi</td><td>辩论发言等</td></tr>
+        <tr><td>AI 模型 API</td><td>文心一言 API</td><td>百度大模型</td><td>WenxinClient</td><td>application.yml : ai.models.wenxin</td><td>辩论发言等</td></tr>
+        <tr><td>搜索 API</td><td>Serper.dev</td><td>Google Search API，获取实时资讯</td><td>WebSearchService</td><td>application.yml : ai.search.serper-api-key</td><td>议员发言前的联网搜索</td></tr>
+        <tr><td>搜索 API</td><td>智谱 GLM-4-Flash</td><td>内置联网搜索+摘要</td><td>WebSearchService</td><td>application.yml : ai.search.zhipu</td><td>议员发言前的联网搜索</td></tr>
+        <tr><td>搜索桥接</td><td>DeepSeek Web Bridge</td><td>本地 Node.js 桥接 DeepSeek 网页搜索</td><td>WebSearchService</td><td>application.yml : ai.search.deepseek-web</td><td>议员发言前的联网搜索（实验性）</td></tr>
+        <tr><td>通知服务</td><td>Server酱</td><td>微信推送会议结论</td><td>NotificationService</td><td>application.yml : notification.serverchan-key</td><td>会议结论达成后通知</td></tr>
+        <tr><td>数据库</td><td>MySQL</td><td>业务数据持久化</td><td>所有 DAO Mapper</td><td>application.yml : spring.datasource</td><td>所有业务功能</td></tr>
+        <tr><td>本地文件系统</td><td>磁盘</td><td>Skill 文件上传存储</td><td>SkillFileService</td><td>uploads/skill-files/</td><td>Skill 文件管理</td></tr>
+    </table>
+
+    <h3>7. 特殊规范</h3>
+
+    <h4>统一异常处理机制</h4>
+    <p>项目未使用 <code>@RestControllerAdvice</code> 全局异常处理，而是采用<strong>Controller 层逐方法 try-catch</strong> 模式：</p>
+    <pre><code>try {
+    // 业务逻辑
+    return ApiResponse.ok(data);
+} catch (Exception e) {
+    log.error("xxx error", e);
+    return ApiResponse.fail(e.getMessage());
+}</code></pre>
+
+    <h4>统一返回值封装</h4>
+    <ul>
+        <li>类名：<code>ApiResponse&lt;T&gt;</code></li>
+        <li>成功：<code>code = 200</code>, <code>msg = "success"</code></li>
+        <li>失败：<code>code = 500</code> 或自定义，附带错误消息</li>
+    </ul>
+
+    <h4>设计模式</h4>
+    <table>
+        <tr><th>模式</th><th>应用位置</th><th>说明</th></tr>
+        <tr><td><strong>策略模式</strong></td><td><code>AiModelClient</code> 及其实现类</td><td>GenericAiClient, OpenAiClient, ClaudeClient, WenxinClient 实现统一接口，由 AiModelRouter 按模型类型路由</td></tr>
+        <tr><td><strong>模板方法模式</strong></td><td><code>MeetingWorkflowService</code></td><td>工作流阶段执行有标准化的推进、审核、回退逻辑</td></tr>
+        <tr><td><strong>状态模式</strong></td><td>会议/工作流/追踪项</td><td>通过枚举状态码控制行为分支</td></tr>
+        <tr><td><strong>工厂模式</strong></td><td><code>ModelRegistryStore</code></td><td>动态注册和管理模型配置</td></tr>
+    </table>
+
+    <hr>
+
+    <h2 id="s2">二、针对指定功能的深度分析</h2>
+    <p><strong>用户指定功能：</strong>AI 会议室创建与启动<br>
+    <strong>主要入口：</strong><code>com.aimeeting.room.controller.MeetingController.createMeeting</code><br>
+    <strong>辅助入口：</strong><code>com.aimeeting.room.controller.MeetingController.startMeeting</code></p>
+
+    <h3>1. 流程图</h3>
+    <p>以下以具体实例 <strong>会议 <code>MTG20260525001</code></strong>（对应数据库记录 <code>id = 1001</code>）贯穿全程。</p>
+    <div class="mermaid">
+flowchart TD
+    A[Client 提交创建请求<br/>POST /api/meetings] --> B[MeetingController.createMeeting]
+    B --> C[MeetingRoomService.createMeeting]
+    C --> D{校验成员与工作流模板<br/>MeetingWorkflowService.validateMeetingMembers}
+    D -->|校验通过| E[构建 AiMeetingRoom 对象<br/>status: 0 CREATED]
+    E --> F[AiMeetingRoomMapper.insert<br/>ai_meeting_room 表 INSERT<br/>记录 id=1001, status=0, current_round=0]
+    F --> G{请求包含成员列表?}
+    G -->|是| H[构建 AiMeetingMember 列表<br/>绑定 modelType / persona]
+    H --> I[AiMeetingMemberMapper.batchInsert<br/>ai_meeting_member 表 INSERT<br/>member_id=2001~2004]
+    G -->|否| J[跳过成员创建]
+    I --> K
+    J --> K[MeetingWorkflowService.ensureWorkflowForMeeting]
+    K --> L{会议是否已有工作流实例?}
+    L -->|否| M[创建工作流运行实例<br/>AiWorkflowRun status=PENDING<br/>ai_workflow_run 表 INSERT]
+    L -->|是| N[返回已有实例]
+    M --> O[返回 meetingId = 1001]
+    N --> O
+    O --> P[ApiResponse.ok 1001]
+
+    P --> Q[Client 提交启动请求<br/>POST /api/meetings/1001/start]
+    Q --> R[MeetingController.startMeeting]
+    R --> S[MeetingRoomService.startMeeting]
+    S --> T[AiMeetingRoomMapper.selectById<br/>校验会议存在且状态合法]
+    T --> U[MeetingWorkflowService.ensureWorkflowForMeeting]
+    U --> V[AiMeetingRoomMapper.updateStatus<br/>status: 0 --> 1 IN_PROGRESS]
+    V --> W{是否为默认圆桌工作流?}
+    W -->|是| X[MeetingWorkflowService.activateMeetingWorkflow]
+    W -->|否| Y[activateMeetingWorkflow + 异常回退到 PAUSED]
+    X --> Z[ExecutorService.submit<br/>提交异步任务 runMeetingFlow]
+    Y --> Z
+    Z --> AA[ApiResponse.ok]
+
+    AA --> AB[异步线程: runMeetingFlow]
+    AB --> AC[for round = 1 to maxRounds]
+    AC --> AD[AiMeetingRoomMapper.updateCurrentRound<br/>current_round = round]
+    AD --> AE[MeetingDebateService.executeDebateRound<br/>生成各成员发言]
+    AE --> AF[MeetingConsensusService.conductVoting<br/>各成员投票]
+    AF --> AG[MeetingConsensusService.clusterVotePositions<br/>语义聚类]
+    AG --> AH[生成轮次摘要<br/>updateRoundSummaries]
+    AH --> AI[MeetingConsensusService.checkConsensus<br/>检查是否达成共识]
+    AI -->|共识达成| AJ[MeetingRoomService.finalizeMeeting<br/>生成结论、总结、决策卡片]
+    AI -->|未达成共识| AK[继续下一轮]
+    AK --> AC
+    AC -->|达到最大轮数| AL[MeetingConsensusService.forceConclude<br/>强制取最大聚类为结论]
+    AL --> AJ
+    AJ --> AM[MeetingWorkflowService.markMeetingConcluded]
+    AM --> AN[NotificationService.sendMeetingConclusion<br/>Server酱微信推送]
+    AN --> AO[结束]
+    </div>
+
+    <h3>2. 时序图</h3>
+    <div class="mermaid">
+sequenceDiagram
+    actor Client
+    participant Ctrl as MeetingController
+    participant Svc as MeetingRoomService
+    participant WFS as MeetingWorkflowService
+    participant DAO1 as AiMeetingRoomMapper
+    participant DAO2 as AiMeetingMemberMapper
+    participant DAO3 as AiWorkflowRunMapper
+    participant Exe as meetingExecutor<br/>(线程池)
+    participant Deb as MeetingDebateService
+    participant Con as MeetingConsensusService
+    participant Orc as MeetingOrchestratorService
+    participant Router as AiModelRouter
+    participant AI as DeepSeek API<br/>(外部)
+    participant Search as Serper.dev<br/>(外部)
+
+    Client->>Ctrl: POST /api/meetings<br/>MeetingCreateRequest
+    Ctrl->>Svc: createMeeting(request)
+    Svc->>WFS: validateMeetingMembers()
+    WFS-->>Svc: ok
+    Svc->>DAO1: insert(room)<br/>status=CREATED(0)
+    DAO1-->>Svc: room.id = 1001
+    Svc->>DAO2: batchInsert(members)
+    DAO2-->>Svc: ok
+    Svc->>WFS: ensureWorkflowForMeeting(room)
+    WFS->>DAO3: selectByMeetingId(1001)
+    DAO3-->>WFS: null
+    WFS->>DAO3: insert(workflowRun)<br/>status=PENDING
+    DAO3-->>WFS: ok
+    WFS-->>Svc: workflowRun
+    Svc-->>Ctrl: 1001
+    Ctrl-->>Client: ApiResponse(200, 1001)
+
+    Client->>Ctrl: POST /api/meetings/1001/start
+    Ctrl->>Svc: startMeeting(1001)
+    Svc->>DAO1: selectById(1001)
+    DAO1-->>Svc: room(status=CREATED)
+    Svc->>WFS: activateMeetingWorkflow(1001)
+    WFS-->>Svc: ok
+    Svc->>DAO1: updateStatus(1001, IN_PROGRESS)
+    DAO1-->>Svc: ok
+    Svc->>Exe: submit(runMeetingFlow)
+    Exe-->>Svc: Future
+    Svc-->>Ctrl: ok
+    Ctrl-->>Client: ApiResponse(200)
+
+    loop 每轮辩论 (round 1..maxRounds)
+        Exe->>Deb: executeDebateRound(1001, round)
+        Deb->>Orc: buildDebateContext()
+        Orc-->>Deb: contextPrompt
+        Deb->>Search: search(query, 3)
+        Search-->>Deb: SearchResult[]
+        Deb->>Router: chatEx(modelType, systemPrompt, contextPrompt)
+        Router->>AI: HTTP POST /v1/chat/completions
+        AI-->>Router: JSON response
+        Router-->>Deb: ChatResult(content, evidence)
+        Deb->>DAO1: insert(opinion)<br/>ai_meeting_opinion
+        DAO1-->>Deb: ok
+        Deb-->>Exe: roundOpinions[]
+
+        Exe->>Con: conductVoting(1001, round)
+        Con->>Orc: buildVotePrompt()
+        Con->>Router: chat()
+        Router->>AI: HTTP POST
+        AI-->>Router: vote JSON
+        Router-->>Con: votePosition
+        Con->>DAO1: insert(vote)<br/>ai_meeting_vote
+        DAO1-->>Con: ok
+
+        Exe->>Con: clusterVotePositions(1001, round)
+        Con->>Orc: buildClusterPrompt()
+        Con->>Router: chat()
+        Router->>AI: HTTP POST
+        AI-->>Router: cluster JSON
+        Router-->>Con: clusters
+        Con->>DAO1: batchInsert(clusters)<br/>ai_meeting_conclusion_cluster
+        DAO1-->>Con: ok
+
+        Exe->>Con: checkConsensus(1001, round)
+        Con->>DAO1: selectConsensusCluster()
+        DAO1-->>Con: cluster / null
+    end
+
+    alt 达成共识
+        Exe->>Svc: finalizeMeeting(1001, result)
+        Svc->>Orc: callModel -> 生成总结
+        Orc->>Router: chat()
+        Router->>AI: HTTP POST
+        AI-->>Router: summary
+        Router-->>Orc: summary
+        Orc-->>Svc: summary
+        Svc->>DAO1: updateSummary(1001, summary)
+        Svc->>DAO1: updateDecisionArtifact(1001, artifactJson)
+        Svc->>DAO1: updateConclusion(1001, CONCLUDED)
+        DAO1-->>Svc: ok
+    else 达到最大轮数
+        Exe->>Con: forceConclude(1001)
+        Con-->>Exe: ConsensusResult
+        Exe->>Svc: finalizeMeeting(1001, forcedResult)
+    end
+    </div>
+
+    <h3>3. 系统间依赖图</h3>
+    <div class="mermaid">
+graph TD
+    Svc[AI会议室服务] --> DB[MySQL ai_meeting 库]
+    Svc --> AI[DeepSeek API 外部 AI 模型]
+    Svc --> Search[Serper.dev 联网搜索]
+    Svc --> Notify[Server酱 微信通知]
+    
+    subgraph 创建阶段
+        Svc -->|INSERT ai_meeting_room| DB
+        Svc -->|INSERT ai_meeting_member| DB
+        Svc -->|INSERT ai_workflow_run| DB
+    end
+    
+    subgraph 启动阶段
+        Svc -->|UPDATE status=IN_PROGRESS| DB
+    end
+    
+    subgraph 辩论阶段
+        Svc -->|search query| Search
+        Search -->|SearchResult 数组| Svc
+        Svc -->|POST v1 chat completions| AI
+        AI -->|content reasoning| Svc
+        Svc -->|INSERT ai_meeting_opinion| DB
+    end
+    
+    subgraph 投票阶段
+        Svc -->|POST v1 chat completions| AI
+        AI -->|vote JSON| Svc
+        Svc -->|INSERT ai_meeting_vote| DB
+    end
+    
+    subgraph 聚类阶段
+        Svc -->|POST v1 chat completions| AI
+        AI -->|cluster JSON| Svc
+        Svc -->|INSERT ai_meeting_conclusion_cluster| DB
+    end
+    
+    subgraph 结论阶段
+        Svc -->|POST v1 chat completions| AI
+        AI -->|summary| Svc
+        Svc -->|UPDATE status=CONCLUDED| DB
+        Svc -->|微信推送| Notify
+    end
+    </div>
+
+    <h3>4. 数据状态变化分析</h3>
+    <h4>会议状态流转</h4>
+    <table>
+        <tr><th>状态码</th><th>状态名</th><th>含义</th></tr>
+        <tr><td>0</td><td>CREATED</td><td>已创建，等待启动</td></tr>
+        <tr><td>1</td><td>IN_PROGRESS</td><td>进行中，正在辩论</td></tr>
+        <tr><td>2</td><td>CONCLUDED</td><td>已达成结论</td></tr>
+        <tr><td>3</td><td>VERIFIED_VALID</td><td>结论已验证有效</td></tr>
+        <tr><td>4</td><td>VERIFIED_INVALID</td><td>结论已验证无效</td></tr>
+        <tr><td>5</td><td>PAUSED</td><td>已暂停</td></tr>
+        <tr><td>6</td><td>REOPENED</td><td>结论修订中（重开）</td></tr>
+        <tr><td>7</td><td>CANCELLED</td><td>已取消</td></tr>
+    </table>
+
+    <h4>实例 MTG20260525001（id=1001）的状态变化</h4>
+    <table>
+        <tr><th>阶段</th><th>触发条件</th><th>状态变更</th><th>业务含义</th></tr>
+        <tr><td>创建完成</td><td>用户调用 POST /api/meetings</td><td>null → CREATED(0)</td><td>会议配置已保存，等待启动</td></tr>
+        <tr><td>启动会议</td><td>用户调用 POST /api/meetings/1001/start</td><td>CREATED(0) → IN_PROGRESS(1)</td><td>异步辩论流程开始执行</td></tr>
+        <tr><td>轮次推进</td><td>每轮开始时自动更新</td><td>current_round 递增</td><td>记录当前辩论轮次</td></tr>
+        <tr><td>达成共识</td><td>某轮聚类同意比例 ≥ 70% 且 ≥ 2 人</td><td>IN_PROGRESS(1) → CONCLUDED(2)</td><td>辩论结束，结论已生成</td></tr>
+        <tr><td>用户验证</td><td>用户调用 POST /api/meetings/1001/verify?valid=true</td><td>CONCLUDED(2) → VERIFIED_VALID(3)</td><td>结论被人类认可，触发积分奖励</td></tr>
+        <tr><td>用户验证</td><td>用户调用 POST /api/meetings/1001/verify?valid=false</td><td>CONCLUDED(2) → VERIFIED_INVALID(4)</td><td>结论被人类否定，触发积分惩罚</td></tr>
+        <tr><td>人类追问</td><td>用户调用 POST /api/meetings/1001/human-message</td><td>CONCLUDED(2) → REOPENED(6)</td><td>基于追问内容重新辩论</td></tr>
+        <tr><td>追踪触发</td><td>追踪项检测到关键变化</td><td>CONCLUDED(2) → REOPENED(6)</td><td>外部信息变化触发重审</td></tr>
+        <tr><td>用户暂停</td><td>用户调用 POST /api/meetings/1001/pause 或 /cancel</td><td>IN_PROGRESS(1) → PAUSED(5)</td><td>暂时中断辩论流程</td></tr>
+        <tr><td>异常终止</td><td>异步流程抛出异常</td><td>IN_PROGRESS(1) → CANCELLED(7)</td><td>系统异常导致会议终止</td></tr>
+    </table>
+
+    <h3>5. UML 类图</h3>
+    <div class="mermaid">
+classDiagram
+    class MeetingController {
+        +createMeeting(MeetingCreateRequest): ApiResponse~Long~
+        +startMeeting(Long): ApiResponse~Void~
+        +getMeetingDetail(Long): ApiResponse~MeetingDetailVO~
+        +sendHumanMessage(Long, Map): ApiResponse~Void~
+        +verifyConclusion(Long, boolean): ApiResponse~Void~
+    }
+
+    class MeetingRoomService {
+        +createMeeting(MeetingCreateRequest): Long
+        +startMeeting(Long): void
+        +getMeetingDetail(Long): MeetingDetailVO
+        +addHumanMessage(Long, String, boolean, Long): void
+        +verifyConclusion(Long, boolean): void
+        +finalizeMeeting(Long, ConsensusResult): void
+        -runMeetingFlow(Long): void
+    }
+
+    class MeetingDebateService {
+        +executeDebateRound(Long, int): List~AiMeetingOpinion~
+        +generateSingleTargetReply(Long, Long, int): AiMeetingOpinion
+        -generateOpinion(Long, AiMeetingMember, int): AiMeetingOpinion
+    }
+
+    class MeetingConsensusService {
+        +conductVoting(Long, int): void
+        +clusterVotePositions(Long, int): void
+        +checkConsensus(Long, int): ConsensusResult
+        +forceConclude(Long): ConsensusResult
+    }
+
+    class MeetingOrchestratorService {
+        +callModel(String, String, String): String
+        +buildDebateContext(Long, Long, int, String): String
+        +buildVotePrompt(Long, Long): String
+        +buildClusterPrompt(Long, int): String
+        +buildSummaryPrompt(Long): String
+    }
+
+    class MeetingWorkflowService {
+        +ensureWorkflowForMeeting(AiMeetingRoom, String): AiWorkflowRun
+        +activateMeetingWorkflow(Long): void
+        +submitCurrentStage(Long, WorkflowStageSubmitRequest): void
+        +reviewCurrentStage(Long, WorkflowStageReviewRequest): void
+    }
+
+    class AiModelRouter {
+        +chat(String, String, String): String
+        +chatEx(String, String, String): ChatResult
+    }
+
+    class WebSearchService {
+        +search(String, int): List~SearchResult~
+        +isEnabled(): boolean
+    }
+
+    class AiMeetingRoom {
+        +Long id
+        +String title
+        +Integer status
+        +Integer currentRound
+        +Integer maxRounds
+        +String finalConclusion
+        +String summary
+        +String decisionArtifact
+    }
+
+    class AiMeetingMember {
+        +Long id
+        +Long meetingId
+        +String memberName
+        +String modelType
+        +String persona
+        +Integer role
+        +Integer totalScore
+    }
+
+    class AiMeetingOpinion {
+        +Long id
+        +Long meetingId
+        +Long memberId
+        +Integer roundNumber
+        +String content
+        +String evidence
+        +Integer opinionType
+    }
+
+    class AiMeetingVote {
+        +Long id
+        +Long meetingId
+        +Long memberId
+        +Integer roundNumber
+        +String votePosition
+        +BigDecimal confidence
+    }
+
+    class AiWorkflowRun {
+        +Long id
+        +Long meetingId
+        +String status
+        +String currentStageKey
+    }
+
+    MeetingController --> MeetingRoomService
+    MeetingController --> MeetingScoreService
+    MeetingController --> TrackingCenterService
+    MeetingRoomService --> MeetingDebateService
+    MeetingRoomService --> MeetingConsensusService
+    MeetingRoomService --> MeetingOrchestratorService
+    MeetingRoomService --> MeetingWorkflowService
+    MeetingRoomService --> NotificationService
+    MeetingDebateService --> MeetingOrchestratorService
+    MeetingDebateService --> WebSearchService
+    MeetingConsensusService --> MeetingOrchestratorService
+    MeetingOrchestratorService --> AiModelRouter
+    MeetingWorkflowService --> WebSearchService
+    MeetingRoomService ..> AiMeetingRoom
+    MeetingRoomService ..> AiMeetingMember
+    MeetingDebateService ..> AiMeetingOpinion
+    MeetingConsensusService ..> AiMeetingVote
+    MeetingWorkflowService ..> AiWorkflowRun
+    </div>
+
+    <h3>6. 功能入口全景与生命周期影响分析</h3>
+
+    <h4>6.1 所有入口点梳理</h4>
+    <table>
+        <tr><th>入口类型</th><th>类名.方法名</th><th>触发方式</th><th>路径/Topic</th><th>业务描述</th></tr>
+        <tr><td>API</td><td>MeetingController.createMeeting</td><td>POST</td><td>/api/meetings</td><td>用户创建新会议</td></tr>
+        <tr><td>API</td><td>MeetingController.startMeeting</td><td>POST</td><td>/api/meetings/{id}/start</td><td>用户启动会议，触发异步辩论</td></tr>
+        <tr><td>API</td><td>MeetingController.getMeetingDetail</td><td>GET</td><td>/api/meetings/{id}</td><td>查询会议详情与进度</td></tr>
+        <tr><td>API</td><td>MeetingController.listMeetings</td><td>GET</td><td>/api/meetings</td><td>查询会议列表</td></tr>
+        <tr><td>API</td><td>MeetingController.listWorkflowTemplates</td><td>GET</td><td>/api/workflow-templates</td><td>查询工作流模板列表</td></tr>
+        <tr><td>API</td><td>MeetingController.getWorkflowTemplateDetail</td><td>GET</td><td>/api/workflow-templates/detail</td><td>查询工作流模板详情</td></tr>
+        <tr><td>API</td><td>MeetingController.createWorkflowTemplate</td><td>POST</td><td>/api/workflow-templates</td><td>创建工作流模板</td></tr>
+        <tr><td>API</td><td>MeetingController.listSkillFiles</td><td>GET</td><td>/api/skill-files</td><td>查询 Skill 文件列表</td></tr>
+        <tr><td>API</td><td>MeetingController.uploadSkillFile</td><td>POST</td><td>/api/skill-files/upload</td><td>上传 Skill 文件</td></tr>
+        <tr><td>API</td><td>MeetingController.downloadSkillFile</td><td>GET</td><td>/api/skill-files/{id}/download</td><td>下载 Skill 文件</td></tr>
+        <tr><td>API</td><td>MeetingController.sendHumanMessage</td><td>POST</td><td>/api/meetings/{id}/human-message</td><td>人类用户介入发言/追问</td></tr>
+        <tr><td>API</td><td>MeetingController.verifyConclusion</td><td>POST</td><td>/api/meetings/{id}/verify</td><td>用户验证结论有效性</td></tr>
+        <tr><td>API</td><td>MeetingController.getContributions</td><td>GET</td><td>/api/meetings/{id}/contributions</td><td>查询成员贡献度</td></tr>
+        <tr><td>API</td><td>MeetingController.getMemberScores</td><td>GET</td><td>/api/members/{memberId}/scores</td><td>查询成员积分历史</td></tr>
+        <tr><td>API</td><td>MeetingController.cancelMeeting</td><td>POST</td><td>/api/meetings/{id}/cancel 或 /api/meetings/{id}/pause</td><td>暂停进行中的会议</td></tr>
+        <tr><td>API</td><td>MeetingController.terminateMeeting</td><td>POST</td><td>/api/meetings/{id}/terminate</td><td>强制终止并生成结论</td></tr>
+        <tr><td>API</td><td>MeetingController.restartMeeting</td><td>POST</td><td>/api/meetings/{id}/restart</td><td>清空记录重启会议</td></tr>
+        <tr><td>API</td><td>MeetingController.cloneMeeting</td><td>POST</td><td>/api/meetings/{id}/clone</td><td>复制会议配置</td></tr>
+        <tr><td>API</td><td>MeetingController.updateTrackingItem</td><td>POST</td><td>/api/tracking-items/{id}/status</td><td>更新追踪项状态</td></tr>
+        <tr><td>API</td><td>MeetingController.trackingOverview</td><td>GET</td><td>/api/tracking-items/overview</td><td>追踪中心概览</td></tr>
+        <tr><td>API</td><td>MeetingController.createCustomTrackingItem</td><td>POST</td><td>/api/tracking-items/custom</td><td>创建自定义追踪项</td></tr>
+        <tr><td>API</td><td>MeetingController.refreshTrackingItem</td><td>POST</td><td>/api/tracking-items/{id}/refresh</td><td>手动刷新追踪项</td></tr>
+        <tr><td>API</td><td>MeetingController.reopenMeetingFromTracking</td><td>POST</td><td>/api/tracking-items/{id}/reopen-meeting</td><td>从追踪项触发会议重开</td></tr>
+        <tr><td>API</td><td>MeetingController.submitWorkflowStage</td><td>POST</td><td>/api/meetings/{id}/workflow/submit</td><td>提交工作流阶段</td></tr>
+        <tr><td>API</td><td>MeetingController.reviewWorkflowStage</td><td>POST</td><td>/api/meetings/{id}/workflow/review</td><td>审核工作流阶段</td></tr>
+        <tr><td>API</td><td>MeetingController.retryWorkflowAutoStage</td><td>POST</td><td>/api/meetings/{id}/workflow/retry-auto</td><td>重试自动执行节点</td></tr>
+        <tr><td>定时</td><td>TrackingCenterService.dispatchDueRefreshes</td><td>@Scheduled</td><td>fixedDelay 60s</td><td>定时扫描并刷新追踪项</td></tr>
+        <tr><td>内部</td><td>MeetingRoomService.runMeetingFlow</td><td>异步线程</td><td>meetingExecutor 线程池</td><td>会议核心辩论循环</td></tr>
+    </table>
+
+    <h4>6.2 完整生命周期流程（状态机图）</h4>
+    <div class="mermaid">
+stateDiagram-v2
+    [*] --> CREATED : MeetingController.createMeeting
+    CREATED --> IN_PROGRESS : MeetingController.startMeeting
+    IN_PROGRESS --> IN_PROGRESS : runMeetingFlow 轮次推进
+    IN_PROGRESS --> CONCLUDED : 共识达成 / forceConclude
+    IN_PROGRESS --> PAUSED : MeetingController.cancelMeeting
+    PAUSED --> IN_PROGRESS : 恢复（前端手动恢复机制）
+    IN_PROGRESS --> CANCELLED : 异常 / 用户取消
+    CONCLUDED --> VERIFIED_VALID : verifyConclusion(valid=true)
+    CONCLUDED --> VERIFIED_INVALID : verifyConclusion(valid=false)
+    CONCLUDED --> REOPENED : sendHumanMessage（追问）
+    CONCLUDED --> REOPENED : TrackingCenterService.dispatchDueRefreshes（关键变化）
+    VERIFIED_VALID --> REOPENED : sendHumanMessage / 追踪触发
+    VERIFIED_INVALID --> REOPENED : sendHumanMessage / 追踪触发
+    REOPENED --> IN_PROGRESS : runMeetingFlow 自动恢复
+    REOPENED --> CONCLUDED : 再次达成结论
+    CANCELLED --> [*]
+    </div>
+
+    <h3>7. 外部依赖接口明细与影响分析</h3>
+    <table>
+        <tr><th>外部依赖</th><th>类型</th><th>接口 / 方法</th><th>交互方式</th><th>传递的关键数据</th><th>接口角色</th><th>影响程度</th><th>备注/降级策略</th></tr>
+        <tr><td>MySQL（ai_meeting 库）</td><td>数据库</td><td>各 Mapper.insert/update/select</td><td>同步 SQL</td><td>会议、成员、发言、投票、聚类、工作流、追踪项全量数据</td><td>业务数据持久化</td><td>阻断</td><td>无降级，必须可用</td></tr>
+        <tr><td>DeepSeek API</td><td>第三方 AI</td><td>POST /v1/chat/completions</td><td>同步 HTTP</td><td>systemPrompt, userPrompt, model, maxTokens</td><td>默认对话与推理模型</td><td>阻断</td><td>自动降级到注册表中其他 enabled 模型</td></tr>
+        <tr><td>OpenAI API</td><td>第三方 AI</td><td>POST /v1/chat/completions</td><td>同步 HTTP</td><td>systemPrompt, userPrompt, model</td><td>兼容 OpenAI 格式的模型</td><td>高</td><td>通过 AiModelRouter 自动路由到其他客户端</td></tr>
+        <tr><td>Serper.dev</td><td>第三方搜索</td><td>POST /search</td><td>同步 HTTP</td><td>query, apiKey</td><td>Google 搜索结果</td><td>中</td><td>未配置时返回空列表，按 Provider 顺序降级到智谱/DeepSeek Web Bridge</td></tr>
+        <tr><td>智谱 GLM-4-Flash</td><td>第三方搜索+摘要</td><td>POST /api/paas/v4/web_search</td><td>同步 HTTP</td><td>search_query, apiKey</td><td>联网搜索与结果摘要</td><td>中</td><td>未配置 API Key 时跳过，按 Provider 顺序降级到其他搜索 Provider</td></tr>
+        <tr><td>DeepSeek Web Bridge</td><td>本地桥接</td><td>POST http://127.0.0.1:8789/search</td><td>同步 HTTP</td><td>query</td><td>DeepSeek 网页搜索桥接</td><td>中</td><td>需本地启动 Node.js 桥接服务，未启用时跳过</td></tr>
+        <tr><td>Server酱</td><td>第三方通知</td><td>POST https://sct.ftqq.com/...</td><td>同步 HTTP</td><td>title, desp</td><td>微信推送会议结论</td><td>低</td><td>未配置 key 时不发送，不影响主流程</td></tr>
+    </table>
+
+    <hr>
+
+    <h2 id="s3">三、数据库表相关分析</h2>
+
+    <h3>0. 业务逻辑相关表</h3>
+    <table>
+        <tr><th>表名</th><th>作用</th><th>操作类型</th><th>关键字段</th></tr>
+        <tr><td>ai_meeting_room</td><td>会议主表</td><td>INSERT, UPDATE</td><td>id, title, status, current_round, max_rounds, final_conclusion, decision_artifact</td></tr>
+        <tr><td>ai_meeting_member</td><td>会议成员</td><td>INSERT</td><td>id, meeting_id, member_name, model_type, persona, role</td></tr>
+        <tr><td>ai_meeting_opinion</td><td>发言记录</td><td>INSERT</td><td>id, meeting_id, member_id, round_number, content, evidence, opinion_type</td></tr>
+        <tr><td>ai_meeting_vote</td><td>投票记录</td><td>INSERT</td><td>id, meeting_id, member_id, round_number, vote_position, confidence</td></tr>
+        <tr><td>ai_meeting_conclusion_cluster</td><td>结论聚类</td><td>INSERT</td><td>id, meeting_id, round_number, cluster_label, agreement_ratio, is_consensus</td></tr>
+        <tr><td>ai_meeting_score_log</td><td>积分日志</td><td>INSERT</td><td>id, meeting_id, member_id, score_delta, reason</td></tr>
+        <tr><td>ai_workflow_template</td><td>工作流模板</td><td>SELECT, INSERT, UPDATE, DELETE</td><td>id, template_key, name, active</td></tr>
+        <tr><td>ai_workflow_stage_template</td><td>阶段模板</td><td>SELECT, INSERT</td><td>id, template_id, stage_key, stage_order, stage_type, pass_target, reject_target</td></tr>
+        <tr><td>ai_workflow_run</td><td>工作流运行</td><td>INSERT, UPDATE</td><td>id, meeting_id, template_id, status, current_stage_key</td></tr>
+        <tr><td>ai_workflow_stage_run</td><td>阶段运行</td><td>INSERT, UPDATE</td><td>id, workflow_run_id, stage_key, status, outcome</td></tr>
+        <tr><td>ai_workflow_stage_submission</td><td>阶段提交记录</td><td>INSERT</td><td>id, stage_run_id, action_type, content</td></tr>
+        <tr><td>ai_meeting_tracking_item</td><td>追踪项</td><td>INSERT, UPDATE</td><td>id, meeting_id, status, watch_query, change_severity</td></tr>
+        <tr><td>ai_meeting_tracking_update</td><td>追踪更新记录</td><td>INSERT</td><td>id, tracking_item_id, update_type, status_before, status_after</td></tr>
+        <tr><td>ai_skill_file</td><td>Skill 文件</td><td>SELECT, INSERT, DELETE</td><td>id, file_name, storage_path</td></tr>
+        <tr><td>ai_user</td><td>系统用户</td><td>SELECT, INSERT</td><td>id, username, password, nickname</td></tr>
+    </table>
+
+    <h3>1. 可视化表关联关系（ER 图）</h3>
+    <div class="mermaid">
+erDiagram
+    ai_meeting_room ||--|{ ai_meeting_member : "1:N meeting_id"
+    ai_meeting_room ||--|{ ai_meeting_opinion : "1:N meeting_id"
+    ai_meeting_room ||--|{ ai_meeting_vote : "1:N meeting_id"
+    ai_meeting_room ||--|{ ai_meeting_conclusion_cluster : "1:N meeting_id"
+    ai_meeting_room ||--|{ ai_meeting_score_log : "1:N meeting_id"
+    ai_meeting_room ||--|| ai_workflow_run : "1:1 meeting_id"
+    ai_meeting_room ||--|{ ai_meeting_tracking_item : "1:N meeting_id"
+    ai_meeting_member ||--|{ ai_meeting_opinion : "1:N member_id"
+    ai_meeting_member ||--|{ ai_meeting_vote : "1:N member_id"
+    ai_workflow_template ||--|{ ai_workflow_stage_template : "1:N template_id"
+    ai_workflow_run ||--|{ ai_workflow_stage_run : "1:N workflow_run_id"
+    ai_workflow_stage_run ||--|{ ai_workflow_stage_submission : "1:N stage_run_id"
+    ai_meeting_tracking_item ||--|{ ai_meeting_tracking_update : "1:N tracking_item_id"
+    ai_meeting_opinion ||--o| ai_meeting_opinion : "1:N parent_opinion_id"
+
+    ai_meeting_room {
+        bigint id PK
+        varchar title
+        text description
+        varchar project_key
+        bigint creator_id FK
+        tinyint status
+        int max_rounds
+        int current_round
+        text final_conclusion
+        text summary
+        text decision_artifact
+        text round_summaries
+        text conclusion_history
+        datetime gmt_create
+        datetime gmt_modify
+    }
+
+    ai_meeting_member {
+        bigint id PK
+        bigint meeting_id FK
+        varchar member_name
+        varchar model_type
+        varchar persona
+        varchar actor_slot_key
+        tinyint role
+        int total_score
+    }
+
+    ai_meeting_opinion {
+        bigint id PK
+        bigint meeting_id FK
+        bigint member_id FK
+        int round_number
+        bigint parent_opinion_id FK
+        text content
+        text evidence
+        tinyint opinion_type
+        datetime gmt_create
+    }
+
+    ai_meeting_vote {
+        bigint id PK
+        bigint meeting_id FK
+        bigint member_id FK
+        int round_number
+        varchar vote_position
+        decimal confidence
+        text reasoning
+    }
+
+    ai_meeting_conclusion_cluster {
+        bigint id PK
+        bigint meeting_id FK
+        int round_number
+        varchar cluster_label
+        int member_count
+        varchar member_ids
+        decimal agreement_ratio
+        tinyint is_consensus
+    }
+
+    ai_workflow_template {
+        bigint id PK
+        varchar template_key UK
+        varchar name
+        text description
+        tinyint built_in
+        tinyint active
+    }
+
+    ai_workflow_stage_template {
+        bigint id PK
+        bigint template_id FK
+        varchar stage_key
+        varchar stage_name
+        int stage_order
+        varchar stage_type
+        varchar actor_type
+        varchar pass_target
+        varchar reject_target
+        varchar reopen_target
+    }
+
+    ai_workflow_run {
+        bigint id PK
+        bigint meeting_id FK
+        bigint template_id FK
+        varchar template_key
+        varchar current_stage_key
+        int current_stage_order
+        varchar status
+        varchar blocked_reason
+    }
+
+    ai_workflow_stage_run {
+        bigint id PK
+        bigint workflow_run_id FK
+        bigint meeting_id FK
+        varchar stage_key
+        varchar stage_name
+        int stage_order
+        varchar stage_type
+        varchar actor_type
+        int attempt_no
+        varchar status
+        text handoff_summary
+        text handoff_payload
+        varchar outcome
+        varchar reject_reason
+        datetime started_at
+        datetime completed_at
+    }
+
+    ai_meeting_tracking_item {
+        bigint id PK
+        bigint meeting_id FK
+        bigint workflow_run_id FK
+        bigint stage_run_id FK
+        varchar source_type
+        varchar item_type
+        varchar title
+        text description
+        varchar status
+        varchar owner_type
+        varchar owner_ref
+        tinyint reopen_trigger
+        tinyint required_for_continue
+        varchar reopen_policy
+        tinyint auto_refresh_enabled
+        varchar refresh_mode
+        int refresh_interval_hours
+        varchar watch_query
+        datetime next_check_at
+        datetime last_checked_at
+        varchar last_check_status
+        text last_check_note
+        varchar change_severity
+        datetime due_at
+        datetime last_update_at
+        datetime closed_at
+    }
+
+    ai_meeting_tracking_update {
+        bigint id PK
+        bigint tracking_item_id FK
+        bigint meeting_id FK
+        varchar update_type
+        varchar status_before
+        varchar status_after
+        text content
+        varchar evidence_ref
+        datetime gmt_create
+    }
+    </div>
+
+    <h3>2. 核心表字段详细说明</h3>
+    <h4>ai_meeting_room（会议主表）</h4>
+    <table>
+        <tr><th>字段名</th><th>类型</th><th>长度</th><th>必填</th><th>默认值</th><th>业务含义</th><th>备注</th></tr>
+        <tr><td>id</td><td>bigint</td><td>-</td><td>是</td><td>自增</td><td>会议唯一标识</td><td>主键</td></tr>
+        <tr><td>title</td><td>varchar</td><td>256</td><td>是</td><td>无</td><td>会议主题</td><td></td></tr>
+        <tr><td>description</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>会议描述</td><td></td></tr>
+        <tr><td>project_key</td><td>varchar</td><td>128</td><td>否</td><td>NULL</td><td>项目标识/工作区键</td><td>用于同项目历史记忆继承</td></tr>
+        <tr><td>project_context</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>项目背景与共享上下文</td><td></td></tr>
+        <tr><td>inherited_context</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>从同项目历史会议继承的上下文</td><td>创建时自动构建</td></tr>
+        <tr><td>creator_id</td><td>bigint</td><td>-</td><td>是</td><td>无</td><td>创建者用户ID</td><td>外键，关联 ai_user</td></tr>
+        <tr><td>status</td><td>tinyint</td><td>-</td><td>是</td><td>0</td><td>会议状态</td><td>0-已创建 1-进行中 2-已达成结论 3-验证有效 4-验证无效 5-已暂停 6-重开中 7-已取消</td></tr>
+        <tr><td>max_rounds</td><td>int</td><td>-</td><td>是</td><td>10</td><td>最大辩论轮数</td><td>可配置</td></tr>
+        <tr><td>current_round</td><td>int</td><td>-</td><td>是</td><td>0</td><td>当前轮次</td><td>进行中时递增</td></tr>
+        <tr><td>final_conclusion</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>最终结论</td><td>共识达成后填充</td></tr>
+        <tr><td>conclusion_time</td><td>datetime</td><td>-</td><td>否</td><td>NULL</td><td>达成结论时间</td><td></td></tr>
+        <tr><td>summary</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>AI生成的会议总结</td><td>结论时由模型生成</td></tr>
+        <tr><td>decision_artifact</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>结构化决策卡片JSON</td><td>含 keyViewpoints, majorDisputes, nextActions 等</td></tr>
+        <tr><td>round_summaries</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>每轮摘要JSON数组</td><td>[{"round":1,"summary":"..."}]</td></tr>
+        <tr><td>conclusion_history</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>结论版本历史JSON</td><td>记录每次结论/重开事件</td></tr>
+        <tr><td>gmt_create</td><td>datetime</td><td>-</td><td>是</td><td>CURRENT_TIMESTAMP</td><td>创建时间</td><td></td></tr>
+        <tr><td>gmt_modify</td><td>datetime</td><td>-</td><td>是</td><td>CURRENT_TIMESTAMP ON UPDATE</td><td>更新时间</td><td></td></tr>
+    </table>
+
+    <h4>ai_meeting_member（会议成员表）</h4>
+    <table>
+        <tr><th>字段名</th><th>类型</th><th>长度</th><th>必填</th><th>默认值</th><th>业务含义</th><th>备注</th></tr>
+        <tr><td>id</td><td>bigint</td><td>-</td><td>是</td><td>自增</td><td>成员唯一标识</td><td>主键</td></tr>
+        <tr><td>meeting_id</td><td>bigint</td><td>-</td><td>是</td><td>无</td><td>所属会议ID</td><td>外键，关联 ai_meeting_room</td></tr>
+        <tr><td>member_name</td><td>varchar</td><td>128</td><td>是</td><td>无</td><td>成员名称</td><td>如"理性分析者"</td></tr>
+        <tr><td>model_type</td><td>varchar</td><td>64</td><td>是</td><td>无</td><td>模型标识</td><td>如 deepseek-chat, gpt-4</td></tr>
+        <tr><td>persona</td><td>varchar</td><td>1024</td><td>是</td><td>无</td><td>人设/系统提示词</td><td>定义成员角色立场</td></tr>
+        <tr><td>actor_slot_key</td><td>varchar</td><td>128</td><td>否</td><td>NULL</td><td>执行槽位标识</td><td>工作流节点绑定用</td></tr>
+        <tr><td>actor_slot_name</td><td>varchar</td><td>128</td><td>否</td><td>NULL</td><td>执行槽位名称</td><td></td></tr>
+        <tr><td>role</td><td>tinyint</td><td>-</td><td>是</td><td>0</td><td>角色</td><td>0-参与者 1-主持人</td></tr>
+        <tr><td>total_score</td><td>int</td><td>-</td><td>是</td><td>0</td><td>累计积分</td><td>验证时奖惩累加</td></tr>
+        <tr><td>gmt_create</td><td>datetime</td><td>-</td><td>是</td><td>CURRENT_TIMESTAMP</td><td>创建时间</td><td></td></tr>
+        <tr><td>gmt_modify</td><td>datetime</td><td>-</td><td>是</td><td>CURRENT_TIMESTAMP ON UPDATE</td><td>更新时间</td><td></td></tr>
+    </table>
+
+    <h4>ai_meeting_opinion（发言记录表）</h4>
+    <table>
+        <tr><th>字段名</th><th>类型</th><th>长度</th><th>必填</th><th>默认值</th><th>业务含义</th><th>备注</th></tr>
+        <tr><td>id</td><td>bigint</td><td>-</td><td>是</td><td>自增</td><td>发言唯一标识</td><td>主键</td></tr>
+        <tr><td>meeting_id</td><td>bigint</td><td>-</td><td>是</td><td>无</td><td>所属会议ID</td><td>外键</td></tr>
+        <tr><td>member_id</td><td>bigint</td><td>-</td><td>是</td><td>无</td><td>发言成员ID</td><td>0=人类用户</td></tr>
+        <tr><td>round_number</td><td>int</td><td>-</td><td>是</td><td>无</td><td>所属轮次</td><td></td></tr>
+        <tr><td>parent_opinion_id</td><td>bigint</td><td>-</td><td>否</td><td>NULL</td><td>回复的发言ID</td><td>NULL=原始发言</td></tr>
+        <tr><td>content</td><td>text</td><td>-</td><td>是</td><td>无</td><td>发言内容</td><td></td></tr>
+        <tr><td>evidence</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>支撑论据JSON</td><td>含搜索来源、核心论据</td></tr>
+        <tr><td>opinion_type</td><td>tinyint</td><td>-</td><td>是</td><td>0</td><td>发言类型</td><td>0-陈述 1-反驳 2-让步 3-人类发言 4-主持人指令 5-定向追问</td></tr>
+        <tr><td>gmt_create</td><td>datetime</td><td>-</td><td>是</td><td>CURRENT_TIMESTAMP</td><td>创建时间</td><td></td></tr>
+    </table>
+
+    <h4>ai_meeting_vote（投票记录表）</h4>
+    <table>
+        <tr><th>字段名</th><th>类型</th><th>长度</th><th>必填</th><th>默认值</th><th>业务含义</th><th>备注</th></tr>
+        <tr><td>id</td><td>bigint</td><td>-</td><td>是</td><td>自增</td><td>投票唯一标识</td><td>主键</td></tr>
+        <tr><td>meeting_id</td><td>bigint</td><td>-</td><td>是</td><td>无</td><td>所属会议ID</td><td>外键</td></tr>
+        <tr><td>member_id</td><td>bigint</td><td>-</td><td>是</td><td>无</td><td>投票成员ID</td><td>外键</td></tr>
+        <tr><td>round_number</td><td>int</td><td>-</td><td>是</td><td>无</td><td>所属轮次</td><td></td></tr>
+        <tr><td>vote_position</td><td>varchar</td><td>1024</td><td>是</td><td>无</td><td>投票立场</td><td>一句话结论</td></tr>
+        <tr><td>confidence</td><td>decimal</td><td>3,2</td><td>是</td><td>0.50</td><td>置信度</td><td>0.00-1.00</td></tr>
+        <tr><td>reasoning</td><td>text</td><td>-</td><td>否</td><td>NULL</td><td>投票理由</td><td></td></tr>
+        <tr><td>gmt_create</td><td>datetime</td><td>-</td><td>是</td><td>CURRENT_TIMESTAMP</td><td>创建时间</td><td></td></tr>
+    </table>
+
+    <h3>3. 索引设计分析</h3>
+    <table>
+        <tr><th>表名</th><th>索引名</th><th>索引类型</th><th>索引字段</th><th>对应 SQL/场景</th><th>风险备注</th></tr>
+        <tr><td>ai_meeting_room</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据会议ID查询详情</td><td>无</td></tr>
+        <tr><td>ai_meeting_room</td><td>idx_creator_id</td><td>普通索引</td><td>creator_id</td><td>查询用户创建的会议列表</td><td>无</td></tr>
+        <tr><td>ai_meeting_room</td><td>idx_status</td><td>普通索引</td><td>status</td><td>按状态筛选会议</td><td>无</td></tr>
+        <tr><td>ai_meeting_room</td><td>idx_project_key</td><td>普通索引</td><td>project_key</td><td>同项目历史会议查询（继承上下文）</td><td>无</td></tr>
+        <tr><td>ai_meeting_member</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据成员ID查询</td><td>无</td></tr>
+        <tr><td>ai_meeting_member</td><td>idx_meeting_id</td><td>普通索引</td><td>meeting_id</td><td>查询会议成员列表</td><td>无</td></tr>
+        <tr><td>ai_meeting_opinion</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据发言ID查询</td><td>无</td></tr>
+        <tr><td>ai_meeting_opinion</td><td>idx_meeting_round</td><td>普通索引</td><td>meeting_id, round_number</td><td>查询某轮发言列表</td><td>联合索引，注意最左前缀</td></tr>
+        <tr><td>ai_meeting_opinion</td><td>idx_parent</td><td>普通索引</td><td>parent_opinion_id</td><td>查询回复关系</td><td>可为 NULL</td></tr>
+        <tr><td>ai_meeting_vote</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据投票ID查询</td><td>无</td></tr>
+        <tr><td>ai_meeting_vote</td><td>uk_meeting_member_round</td><td>唯一索引</td><td>meeting_id, member_id, round_number</td><td>防重复投票</td><td>每成员每轮仅一票</td></tr>
+        <tr><td>ai_meeting_vote</td><td>idx_meeting_round</td><td>普通索引</td><td>meeting_id, round_number</td><td>查询某轮投票列表</td><td>无</td></tr>
+        <tr><td>ai_meeting_conclusion_cluster</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据聚类ID查询</td><td>无</td></tr>
+        <tr><td>ai_meeting_conclusion_cluster</td><td>idx_meeting_round</td><td>普通索引</td><td>meeting_id, round_number</td><td>查询某轮聚类结果</td><td>无</td></tr>
+        <tr><td>ai_workflow_template</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据模板ID查询</td><td>无</td></tr>
+        <tr><td>ai_workflow_template</td><td>uk_template_key</td><td>唯一索引</td><td>template_key</td><td>根据模板标识查询</td><td>模板键全局唯一</td></tr>
+        <tr><td>ai_workflow_stage_template</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据阶段模板ID查询</td><td>无</td></tr>
+        <tr><td>ai_workflow_stage_template</td><td>idx_template_id</td><td>普通索引</td><td>template_id</td><td>查询模板下阶段列表</td><td>无</td></tr>
+        <tr><td>ai_workflow_run</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据运行ID查询</td><td>无</td></tr>
+        <tr><td>ai_workflow_run</td><td>uk_meeting_id</td><td>唯一索引</td><td>meeting_id</td><td>查询会议绑定的工作流</td><td>一对一关系</td></tr>
+        <tr><td>ai_workflow_stage_run</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据阶段运行ID查询</td><td>无</td></tr>
+        <tr><td>ai_workflow_stage_run</td><td>idx_workflow_run_id</td><td>普通索引</td><td>workflow_run_id</td><td>查询工作流下阶段列表</td><td>无</td></tr>
+        <tr><td>ai_workflow_stage_run</td><td>idx_meeting_stage_key</td><td>普通索引</td><td>meeting_id, stage_key</td><td>查询会议特定阶段</td><td>联合索引</td></tr>
+        <tr><td>ai_meeting_tracking_item</td><td>PRIMARY</td><td>主键</td><td>id</td><td>根据追踪项ID查询</td><td>无</td></tr>
+        <tr><td>ai_meeting_tracking_item</td><td>idx_meeting_id</td><td>普通索引</td><td>meeting_id</td><td>查询会议追踪项</td><td>可为 NULL（自定义追踪）</td></tr>
+        <tr><td>ai_meeting_tracking_item</td><td>idx_status</td><td>普通索引</td><td>status</td><td>按状态筛选追踪项</td><td>无</td></tr>
+        <tr><td>ai_meeting_tracking_item</td><td>idx_next_check</td><td>普通索引</td><td>next_check_at</td><td>定时任务扫描到期刷新项</td><td>联合 idx_status 可优化</td></tr>
+    </table>
+
+    <h3>4. 数据迁移与版本管理考虑</h3>
+    <table>
+        <tr><th>版本</th><th>变更类型</th><th>变更内容</th><th>迁移脚本</th><th>回滚策略</th><th>执行状态</th></tr>
+        <tr><td>V1.0.0</td><td>初始建表</td><td>创建 ai_meeting_room, ai_meeting_member, ai_meeting_opinion, ai_meeting_vote, ai_meeting_score_log, ai_meeting_conclusion_cluster</td><td>init.sql</td><td>无</td><td>已执行</td></tr>
+        <tr><td>V1.1.0</td><td>新增表</td><td>新增工作流相关表：ai_workflow_template, ai_workflow_stage_template, ai_workflow_run, ai_workflow_stage_run, ai_workflow_stage_submission</td><td>init.sql</td><td>删除表</td><td>已执行</td></tr>
+        <tr><td>V1.2.0</td><td>新增表</td><td>新增追踪中心表：ai_meeting_tracking_item, ai_meeting_tracking_update</td><td>init.sql</td><td>删除表</td><td>已执行</td></tr>
+        <tr><td>V1.3.0</td><td>新增表</td><td>新增 ai_skill_file Skill 文件库</td><td>init.sql</td><td>删除表</td><td>已执行</td></tr>
+        <tr><td>V1.4.0</td><td>字段扩展</td><td>ai_meeting_room 增加 round_summaries, conclusion_history, decision_artifact, inherited_context 等字段</td><td>migrate-server-20260503.sql</td><td>非破坏性可保留</td><td>已执行</td></tr>
+    </table>
+
+    <h3>5. 数据样例</h3>
+    <p>以实例 <strong>会议 <code>id = 1001</code></strong>，主题 "2026年新能源汽车市场趋势分析" 串联所有表。</p>
+
+    <h4>ai_meeting_room（会议主表）</h4>
+    <table>
+        <tr><th>id</th><th>title</th><th>description</th><th>project_key</th><th>creator_id</th><th>status</th><th>max_rounds</th><th>current_round</th><th>final_conclusion</th><th>gmt_create</th></tr>
+        <tr><td>1001</td><td>2026年新能源汽车市场趋势分析</td><td>分析2026年新能源车市场走向</td><td>auto-industry</td><td>1</td><td>2</td><td>10</td><td>3</td><td>2026年新能源汽车市场将继续保持高速增长，渗透率有望突破50%，但价格战将加剧。</td><td>2026-05-25 09:00:00</td></tr>
+    </table>
+
+    <h4>ai_meeting_member（会议成员表）</h4>
+    <table>
+        <tr><th>id</th><th>meeting_id</th><th>member_name</th><th>model_type</th><th>persona</th><th>role</th><th>total_score</th></tr>
+        <tr><td>2001</td><td>1001</td><td>乐观派分析师</td><td>deepseek-chat</td><td>你从乐观角度分析行业...</td><td>0</td><td>100</td></tr>
+        <tr><td>2002</td><td>1001</td><td>保守派分析师</td><td>deepseek-chat</td><td>你从风险角度审视市场...</td><td>0</td><td>50</td></tr>
+        <tr><td>2003</td><td>1001</td><td>数据专家</td><td>deepseek-chat</td><td>你专注于数据验证...</td><td>0</td><td>80</td></tr>
+        <tr><td>2004</td><td>1001</td><td>主持人</td><td>deepseek-chat</td><td>你负责引导讨论...</td><td>1</td><td>0</td></tr>
+    </table>
+
+    <h4>ai_meeting_opinion（发言记录表 - 第1轮部分）</h4>
+    <table>
+        <tr><th>id</th><th>meeting_id</th><th>member_id</th><th>round_number</th><th>parent_opinion_id</th><th>content</th><th>opinion_type</th><th>gmt_create</th></tr>
+        <tr><td>3001</td><td>1001</td><td>2001</td><td>1</td><td>NULL</td><td>我认为2026年新能源渗透率将突破55%...</td><td>0</td><td>2026-05-25 09:01:00</td></tr>
+        <tr><td>3002</td><td>1001</td><td>2002</td><td>1</td><td>NULL</td><td>我对此持谨慎态度，原材料成本上升...</td><td>0</td><td>2026-05-25 09:02:00</td></tr>
+        <tr><td>3003</td><td>1001</td><td>2003</td><td>1</td><td>NULL</td><td>根据最新销量数据，Q1同比增长42%...</td><td>0</td><td>2026-05-25 09:03:00</td></tr>
+    </table>
+
+    <h4>ai_meeting_vote（投票记录表 - 第3轮）</h4>
+    <table>
+        <tr><th>id</th><th>meeting_id</th><th>member_id</th><th>round_number</th><th>vote_position</th><th>confidence</th><th>reasoning</th></tr>
+        <tr><td>4001</td><td>1001</td><td>2001</td><td>3</td><td>市场将继续高速增长，渗透率突破50%</td><td>0.85</td><td>数据支撑充分</td></tr>
+        <tr><td>4002</td><td>1001</td><td>2002</td><td>3</td><td>增长存在不确定性，价格战风险高</td><td>0.60</td><td>成本压力未缓解</td></tr>
+        <tr><td>4003</td><td>1001</td><td>2003</td><td>3</td><td>市场将继续增长，但增速放缓至35%</td><td>0.75</td><td>基效应导致增速回落</td></tr>
+    </table>
+
+    <h4>ai_meeting_conclusion_cluster（结论聚类 - 第3轮）</h4>
+    <table>
+        <tr><th>id</th><th>meeting_id</th><th>round_number</th><th>cluster_label</th><th>member_count</th><th>member_ids</th><th>agreement_ratio</th><th>is_consensus</th></tr>
+        <tr><td>5001</td><td>1001</td><td>3</td><td>市场继续增长，渗透率突破50%</td><td>2</td><td>2001,2003</td><td>0.67</td><td>0</td></tr>
+        <tr><td>5002</td><td>1001</td><td>3</td><td>增长存在不确定性</td><td>1</td><td>2002</td><td>0.33</td><td>0</td></tr>
+    </table>
+
+    <h4>ai_workflow_run（工作流运行实例）</h4>
+    <table>
+        <tr><th>id</th><th>meeting_id</th><th>template_id</th><th>template_key</th><th>current_stage_key</th><th>current_stage_order</th><th>status</th><th>blocked_reason</th></tr>
+        <tr><td>6001</td><td>1001</td><td>1</td><td>default-roundtable</td><td>conclusion</td><td>2</td><td>CONCLUDED</td><td>NULL</td></tr>
+    </table>
+
+    <h4>ai_meeting_tracking_item（追踪项）</h4>
+    <table>
+        <tr><th>id</th><th>meeting_id</th><th>title</th><th>description</th><th>status</th><th>watch_query</th><th>change_severity</th><th>auto_refresh_enabled</th><th>next_check_at</th></tr>
+        <tr><td>7001</td><td>1001</td><td>监控新能源渗透率数据</td><td>追踪每月新能源渗透率变化</td><td>OPEN</td><td>2026年新能源汽车渗透率最新数据</td><td>NONE</td><td>1</td><td>2026-05-26 09:00:00</td></tr>
+    </table>
+
+    <h3>6. 表关联模式总结</h3>
+    <ul>
+        <li><strong>一对一</strong>：ai_meeting_room 与 ai_workflow_run（通过 meeting_id 关联，逻辑外键，应用层维护唯一性约束 uk_meeting_id）</li>
+        <li><strong>一对多</strong>：ai_meeting_room 与 ai_meeting_member（通过 meeting_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_meeting_room 与 ai_meeting_opinion（通过 meeting_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_meeting_room 与 ai_meeting_vote（通过 meeting_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_meeting_room 与 ai_meeting_conclusion_cluster（通过 meeting_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_workflow_template 与 ai_workflow_stage_template（通过 template_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_workflow_run 与 ai_workflow_stage_run（通过 workflow_run_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_workflow_stage_run 与 ai_workflow_stage_submission（通过 stage_run_id 关联，逻辑外键）</li>
+        <li><strong>一对多</strong>：ai_meeting_tracking_item 与 ai_meeting_tracking_update（通过 tracking_item_id 关联，逻辑外键）</li>
+        <li><strong>自关联</strong>：ai_meeting_opinion 通过 parent_opinion_id 关联自身，形成回复链</li>
+        <li><strong>分库分表</strong>：当前项目未实施分库分表，单库单表架构</li>
+    </ul>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default' });
+    </script>
+</body>
+</html>

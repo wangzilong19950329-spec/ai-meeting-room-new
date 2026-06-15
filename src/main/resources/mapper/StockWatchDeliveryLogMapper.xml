@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchDeliveryLogMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchDeliveryLog">
+        <id column="id" property="id"/>
+        <result column="config_id" property="configId"/>
+        <result column="analysis_id" property="analysisId"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="recipient_hash" property="recipientHash"/>
+        <result column="recipient_masked" property="recipientMasked"/>
+        <result column="status" property="status"/>
+        <result column="message_id" property="messageId"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="sent_at" property="sentAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_delivery_log
+        (config_id, analysis_id, symbol, market, recipient_hash, recipient_masked, status, message_id, error_message, sent_at)
+        VALUES
+        (#{configId}, #{analysisId}, #{symbol}, #{market}, #{recipientHash}, #{recipientMasked},
+         #{status}, #{messageId}, #{errorMessage}, #{sentAt})
+    </insert>
+
+    <select id="selectByAnalysisRecipient" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_delivery_log
+        WHERE analysis_id = #{analysisId}
+          AND recipient_hash = #{recipientHash}
+        LIMIT 1
+    </select>
+
+    <update id="resetPending">
+        UPDATE stock_watch_delivery_log
+        SET status = 'PENDING',
+            message_id = NULL,
+            error_message = NULL,
+            sent_at = NULL
+        WHERE id = #{id}
+          AND status != 'SENT'
+    </update>
+
+    <update id="updateStatus">
+        UPDATE stock_watch_delivery_log
+        SET status = #{status},
+            message_id = #{messageId},
+            error_message = #{errorMessage},
+            sent_at = CASE WHEN #{status} = 'SENT' THEN CURRENT_TIMESTAMP ELSE sent_at END
+        WHERE id = #{id}
+    </update>
+
+    <select id="countByConfig" resultType="map">
+        SELECT status, COUNT(*) AS count
+        FROM stock_watch_delivery_log
+        WHERE config_id = #{configId}
+        GROUP BY status
+    </select>
+</mapper>

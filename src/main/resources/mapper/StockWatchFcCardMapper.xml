@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchFcCardMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchFcCard">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="card_key" property="cardKey"/>
+        <result column="card_title" property="cardTitle"/>
+        <result column="card_type" property="cardType"/>
+        <result column="thesis" property="thesis"/>
+        <result column="trigger_logic" property="triggerLogic"/>
+        <result column="data_source_tier" property="dataSourceTier"/>
+        <result column="data_sources" property="dataSources"/>
+        <result column="collection_method" property="collectionMethod"/>
+        <result column="frequency" property="frequency"/>
+        <result column="parser_spec" property="parserSpec"/>
+        <result column="baseline_reading" property="baselineReading"/>
+        <result column="failure_monitor" property="failureMonitor"/>
+        <result column="auto_proxy" property="autoProxy"/>
+        <result column="activation_status" property="activationStatus"/>
+        <result column="activation_blockers" property="activationBlockers"/>
+        <result column="enabled" property="enabled"/>
+        <result column="notify_enabled" property="notifyEnabled"/>
+        <result column="last_collect_status" property="lastCollectStatus"/>
+        <result column="last_collect_note" property="lastCollectNote"/>
+        <result column="last_collected_at" property="lastCollectedAt"/>
+        <result column="raw_markdown" property="rawMarkdown"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_fc_card
+        (symbol, market, stock_name, card_key, card_title, card_type, thesis, trigger_logic,
+         data_source_tier, data_sources, collection_method, frequency, parser_spec,
+         baseline_reading, failure_monitor, auto_proxy, activation_status, activation_blockers,
+         enabled, notify_enabled, last_collect_status, last_collect_note, last_collected_at, raw_markdown)
+        VALUES
+        (#{symbol}, #{market}, #{stockName}, #{cardKey}, #{cardTitle}, #{cardType}, #{thesis}, #{triggerLogic},
+         #{dataSourceTier}, #{dataSources}, #{collectionMethod}, #{frequency}, #{parserSpec},
+         #{baselineReading}, #{failureMonitor}, #{autoProxy}, #{activationStatus}, #{activationBlockers},
+         #{enabled}, #{notifyEnabled}, #{lastCollectStatus}, #{lastCollectNote}, #{lastCollectedAt}, #{rawMarkdown})
+    </insert>
+
+    <update id="update">
+        UPDATE stock_watch_fc_card
+        SET stock_name = #{stockName},
+            card_title = #{cardTitle},
+            card_type = #{cardType},
+            thesis = #{thesis},
+            trigger_logic = #{triggerLogic},
+            data_source_tier = #{dataSourceTier},
+            data_sources = #{dataSources},
+            collection_method = #{collectionMethod},
+            frequency = #{frequency},
+            parser_spec = #{parserSpec},
+            baseline_reading = #{baselineReading},
+            failure_monitor = #{failureMonitor},
+            auto_proxy = #{autoProxy},
+            activation_status = #{activationStatus},
+            activation_blockers = #{activationBlockers},
+            enabled = #{enabled},
+            notify_enabled = #{notifyEnabled},
+            last_collect_status = #{lastCollectStatus},
+            last_collect_note = #{lastCollectNote},
+            last_collected_at = #{lastCollectedAt},
+            raw_markdown = #{rawMarkdown}
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM stock_watch_fc_card WHERE id = #{id}
+    </delete>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_fc_card
+        WHERE id = #{id}
+        LIMIT 1
+    </select>
+
+    <select id="selectBySymbolCardKey" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_fc_card
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND card_key = #{cardKey}
+        LIMIT 1
+    </select>
+
+    <select id="selectBySymbolMarket" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_fc_card
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+        ORDER BY
+          CASE activation_status
+            WHEN 'ACTIVE' THEN 1
+            WHEN 'DRAFT' THEN 2
+            WHEN 'SUSPENDED' THEN 3
+            ELSE 4
+          END,
+          id ASC
+    </select>
+</mapper>

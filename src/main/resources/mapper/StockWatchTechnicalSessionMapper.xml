@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchTechnicalSessionMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchTechnicalSession">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="period_type" property="periodType"/>
+        <result column="session_key" property="sessionKey"/>
+        <result column="bridge_target_id" property="bridgeTargetId"/>
+        <result column="conversation_url" property="conversationUrl"/>
+        <result column="status" property="status"/>
+        <result column="generation" property="generation"/>
+        <result column="context_chars" property="contextChars"/>
+        <result column="context_limit_chars" property="contextLimitChars"/>
+        <result column="last_run_at" property="lastRunAt"/>
+        <result column="last_run_status" property="lastRunStatus"/>
+        <result column="last_error" property="lastError"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_technical_session
+        (symbol, market, stock_name, period_type, session_key, bridge_target_id, conversation_url, status,
+         generation, context_chars, context_limit_chars, last_run_at, last_run_status, last_error)
+        VALUES
+        (#{symbol}, #{market}, #{stockName}, #{periodType}, #{sessionKey}, #{bridgeTargetId}, #{conversationUrl}, #{status},
+         #{generation}, #{contextChars}, #{contextLimitChars}, #{lastRunAt}, #{lastRunStatus}, #{lastError})
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_session WHERE id = #{id}
+    </select>
+
+    <select id="selectActive" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_session
+        WHERE symbol = #{symbol} AND market = #{market} AND status = 'ACTIVE'
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+        ORDER BY generation DESC, id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectLatest" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_session
+        WHERE symbol = #{symbol} AND market = #{market}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+        ORDER BY generation DESC, id DESC
+        LIMIT 1
+    </select>
+
+    <update id="deactivateActive">
+        UPDATE stock_watch_technical_session
+        SET status = #{status},
+            last_error = #{lastError},
+            gmt_modify = NOW()
+        WHERE symbol = #{symbol} AND market = #{market} AND status = 'ACTIVE'
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+    </update>
+
+    <update id="updateAfterRun">
+        UPDATE stock_watch_technical_session
+        SET bridge_target_id = #{bridgeTargetId},
+            conversation_url = #{conversationUrl},
+            context_chars = #{contextChars},
+            last_run_at = #{lastRunAt},
+            last_run_status = #{lastRunStatus},
+            last_error = #{lastError},
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+</mapper>

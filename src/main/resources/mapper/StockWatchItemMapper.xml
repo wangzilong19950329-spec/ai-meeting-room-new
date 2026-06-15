@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchItemMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchItem">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="image_url" property="imageUrl"/>
+        <result column="enabled" property="enabled"/>
+        <result column="source" property="source"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_item
+        (symbol, market, stock_name, image_url, enabled, source)
+        VALUES
+        (#{symbol}, #{market}, #{stockName}, #{imageUrl}, #{enabled}, #{source})
+    </insert>
+
+    <update id="update">
+        UPDATE stock_watch_item
+        SET stock_name = #{stockName},
+            image_url = #{imageUrl},
+            enabled = #{enabled},
+            source = #{source},
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <select id="selectBySymbolMarket" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_item
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+        LIMIT 1
+    </select>
+
+    <select id="selectEnabled" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_item
+        WHERE enabled = 1
+        ORDER BY gmt_create ASC, id ASC
+    </select>
+</mapper>

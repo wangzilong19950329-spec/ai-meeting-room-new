@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMeetingTrackingItemMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiMeetingTrackingItem">
+        <id column="id" property="id"/>
+        <result column="creator_id" property="creatorId"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="workflow_run_id" property="workflowRunId"/>
+        <result column="stage_run_id" property="stageRunId"/>
+        <result column="source_type" property="sourceType"/>
+        <result column="item_type" property="itemType"/>
+        <result column="title" property="title"/>
+        <result column="description" property="description"/>
+        <result column="status" property="status"/>
+        <result column="owner_type" property="ownerType"/>
+        <result column="owner_ref" property="ownerRef"/>
+        <result column="reopen_trigger" property="reopenTrigger"/>
+        <result column="required_for_continue" property="requiredForContinue"/>
+        <result column="reopen_policy" property="reopenPolicy"/>
+        <result column="auto_refresh_enabled" property="autoRefreshEnabled"/>
+        <result column="refresh_mode" property="refreshMode"/>
+        <result column="refresh_interval_hours" property="refreshIntervalHours"/>
+        <result column="watch_query" property="watchQuery"/>
+        <result column="watch_scope" property="watchScope"/>
+        <result column="next_check_at" property="nextCheckAt"/>
+        <result column="last_checked_at" property="lastCheckedAt"/>
+        <result column="last_check_status" property="lastCheckStatus"/>
+        <result column="last_check_note" property="lastCheckNote"/>
+        <result column="last_check_fingerprint" property="lastCheckFingerprint"/>
+        <result column="change_severity" property="changeSeverity"/>
+        <result column="due_at" property="dueAt"/>
+        <result column="last_update_at" property="lastUpdateAt"/>
+        <result column="closed_at" property="closedAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_tracking_item
+        (creator_id, meeting_id, workflow_run_id, stage_run_id, source_type, item_type, title, description, status,
+         owner_type, owner_ref, reopen_trigger, required_for_continue, reopen_policy, auto_refresh_enabled,
+         refresh_mode, refresh_interval_hours, watch_query, watch_scope, next_check_at, last_checked_at,
+         last_check_status, last_check_note, last_check_fingerprint, change_severity, due_at, last_update_at, closed_at)
+        VALUES
+        (#{creatorId}, #{meetingId}, #{workflowRunId}, #{stageRunId}, #{sourceType}, #{itemType}, #{title}, #{description}, #{status},
+         #{ownerType}, #{ownerRef}, #{reopenTrigger}, #{requiredForContinue}, #{reopenPolicy}, #{autoRefreshEnabled},
+         #{refreshMode}, #{refreshIntervalHours}, #{watchQuery}, #{watchScope}, #{nextCheckAt}, #{lastCheckedAt},
+         #{lastCheckStatus}, #{lastCheckNote}, #{lastCheckFingerprint}, #{changeSeverity}, #{dueAt}, #{lastUpdateAt}, #{closedAt})
+    </insert>
+
+    <insert id="batchInsert" parameterType="java.util.List">
+        INSERT INTO ai_meeting_tracking_item
+        (creator_id, meeting_id, workflow_run_id, stage_run_id, source_type, item_type, title, description, status,
+         owner_type, owner_ref, reopen_trigger, required_for_continue, reopen_policy, auto_refresh_enabled,
+         refresh_mode, refresh_interval_hours, watch_query, watch_scope, next_check_at, last_checked_at,
+         last_check_status, last_check_note, last_check_fingerprint, change_severity, due_at, last_update_at, closed_at)
+        VALUES
+        <foreach collection="list" item="item" separator=",">
+            (#{item.creatorId}, #{item.meetingId}, #{item.workflowRunId}, #{item.stageRunId}, #{item.sourceType},
+             #{item.itemType}, #{item.title}, #{item.description}, #{item.status}, #{item.ownerType},
+             #{item.ownerRef}, #{item.reopenTrigger}, #{item.requiredForContinue}, #{item.reopenPolicy},
+             #{item.autoRefreshEnabled}, #{item.refreshMode}, #{item.refreshIntervalHours}, #{item.watchQuery},
+             #{item.watchScope}, #{item.nextCheckAt}, #{item.lastCheckedAt}, #{item.lastCheckStatus},
+             #{item.lastCheckNote}, #{item.lastCheckFingerprint}, #{item.changeSeverity}, #{item.dueAt},
+             #{item.lastUpdateAt}, #{item.closedAt})
+        </foreach>
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_tracking_item WHERE id = #{id}
+    </select>
+
+    <select id="selectByMeetingId" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_tracking_item WHERE meeting_id = #{meetingId} ORDER BY gmt_create DESC, id DESC
+    </select>
+
+    <select id="selectAll" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_tracking_item
+        ORDER BY COALESCE(next_check_at, gmt_create) ASC, id DESC
+    </select>
+
+    <select id="selectDueForRefresh" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_tracking_item
+        WHERE auto_refresh_enabled = 1
+          AND (status IS NULL OR status NOT IN ('CLOSED', 'REJECTED'))
+          AND (next_check_at IS NULL OR next_check_at &lt;= #{now})
+        ORDER BY COALESCE(next_check_at, gmt_create) ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectByMeetingIdAndTitle" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_tracking_item
+        WHERE meeting_id = #{meetingId} AND title = #{title}
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <update id="updateStatus">
+        UPDATE ai_meeting_tracking_item
+        SET status = #{status},
+            last_update_at = #{lastUpdateAt},
+            closed_at = #{closedAt},
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateRefreshState">
+        UPDATE ai_meeting_tracking_item
+        SET next_check_at = #{nextCheckAt},
+            last_checked_at = #{lastCheckedAt},
+            last_check_status = #{lastCheckStatus},
+            last_check_note = #{lastCheckNote},
+            last_check_fingerprint = #{lastCheckFingerprint},
+            change_severity = #{changeSeverity},
+            last_update_at = #{lastUpdateAt},
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_tracking_item WHERE meeting_id = #{meetingId}
+    </delete>
+</mapper>

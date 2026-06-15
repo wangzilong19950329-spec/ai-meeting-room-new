@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiWorkflowRunMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.AiWorkflowRun">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="template_id" property="templateId"/>
+        <result column="template_key" property="templateKey"/>
+        <result column="current_stage_key" property="currentStageKey"/>
+        <result column="current_stage_order" property="currentStageOrder"/>
+        <result column="status" property="status"/>
+        <result column="blocked_reason" property="blockedReason"/>
+        <result column="reopen_count" property="reopenCount"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_workflow_run
+        (meeting_id, template_id, template_key, current_stage_key, current_stage_order, status, blocked_reason, reopen_count)
+        VALUES
+        (#{meetingId}, #{templateId}, #{templateKey}, #{currentStageKey}, #{currentStageOrder}, #{status}, #{blockedReason}, #{reopenCount})
+    </insert>
+
+    <select id="selectByMeetingId" resultMap="BaseResultMap">
+        SELECT * FROM ai_workflow_run WHERE meeting_id = #{meetingId} LIMIT 1
+    </select>
+
+    <update id="updateStatus">
+        UPDATE ai_workflow_run
+        SET status = #{status},
+            blocked_reason = #{blockedReason},
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="updateCurrentStage">
+        UPDATE ai_workflow_run
+        SET current_stage_key = #{currentStageKey},
+            current_stage_order = #{currentStageOrder},
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <update id="incrementReopenCount">
+        UPDATE ai_workflow_run
+        SET reopen_count = reopen_count + 1,
+            gmt_modify = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_workflow_run WHERE meeting_id = #{meetingId}
+    </delete>
+</mapper>

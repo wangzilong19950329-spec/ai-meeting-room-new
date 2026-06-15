@@ -1,0 +1,795 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stock Watch Multi Period Analysis Prototype</title>
+  <style>
+    :root {
+      --ink: #101828;
+      --muted: #667085;
+      --soft: #f3f7f8;
+      --line: #dfe7ee;
+      --green: #059669;
+      --blue: #2563eb;
+      --amber: #d97706;
+      --red: #dc2626;
+      --panel: rgba(255, 255, 255, .88);
+      --shadow: 0 24px 64px rgba(15, 23, 42, .10);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(16, 185, 129, .12), transparent 34%),
+        radial-gradient(circle at 90% 10%, rgba(37, 99, 235, .10), transparent 34%),
+        linear-gradient(180deg, #f7faf9 0%, #eef3f6 54%, #f8fafc 100%);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    .page {
+      width: min(1540px, calc(100vw - 44px));
+      margin: 22px auto 48px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .hero,
+    .panel,
+    .metric {
+      border: 1px solid rgba(148, 163, 184, .24);
+      border-radius: 28px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(16px);
+    }
+
+    .hero {
+      min-height: 178px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: center;
+      padding: 28px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero:after {
+      content: "";
+      position: absolute;
+      right: 32px;
+      top: 50%;
+      width: 150px;
+      height: 150px;
+      border: 1px solid rgba(16, 185, 129, .20);
+      border-radius: 42px;
+      background:
+        linear-gradient(135deg, rgba(16, 185, 129, .16), rgba(37, 99, 235, .08)),
+        repeating-linear-gradient(135deg, rgba(15, 23, 42, .07) 0 1px, transparent 1px 12px);
+      transform: translateY(-50%) rotate(8deg);
+      opacity: .46;
+    }
+
+    .hero > * {
+      position: relative;
+      z-index: 1;
+    }
+
+    .hero h1 {
+      margin: 6px 0 10px;
+      font-size: clamp(34px, 3.4vw, 54px);
+      line-height: 1.02;
+      letter-spacing: -.06em;
+    }
+
+    .hero p {
+      margin: 0;
+      max-width: 850px;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.75;
+      font-weight: 650;
+    }
+
+    .label {
+      color: #667085;
+      font-size: 12px;
+      font-weight: 950;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      align-items: center;
+      margin-right: 170px;
+    }
+
+    .pill,
+    .tab,
+    .button {
+      min-height: 48px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border: 1px solid rgba(148, 163, 184, .28);
+      border-radius: 999px;
+      padding: 0 20px;
+      font-size: 16px;
+      font-weight: 950;
+      background: #fff;
+      white-space: nowrap;
+    }
+
+    .pill.green { color: #047857; background: #dff8ec; border-color: #c3f1dd; }
+    .pill.blue { color: #075985; background: #e0f2fe; border-color: #c7e7fb; }
+    .pill.gray { color: #475569; background: #e8edf2; }
+    .button.dark { color: #fff; background: linear-gradient(135deg, #101828, #173226); border-color: #101828; }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .metric {
+      min-height: 130px;
+      padding: 20px 22px;
+    }
+
+    .metric span {
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 850;
+    }
+
+    .metric strong {
+      display: block;
+      margin: 10px 0 5px;
+      font-size: 38px;
+      line-height: 1;
+      letter-spacing: -.06em;
+    }
+
+    .metric small {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 410px minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+
+    .side {
+      display: grid;
+      gap: 16px;
+      position: sticky;
+      top: 18px;
+    }
+
+    .panel {
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 22px 24px 18px;
+      border-bottom: 1px solid rgba(148, 163, 184, .16);
+    }
+
+    .panel-head h2,
+    .period-title h2 {
+      margin: 5px 0 0;
+      font-size: 26px;
+      letter-spacing: -.04em;
+    }
+
+    .period-tabs {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      padding: 16px;
+      background: rgba(248, 250, 252, .78);
+      border-bottom: 1px solid rgba(148, 163, 184, .16);
+    }
+
+    .tab {
+      min-height: 66px;
+      border-radius: 20px;
+      cursor: pointer;
+      flex-direction: column;
+      align-items: flex-start;
+      padding: 12px 14px;
+      color: #475569;
+      transition: .18s ease;
+    }
+
+    .tab b {
+      color: #101828;
+      font-size: 22px;
+      line-height: 1;
+    }
+
+    .tab small {
+      margin-top: 6px;
+      color: #667085;
+      font-size: 12px;
+    }
+
+    .tab.active {
+      color: #fff;
+      border-color: #101828;
+      background: linear-gradient(135deg, #101828, #153426);
+      box-shadow: 0 18px 36px rgba(15, 23, 42, .18);
+    }
+
+    .tab.active b,
+    .tab.active small { color: #fff; }
+
+    .period-list {
+      display: grid;
+      gap: 10px;
+      padding: 16px;
+      max-height: 690px;
+      overflow: auto;
+    }
+
+    .period-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      min-height: 84px;
+      padding: 14px 16px;
+      border: 1px solid rgba(148, 163, 184, .20);
+      border-radius: 20px;
+      background: #fff;
+    }
+
+    .period-row.active {
+      border-color: #2563eb;
+      background: #dcfce7;
+      box-shadow: inset 0 0 0 2px #2563eb;
+    }
+
+    .period-row strong {
+      display: block;
+      font-size: 22px;
+      letter-spacing: -.03em;
+    }
+
+    .period-row small {
+      color: #667085;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .period-row em {
+      font-style: normal;
+      color: #047857;
+      font-size: 14px;
+      font-weight: 950;
+    }
+
+    .main {
+      display: grid;
+      gap: 18px;
+    }
+
+    .period-hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(330px, .85fr);
+      gap: 16px;
+      padding: 20px;
+      background:
+        radial-gradient(circle at 92% 0%, rgba(37, 99, 235, .12), transparent 34%),
+        #fff;
+    }
+
+    .period-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: flex-start;
+      margin-bottom: 18px;
+    }
+
+    .stance {
+      display: inline-flex;
+      align-items: center;
+      min-height: 42px;
+      border-radius: 999px;
+      padding: 0 16px;
+      font-weight: 950;
+    }
+
+    .stance.red { color: #b42318; background: #fee4e2; }
+    .stance.amber { color: #92400e; background: #fef3c7; }
+    .stance.green { color: #047857; background: #dff8ec; }
+
+    .summary-text {
+      color: #344054;
+      font-size: 19px;
+      line-height: 1.82;
+      font-weight: 650;
+    }
+
+    .evidence {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .evidence span {
+      min-height: 36px;
+      display: inline-flex;
+      align-items: center;
+      border-radius: 12px;
+      padding: 0 12px;
+      color: #334155;
+      background: #edf2f7;
+      font-size: 14px;
+      font-weight: 850;
+    }
+
+    .dimension-grid {
+      display: grid;
+      gap: 12px;
+    }
+
+    .dimension-card {
+      min-height: 118px;
+      padding: 16px;
+      border: 1px solid rgba(148, 163, 184, .22);
+      border-radius: 20px;
+      background: rgba(248, 250, 252, .86);
+    }
+
+    .dimension-card span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 950;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .dimension-card strong {
+      display: block;
+      margin: 9px 0 6px;
+      font-size: 22px;
+      letter-spacing: -.04em;
+    }
+
+    .dimension-card p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+      font-weight: 650;
+    }
+
+    .section-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .logic-card {
+      padding: 20px;
+      border: 1px solid rgba(148, 163, 184, .22);
+      border-radius: 24px;
+      background: #fff;
+    }
+
+    .logic-card h3 {
+      margin: 8px 0 10px;
+      font-size: 22px;
+      letter-spacing: -.04em;
+    }
+
+    .logic-card p {
+      margin: 0;
+      color: #475569;
+      line-height: 1.68;
+      font-size: 15px;
+      font-weight: 650;
+    }
+
+    .timeline {
+      padding: 18px 22px 22px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .record {
+      display: grid;
+      grid-template-columns: 120px minmax(0, 1fr) 140px;
+      gap: 18px;
+      align-items: start;
+      padding: 18px;
+      border: 1px solid rgba(148, 163, 184, .20);
+      border-radius: 22px;
+      background: #fff;
+    }
+
+    .record time {
+      color: #667085;
+      font-size: 15px;
+      font-weight: 900;
+    }
+
+    .record strong {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 20px;
+      letter-spacing: -.035em;
+    }
+
+    .record p {
+      margin: 0;
+      color: #475569;
+      line-height: 1.66;
+      font-weight: 650;
+    }
+
+    .record .button {
+      min-height: 42px;
+      border-radius: 14px;
+      font-size: 14px;
+    }
+
+    .architecture {
+      padding: 20px 22px 24px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .flow article {
+      min-height: 150px;
+      padding: 16px;
+      border: 1px solid rgba(148, 163, 184, .22);
+      border-radius: 20px;
+      background: #fff;
+    }
+
+    .flow b {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      color: #fff;
+      background: #111827;
+      font-size: 15px;
+    }
+
+    .flow strong {
+      display: block;
+      margin: 12px 0 8px;
+      font-size: 18px;
+    }
+
+    .flow p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.55;
+      font-weight: 650;
+    }
+
+    @media (max-width: 1120px) {
+      .layout,
+      .period-hero {
+        grid-template-columns: 1fr;
+      }
+
+      .side {
+        position: static;
+      }
+
+      .metrics,
+      .section-grid,
+      .flow {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        width: min(100vw - 20px, 1540px);
+      }
+
+      .hero,
+      .panel-head,
+      .period-title,
+      .record {
+        grid-template-columns: 1fr;
+      }
+
+      .hero-actions {
+        margin-right: 0;
+        justify-content: flex-start;
+      }
+
+      .metrics,
+      .period-tabs,
+      .section-grid,
+      .flow {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div>
+        <div class="label">DeepSeek Web Analysis · D / W / M</div>
+        <h1>技术面分析升级为日周月三层视角</h1>
+        <p>
+          日维度保留 30 分钟盘中判断；周维度回答“本周结构有没有变化”；月维度回答“中期趋势和关键假设是否仍成立”。
+          这样不会把 30 分钟噪音误当成大级别结论，也方便邮件只推送真正有价值的周期变化。
+        </p>
+      </div>
+      <div class="hero-actions">
+        <span class="pill green">D 日内 30m</span>
+        <span class="pill blue">W 周复盘</span>
+        <span class="pill gray">M 月框架</span>
+        <span class="button dark">立即分析</span>
+      </div>
+    </section>
+
+    <section class="metrics">
+      <article class="metric">
+        <span>日内分析</span>
+        <strong>30m</strong>
+        <small>交易时段运行，展示当天所有执行记录。</small>
+      </article>
+      <article class="metric">
+        <span>周度分析</span>
+        <strong>1W</strong>
+        <small>周五收盘后或手动生成，汇总本周日内记录。</small>
+      </article>
+      <article class="metric">
+        <span>月度分析</span>
+        <strong>1M</strong>
+        <small>月末生成，聚焦中期趋势、区间和关键假设。</small>
+      </article>
+      <article class="metric">
+        <span>会话策略</span>
+        <strong>3类</strong>
+        <small>建议每只股票保持日/周/月独立 DeepSeek 会话。</small>
+      </article>
+    </section>
+
+    <section class="layout">
+      <aside class="side">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="label">period switch</div>
+              <h2>周期视图</h2>
+            </div>
+          </div>
+
+          <div class="period-tabs">
+            <button class="tab"><b>日</b><small>最近30天</small></button>
+            <button class="tab active"><b>周</b><small>最近12周</small></button>
+            <button class="tab"><b>月</b><small>最近12月</small></button>
+          </div>
+
+          <div class="period-list">
+            <article class="period-row active">
+              <div>
+                <strong>2026-W24</strong>
+                <small>06/08 - 06/14 · 18 条日内结论</small>
+              </div>
+              <em>已汇总</em>
+            </article>
+            <article class="period-row">
+              <div>
+                <strong>2026-W23</strong>
+                <small>06/01 - 06/07 · 9 条日内结论</small>
+              </div>
+              <em>偏弱</em>
+            </article>
+            <article class="period-row">
+              <div>
+                <strong>2026-W22</strong>
+                <small>05/25 - 05/31 · 6 条日内结论</small>
+              </div>
+              <em>震荡</em>
+            </article>
+            <article class="period-row">
+              <div>
+                <strong>2026-W21</strong>
+                <small>05/18 - 05/24 · 11 条日内结论</small>
+              </div>
+              <em>修复</em>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="label">rules</div>
+              <h2>生成节奏建议</h2>
+            </div>
+          </div>
+          <div class="architecture">
+            <article class="dimension-card">
+              <span>日维度</span>
+              <strong>盘中事实 + 当日信号</strong>
+              <p>来源东方财富 10m/日内快照，适合邮件即时提醒。</p>
+            </article>
+            <article class="dimension-card">
+              <span>周维度</span>
+              <strong>一周结构复盘</strong>
+              <p>周五收盘后用本周日记录、周K、资金流、关键位重新判断。</p>
+            </article>
+            <article class="dimension-card">
+              <span>月维度</span>
+              <strong>中期假设校验</strong>
+              <p>月末或手动生成，和 FC 卡、财报节点、行业事件联动。</p>
+            </article>
+          </div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <section class="panel period-hero">
+          <div>
+            <div class="period-title">
+              <div>
+                <div class="label">weekly synthesis</div>
+                <h2>绿的谐波 · 2026-W24 周度技术面结论</h2>
+              </div>
+              <span class="stance red">偏空延续</span>
+            </div>
+            <p class="summary-text">
+              本周核心不是“某一次 30 分钟波动”，而是 348 支撑连续被测试后仍未出现有效缩量承接。
+              周线级别仍处于下行修复后的确认阶段，短线反抽必须重新站回 370-387 压力带且量能改善，才可把日内风险降级为震荡。
+            </p>
+            <div class="evidence">
+              <span>本周 18 条日内结论：12 条 negative</span>
+              <span>周低 348 未有效远离</span>
+              <span>主力净流出连续 3 日</span>
+              <span>周K仍在 MA20 下方</span>
+            </div>
+          </div>
+
+          <div class="dimension-grid">
+            <article class="dimension-card">
+              <span>日内噪音过滤</span>
+              <strong>反抽未改变周线结构</strong>
+              <p>日内两次反弹被 370 附近压回，不能单独视为趋势转折。</p>
+            </article>
+            <article class="dimension-card">
+              <span>关键价位</span>
+              <strong>348 / 370-387 / 410</strong>
+              <p>周度只保留会影响下一周判断的价位，避免重复展示每轮 30m 细节。</p>
+            </article>
+            <article class="dimension-card">
+              <span>下周验证</span>
+              <strong>缩量守 348 或放量跌破</strong>
+              <p>下周首要观察不是预测，而是验证支撑位的真实承接。</p>
+            </article>
+          </div>
+        </section>
+
+        <section class="section-grid">
+          <article class="logic-card">
+            <div class="label">方案 A</div>
+            <h3>前端临时聚合</h3>
+            <p>最快，但质量一般。只把日记录按周/月分组展示，不能产生真正的周月结论，适合过渡。</p>
+          </article>
+          <article class="logic-card">
+            <div class="label">方案 B · 推荐</div>
+            <h3>独立周期分析记录</h3>
+            <p>新增 period=DAY/WEEK/MONTH，周月由 DeepSeek 单独生成；可追溯、可邮件、可独立会话。</p>
+          </article>
+          <article class="logic-card">
+            <div class="label">方案 C</div>
+            <h3>全量多周期会话</h3>
+            <p>每个周期单独会话，质量最好，但会话和成本更多。适合后续扩大到高优先级股票。</p>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="label">drill down</div>
+              <h2>周结论下钻到日内证据</h2>
+            </div>
+            <span class="pill blue">点击周结论可展开来源记录</span>
+          </div>
+
+          <div class="timeline">
+            <article class="record">
+              <time>06/14 14:00</time>
+              <div>
+                <strong>盘后确认低位承压，无新交易信号</strong>
+                <p>作为周度结论的主要证据：支撑位附近没有出现有效承接，风险尚未解除。</p>
+              </div>
+              <span class="button">查看原会话</span>
+            </article>
+            <article class="record">
+              <time>06/13 13:30</time>
+              <div>
+                <strong>反抽失败，压力带继续有效</strong>
+                <p>日内反弹被 370 附近压回，纳入周度“压力未突破”的证据组。</p>
+              </div>
+              <span class="button">查看记录</span>
+            </article>
+            <article class="record">
+              <time>06/12 15:00</time>
+              <div>
+                <strong>低位放量但未确认止跌</strong>
+                <p>被周度摘要归类为“支撑测试”，不是独立买入信号。</p>
+              </div>
+              <span class="button">查看记录</span>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="label">implementation map</div>
+              <h2>落地改造路径</h2>
+            </div>
+          </div>
+          <div class="architecture">
+            <div class="flow">
+              <article>
+                <b>1</b>
+                <strong>数据模型补 period</strong>
+                <p>记录增加 periodType、periodKey、sourceRecordIds，支持 DAY/WEEK/MONTH。</p>
+              </article>
+              <article>
+                <b>2</b>
+                <strong>调度器分层</strong>
+                <p>日内 30m；周五收盘后生成周结论；月末生成月结论。</p>
+              </article>
+              <article>
+                <b>3</b>
+                <strong>Prompt 分层</strong>
+                <p>日看即时交易信号；周看结构变化；月看中期趋势和假设。</p>
+              </article>
+              <article>
+                <b>4</b>
+                <strong>UI 周期切换</strong>
+                <p>左侧 period rail 切换日/周/月，中间展示摘要，底部下钻证据。</p>
+              </article>
+            </div>
+          </div>
+        </section>
+      </main>
+    </section>
+  </main>
+</body>
+</html>

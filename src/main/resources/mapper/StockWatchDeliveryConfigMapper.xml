@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchDeliveryConfigMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchDeliveryConfig">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="enabled" property="enabled"/>
+        <result column="recipients_json" property="recipientsJson"/>
+        <result column="sender_mode" property="senderMode"/>
+        <result column="frequency_type" property="frequencyType"/>
+        <result column="interval_minutes" property="intervalMinutes"/>
+        <result column="trigger_policy_json" property="triggerPolicyJson"/>
+        <result column="active_from" property="activeFrom"/>
+        <result column="last_dispatch_status" property="lastDispatchStatus"/>
+        <result column="last_dispatch_message" property="lastDispatchMessage"/>
+        <result column="last_dispatch_at" property="lastDispatchAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_delivery_config
+        (symbol, market, stock_name, enabled, recipients_json, sender_mode, frequency_type,
+         interval_minutes, trigger_policy_json, active_from, last_dispatch_status, last_dispatch_message)
+        VALUES
+        (#{symbol}, #{market}, #{stockName}, #{enabled}, #{recipientsJson}, #{senderMode}, #{frequencyType},
+         #{intervalMinutes}, #{triggerPolicyJson}, #{activeFrom}, #{lastDispatchStatus}, #{lastDispatchMessage})
+    </insert>
+
+    <update id="update">
+        UPDATE stock_watch_delivery_config
+        SET stock_name = #{stockName},
+            enabled = #{enabled},
+            recipients_json = #{recipientsJson},
+            sender_mode = #{senderMode},
+            frequency_type = #{frequencyType},
+            interval_minutes = #{intervalMinutes},
+            trigger_policy_json = #{triggerPolicyJson},
+            active_from = #{activeFrom},
+            last_dispatch_status = #{lastDispatchStatus},
+            last_dispatch_message = #{lastDispatchMessage}
+        WHERE id = #{id}
+    </update>
+
+    <select id="selectBySymbolMarket" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_delivery_config
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+        LIMIT 1
+    </select>
+
+    <select id="selectEnabled" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_delivery_config
+        WHERE enabled = 1
+        ORDER BY gmt_modify DESC, id DESC
+    </select>
+
+    <update id="updateDispatchStatus">
+        UPDATE stock_watch_delivery_config
+        SET last_dispatch_status = #{status},
+            last_dispatch_message = #{message},
+            last_dispatch_at = CASE WHEN #{dispatchAt} IS NULL THEN last_dispatch_at ELSE #{dispatchAt} END
+        WHERE id = #{id}
+    </update>
+</mapper>

@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper">
+
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchTechnicalAnalysis">
+        <id column="id" property="id"/>
+        <result column="session_id" property="sessionId"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="analysis_date" property="analysisDate"/>
+        <result column="run_slot" property="runSlot"/>
+        <result column="period_type" property="periodType"/>
+        <result column="period_key" property="periodKey"/>
+        <result column="source_record_ids" property="sourceRecordIds"/>
+        <result column="status" property="status"/>
+        <result column="stance" property="stance"/>
+        <result column="tone" property="tone"/>
+        <result column="confidence" property="confidence"/>
+        <result column="title" property="title"/>
+        <result column="conclusion" property="conclusion"/>
+        <result column="evidence_json" property="evidenceJson"/>
+        <result column="raw_response" property="rawResponse"/>
+        <result column="prompt_hash" property="promptHash"/>
+        <result column="provider" property="provider"/>
+        <result column="bridge_target_id" property="bridgeTargetId"/>
+        <result column="conversation_url" property="conversationUrl"/>
+        <result column="context_chars_delta" property="contextCharsDelta"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_technical_analysis
+        (session_id, symbol, market, stock_name, analysis_date, run_slot, period_type, period_key, source_record_ids,
+         status, stance, tone, confidence,
+         title, conclusion, evidence_json, raw_response, prompt_hash, provider, bridge_target_id,
+         conversation_url, context_chars_delta, error_message)
+        VALUES
+        (#{sessionId}, #{symbol}, #{market}, #{stockName}, #{analysisDate}, #{runSlot}, #{periodType}, #{periodKey},
+         #{sourceRecordIds}, #{status}, #{stance},
+         #{tone}, #{confidence}, #{title}, #{conclusion}, #{evidenceJson}, #{rawResponse}, #{promptHash},
+         #{provider}, #{bridgeTargetId}, #{conversationUrl}, #{contextCharsDelta}, #{errorMessage})
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis WHERE id = #{id}
+    </select>
+
+    <select id="selectLatestBySymbolDateSlot" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND analysis_date = #{analysisDate}
+          AND run_slot = #{runSlot}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+          AND (period_key = #{periodKey} OR (period_key IS NULL AND #{periodType} = 'DAY'))
+        ORDER BY id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectBySymbolDateRange" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND analysis_date &gt;= #{startDate}
+          AND analysis_date &lt;= #{endDate}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+        ORDER BY analysis_date DESC, gmt_create DESC, id DESC
+    </select>
+
+    <select id="selectBySymbolPeriodKeys" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+          <choose>
+              <when test="periodKeys != null and periodKeys.size() > 0">
+                  AND period_key IN
+                  <foreach collection="periodKeys" item="key" open="(" separator="," close=")">
+                      #{key}
+                  </foreach>
+              </when>
+              <otherwise>
+                  AND 1 = 0
+              </otherwise>
+          </choose>
+        ORDER BY analysis_date DESC, gmt_create DESC, id DESC
+    </select>
+
+    <select id="selectRecentBySymbol" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+        ORDER BY gmt_create DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectSuccessfulByDateRange" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND status = 'SUCCESS'
+          AND analysis_date &gt;= #{startDate}
+          AND analysis_date &lt;= #{endDate}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+        ORDER BY analysis_date ASC, gmt_create ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectSuccessfulSince" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND status = 'SUCCESS'
+          AND gmt_create &gt;= #{activeFrom}
+        ORDER BY gmt_create ASC, id ASC
+        LIMIT #{limit}
+    </select>
+</mapper>

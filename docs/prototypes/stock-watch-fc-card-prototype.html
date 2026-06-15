@@ -1,0 +1,1012 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>迈瑞医疗个股详情 - FC论点证伪卡</title>
+  <style>
+    :root {
+      --ink: #101828;
+      --muted: #667085;
+      --line: #d8e2ee;
+      --panel: rgba(255, 255, 255, .92);
+      --black: #0d1728;
+      --green: #08765a;
+      --green-soft: #dff8ed;
+      --blue: #2457d6;
+      --blue-soft: #e7efff;
+      --amber: #b66a00;
+      --amber-soft: #fff1cf;
+      --red: #c43d36;
+      --red-soft: #ffe4df;
+      --violet: #6236c9;
+      --violet-soft: #efe8ff;
+      --shadow: 0 24px 80px rgba(23, 39, 68, .13);
+      --shadow-soft: 0 12px 34px rgba(23, 39, 68, .08);
+      font-family: "Avenir Next", "DIN Alternate", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow-x: hidden;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 8%, rgba(94, 196, 137, .23), transparent 30%),
+        radial-gradient(circle at 92% 4%, rgba(83, 116, 255, .17), transparent 30%),
+        linear-gradient(135deg, #f8faf5 0%, #edf5f9 52%, #fbf7ef 100%);
+    }
+
+    button, input, select, textarea { font: inherit; }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    p, strong, small, .tab, .button, .stock-name, .stock-meta, .card-title, .card-subtitle, .field p {
+      overflow-wrap: anywhere;
+    }
+
+    .shell {
+      width: min(1680px, calc(100vw - 48px));
+      margin: 26px auto 56px;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: start;
+      margin-bottom: 18px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: #64bd86;
+      font-weight: 950;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(38px, 4vw, 66px);
+      line-height: .94;
+      letter-spacing: -.07em;
+    }
+
+    .subcopy {
+      max-width: 980px;
+      color: var(--muted);
+      font-size: 18px;
+      line-height: 1.7;
+      margin: 0;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+
+    .button {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: #263247;
+      border-radius: 18px;
+      padding: 13px 18px;
+      font-weight: 950;
+      cursor: pointer;
+      box-shadow: var(--shadow-soft);
+      white-space: nowrap;
+    }
+
+    .button.primary {
+      background: var(--black);
+      border-color: var(--black);
+      color: #fff;
+    }
+
+    .button.ghost {
+      background: rgba(255, 255, 255, .68);
+      box-shadow: none;
+    }
+
+    .stock-strip {
+      display: grid;
+      grid-template-columns: 1.35fr .8fr .8fr .8fr;
+      gap: 14px;
+      margin-bottom: 16px;
+    }
+
+    .metric {
+      min-width: 0;
+      min-height: 132px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 28px;
+      padding: 20px;
+      box-shadow: var(--shadow-soft);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .metric::after {
+      content: "";
+      position: absolute;
+      right: -42px;
+      bottom: -72px;
+      width: 160px;
+      height: 160px;
+      border-radius: 999px;
+      background: rgba(36, 87, 214, .08);
+    }
+
+    .stock-card {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      align-items: center;
+      gap: 18px;
+    }
+
+    .avatar {
+      width: 82px;
+      height: 82px;
+      display: grid;
+      place-items: center;
+      border-radius: 26px;
+      background: linear-gradient(135deg, #ddfaed, #eef7ff);
+      color: var(--green);
+      font-size: 28px;
+      font-weight: 950;
+      letter-spacing: -.08em;
+    }
+
+    .metric small {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 950;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      margin-bottom: 9px;
+    }
+
+    .stock-name {
+      font-size: 30px;
+      font-weight: 950;
+      letter-spacing: -.05em;
+    }
+
+    .stock-meta {
+      display: flex;
+      gap: 9px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      color: var(--muted);
+      font-weight: 850;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 40px;
+      line-height: 1;
+      letter-spacing: -.06em;
+    }
+
+    .metric p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.45;
+      font-weight: 750;
+    }
+
+    .detail-tabs {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, .76);
+      border-radius: 24px;
+      padding: 8px;
+      box-shadow: var(--shadow-soft);
+    }
+
+    .tab {
+      border: 0;
+      border-radius: 18px;
+      background: transparent;
+      color: #475467;
+      padding: 13px 10px;
+      font-weight: 950;
+      cursor: pointer;
+    }
+
+    .tab.active {
+      background: var(--black);
+      color: #fff;
+      box-shadow: 0 10px 24px rgba(16, 24, 40, .16);
+    }
+
+    .embedded-note {
+      margin-bottom: 18px;
+      border: 1px solid #b9dbc9;
+      border-radius: 24px;
+      background: linear-gradient(135deg, rgba(223, 248, 237, .86), rgba(255, 255, 255, .78));
+      color: #225443;
+      padding: 16px 18px;
+      font-weight: 850;
+      line-height: 1.6;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 420px minmax(0, 1fr) 360px;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 30px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      padding: 22px 24px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, .72);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 18px;
+    }
+
+    .panel-head h2 {
+      margin: 0;
+      font-size: 25px;
+      letter-spacing: -.04em;
+    }
+
+    .panel-head p {
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-weight: 750;
+    }
+
+    .filters {
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .filter {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: #344054;
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      font-weight: 950;
+    }
+
+    .filter.active {
+      background: var(--black);
+      color: #fff;
+      border-color: var(--black);
+    }
+
+    .card-list {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      max-height: 820px;
+      overflow: auto;
+    }
+
+    .fc-card {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 24px;
+      padding: 18px;
+    }
+
+    .fc-card.active {
+      border-color: #192338;
+      box-shadow: inset 0 0 0 2px #192338, var(--shadow-soft);
+    }
+
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .card-title {
+      font-size: 20px;
+      line-height: 1.25;
+      font-weight: 950;
+      letter-spacing: -.04em;
+    }
+
+    .card-subtitle {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin: 12px 0;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 6px 9px;
+      font-size: 12px;
+      font-weight: 950;
+      white-space: nowrap;
+    }
+
+    .badge.green { color: var(--green); background: var(--green-soft); }
+    .badge.blue { color: var(--blue); background: var(--blue-soft); }
+    .badge.amber { color: var(--amber); background: var(--amber-soft); }
+    .badge.red { color: var(--red); background: var(--red-soft); }
+    .badge.violet { color: var(--violet); background: var(--violet-soft); }
+    .badge.gray { color: #475467; background: #eef2f6; }
+
+    .trigger {
+      margin: 0;
+      color: #344054;
+      font-size: 14px;
+      line-height: 1.55;
+      font-weight: 720;
+    }
+
+    .mini-grid {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+
+    .mini {
+      background: #f6f9fc;
+      border: 1px solid #e3ebf4;
+      border-radius: 14px;
+      padding: 9px;
+    }
+
+    .mini small {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 950;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    .mini strong {
+      display: block;
+      margin-top: 4px;
+      color: #1d2939;
+      font-size: 13px;
+    }
+
+    .detail-body {
+      padding: 22px;
+    }
+
+    .detail-hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 260px;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .hero-card,
+    .status-card,
+    .field,
+    .form-card {
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 24px;
+      padding: 18px;
+    }
+
+    .hero-card {
+      padding: 22px;
+      background:
+        radial-gradient(circle at 90% 0%, rgba(8, 118, 90, .12), transparent 34%),
+        linear-gradient(135deg, #ffffff, #f6fbf7);
+    }
+
+    .hero-card h2 {
+      margin: 0 0 12px;
+      font-size: 34px;
+      line-height: 1.08;
+      letter-spacing: -.06em;
+    }
+
+    .hero-card p,
+    .status-card p,
+    .field p {
+      margin: 0;
+      color: #405169;
+      line-height: 1.65;
+      font-weight: 750;
+    }
+
+    .status-card small {
+      display: block;
+      color: var(--muted);
+      font-weight: 950;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+
+    .status-card strong {
+      display: block;
+      font-size: 36px;
+      letter-spacing: -.06em;
+    }
+
+    .section-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .field.wide { grid-column: 1 / -1; }
+
+    .field-label {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 950;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .field h3 {
+      margin: 0 0 8px;
+      font-size: 21px;
+      letter-spacing: -.04em;
+    }
+
+    .gate {
+      margin-top: 16px;
+      border-radius: 26px;
+      background: #101828;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    .gate-head {
+      padding: 20px 22px;
+      border-bottom: 1px solid rgba(255, 255, 255, .13);
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: center;
+    }
+
+    .gate-head h3 {
+      margin: 0;
+      font-size: 24px;
+      letter-spacing: -.04em;
+    }
+
+    .gate-head p {
+      margin: 5px 0 0;
+      color: rgba(255, 255, 255, .64);
+      font-weight: 750;
+    }
+
+    .gate-items {
+      padding: 10px 16px 18px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+    }
+
+    .gate-item {
+      border: 1px solid rgba(255, 255, 255, .13);
+      background: rgba(255, 255, 255, .06);
+      border-radius: 18px;
+      padding: 14px;
+    }
+
+    .gate-item span {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 20px;
+    }
+
+    .gate-item strong {
+      display: block;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .gate-item small {
+      display: block;
+      margin-top: 6px;
+      color: rgba(255, 255, 255, .56);
+      font-weight: 800;
+      line-height: 1.35;
+    }
+
+    .manual-panel {
+      margin-top: 16px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .form-card h3,
+    .rail-section h3 {
+      margin-bottom: 14px;
+      font-size: 20px;
+      letter-spacing: -.03em;
+    }
+
+    .form-row {
+      display: grid;
+      grid-template-columns: 104px minmax(0, 1fr);
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 950;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid #cbd7e6;
+      border-radius: 14px;
+      background: #fbfdff;
+      color: var(--ink);
+      padding: 11px 12px;
+      font-weight: 800;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 88px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    .rail-section {
+      padding: 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .rail-section:last-child { border-bottom: 0; }
+
+    .health-meter {
+      height: 14px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #edf2f7;
+      display: grid;
+      grid-template-columns: 34% 33% 33%;
+      margin-bottom: 12px;
+    }
+
+    .health-meter span:nth-child(1) { background: var(--green); }
+    .health-meter span:nth-child(2) { background: var(--amber); }
+    .health-meter span:nth-child(3) { background: var(--violet); }
+
+    .legend-row {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 900;
+      margin-top: 8px;
+    }
+
+    .queue {
+      display: grid;
+      gap: 10px;
+    }
+
+    .queue-item {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #fff;
+      padding: 12px;
+    }
+
+    .queue-item strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    .queue-item p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      font-weight: 750;
+    }
+
+    .timeline {
+      display: grid;
+      gap: 13px;
+    }
+
+    .timeline-item {
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .dot {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 13px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 950;
+    }
+
+    .timeline-item strong {
+      display: block;
+      font-size: 15px;
+      line-height: 1.35;
+    }
+
+    .timeline-item small {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-weight: 800;
+      line-height: 1.35;
+    }
+
+    @media (max-width: 1280px) {
+      .stock-strip { grid-template-columns: 1fr 1fr; }
+      .layout { grid-template-columns: 390px minmax(0, 1fr); }
+      .right-rail { grid-column: 1 / -1; }
+    }
+
+    @media (max-width: 900px) {
+      .shell { width: min(calc(100vw - 28px), 720px); }
+      .topbar,
+      .stock-strip,
+      .layout,
+      .detail-hero,
+      .section-grid,
+      .manual-panel {
+        grid-template-columns: 1fr;
+      }
+      .actions { justify-content: flex-start; }
+      .detail-tabs { grid-template-columns: 1fr 1fr; }
+      .gate-items { grid-template-columns: 1fr; }
+      .card-list { max-height: none; }
+    }
+
+    @media (max-width: 520px) {
+      .shell { width: min(calc(100vw - 40px), 720px); margin-top: 18px; }
+      .topbar .actions {
+        width: 100%;
+        display: grid;
+        grid-template-columns: 1fr;
+      }
+      .topbar .actions .button { width: 100%; min-width: 0; }
+      .detail-tabs { grid-template-columns: 1fr; }
+      .metric,
+      .panel { border-radius: 24px; }
+      .hero-card h2 { font-size: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="topbar">
+      <div>
+        <p class="eyebrow">STOCK WATCH DETAIL</p>
+        <h1>迈瑞医疗 个股详情</h1>
+        <p class="subcopy">FC 卡不是一个新的全局模块，而是单只股票详情页里的“论点证伪”区域。它和行情、技术面、观察更新、邮件配置同属当前股票，所有基线、采集器、通知策略都按股票粒度保存。</p>
+      </div>
+      <div class="actions">
+        <button class="button ghost">← 返回股票池</button>
+        <button class="button">刷新行情</button>
+        <button class="button primary">立即技术面分析</button>
+      </div>
+    </section>
+
+    <section class="stock-strip">
+      <article class="metric stock-card">
+        <div class="avatar">MR</div>
+        <div>
+          <small>watch item</small>
+          <div class="stock-name">迈瑞医疗</div>
+          <div class="stock-meta">
+            <span>300760.SZ</span>
+            <span>医疗器械</span>
+            <span>观察仓</span>
+          </div>
+        </div>
+      </article>
+      <article class="metric">
+        <small>latest quote</small>
+        <strong>180.34</strong>
+        <p>+0.87% · 10 分钟前刷新，行情只作为 FC 价格卡输入。</p>
+      </article>
+      <article class="metric">
+        <small>fc cards</small>
+        <strong>3</strong>
+        <p>1 张可自动化，2 张仍需人工基线或半自动复核。</p>
+      </article>
+      <article class="metric">
+        <small>next action</small>
+        <strong>2</strong>
+        <p>录入国内收入基线；确认 IVD 集采公告页面路径。</p>
+      </article>
+    </section>
+
+    <nav class="detail-tabs" aria-label="个股详情导航">
+      <button class="tab">概览</button>
+      <button class="tab">实时技术面</button>
+      <button class="tab">观察更新</button>
+      <button class="tab active">FC 论点证伪</button>
+      <button class="tab">邮件配置</button>
+    </nav>
+
+    <div class="embedded-note">
+      当前区域嵌入在迈瑞医疗详情页。导入 Markdown 时，系统只落库属于 300760 的卡；其他股票的 FC 卡会被提示拆分到对应个股详情页。
+    </div>
+
+    <section class="layout">
+      <aside class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>迈瑞医疗 FC 卡</h2>
+            <p>当前股票自己的证伪卡，不混入其他标的</p>
+          </div>
+        </div>
+        <div class="filters">
+          <button class="filter active">全部</button>
+          <button class="filter">已激活</button>
+          <button class="filter">草稿</button>
+          <button class="filter">需人工</button>
+          <button class="filter">T1</button>
+          <button class="filter">T2/T3</button>
+        </div>
+        <div class="card-list">
+          <article class="fc-card">
+            <div class="card-top">
+              <div>
+                <div class="card-title">FC-迈瑞-1｜国内收入</div>
+                <div class="card-subtitle">迈瑞医疗 300760｜业绩型</div>
+              </div>
+              <span class="badge amber">草稿</span>
+            </div>
+            <div class="badge-row">
+              <span class="badge violet">T3</span>
+              <span class="badge amber">人工</span>
+              <span class="badge gray">季报披露日</span>
+            </div>
+            <p class="trigger">连续两季国内收入同比仍为负 → 复苏证伪，移出候选池。</p>
+            <div class="mini-grid">
+              <div class="mini"><small>基线</small><strong>待采</strong></div>
+              <div class="mini"><small>失效监控</small><strong>3交易日</strong></div>
+              <div class="mini"><small>状态</small><strong>不入库</strong></div>
+            </div>
+          </article>
+
+          <article class="fc-card active">
+            <div class="card-top">
+              <div>
+                <div class="card-title">FC-迈瑞-2｜IVD 集采扩围</div>
+                <div class="card-subtitle">迈瑞医疗 300760｜事件型</div>
+              </div>
+              <span class="badge amber">人工确认</span>
+            </div>
+            <div class="badge-row">
+              <span class="badge violet">T2-T3</span>
+              <span class="badge amber">半自动</span>
+              <span class="badge gray">每月</span>
+            </div>
+            <p class="trigger">集采扩至化学发光 / 核心高毛利线，且平均降幅 &gt;50% → 红牌。</p>
+            <div class="mini-grid">
+              <div class="mini"><small>基线</small><strong>待采</strong></div>
+              <div class="mini"><small>命中</small><strong>关键词</strong></div>
+              <div class="mini"><small>动作</small><strong>复核</strong></div>
+            </div>
+          </article>
+
+          <article class="fc-card">
+            <div class="card-top">
+              <div>
+                <div class="card-title">FC-迈瑞-3｜回款质量</div>
+                <div class="card-subtitle">迈瑞医疗 300760｜业绩辅助型</div>
+              </div>
+              <span class="badge red">字段待核</span>
+            </div>
+            <div class="badge-row">
+              <span class="badge green">T1</span>
+              <span class="badge blue">自动</span>
+              <span class="badge gray">季频</span>
+            </div>
+            <p class="trigger">应收账款增速 − 营收增速持续 &gt;20pct → 黄牌。</p>
+            <div class="mini-grid">
+              <div class="mini"><small>基线</small><strong>待采</strong></div>
+              <div class="mini"><small>接口</small><strong>待核</strong></div>
+              <div class="mini"><small>状态</small><strong>草稿</strong></div>
+            </div>
+          </article>
+        </div>
+      </aside>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>FC 卡详情</h2>
+            <p>当前选中：FC-迈瑞-2｜IVD 集采扩围</p>
+          </div>
+          <div class="actions">
+            <button class="button">导入 Markdown</button>
+            <button class="button ghost">复制卡片</button>
+            <button class="button primary">保存草稿</button>
+          </div>
+        </div>
+
+        <div class="detail-body">
+          <div class="detail-hero">
+            <article class="hero-card">
+              <h2>化学发光集采扩围是否证伪迈瑞利润池安全性</h2>
+              <p>这张卡不是买卖指令，只负责判断原始论点是否被证伪。系统允许自动命中公告线索，但平均降幅和产品线影响必须由人工确认后才能触发红牌。</p>
+            </article>
+            <article class="status-card">
+              <small>activation state</small>
+              <strong>草稿</strong>
+              <p>基线未采，页面路径未确认，因此不进入监控队列。</p>
+            </article>
+          </div>
+
+          <div class="section-grid">
+            <article class="field">
+              <div class="field-label">01 thesis <span class="badge green">已填</span></div>
+              <h3>核心利润池受损风险</h3>
+              <p>化学发光是迈瑞核心利润池，若集采扩围并出现大幅降价，将证伪利润率稳定论点。</p>
+            </article>
+            <article class="field">
+              <div class="field-label">02 trigger logic <span class="badge amber">阈值待校准</span></div>
+              <h3>扩围 + 降幅双条件</h3>
+              <p>集采扩至化学发光 / 迈瑞核心高毛利线，且平均降幅 &gt;50% → 红牌。</p>
+            </article>
+            <article class="field">
+              <div class="field-label">03 data source <span class="badge violet">T2-T3</span></div>
+              <h3>医保局公告链</h3>
+              <p>国家医保局 + 牵头省份医保局公告页。网页可爬但选择器会坏，部分内容需要人工读公告正文。</p>
+            </article>
+            <article class="field">
+              <div class="field-label">04 collection <span class="badge amber">半自动</span></div>
+              <h3>关键词命中后人工研判</h3>
+              <p>系统按关键词抓取公告；命中后进入人工队列，确认品类、企业覆盖、降幅、实施时间。</p>
+            </article>
+            <article class="field">
+              <div class="field-label">05 frequency <span class="badge gray">月频</span></div>
+              <h3>每月扫描 + 命中即时提醒</h3>
+              <p>月度例行扫描；如果公告源出现关键词命中，则立即创建复核任务。</p>
+            </article>
+            <article class="field">
+              <div class="field-label">06 parser <span class="badge amber">需确认选择器</span></div>
+              <h3>关键词 + 人工字段</h3>
+              <p>关键词：化学发光 / 体外诊断 / IVD / 集中采购。人工字段：覆盖区域、降幅、品类、迈瑞相关性。</p>
+            </article>
+            <article class="field wide">
+              <div class="field-label">07 baseline + failure monitor <span class="badge red">阻塞激活</span></div>
+              <h3>基线未采，失效监控待接入</h3>
+              <p>基线：当前已覆盖区域 + 最近降幅。失效监控：连续 2 个月 0 命中时，不默认安全，需要提示人工核对页面结构是否变化。</p>
+            </article>
+          </div>
+
+          <section class="gate">
+            <div class="gate-head">
+              <div>
+                <h3>激活闸门</h3>
+                <p>填满字段不等于可执行。跑出真实数字 / 完成人工基线，才允许进入当前股票的监控队列。</p>
+              </div>
+              <span class="badge red">不可激活</span>
+            </div>
+            <div class="gate-items">
+              <div class="gate-item"><span>✓</span><strong>七字段完整</strong><small>Markdown 已解析出完整字段。</small></div>
+              <div class="gate-item"><span>✓</span><strong>非 T4 来源</strong><small>公开可访问，但稳定性为 T2-T3。</small></div>
+              <div class="gate-item"><span>!</span><strong>基线未采</strong><small>缺当前覆盖区域和最近降幅。</small></div>
+              <div class="gate-item"><span>!</span><strong>采集器未验收</strong><small>公告页选择器和关键词命中未 smoke test。</small></div>
+              <div class="gate-item"><span>!</span><strong>人工确认未配置</strong><small>命中公告后的复核字段未完成。</small></div>
+              <div class="gate-item"><span>✓</span><strong>通知策略存在</strong><small>红牌邮件 + 候选池移除任务。</small></div>
+            </div>
+          </section>
+
+          <section class="manual-panel">
+            <article class="form-card">
+              <h3>人工基线录入</h3>
+              <div class="form-row"><label>覆盖区域</label><input value="待录入"></div>
+              <div class="form-row"><label>最近降幅</label><input value="待录入"></div>
+              <div class="form-row"><label>来源路径</label><input value="国家医保局 / 省医保局公告页 URL"></div>
+              <textarea>人工备注：确认当前已覆盖区域、是否涉及化学发光、是否影响迈瑞核心高毛利线。</textarea>
+            </article>
+            <article class="form-card">
+              <h3>触发后动作</h3>
+              <div class="form-row">
+                <label>级别</label>
+                <select><option>红牌：候选池删除</option><option>黄牌：继续观察</option></select>
+              </div>
+              <div class="form-row">
+                <label>通知</label>
+                <select><option>邮件 + 页面提醒</option><option>仅页面提醒</option></select>
+              </div>
+              <textarea>邮件小节：触发逻辑、命中公告、人工确认字段、候选池处理建议、后续复核时间。</textarea>
+            </article>
+          </section>
+        </div>
+      </section>
+
+      <aside class="panel right-rail">
+        <div class="panel-head">
+          <div>
+            <h2>个股执行侧栏</h2>
+            <p>只统计迈瑞医疗</p>
+          </div>
+        </div>
+        <section class="rail-section">
+          <h3>FC 可执行性</h3>
+          <div class="health-meter"><span></span><span></span><span></span></div>
+          <div class="legend-row"><span>T1 结构化 API</span><strong>1 张</strong></div>
+          <div class="legend-row"><span>T2/T3 半自动</span><strong>1 张</strong></div>
+          <div class="legend-row"><span>T3 人工读取</span><strong>1 张</strong></div>
+        </section>
+        <section class="rail-section">
+          <h3>待处理队列</h3>
+          <div class="queue">
+            <div class="queue-item"><strong>迈瑞国内收入基线</strong><p>打开最近一期定期报告，录入国内收入同比。</p></div>
+            <div class="queue-item"><strong>IVD 集采公告路径</strong><p>确认国家医保局和牵头省份医保局页面路径。</p></div>
+            <div class="queue-item"><strong>回款质量字段核对</strong><p>核对 akshare / 新浪财报接口字段名和返回列。</p></div>
+          </div>
+        </section>
+        <section class="rail-section">
+          <h3>采集与判断日志</h3>
+          <div class="timeline">
+            <div class="timeline-item"><div class="dot">1</div><div><strong>导入 Markdown 后拆出 3 张迈瑞卡</strong><small>14:42 · parser</small></div></div>
+            <div class="timeline-item"><div class="dot">2</div><div><strong>FC-迈瑞-2 阻塞：基线未采</strong><small>14:45 · activation gate</small></div></div>
+            <div class="timeline-item"><div class="dot">3</div><div><strong>其他股票卡已提示拆分</strong><small>药明康德卡不会出现在迈瑞详情页</small></div></div>
+          </div>
+        </section>
+      </aside>
+    </section>
+  </main>
+</body>
+</html>
