@@ -94,4 +94,8 @@
         LIMIT 3
     </select>
 
+    <delete id="deleteById">
+        DELETE FROM ai_meeting_room WHERE id = #{id}
+    </delete>
+
 </mapper>

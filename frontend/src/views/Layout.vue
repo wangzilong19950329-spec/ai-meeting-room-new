@@ -10,6 +10,7 @@
         background-color="#1a1f2e" text-color="#a0aec0" active-text-color="#ffffff">
         <el-menu-item index="/meetings"><el-icon><Grid /></el-icon><span>会议列表</span></el-menu-item>
         <el-menu-item index="/meetings/create"><el-icon><Plus /></el-icon><span>发起会议</span></el-menu-item>
+        <el-menu-item index="/stock-watch"><el-icon><Timer /></el-icon><span>股票盯盘</span></el-menu-item>
         <el-menu-item index="/tracking"><el-icon><Clock /></el-icon><span>追踪中心</span></el-menu-item>
         <el-menu-item index="/member-templates"><el-icon><User /></el-icon><span>议员模版</span></el-menu-item>
         <el-menu-item index="/workflow-templates"><el-icon><Switch /></el-icon><span>流程模板</span></el-menu-item>
@@ -30,6 +31,7 @@
         style="border-right:none; height:100%">
         <el-menu-item index="/meetings"><el-icon><Grid /></el-icon><span>会议列表</span></el-menu-item>
         <el-menu-item index="/meetings/create"><el-icon><Plus /></el-icon><span>发起会议</span></el-menu-item>
+        <el-menu-item index="/stock-watch"><el-icon><Timer /></el-icon><span>股票盯盘</span></el-menu-item>
         <el-menu-item index="/tracking"><el-icon><Clock /></el-icon><span>追踪中心</span></el-menu-item>
         <el-menu-item index="/member-templates"><el-icon><User /></el-icon><span>议员模版</span></el-menu-item>
         <el-menu-item index="/workflow-templates"><el-icon><Switch /></el-icon><span>流程模板</span></el-menu-item>
@@ -110,6 +112,7 @@ const currentTitle = computed(() => {
   const map = {
     '/meetings': '会议列表',
     '/meetings/create': '发起会议',
+    '/stock-watch': '股票盯盘',
     '/tracking': '追踪中心',
     '/member-templates': '议员模版',
     '/workflow-templates': '流程模板',

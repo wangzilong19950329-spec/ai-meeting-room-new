@@ -50,15 +50,19 @@
           <el-progress :percentage="progressPct" :stroke-width="5" striped striped-flow status="striped" />
         </div>
 
-        <el-alert v-if="meeting.finalConclusion"
-          :title="'最终结论：' + meeting.finalConclusion"
-          type="success" :closable="false" show-icon style="margin-top:10px" />
+        <div v-if="meeting.finalConclusion" class="final-conclusion-card">
+          <div class="final-conclusion-head">
+            <el-icon color="#67c23a"><CircleCheckFilled /></el-icon>
+            <span>最终结论</span>
+          </div>
+          <MarkdownView :content="meeting.finalConclusion" class="final-conclusion-body" />
+        </div>
       </el-card>
 
       <el-row :gutter="16">
 
-        <!-- 左：聊天室主体 -->
-        <el-col :xs="24" :md="17">
+        <!-- 左：聊天室主体（流程模板模式下隐藏讨论过程） -->
+        <el-col v-if="!isWorkflowTemplateMode" :xs="24" :md="17">
           <el-card shadow="never" class="chat-card">
             <template #header>
               <div class="chat-card-header">
@@ -346,8 +350,8 @@
           </el-card>
         </el-col>
 
-        <!-- 右侧：成员 + 贡献 + 总结 -->
-        <el-col :xs="24" :md="7">
+        <!-- 右侧：成员 + 贡献 + 总结（流程模板模式下全宽平铺） -->
+        <el-col :xs="24" :md="isWorkflowTemplateMode ? 24 : 7" :class="{ 'tiled-modules': isWorkflowTemplateMode }">
           <el-card shadow="never" class="members-card">
             <template #header><span>👥 参与成员</span></template>
             <div v-for="(m, idx) in meeting.members" :key="idx" class="member-item">
@@ -454,7 +458,20 @@
                 </el-button>
               </div>
             </div>
-            <div v-if="workflowNodes.length" class="workflow-map">
+            <template v-if="workflowNodes.length && hasWorkflowCanvas">
+              <div class="workflow-canvas-head">
+                <span>流程图</span>
+                <el-button link type="primary" @click="workflowCanvasDialogVisible = true">全屏查看</el-button>
+              </div>
+              <WorkflowCanvasView
+                :layout-config="workflowLayoutConfig"
+                :nodes="workflowNodes"
+                :current-stage-key="workflowSummary.currentStageKey"
+                style="margin-top:8px"
+                @node-click="openWorkflowNode"
+              />
+            </template>
+            <div v-else-if="workflowNodes.length" class="workflow-map">
               <div
                 v-for="(node, idx) in workflowNodes"
                 :key="node.stageKey"
@@ -570,17 +587,40 @@
             </div>
           </el-card>
 
+          <el-dialog
+            v-model="workflowCanvasDialogVisible"
+            title="会议流程图"
+            width="92vw"
+            top="4vh"
+            append-to-body
+            destroy-on-close
+          >
+            <WorkflowCanvasView
+              v-if="workflowNodes.length && hasWorkflowCanvas"
+              :layout-config="workflowLayoutConfig"
+              :nodes="workflowNodes"
+              :current-stage-key="workflowSummary.currentStageKey"
+              @node-click="onCanvasDialogNodeClick"
+            />
+          </el-dialog>
+
           <el-drawer
             v-model="workflowDrawerVisible"
             :title="selectedWorkflowNode ? `${selectedWorkflowNode.stageName} · 节点时间线` : '节点时间线'"
-            size="min(720px, 92vw)"
+            size="min(820px, 94vw)"
+            modal-class="workflow-focus-overlay"
+            class="workflow-focus-drawer"
           >
             <template v-if="selectedWorkflowNode">
+              <div class="workflow-drawer-inner">
+              <div class="workflow-drawer-section">
+              <div class="workflow-drawer-section-title">节点概览</div>
               <div class="workflow-drawer-meta">
                 <el-tag size="small" effect="plain">{{ selectedWorkflowNode.stageType }}</el-tag>
                 <el-tag size="small" effect="plain">{{ selectedWorkflowNode.actorType }}</el-tag>
                 <el-tag v-if="selectedWorkflowNode.actorSlotKey" size="small" type="info" effect="plain">槽位 · {{ selectedWorkflowNode.actorSlotKey }}</el-tag>
                 <el-tag size="small" type="warning" effect="plain">{{ selectedWorkflowNode.searchStrategyLabel }}</el-tag>
+                <el-tag v-if="selectedWorkflowNode.inputStageKeys?.length" size="small" type="success" effect="plain">ALL_READY · {{ selectedWorkflowNode.inputStageKeys.length }} 输入</el-tag>
                 <el-tag size="small" :type="workflowNodeStatusType(selectedWorkflowNode.latestStatus)" effect="plain">{{ selectedWorkflowNode.latestStatusName }}</el-tag>
                 <el-tag
                   v-if="selectedWorkflowNode.searchStatus || selectedWorkflowNode.searchNote"
@@ -599,6 +639,7 @@
                 {{ selectedWorkflowNode.searchDiagnostics.join('；') }}
               </div>
               <div v-if="selectedWorkflowNode.skillKey" class="workflow-line"><span>Skill</span><b>{{ skillLabel(selectedWorkflowNode.skillKey) }}</b></div>
+              <div v-if="selectedWorkflowNode.inputStageKeys?.length" class="workflow-line"><span>等待输入</span><b>{{ selectedWorkflowNode.inputStageKeys.join('、') }}</b></div>
               <div v-if="selectedWorkflowNode.skillPrompt" class="workflow-blocked workflow-skill-prompt">Skill 指令：{{ selectedWorkflowNode.skillPrompt }}</div>
               <div v-if="selectedWorkflowNode.executionGuide?.checkpoints?.length" class="workflow-guide-list">
                 <div class="workflow-guide-title">{{ selectedWorkflowNode.executionGuide.actionTitle }}</div>
@@ -613,7 +654,9 @@
                   <el-button link @click="downloadSkillFile(file.id)">下载</el-button>
                 </div>
               </div>
+              </div>
 
+              <div class="workflow-drawer-section-title">执行记录</div>
               <div class="workflow-attempt-list">
                 <div
                   v-for="stage in selectedWorkflowNode.attempts"
@@ -634,19 +677,15 @@
                   </div>
                   <div v-if="stage.handoffArtifact || stage.handoffSummary" class="workflow-stage-handoff">
                     <div class="workflow-handoff-title">节点输入 / 上游交付</div>
-                    <div v-if="stage.handoffArtifact?.sourceStageName" class="workflow-handoff-meta">
+                    <div v-if="stage.handoffArtifact?.sourceMode === 'ALL_READY'" class="workflow-handoff-meta">
+                      ALL_READY 汇聚自 {{ stage.handoffArtifact.sourceStageKeys?.join('、') }}
+                    </div>
+                    <div v-else-if="stage.handoffArtifact?.sourceStageName" class="workflow-handoff-meta">
                       来自 {{ stage.handoffArtifact.sourceStageName }}
                       <template v-if="stage.handoffArtifact.sourceAttemptNo"> · 第 {{ stage.handoffArtifact.sourceAttemptNo }} 次</template>
                       <template v-if="stage.handoffArtifact.createdAt"> · {{ formatDateTime(stage.handoffArtifact.createdAt) }}</template>
                     </div>
-                    <div v-if="stage.handoffArtifact?.artifact" class="workflow-artifact-card">
-                      <div class="workflow-artifact-summary">{{ stage.handoffArtifact.artifact.summary }}</div>
-                      <ul v-if="stage.handoffArtifact.artifact.highlights?.length" class="workflow-artifact-list">
-                        <li v-for="item in stage.handoffArtifact.artifact.highlights" :key="item">{{ item }}</li>
-                      </ul>
-                      <div v-if="stage.handoffArtifact.artifact.detailText" class="workflow-artifact-detail">{{ stage.handoffArtifact.artifact.detailText }}</div>
-                    </div>
-                    <div v-else class="workflow-handoff-content">{{ stage.handoffArtifact?.content || stage.handoffSummary }}</div>
+                    <MarkdownView v-if="stage.handoffArtifact?.content || stage.handoffSummary" :content="stage.handoffArtifact?.content || stage.handoffSummary" class="workflow-handoff-content" />
                   </div>
                   <div v-if="stage.rejectReason" class="workflow-stage-reject">打回原因：{{ stage.rejectReason }}</div>
                   <div v-if="stage.submissions?.length" class="workflow-submission-list">
@@ -731,18 +770,21 @@
                           </div>
                         </div>
                       </div>
-                      <div v-if="submission.artifact" class="workflow-artifact-card">
-                        <div class="workflow-artifact-summary">{{ submission.artifact.summary }}</div>
-                        <ul v-if="submission.artifact.highlights?.length" class="workflow-artifact-list">
-                          <li v-for="item in submission.artifact.highlights" :key="item">{{ item }}</li>
-                        </ul>
-                        <div v-if="submission.artifact.detailText" class="workflow-artifact-detail">{{ submission.artifact.detailText }}</div>
+                      <div v-if="submission.content || submission.artifact" class="workflow-artifact-card">
+                        <MarkdownView v-if="submission.content" :content="submission.content" class="workflow-submission-content" />
+                        <template v-else>
+                          <div class="workflow-artifact-summary">{{ submission.artifact.summary }}</div>
+                          <ul v-if="submission.artifact.highlights?.length" class="workflow-artifact-list">
+                            <li v-for="item in submission.artifact.highlights" :key="item">{{ item }}</li>
+                          </ul>
+                          <MarkdownView v-if="submission.artifact.detailText" :content="submission.artifact.detailText" class="workflow-artifact-detail" />
+                        </template>
                         <div
                           v-if="stage.handoffArtifact?.actionType === 'REJECT' && stage.handoffArtifact?.content && submission.diffFromPrevious"
                           class="workflow-review-feedback"
                         >
                           <div class="workflow-review-feedback-title">对应审核意见</div>
-                          <div class="workflow-review-feedback-content">{{ stage.handoffArtifact.content }}</div>
+                          <MarkdownView :content="stage.handoffArtifact.content" class="workflow-review-feedback-content" />
                           <div v-if="submission.diffFromPrevious.reviewAlignmentNote" class="workflow-review-feedback-note">
                             {{ submission.diffFromPrevious.reviewAlignmentNote }}
                           </div>
@@ -758,10 +800,10 @@
                           </div>
                         </div>
                       </div>
-                      <div v-else-if="submission.content" class="workflow-submission-content">{{ submission.content }}</div>
                     </div>
                   </div>
                 </div>
+              </div>
               </div>
             </template>
           </el-drawer>
@@ -774,7 +816,7 @@
               <el-tag size="small" type="danger">阻塞 {{ trackingSummary.blockedCount || 0 }}</el-tag>
               <el-tag size="small" type="success">触发继续 {{ trackingSummary.triggerCount || 0 }}</el-tag>
             </div>
-            <div v-if="trackingSummary.resumePolicy" class="tracking-policy-card">
+            <div v-if="hasTrackingItems && trackingSummary.resumePolicy" class="tracking-policy-card">
               <div class="tracking-policy-head">
                 <span class="tracking-policy-title">继续会议判定</span>
                 <el-tag
@@ -1136,10 +1178,12 @@
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowDown, ArrowRight, User, Refresh, Document } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowRight, User, Refresh, Document, CircleCheckFilled } from '@element-plus/icons-vue'
 import dayjs from 'dayjs'
 import { meetingApi } from '@/api/meeting'
 import { getWorkflowSkillMeta } from '@/config/workflowSkills'
+import WorkflowCanvasView from '@/components/WorkflowCanvasView.vue'
+import MarkdownView from '@/components/MarkdownView.vue'
 
 const route = useRoute()
 const meetingId = route.params.id
@@ -1160,6 +1204,7 @@ const workflowActionInput = ref('')
 const workflowActorRef = ref('')
 const workflowActionLoading = ref(false)
 const workflowDrawerVisible = ref(false)
+const workflowCanvasDialogVisible = ref(false)
 const selectedWorkflowNodeKey = ref(null)
 const focusedOpinionId = ref(null)
 const focusedStageRunId = ref(null)
@@ -1261,10 +1306,21 @@ const progressPct = computed(() => {
 const decisionArtifact = computed(() => meeting.value?.decisionArtifact || null)
 const workflowSummary = computed(() => meeting.value?.workflow || null)
 const workflowNodes = computed(() => workflowSummary.value?.nodes || [])
+const workflowLayoutConfig = computed(() => workflowSummary.value?.layoutConfig || '')
+const hasWorkflowCanvas = computed(() => {
+  if (!workflowLayoutConfig.value) return false
+  try {
+    const parsed = JSON.parse(workflowLayoutConfig.value)
+    return Array.isArray(parsed?.stageLayouts) && parsed.stageLayouts.length > 0
+  } catch {
+    return false
+  }
+})
 const selectedWorkflowNode = computed(() =>
   workflowNodes.value.find(node => node.stageKey === selectedWorkflowNodeKey.value) || null
 )
 const trackingSummary = computed(() => meeting.value?.tracking || null)
+const hasTrackingItems = computed(() => (trackingSummary.value?.items?.length || 0) > 0)
 const latestConclusionVersion = computed(() => {
   const history = meeting.value?.conclusionHistory || []
   const concluded = history.filter(entry => entry.eventType === 'CONCLUDED' && entry.conclusion)
@@ -1296,6 +1352,8 @@ const canRetryWorkflowStage = computed(() =>
 )
 const showWorkflowActionPanel = computed(() => canSubmitWorkflowStage.value || canReviewWorkflowStage.value || canRetryWorkflowStage.value)
 const isDefaultWorkflow = computed(() => workflowSummary.value?.templateKey === 'default-roundtable')
+// 使用流程模板（非默认圆桌辩论）时：隐藏“讨论过程”，其余模块全宽平铺。
+const isWorkflowTemplateMode = computed(() => !!workflowSummary.value && !isDefaultWorkflow.value)
 const workflowActionPlaceholder = computed(() => {
   if (workflowSummary.value?.currentStageGuide?.actionPlaceholder) return workflowSummary.value.currentStageGuide.actionPlaceholder
   if (canReviewWorkflowStage.value) return '填写审核意见；通过时可留空，打回时建议说明原因'
@@ -1343,6 +1401,11 @@ function openWorkflowNode(node) {
   if (!node?.stageKey) return
   selectedWorkflowNodeKey.value = node.stageKey
   workflowDrawerVisible.value = true
+}
+
+function onCanvasDialogNodeClick(node) {
+  workflowCanvasDialogVisible.value = false
+  openWorkflowNode(node)
 }
 
 function workflowAttemptTitle(attempt) {
@@ -1980,6 +2043,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .contrib-item  { margin-bottom: 10px; }
 .contrib-name  { font-size: 13px; font-weight: 500; margin-bottom: 4px; }
 .workflow-overview { display: flex; flex-direction: column; gap: 8px; }
+.workflow-canvas-head { display: flex; align-items: center; justify-content: space-between; margin-top: 14px; font-size: 13px; font-weight: 600; color: #475569; }
 .workflow-line { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; color: #606266; }
 .workflow-line span:first-child { color: #909399; }
 .workflow-line-search { align-items: flex-start; }
@@ -2074,6 +2138,45 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
   gap: 8px;
   flex-wrap: wrap;
 }
+/* 流程模板模式：模块全宽平铺 */
+.tiled-modules .members-card :deep(.el-card__body) {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+.tiled-modules .members-card .member-item {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #eef1f6;
+  border-radius: 10px;
+  background: #fbfcfe;
+}
+/* 节点时间线抽屉：聚焦阅读模式 */
+.workflow-drawer-inner {
+  max-width: 720px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.workflow-drawer-section {
+  background: #fbfcfe;
+  border: 1px solid #eef1f6;
+  border-radius: 10px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.workflow-drawer-section-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #1f2d3d;
+  padding-left: 9px;
+  border-left: 3px solid #409eff;
+  line-height: 1.3;
+}
+.workflow-stage-item { padding: 14px 16px; }
 .workflow-node-order {
   font-size: 11px;
   font-weight: 700;
@@ -2138,7 +2241,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .workflow-stage-handoff { margin-top: 6px; font-size: 12px; color: #606266; line-height: 1.6; background: #f8fafc; border: 1px solid #e8eef5; border-radius: 6px; padding: 6px 8px; }
 .workflow-handoff-title { font-size: 12px; font-weight: 600; color: #606266; }
 .workflow-handoff-meta { margin-top: 4px; font-size: 11px; color: #909399; }
-.workflow-handoff-content { margin-top: 6px; white-space: pre-wrap; color: #303133; }
+.workflow-handoff-content { margin-top: 6px; color: #303133; }
 .workflow-stage-reject { margin-top: 6px; font-size: 12px; color: #f56c6c; line-height: 1.6; }
 .workflow-submission-list { margin-top: 10px; padding-top: 10px; border-top: 1px dashed #e5e7eb; display: flex; flex-direction: column; gap: 8px; }
 .workflow-submission-title { font-size: 12px; font-weight: 600; color: #606266; }
@@ -2147,15 +2250,15 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .workflow-submission-actor,
 .workflow-submission-time { font-size: 12px; color: #909399; }
 .workflow-submission-sources { margin-top: 6px; font-size: 12px; color: #b45309; line-height: 1.6; }
-.workflow-submission-content { margin-top: 6px; font-size: 12px; color: #303133; line-height: 1.7; white-space: pre-wrap; }
+.workflow-submission-content { margin-top: 6px; color: #303133; }
 .workflow-artifact-card { margin-top: 6px; padding: 8px; border: 1px solid #e8eef5; border-radius: 8px; background: #fff; }
 .workflow-artifact-summary { font-size: 12px; font-weight: 600; color: #303133; line-height: 1.7; }
 .workflow-artifact-list { margin: 6px 0 0 0; padding-left: 18px; color: #475569; font-size: 12px; }
 .workflow-artifact-list li { line-height: 1.7; }
-.workflow-artifact-detail { margin-top: 6px; font-size: 12px; color: #606266; line-height: 1.7; white-space: pre-wrap; }
+.workflow-artifact-detail { margin-top: 6px; color: #606266; }
 .workflow-review-feedback { margin-top: 8px; padding: 8px; border-radius: 8px; background: #fff7ed; border: 1px solid #fed7aa; }
 .workflow-review-feedback-title { font-size: 12px; font-weight: 600; color: #c2410c; }
-.workflow-review-feedback-content { margin-top: 4px; font-size: 12px; color: #9a3412; line-height: 1.7; white-space: pre-wrap; }
+.workflow-review-feedback-content { margin-top: 4px; color: #9a3412; }
 .workflow-review-feedback-note { margin-top: 6px; font-size: 12px; color: #7c2d12; line-height: 1.7; }
 .workflow-review-feedback-list { margin-top: 6px; font-size: 12px; }
 .workflow-review-feedback-list span.matched { color: #15803d; font-weight: 600; }
@@ -2295,9 +2398,32 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .conclusion-history-links-actions { margin-bottom: 4px; }
 .conclusion-history-links-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .summary-text  { font-size: 13px; line-height: 1.8; color: #303133; white-space: pre-wrap; }
+.final-conclusion-card { margin-top: 12px; border: 1px solid #c2e7b0; border-radius: 10px; background: #f6ffed; overflow: hidden; }
+.final-conclusion-head { display: flex; align-items: center; gap: 8px; padding: 10px 16px; font-weight: 700; color: #2f6b1f; background: #eaf7e1; border-bottom: 1px solid #d3edc3; }
+.final-conclusion-body { padding: 14px 16px; }
 .memory-section + .memory-section,
 .artifact-section + .artifact-section { margin-top: 12px; }
 .memory-title { font-size: 12px; color: #909399; margin-bottom: 6px; font-weight: 600; }
 .artifact-list { margin: 0; padding-left: 18px; color: #303133; line-height: 1.7; }
 .pre-wrap { white-space: pre-wrap; }
+</style>
+
+<!-- 节点时间线抽屉为 teleport 到 body 的弹层，scoped 样式无法命中，需全局样式 -->
+<style>
+.workflow-focus-overlay {
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(2px);
+}
+.workflow-focus-drawer .el-drawer__header {
+  margin-bottom: 0;
+  padding: 18px 24px;
+  border-bottom: 1px solid #eef1f6;
+  font-size: 15px;
+  font-weight: 700;
+  color: #1f2d3d;
+}
+.workflow-focus-drawer .el-drawer__body {
+  padding: 22px 24px 32px;
+  background: #f7f9fc;
+}
 </style>

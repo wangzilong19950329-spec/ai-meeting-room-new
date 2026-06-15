@@ -7,6 +7,19 @@ spring:
     username: ${AI_MEETING_DB_USERNAME:ai_meeting}
     password: ${AI_MEETING_DB_PASSWORD:}
     driver-class-name: com.mysql.cj.jdbc.Driver
+  mail:
+    host: ${SMTP_HOST:}
+    port: ${SMTP_PORT:465}
+    username: ${SMTP_USERNAME:}
+    password: ${SMTP_PASSWORD:}
+    protocol: smtp
+    properties:
+      mail.smtp.auth: ${SMTP_AUTH:true}
+      mail.smtp.ssl.enable: ${SMTP_SSL_ENABLE:true}
+      mail.smtp.starttls.enable: ${SMTP_STARTTLS_ENABLE:false}
+      mail.smtp.connectiontimeout: 10000
+      mail.smtp.timeout: 15000
+      mail.smtp.writetimeout: 15000
 
 mybatis:
   mapper-locations: classpath:mapper/*.xml
@@ -59,8 +72,15 @@ ai:
 
   # 搜索配置（可选，配置后议员将联网获取实时资讯）
   search:
-    provider-order: deepseek-web,zhipu,serper
+    provider-order: tavily,deepseek-web,zhipu,serper
     serper-api-key: ${SERPER_API_KEY:}   # 从 https://serper.dev 免费获取，填入环境变量后启用真实搜索
+    tavily:                              # 中文友好，作为默认优先搜索源；支持 include_domains 定向搜索
+      api-key: ${TAVILY_API_KEY:}        # 从 https://tavily.com 获取，填入环境变量后启用
+      api-url: https://api.tavily.com/search
+      search-depth: advanced             # basic / advanced
+      include-answer: true               # 返回智能摘要，用于结果复核
+      country: ""                        # 留空自动判断；可填 china 偏向中文站点
+      timeout-seconds: 30
     zhipu:
       api-key: ${ZHIPU_API_KEY:}
       api-url: https://open.bigmodel.cn/api/paas/v4/web_search
@@ -98,4 +118,41 @@ ai:
 
 # 通知配置
 notification:
-  serverchan-key: ""   # Server酱 key，从 https://sct.ftqq.com 获取，填入后启用微信推送
+  serverchan-key: ${SERVERCHAN_KEY:}   # Server酱 key，从 https://sct.ftqq.com 获取，填入后启用微信推送
+  email:
+    enabled: ${NOTIFICATION_EMAIL_ENABLED:false}
+    from: ${NOTIFICATION_EMAIL_FROM:}
+    to: ${NOTIFICATION_EMAIL_TO:}      # 多个收件人用英文逗号分隔
+
+# 股票盯盘后端定时器。页面关闭后仍可运行；机器睡眠后仍会暂停。
+stock-watch:
+  monitor:
+    enabled: ${STOCK_WATCH_MONITOR_ENABLED:true}
+    notify-enabled: ${STOCK_WATCH_NOTIFY_ENABLED:true}
+    trading-hours-only: ${STOCK_WATCH_TRADING_HOURS_ONLY:true}
+    scan-interval-ms: ${STOCK_WATCH_SCAN_INTERVAL_MS:600000}
+    initial-delay-ms: ${STOCK_WATCH_INITIAL_DELAY_MS:30000}
+    symbols: ${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}
+    # 格式：symbol.market:ruleId:support:requiredBreakDays:severity
+    rules: ${STOCK_WATCH_RULES:688017.sh:BREAK_287:287:5:risk,300760.sz:BREAK_155:155:3:risk,002594.sz:BREAK_205:205:3:risk}
+    state-file: ${STOCK_WATCH_STATE_FILE:}
+  ai-rules:
+    store-file: ${STOCK_WATCH_AI_RULES_FILE:}
+    default-model: ${STOCK_WATCH_AI_MODEL:deepseek-chat}
+  technical-analysis:
+    enabled: ${STOCK_WATCH_TECH_ANALYSIS_ENABLED:true}
+    trading-hours-only: ${STOCK_WATCH_TECH_TRADING_HOURS_ONLY:true}
+    scan-interval-ms: ${STOCK_WATCH_TECH_SCAN_INTERVAL_MS:1800000}
+    initial-delay-ms: ${STOCK_WATCH_TECH_INITIAL_DELAY_MS:90000}
+    symbols: ${STOCK_WATCH_TECH_SYMBOLS:${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}}
+    context-limit-chars: ${STOCK_WATCH_TECH_CONTEXT_LIMIT_CHARS:80000}
+    context-rotate-ratio: ${STOCK_WATCH_TECH_CONTEXT_ROTATE_RATIO:0.85}
+    bridge-url: ${STOCK_WATCH_TECH_BRIDGE_URL:${DEEPSEEK_WEB_BRIDGE_URL:http://127.0.0.1:8789/search}}
+    debug-port: ${STOCK_WATCH_TECH_DEBUG_PORT:${DEEPSEEK_WEB_DEBUG_PORT:9333}}
+    connect-timeout-seconds: ${STOCK_WATCH_TECH_CONNECT_TIMEOUT_SECONDS:10}
+    read-timeout-seconds: ${STOCK_WATCH_TECH_READ_TIMEOUT_SECONDS:320}
+  delivery:
+    enabled: ${STOCK_WATCH_DELIVERY_ENABLED:true}
+    scan-interval-ms: ${STOCK_WATCH_DELIVERY_SCAN_INTERVAL_MS:300000}
+    initial-delay-ms: ${STOCK_WATCH_DELIVERY_INITIAL_DELAY_MS:45000}
+    batch-limit: ${STOCK_WATCH_DELIVERY_BATCH_LIMIT:100}

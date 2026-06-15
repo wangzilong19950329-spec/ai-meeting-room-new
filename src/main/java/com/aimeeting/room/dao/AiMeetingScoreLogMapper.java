@@ -13,4 +13,6 @@ public interface AiMeetingScoreLogMapper {
     List<AiMeetingScoreLog> selectByMeetingId(Long meetingId);
 
     List<AiMeetingScoreLog> selectByMemberId(Long memberId);
+
+    int deleteByMeetingId(Long meetingId);
 }

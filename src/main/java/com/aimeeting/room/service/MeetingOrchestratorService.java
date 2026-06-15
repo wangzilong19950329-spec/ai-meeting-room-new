@@ -399,6 +399,7 @@ public class MeetingOrchestratorService {
         sb.append("请先判断信息需求类型，例如：realtime_price（实时价格）、latest_news（最新新闻）、forecast_outlook（最新预测）、background_fact（背景事实）、policy_event（政策/事件）。\n");
         sb.append("如果需要搜索，请先决定你最需要核验的事实类型，再指定优先来源域名 sourceFocus，例如路透、彭博、监管网站、交易所公告、统计局、行业协会、公司公告站点。\n");
         sb.append("查询词要体现“最新时间窗口 + 目标年份 + 关键指标 + 优先来源”。sourceFocus 里放域名，不要写自然语言描述。\n");
+        sb.append("当你确定某个事实只该从特定站点取证（如交易所/统计局/公司公告/指定财经媒体，例如 eastmoney.com、stats.gov.cn），就把该域名放进 sourceFocus，系统会定向只检索这些站点；也可直接在查询词里写 site:域名。不确定来源时 sourceFocus 留空即可。\n");
         sb.append("若需要，返回：{\"need\":true,\"intent\":\"forecast_outlook\",\"freshnessDays\":30,\"targetYear\":2026,\"sourceFocus\":[\"reuters.com\",\"stats.gov.cn\"],\"q\":[\"搜索词1\",\"搜索词2\"]}\n");
         sb.append("若不需要，返回：{\"need\":false}\n");
         sb.append("只返回JSON，不要其他内容。");

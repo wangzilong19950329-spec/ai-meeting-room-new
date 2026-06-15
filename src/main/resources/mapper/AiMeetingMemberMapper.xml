@@ -45,4 +45,12 @@
         UPDATE ai_meeting_member SET total_score = #{totalScore}, gmt_modify = NOW() WHERE id = #{id}
     </update>
 
+    <select id="countByMemberName" resultType="int">
+        SELECT COUNT(*) FROM ai_meeting_member WHERE member_name = #{name}
+    </select>
+
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_member WHERE meeting_id = #{meetingId}
+    </delete>
+
 </mapper>

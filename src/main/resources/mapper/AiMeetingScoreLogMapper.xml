@@ -26,4 +26,8 @@
         SELECT * FROM ai_meeting_score_log WHERE member_id = #{memberId} ORDER BY gmt_create DESC
     </select>
 
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_score_log WHERE meeting_id = #{meetingId}
+    </delete>
+
 </mapper>

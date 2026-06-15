@@ -2,11 +2,20 @@
   <div class="meeting-create">
     <el-card shadow="never" class="create-card">
       <template #header>
-        <span class="card-title">🧠 发起新会议</span>
+        <span class="card-title">🧠 {{ isCloneMode ? '复制并发起会议' : '发起新会议' }}</span>
         <p class="card-desc">{{ usesActorSlots ? '按流程节点槽位配置执行议员，启动流程化协作会议' : '配置会议主题与AI成员，启动多模型协作讨论' }}</p>
       </template>
 
-      <el-form :model="form" :rules="rules" ref="formRef" label-width="80px" size="default">
+      <el-alert
+        v-if="isCloneMode"
+        type="info"
+        :closable="false"
+        show-icon
+        title="已载入被复制会议的配置，可自由调整后再创建并启动"
+        style="margin-bottom:16px"
+      />
+
+      <el-form v-loading="cloning" :model="form" :rules="rules" ref="formRef" label-width="80px" size="default">
         <el-divider content-position="left"><b>基本信息</b></el-divider>
         <el-form-item label="会议主题" prop="title">
           <el-input v-model="form.title" placeholder="例如：量子计算会在10年内超越传统计算机吗？" />
@@ -89,7 +98,8 @@
 
         <div v-if="usesActorSlots" class="slot-config-panel">
           <div class="workflow-hint slot-hint">
-            当前模板定义了 {{ templateActorSlots.length }} 个执行槽位。这里直接给每个槽位绑定执行议员，不需要再额外配置一套全局参会成员。
+            <template v-if="hasPrefilledRoster">已按模板默认阵容预填执行议员，可在此基础上调整。当前模板定义了 {{ templateActorSlots.length }} 个执行槽位。</template>
+            <template v-else>当前模板定义了 {{ templateActorSlots.length }} 个执行槽位。这里直接给每个槽位绑定执行议员，不需要再额外配置一套全局参会成员。</template>
           </div>
           <div v-if="selectedModelWarnings.length" class="model-warning-list">
             <div v-for="warning in selectedModelWarnings" :key="warning.key" class="model-warning-item">
@@ -112,6 +122,7 @@
                 <div v-for="(binding, memberIdx) in slot.bindings" :key="binding.uid" class="slot-member-item">
                   <div class="slot-member-head">
                     <strong>执行议员 {{ memberIdx + 1 }}</strong>
+                    <el-tag v-if="binding.templateMissing" size="small" type="danger" effect="plain">模版已删除（使用存档快照）</el-tag>
                     <el-button
                       v-if="slot.allowMultiple === 1"
                       link
@@ -326,15 +337,18 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, computed, watch } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, reactive, onMounted, computed, watch, nextTick } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { meetingApi, templateApi } from '@/api/meeting'
 import { configApi } from '@/api/config'
 import { useUserStore } from '@/stores/user'
 
 const router = useRouter()
+const route = useRoute()
 const userStore = useUserStore()
+const cloning = ref(false)
+const isCloneMode = computed(() => !!route.query.cloneFrom)
 const formRef = ref()
 const submitting = ref(false)
 const availableModels = ref([])
@@ -430,7 +444,69 @@ async function loadTemplates() {
     templates.value = res.data || []
   } catch {}
 }
-onMounted(() => { loadModels(); loadWorkflowTemplates(); loadTemplates() })
+onMounted(async () => {
+  await Promise.all([loadModels(), loadWorkflowTemplates(), loadTemplates()])
+  const cloneFrom = Number(route.query.cloneFrom)
+  if (cloneFrom) await applyCloneFrom(cloneFrom)
+})
+
+async function applyCloneFrom(id) {
+  cloning.value = true
+  try {
+    const res = await meetingApi.getDetail(id)
+    const d = res.data
+    if (!d) return
+    form.title = `${d.title || ''}（副本）`
+    form.description = d.description || ''
+    form.projectKey = d.projectKey || ''
+    form.projectContext = d.projectContext || ''
+    form.maxRounds = Number(d.totalRounds) || form.maxRounds
+    const members = (d.members || []).map(m => ({
+      memberName: m.memberName || '',
+      modelType: resolveClonedModel(m.modelType),
+      persona: m.persona || '',
+      role: m.role ?? 0,
+      actorSlotKey: m.actorSlotKey || ''
+    }))
+    const tplKey = d.workflow?.templateKey || ''
+    const hasTemplate = tplKey && workflowTemplates.value.some(t => t.templateKey === tplKey)
+    form.workflowTemplateKey = hasTemplate ? tplKey : ''
+    await nextTick()
+    if (hasTemplate && usesActorSlots.value) {
+      const bySlot = new Map()
+      for (const m of members) {
+        const key = m.actorSlotKey || ''
+        if (!bySlot.has(key)) bySlot.set(key, [])
+        bySlot.get(key).push(m)
+      }
+      form.slotBindings.forEach(slot => {
+        const matched = bySlot.get(slot.slotKey)
+        if (matched && matched.length) {
+          slot.bindings = matched.map(m => newSlotMemberBinding({
+            memberName: m.memberName,
+            modelType: m.modelType,
+            persona: m.persona,
+            role: m.role,
+            templateId: null
+          }))
+        }
+      })
+    } else if (members.length) {
+      form.members = members.map(({ memberName, modelType, persona, role }) => ({ memberName, modelType, persona, role }))
+    }
+  } catch {
+    ElMessage.error('加载被复制会议失败，已切换为新建会议')
+  } finally {
+    cloning.value = false
+  }
+}
+
+function resolveClonedModel(modelType) {
+  if (modelType && availableModels.value.some(item => (item.modelKey || item.modelId) === modelType)) {
+    return modelType
+  }
+  return defaultModelKey()
+}
 
 function toggleTemplate(t) {
   const s = new Set(selectedTemplateIds.value)
@@ -518,31 +594,48 @@ function syncSlotBindingsFromTemplate() {
   }
   form.slotBindings = templateActorSlots.value.map(slot => {
     const existing = form.slotBindings.find(item => item.slotKey === slot.slotKey)
-    const existingBindings = Array.isArray(existing?.bindings) && existing.bindings.length
-      ? existing.bindings
-      : [newSlotMemberBinding({
-          memberName: existing?.memberName || slot.slotName || '',
-          modelType: existing?.modelType || slot.defaultModelType || defaultModelKey(),
-          persona: existing?.persona || slot.defaultPersona || '',
-          role: existing?.role ?? 0,
-          templateId: existing?.templateId ?? null
-        })]
+    let bindings
+    if (Array.isArray(existing?.bindings) && existing.bindings.length) {
+      bindings = existing.bindings.map(binding => newSlotMemberBinding({
+        memberName: binding.memberName || '',
+        modelType: binding.modelType || slot.defaultModelType || defaultModelKey(),
+        persona: binding.persona || slot.defaultPersona || '',
+        role: binding.role ?? 0,
+        templateId: binding.templateId ?? null,
+        templateMissing: binding.templateMissing === true
+      }))
+    } else if (Array.isArray(slot.defaultMembers) && slot.defaultMembers.length) {
+      bindings = slot.defaultMembers.map(m => newSlotMemberBinding({
+        memberName: m.memberName || slot.slotName || '',
+        modelType: m.modelType || slot.defaultModelType || defaultModelKey(),
+        persona: m.persona || slot.defaultPersona || '',
+        role: 0,
+        templateId: m.memberTemplateId ?? null,
+        templateMissing: m.templateExists === false
+      }))
+    } else {
+      bindings = [newSlotMemberBinding({
+        memberName: slot.slotName || '',
+        modelType: slot.defaultModelType || defaultModelKey(),
+        persona: slot.defaultPersona || '',
+        role: 0,
+        templateId: null
+      })]
+    }
     return {
       slotKey: slot.slotKey,
       slotName: slot.slotName,
       description: slot.description || '',
       required: Number(slot.required ?? 1),
       allowMultiple: Number(slot.allowMultiple ?? 0),
-      bindings: existingBindings.map(binding => newSlotMemberBinding({
-        memberName: binding.memberName || '',
-        modelType: binding.modelType || slot.defaultModelType || defaultModelKey(),
-        persona: binding.persona || slot.defaultPersona || '',
-        role: binding.role ?? 0,
-        templateId: binding.templateId ?? null
-      }))
+      bindings
     }
   })
 }
+
+const hasPrefilledRoster = computed(() =>
+  templateActorSlots.value.some(slot => Array.isArray(slot.defaultMembers) && slot.defaultMembers.length)
+)
 
 const rules = { title: [{ required: true, message: '请输入会议主题', trigger: 'blur' }] }
 
@@ -576,6 +669,7 @@ function newSlotMemberBinding(overrides = {}) {
     persona: '',
     role: 0,
     templateId: null,
+    templateMissing: false,
     ...overrides
   }
 }
@@ -595,6 +689,7 @@ function removeSlotBinding(slotIndex, bindingIndex) {
 function applySlotTemplate(binding) {
   const tpl = templates.value.find(item => item.id === binding.templateId)
   if (!tpl) return
+  binding.templateMissing = false
   binding.memberName = tpl.name || binding.memberName
   binding.modelType = (tpl.modelType && availableModels.value.some(item => (item.modelKey || item.modelId) === tpl.modelType))
     ? tpl.modelType

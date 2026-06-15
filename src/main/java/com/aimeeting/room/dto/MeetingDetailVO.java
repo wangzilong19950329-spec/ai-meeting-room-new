@@ -104,6 +104,7 @@ public class MeetingDetailVO {
         private Integer reopenCount;
         private List<WorkflowNodeVO> nodes = new ArrayList<>();
         private List<StageSummaryVO> stageHistory = new ArrayList<>();
+        private String layoutConfig;
     }
 
     @Data
@@ -127,6 +128,7 @@ public class MeetingDetailVO {
         private String reopenTarget;
         private String searchStrategy;
         private String searchStrategyLabel;
+        private List<String> inputStageKeys = new ArrayList<>();
         private String latestStatus;
         private String latestStatusName;
         private Integer latestAttemptNo;
@@ -159,6 +161,7 @@ public class MeetingDetailVO {
         private Boolean autoStage;
         private String searchStrategy;
         private String searchStrategyLabel;
+        private List<String> inputStageKeys = new ArrayList<>();
         private Integer attemptNo;
         private String status;
         private String statusName;
@@ -237,6 +240,8 @@ public class MeetingDetailVO {
         private String sourceStageKey;
         private String sourceStageName;
         private Integer sourceAttemptNo;
+        private String sourceMode;
+        private List<String> sourceStageKeys = new ArrayList<>();
         private String actionType;
         private String actorRef;
         private String content;

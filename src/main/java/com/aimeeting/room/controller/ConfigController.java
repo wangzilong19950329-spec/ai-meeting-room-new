@@ -5,6 +5,7 @@ import com.aimeeting.room.config.AiModelProperties;
 import com.aimeeting.room.config.ModelEntry;
 import com.aimeeting.room.config.ModelRegistryStore;
 import com.aimeeting.room.dto.ModelConfigRequest;
+import com.aimeeting.room.service.NotificationService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.*;
@@ -20,6 +21,7 @@ public class ConfigController {
 
     private final AiModelProperties aiModelProperties;
     private final ModelRegistryStore registry;
+    private final NotificationService notificationService;
 
     // ============================================================
     // 模型注册表 CRUD
@@ -146,5 +148,25 @@ public class ConfigController {
         if (mp.getDissentPenaltyFactor() != null) mc.setDissentPenaltyFactor(mp.getDissentPenaltyFactor());
         log.info("Meeting config updated");
         return ApiResponse.ok(null);
+    }
+
+    @PostMapping("/notification/test-email")
+    public ApiResponse<Map<String, Object>> sendTestEmail(@RequestBody(required = false) Map<String, String> body) {
+        String subject = body != null ? body.get("subject") : null;
+        String content = body != null ? body.get("content") : null;
+        boolean sent = notificationService.sendEmail(
+                firstNonBlank(subject, "AI 会议室 · 邮件通知测试"),
+                firstNonBlank(content, "如果你收到这封邮件，说明 SMTP 邮件通知已经配置成功。")
+        );
+        if (!sent) {
+            return ApiResponse.fail("邮件未发送：请确认 NOTIFICATION_EMAIL_ENABLED=true、SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD、NOTIFICATION_EMAIL_TO 已配置，并查看后端日志");
+        }
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("sent", true);
+        return ApiResponse.ok(result);
+    }
+
+    private String firstNonBlank(String value, String fallback) {
+        return value == null || value.trim().isEmpty() ? fallback : value.trim();
     }
 }

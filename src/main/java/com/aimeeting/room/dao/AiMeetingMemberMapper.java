@@ -19,5 +19,10 @@ public interface AiMeetingMemberMapper {
 
     int countByMeetingId(Long meetingId);
 
+    /** 统计全部会议中以该名称参会的议员数量（用于模版占用提示，议员与模版为复制关系，按名称近似匹配） */
+    int countByMemberName(@Param("name") String name);
+
     int updateTotalScore(@Param("id") Long id, @Param("totalScore") int totalScore);
+
+    int deleteByMeetingId(@Param("meetingId") Long meetingId);
 }

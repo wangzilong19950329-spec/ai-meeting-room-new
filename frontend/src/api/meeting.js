@@ -17,7 +17,7 @@ export const meetingApi = {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
   deleteSkillFile: (id) => http.delete(`/skill-files/${id}`),
-  cancel: (id) => http.post(`/meetings/${id}/cancel`),
+  cancel: (id, config = {}) => http.post(`/meetings/${id}/cancel`, null, config),
   verify: (id, valid) => http.post(`/meetings/${id}/verify`, null, { params: { valid } }),
   getContributions: (id) => http.get(`/meetings/${id}/contributions`),
   getMemberScores: (memberId) => http.get(`/members/${memberId}/scores`),
@@ -37,6 +37,8 @@ export const meetingApi = {
   clone: (id, title) => http.post(`/meetings/${id}/clone`, { title }),
   terminate: (id) => http.post(`/meetings/${id}/terminate`),
   restart: (id) => http.post(`/meetings/${id}/restart`),
+  remove: (id) => http.delete(`/meetings/${id}`),
+  batchRemove: (ids, config = {}) => http.post('/meetings/batch-delete', { ids }, config),
 }
 
 export const templateApi = {

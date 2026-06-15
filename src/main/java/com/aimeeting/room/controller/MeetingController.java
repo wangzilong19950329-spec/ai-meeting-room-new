@@ -256,6 +256,31 @@ public class MeetingController {
         }
     }
 
+    /** 删除会议及其全部关联数据（成员/发言/投票/共识/积分/工作流/追踪项，级联清理） */
+    @DeleteMapping("/meetings/{id}")
+    public ApiResponse<Void> deleteMeeting(@PathVariable Long id) {
+        try {
+            meetingRoomService.deleteMeeting(id);
+            return ApiResponse.ok();
+        } catch (Exception e) {
+            log.error("deleteMeeting error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 批量删除会议及其全部关联数据（复用单会议级联清理与状态保护） */
+    @PostMapping("/meetings/batch-delete")
+    public ApiResponse<Integer> deleteMeetings(@RequestBody Map<String, List<Long>> body) {
+        try {
+            List<Long> ids = body == null ? null : body.get("ids");
+            int deleted = meetingRoomService.deleteMeetings(ids);
+            return ApiResponse.ok(deleted);
+        } catch (Exception e) {
+            log.error("deleteMeetings error", e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
     /** 人类用户向会议发送消息 */
     @PostMapping("/meetings/{id}/human-message")
     public ApiResponse<Void> sendHumanMessage(@PathVariable Long id,

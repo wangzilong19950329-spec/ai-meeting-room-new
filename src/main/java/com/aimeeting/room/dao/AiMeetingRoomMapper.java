@@ -33,4 +33,6 @@ public interface AiMeetingRoomMapper {
 
     List<AiMeetingRoom> selectRecentConcludedByProject(@Param("creatorId") Long creatorId,
                                                        @Param("projectKey") String projectKey);
+
+    int deleteById(Long id);
 }

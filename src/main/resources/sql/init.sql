@@ -58,6 +58,7 @@ CREATE TABLE `ai_workflow_stage_template` (
     `skill_prompt`    TEXT                                  COMMENT '节点skill补充指令',
     `skill_file_ids`  TEXT                                  COMMENT '节点绑定的skill文件ID列表JSON',
     `search_strategy` VARCHAR(32)                           COMMENT '联网搜索策略: OFF/OPTIONAL/REQUIRED',
+    `input_stage_keys` TEXT                                  COMMENT 'ALL_READY输入阶段标识JSON数组',
     `pass_target`     VARCHAR(128)                          COMMENT '通过后目标阶段',
     `reject_target`   VARCHAR(128)                          COMMENT '打回目标阶段',
     `reopen_target`   VARCHAR(128)                          COMMENT '重开目标阶段',
@@ -268,3 +269,156 @@ CREATE TABLE `ai_meeting_conclusion_cluster` (
     PRIMARY KEY (`id`),
     KEY `idx_meeting_round` (`meeting_id`, `round_number`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='结论聚类';
+
+-- 股票盯盘：后端持久化监控列表
+CREATE TABLE IF NOT EXISTS `stock_watch_item` (
+    `id`         BIGINT      NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `symbol`     VARCHAR(16) NOT NULL                COMMENT '股票代码',
+    `market`     VARCHAR(8)  NOT NULL                COMMENT '市场 sh/sz/bj',
+    `stock_name` VARCHAR(128)                        COMMENT '股票名称',
+    `image_url`  TEXT                                COMMENT '图片 URL，base64 大图仅保留在前端本地',
+    `enabled`    TINYINT     NOT NULL DEFAULT 1      COMMENT '是否纳入后端定时分析',
+    `source`     VARCHAR(32) NOT NULL DEFAULT 'manual' COMMENT '来源',
+    `gmt_create` DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify` DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_item_symbol` (`symbol`, `market`),
+    KEY `idx_sw_item_enabled` (`enabled`, `symbol`, `market`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘监控列表';
+
+-- 股票盯盘：DeepSeek 网页技术面分析会话
+CREATE TABLE IF NOT EXISTS `stock_watch_technical_session` (
+    `id`                  BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `symbol`              VARCHAR(16)  NOT NULL                COMMENT '股票代码',
+    `market`              VARCHAR(8)   NOT NULL                COMMENT '市场 sh/sz/bj',
+    `stock_name`          VARCHAR(128)                         COMMENT '股票名称',
+    `period_type`         VARCHAR(16)  NOT NULL DEFAULT 'DAY'  COMMENT '周期 DAY/WEEK/MONTH',
+    `session_key`         VARCHAR(128) NOT NULL                COMMENT 'DeepSeek 网页会话绑定键',
+    `bridge_target_id`    VARCHAR(128)                         COMMENT 'Chrome CDP targetId',
+    `conversation_url`    VARCHAR(1024)                        COMMENT 'DeepSeek 网页会话 URL',
+    `status`              VARCHAR(32)  NOT NULL DEFAULT 'ACTIVE' COMMENT 'ACTIVE/CONTEXT_ROTATED/MANUAL_ROTATED',
+    `generation`          INT          NOT NULL DEFAULT 1      COMMENT '会话代数',
+    `context_chars`       INT          NOT NULL DEFAULT 0      COMMENT '近似累计上下文字符数',
+    `context_limit_chars` INT          NOT NULL DEFAULT 80000  COMMENT '近似上下文阈值',
+    `last_run_at`         DATETIME                              COMMENT '最近分析时间',
+    `last_run_status`     VARCHAR(64)                           COMMENT '最近分析状态',
+    `last_error`          TEXT                                  COMMENT '最近错误',
+    `gmt_create`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_sw_tech_session_symbol` (`symbol`, `market`, `period_type`, `status`),
+    KEY `idx_sw_tech_session_key` (`session_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘DeepSeek网页会话';
+
+-- 股票盯盘：DeepSeek 网页技术面分析结论
+CREATE TABLE IF NOT EXISTS `stock_watch_technical_analysis` (
+    `id`                  BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `session_id`          BIGINT                                COMMENT '会话ID',
+    `symbol`              VARCHAR(16)  NOT NULL                COMMENT '股票代码',
+    `market`              VARCHAR(8)   NOT NULL                COMMENT '市场 sh/sz/bj',
+    `stock_name`          VARCHAR(128)                         COMMENT '股票名称',
+    `analysis_date`       DATE         NOT NULL                COMMENT '分析日期',
+    `run_slot`            VARCHAR(16)  NOT NULL                COMMENT '运行槽位 HH:mm',
+    `period_type`         VARCHAR(16)  NOT NULL DEFAULT 'DAY'  COMMENT '周期 DAY/WEEK/MONTH',
+    `period_key`          VARCHAR(32)                           COMMENT '周期主键 YYYY-MM-DD/YYYY-Www/YYYY-MM',
+    `source_record_ids`   TEXT                                  COMMENT '汇总引用的日内记录ID数组',
+    `status`              VARCHAR(32)  NOT NULL                COMMENT 'SUCCESS/ERROR',
+    `stance`              VARCHAR(64)                          COMMENT '技术面立场',
+    `tone`                VARCHAR(32)                          COMMENT 'UI色调 green/blue/amber/red',
+    `confidence`          DECIMAL(5,4)                          COMMENT '置信度 0-1',
+    `title`               VARCHAR(256)                         COMMENT '结论标题',
+    `conclusion`          TEXT                                  COMMENT '分析结论',
+    `evidence_json`       TEXT                                  COMMENT '证据数组JSON',
+    `raw_response`        MEDIUMTEXT                            COMMENT 'DeepSeek 原始响应',
+    `prompt_hash`         VARCHAR(128)                         COMMENT 'prompt哈希',
+    `provider`            VARCHAR(64)                          COMMENT 'provider',
+    `bridge_target_id`    VARCHAR(128)                         COMMENT 'Chrome CDP targetId',
+    `conversation_url`    VARCHAR(1024)                        COMMENT 'DeepSeek 网页会话 URL',
+    `context_chars_delta` INT          DEFAULT 0               COMMENT '本轮近似上下文增量',
+    `error_message`       TEXT                                  COMMENT '错误信息',
+    `gmt_create`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_sw_tech_analysis_symbol_date` (`symbol`, `market`, `period_type`, `analysis_date`),
+    KEY `idx_sw_tech_analysis_session` (`session_id`),
+    KEY `idx_sw_tech_analysis_slot` (`symbol`, `market`, `period_type`, `period_key`, `analysis_date`, `run_slot`),
+    KEY `idx_sw_tech_analysis_period` (`symbol`, `market`, `period_type`, `period_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘DeepSeek网页技术面分析';
+
+-- 股票盯盘：单股邮件推送配置
+CREATE TABLE IF NOT EXISTS `stock_watch_delivery_config` (
+    `id`                    BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `symbol`                VARCHAR(16)  NOT NULL                COMMENT '股票代码',
+    `market`                VARCHAR(8)   NOT NULL                COMMENT '市场 sh/sz/bj',
+    `stock_name`            VARCHAR(128)                         COMMENT '股票名称',
+    `enabled`               TINYINT      NOT NULL DEFAULT 0      COMMENT '是否启用',
+    `recipients_json`       TEXT         NOT NULL                COMMENT '收件邮箱数组JSON',
+    `sender_mode`           VARCHAR(32)  NOT NULL DEFAULT 'SYSTEM' COMMENT '发件方式',
+    `frequency_type`        VARCHAR(32)  NOT NULL DEFAULT 'MANUAL' COMMENT 'IMMEDIATE/INTERVAL/DAILY_CLOSE/MANUAL',
+    `interval_minutes`      INT          NOT NULL DEFAULT 120    COMMENT 'INTERVAL模式下的发送间隔分钟数',
+    `trigger_policy_json`   TEXT                                  COMMENT '触发策略JSON',
+    `active_from`           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '启用起点，默认不补发之前历史',
+    `last_dispatch_status`  VARCHAR(32)                          COMMENT '最近调度状态',
+    `last_dispatch_message` TEXT                                  COMMENT '最近调度信息',
+    `last_dispatch_at`      DATETIME                              COMMENT '最近实际发送时间',
+    `gmt_create`            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify`            DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_delivery_config_symbol` (`symbol`, `market`),
+    KEY `idx_sw_delivery_config_enabled` (`enabled`, `frequency_type`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘单股邮件推送配置';
+
+-- 股票盯盘：分析结论邮件发送日志
+CREATE TABLE IF NOT EXISTS `stock_watch_delivery_log` (
+    `id`               BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `config_id`        BIGINT       NOT NULL                COMMENT '配置ID',
+    `analysis_id`      BIGINT       NOT NULL                COMMENT '技术分析结论ID',
+    `symbol`           VARCHAR(16)  NOT NULL                COMMENT '股票代码',
+    `market`           VARCHAR(8)   NOT NULL                COMMENT '市场 sh/sz/bj',
+    `recipient_hash`   VARCHAR(64)  NOT NULL                COMMENT '收件人hash',
+    `recipient_masked` VARCHAR(255) NOT NULL                COMMENT '脱敏收件人',
+    `status`           VARCHAR(32)  NOT NULL                COMMENT 'PENDING/SENT/FAILED',
+    `message_id`       VARCHAR(255)                         COMMENT '发送消息ID',
+    `error_message`    TEXT                                  COMMENT '失败原因',
+    `sent_at`          DATETIME                              COMMENT '发送成功时间',
+    `gmt_create`       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify`       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_delivery_once` (`analysis_id`, `recipient_hash`),
+    KEY `idx_sw_delivery_config_status` (`config_id`, `status`),
+    KEY `idx_sw_delivery_symbol_time` (`symbol`, `market`, `gmt_create`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘分析结论邮件发送日志';
+
+-- 股票盯盘：单股 FC 论点证伪卡
+CREATE TABLE IF NOT EXISTS `stock_watch_fc_card` (
+    `id`                  BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `symbol`              VARCHAR(16)  NOT NULL                COMMENT '股票代码',
+    `market`              VARCHAR(8)   NOT NULL                COMMENT '市场 sh/sz/bj',
+    `stock_name`          VARCHAR(128)                         COMMENT '股票名称',
+    `card_key`            VARCHAR(128) NOT NULL                COMMENT 'FC卡唯一键',
+    `card_title`          VARCHAR(256) NOT NULL                COMMENT '卡片标题',
+    `card_type`           VARCHAR(64)                          COMMENT '业绩型/事件型/价格型',
+    `thesis`              TEXT                                  COMMENT '论点',
+    `trigger_logic`       TEXT                                  COMMENT '触发逻辑',
+    `data_source_tier`    VARCHAR(32)                           COMMENT 'T1/T2/T3/T4',
+    `data_sources`        TEXT                                  COMMENT '数据源',
+    `collection_method`   VARCHAR(32)                           COMMENT '自动/半自动/人工',
+    `frequency`           VARCHAR(128)                          COMMENT '频率',
+    `parser_spec`         TEXT                                  COMMENT '解析方法',
+    `baseline_reading`    TEXT                                  COMMENT '基线读数',
+    `failure_monitor`     TEXT                                  COMMENT '失效监控',
+    `auto_proxy`          TEXT                                  COMMENT '自动代理说明',
+    `activation_status`   VARCHAR(32)  NOT NULL DEFAULT 'DRAFT' COMMENT 'DRAFT/ACTIVE/SUSPENDED/INVALID',
+    `activation_blockers` TEXT                                  COMMENT '阻塞项JSON',
+    `enabled`             TINYINT      NOT NULL DEFAULT 0      COMMENT '是否进入监控',
+    `notify_enabled`      TINYINT      NOT NULL DEFAULT 1      COMMENT '触发后是否通知',
+    `last_collect_status` VARCHAR(64)                           COMMENT '最近采集状态',
+    `last_collect_note`   TEXT                                  COMMENT '最近采集说明',
+    `last_collected_at`   DATETIME                              COMMENT '最近采集时间',
+    `raw_markdown`        MEDIUMTEXT                            COMMENT '原始Markdown片段',
+    `gmt_create`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_fc_card_key` (`symbol`, `market`, `card_key`),
+    KEY `idx_sw_fc_card_symbol_status` (`symbol`, `market`, `activation_status`),
+    KEY `idx_sw_fc_card_enabled` (`enabled`, `symbol`, `market`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘单股FC论点证伪卡';

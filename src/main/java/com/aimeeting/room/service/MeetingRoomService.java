@@ -5,6 +5,7 @@ import com.aimeeting.room.dao.AiMeetingMemberMapper;
 import com.aimeeting.room.dao.AiMeetingConclusionClusterMapper;
 import com.aimeeting.room.dao.AiMeetingOpinionMapper;
 import com.aimeeting.room.dao.AiMeetingRoomMapper;
+import com.aimeeting.room.dao.AiMeetingScoreLogMapper;
 import com.aimeeting.room.dao.AiMeetingVoteMapper;
 import com.aimeeting.room.dto.ConsensusResult;
 import com.aimeeting.room.dto.MeetingCreateRequest;
@@ -26,6 +27,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.CollectionUtils;
 
 import java.util.ArrayList;
@@ -34,6 +36,7 @@ import java.util.HashSet;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
@@ -47,6 +50,7 @@ public class MeetingRoomService {
     @Autowired private AiMeetingConclusionClusterMapper clusterMapper;
     @Autowired private AiMeetingOpinionMapper opinionMapper;
     @Autowired private AiMeetingVoteMapper voteMapper;
+    @Autowired private AiMeetingScoreLogMapper scoreLogMapper;
     @Autowired private MeetingDebateService debateService;
     @Autowired private MeetingConsensusService consensusService;
     @Autowired private MeetingScoreService scoreService;
@@ -241,6 +245,51 @@ public class MeetingRoomService {
         voteMapper.deleteByMeetingId(meetingId);
         roomMapper.resetForRestart(meetingId);
         log.info("Meeting {} reset for restart", meetingId);
+    }
+
+    /**
+     * 删除会议及其全部关联数据（级联清理）。
+     * 进行中/修订中的会议会先切到暂停态，让异步流程在下一次状态检查时停止，再执行级联清理。
+     */
+    @Transactional
+    public void deleteMeeting(Long meetingId) {
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        if (room == null) throw new IllegalArgumentException("会议不存在: " + meetingId);
+        if (isActiveStatus(room.getStatus())) {
+            roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+            log.info("Meeting {} paused before deletion", meetingId);
+        }
+
+        // 工作流运行 + 阶段记录 + 追踪项/追踪更新
+        workflowService.purgeWorkflowAndTrackingData(meetingId);
+        // 会议自身的子数据
+        scoreLogMapper.deleteByMeetingId(meetingId);
+        clusterMapper.deleteByMeetingId(meetingId);
+        voteMapper.deleteByMeetingId(meetingId);
+        opinionMapper.deleteByMeetingId(meetingId);
+        memberMapper.deleteByMeetingId(meetingId);
+        roomMapper.deleteById(meetingId);
+        log.info("Meeting {} and all related data deleted", meetingId);
+    }
+
+    /** 批量删除会议，复用单会议级联清理与状态保护逻辑。 */
+    @Transactional
+    public int deleteMeetings(List<Long> meetingIds) {
+        if (CollectionUtils.isEmpty(meetingIds)) {
+            throw new IllegalArgumentException("请选择要删除的会议");
+        }
+        List<Long> distinctIds = meetingIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (distinctIds.isEmpty()) {
+            throw new IllegalArgumentException("请选择要删除的会议");
+        }
+        for (Long meetingId : distinctIds) {
+            deleteMeeting(meetingId);
+        }
+        log.info("{} meetings deleted in batch: {}", distinctIds.size(), distinctIds);
+        return distinctIds.size();
     }
 
     /** 人类用户发送消息，插入当前轮次 */
