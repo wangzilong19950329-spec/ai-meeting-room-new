@@ -3,11 +3,15 @@ package com.aimeeting.room.service;
 import com.aimeeting.room.dao.AiMeetingMemberMapper;
 import com.aimeeting.room.dao.AiMeetingOpinionMapper;
 import com.aimeeting.room.dao.AiMeetingRoomMapper;
+import com.aimeeting.room.dao.StockWatchItemMapper;
 import com.aimeeting.room.config.ModelEntry;
 import com.aimeeting.room.config.ModelRegistryStore;
 import com.aimeeting.room.dto.ChatResult;
 import com.aimeeting.room.entity.AiMeetingMember;
 import com.aimeeting.room.entity.AiMeetingOpinion;
+import com.aimeeting.room.entity.AiMeetingRoom;
+import com.aimeeting.room.entity.StockWatchItem;
+import com.aimeeting.room.enums.MeetingStatusEnum;
 import com.aimeeting.room.enums.OpinionTypeEnum;
 import com.aimeeting.room.service.ai.WebSearchService;
 import com.alibaba.fastjson.JSON;
@@ -17,12 +21,17 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -42,16 +51,47 @@ public class MeetingDebateService {
     @Autowired private MeetingWorkflowService workflowService;
     @Autowired private WebSearchService webSearch;
     @Autowired private ModelRegistryStore modelRegistryStore;
+    @Autowired private EastmoneyMarketDataService eastmoneyMarketDataService;
+    @Autowired private StockWatchItemMapper stockWatchItemMapper;
 
     private static final String REPLY_MARKER = "==REPLY==";
     private static final Pattern YEAR_PATTERN = Pattern.compile("(20\\d{2})");
     private static final Pattern FACT_PAIR_PATTERN = Pattern.compile("([\\u4e00-\\u9fa5A-Za-z][\\u4e00-\\u9fa5A-Za-z0-9_ /()%.,+\\-]{0,24})[：:]\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*([%A-Za-z\\u4e00-\\u9fa5]{0,8})");
+    private static final Pattern STOCK_CODE_WITH_MARKET_PATTERN = Pattern.compile("(?i)(?:\\b(?:sh|sz|bj)[._-]?(\\d{6})\\b|\\b(\\d{6})[._-]?(?:sh|sz|bj)\\b)");
+    private static final Pattern GROUNDED_NUMERIC_CLAIM_PATTERN = Pattern.compile("[-+]?\\d+(?:\\.\\d+)?\\s*(?:%|亿|万元|元|倍|bp|bps)");
+    private static final String[][] GUARDED_STOCK_TERMS = {
+            {"全a量化", "全a量化"},
+            {"量化多头备选池", "量化多头备选池"},
+            {"自有数据库", "自有数据库"},
+            {"我自己的", "我自己的"},
+            {"我当下的", "我当下的"},
+            {"wind", "wind"},
+            {"万得", "万得"},
+            {"一致预期", "一致预期"},
+            {"ic值", "ic值"},
+            {"标准化暴露", "标准化暴露"},
+            {"因子综合得分", "因子综合得分"},
+            {"排名前", "排名前"},
+            {"z≈", "z≈"},
+            {"z=", "z="},
+            {"beta", "beta"},
+            {"贝塔", "贝塔"},
+            {"中证1000波动率", "中证1000波动率"},
+            {"业绩预告", "业绩预告"},
+            {"eps", "eps"},
+            {"roe", "roe"}
+    };
 
     public List<AiMeetingOpinion> executeDebateRound(Long meetingId, int roundNumber) {
         List<AiMeetingMember> members = workflowService.resolveMembersForCurrentStage(
                 meetingId,
                 memberMapper.selectByMeetingId(meetingId)
         );
+        if (!isMeetingActiveForDebate(meetingId)) {
+            log.info("Meeting {} no longer active before round {} debate starts, skip member opinions",
+                    meetingId, roundNumber);
+            return Collections.emptyList();
+        }
         Long pendingTargetMemberId = findPendingTargetMemberId(meetingId);
         if (pendingTargetMemberId != null) {
             List<AiMeetingMember> targetedMembers = members.stream()
@@ -68,11 +108,34 @@ public class MeetingDebateService {
         // 每个成员发表一次综合发言（包含对他人观点的回应）
         // context 中已注入本轮已有发言，后发言者自然能看到先发言者的内容
         for (AiMeetingMember member : members) {
+            if (!isMeetingActiveForDebate(meetingId)) {
+                log.info("Meeting {} no longer active during round {}, stop before member {}",
+                        meetingId, roundNumber, member != null ? member.getId() : null);
+                break;
+            }
             AiMeetingOpinion opinion = generateOpinionWithRetry(meetingId, member, roundNumber);
             if (opinion != null) roundOpinions.add(opinion);
         }
 
         return roundOpinions;
+    }
+
+    private boolean isMeetingActiveForDebate(Long meetingId) {
+        if (meetingId == null) {
+            return true;
+        }
+        try {
+            AiMeetingRoom room = roomMapper.selectById(meetingId);
+            if (room == null) {
+                return false;
+            }
+            Integer status = room.getStatus();
+            return MeetingStatusEnum.IN_PROGRESS.getCode().equals(status)
+                    || MeetingStatusEnum.REOPENED.getCode().equals(status);
+        } catch (Exception e) {
+            log.warn("Failed to check meeting active status. meetingId={} error={}", meetingId, e.getMessage());
+            return true;
+        }
     }
 
     public AiMeetingOpinion generateSingleTargetReply(Long meetingId, Long memberId, int roundNumber) {
@@ -143,6 +206,11 @@ public class MeetingDebateService {
                 }
             }
         }
+        List<WebSearchService.SearchResult> eastmoneyResults = fetchEastmoneyResults(meetingId, searchPlan);
+        if (!eastmoneyResults.isEmpty()) {
+            searchResults.addAll(eastmoneyResults);
+            searchQueries.add(buildEastmoneyQueryLabel(searchPlan, eastmoneyResults));
+        }
         searchResults = prioritizeSearchResults(searchResults, searchPlan, meetingId);
         JSONObject conflictValidation = buildConflictValidation(meetingId, member.getId(), roundNumber, searchResults);
         WebSearchService.SearchMeta searchMeta = webSearch.peekSessionMeta();
@@ -176,7 +244,7 @@ public class MeetingDebateService {
         // ── 阶段2：生成发言 ──
         WebSearchService.ResearchDigest researchDigest = buildResearchDigest(meetingId, searchPlan, searchQueries, searchResults);
         searchMeta = webSearch.consumeSessionMeta();
-        String searchContext = buildSearchContext(searchResults, researchDigest);
+        String searchContext = buildSearchContext(searchResults, researchDigest, searchPlan);
         String conflictPrompt = buildConflictPrompt(conflictValidation);
         if (conflictPrompt != null && !conflictPrompt.isBlank()) {
             searchContext = searchContext == null || searchContext.isBlank()
@@ -261,7 +329,7 @@ public class MeetingDebateService {
                     if (fallbackModelType != null) {
                         WebSearchService.ResearchDigest fallbackDigest = buildResearchDigest(meetingId, searchPlan, searchQueries, searchResults);
                         researchDigest = fallbackDigest;
-                        String fallbackSearchContext = buildSearchContext(searchResults, fallbackDigest);
+                        String fallbackSearchContext = buildSearchContext(searchResults, fallbackDigest, searchPlan);
                         String fallbackContext = orchestrator.buildDebateContext(meetingId, member.getId(), roundNumber, fallbackSearchContext);
                         ChatResult rerun = orchestrator.callModelEx(fallbackModelType, systemPrompt, fallbackContext);
                         if (rerun != null && rerun.content != null && !rerun.content.isBlank()) {
@@ -273,15 +341,28 @@ public class MeetingDebateService {
                                     "success_after_builtin_timeout",
                                     "内置联网搜索失败后，已自动切换到外部搜索结果并重新生成发言。"
                             );
+                            context = fallbackContext;
+                            generationModelType = fallbackModelType;
                         }
                     }
                 }
             }
         }
 
-        // 合并 Serper 搜索 + tool_call 搜索的证据
-        searchQueries.addAll(chatResult.searchQueries);
-        searchResults.addAll(chatResult.searchResults);
+        chatResult = enforceSearchEvidenceGrounding(
+                member,
+                systemPrompt,
+                context,
+                generationModelType,
+                searchQueries,
+                searchResults,
+                searchPlan,
+                chatResult
+        );
+
+        // 合并外部搜索 + tool_call 搜索证据；strict fallback 会把同一批证据随 ChatResult 带回，必须去重后再入库。
+        searchQueries = mergeSearchQueries(searchQueries, chatResult.searchQueries);
+        searchResults = mergeSearchResults(searchResults, chatResult.searchResults);
 
         String[] parsed = parseEvidenceAndContent(chatResult.content);
         String evidence = buildEvidenceJson(meetingId, member.getId(), roundNumber, parsed[0], searchQueries, searchResults, searchPlan, chatResult, searchMeta, researchDigest, conflictValidation);
@@ -413,6 +494,14 @@ public class MeetingDebateService {
         plan.targetYear = inferTargetYearFromTitle(title);
         plan.freshnessDays = "realtime_price".equals(plan.intent) ? 7 : 30;
         plan.sourceFocus = buildPreferredSourceFocus(title, memberName, persona, plan.intent);
+        if (isStockTopic(title, persona, memberName)) {
+            plan.eastmoneyFields = defaultEastmoneyFields(plan.intent);
+            StockRef ref = resolveEastmoneyStockRef(meetingId, plan);
+            if (ref != null) {
+                plan.eastmoneySymbol = ref.symbol;
+                plan.eastmoneyMarket = ref.market;
+            }
+        }
 
         LinkedHashSet<String> queries = new LinkedHashSet<>();
         for (String roleSpecificQuery : buildRoleSpecificQueries(title, memberName, persona, plan.intent)) {
@@ -427,6 +516,8 @@ public class MeetingDebateService {
                 queries.add((title + " 业绩指引 预期差 最新").trim());
             } else if ("realtime_price".equals(plan.intent)) {
                 queries.add((title + " 最新价格 最新数据").trim());
+            } else if ("technical_indicator_research".equals(plan.intent)) {
+                queries.add((title + " 技术指标 有效性 回测").trim());
             } else if ("latest_news".equals(plan.intent)) {
                 queries.add((title + " 最新新闻").trim());
             } else {
@@ -449,8 +540,16 @@ public class MeetingDebateService {
     }
 
     private String inferIntentFromTitleAndPersona(String title, String persona) {
-        String combined = ((title == null ? "" : title) + " " + (persona == null ? "" : persona)).toLowerCase();
-        if (combined.contains("预测") || combined.contains("展望") || combined.contains("分析")) {
+        String titleText = title == null ? "" : title.trim().toLowerCase(Locale.ROOT);
+        String personaText = persona == null ? "" : persona.trim().toLowerCase(Locale.ROOT);
+        String combined = (titleText + " " + personaText).trim();
+        if (containsAny(titleText,
+                "技术指标", "技术面指标", "指标有效", "指标误导", "防误导",
+                "假突破", "背离", "量价", "均线", "macd", "rsi", "kdj")) {
+            return "technical_indicator_research";
+        }
+        if (containsAny(titleText, "未来", "三个月", "走势", "预测", "展望", "目标价")
+                || containsAny(combined, "预测", "展望")) {
             return "forecast_outlook";
         }
         if (combined.contains("价格") || combined.contains("金价") || combined.contains("现货") || combined.contains("报价")) {
@@ -471,6 +570,12 @@ public class MeetingDebateService {
         String normalizedTitle = title == null ? "" : title.trim();
         if (normalizedTitle.isBlank()) {
             return new ArrayList<>();
+        }
+        if ("technical_indicator_research".equalsIgnoreCase(intent)) {
+            queries.add((normalizedTitle + " 技术指标 有效性 回测 胜率 A股").trim());
+            queries.add((normalizedTitle + " 均线 MACD RSI KDJ 假突破 背离 量价").trim());
+            queries.add((normalizedTitle + " 趋势 震荡 市场 技术指标 失效").trim());
+            return new ArrayList<>(queries);
         }
         if (containsAny(combined, "量化", "因子", "ic", "夏普")) {
             queries.add((normalizedTitle + " 盈利惊喜 波动率 ROE 最新").trim());
@@ -625,6 +730,61 @@ public class MeetingDebateService {
         return limited;
     }
 
+    private List<String> mergeSearchQueries(List<String> primary, List<String> secondary) {
+        List<String> merged = new ArrayList<>();
+        if (primary != null) {
+            merged.addAll(primary);
+        }
+        if (secondary != null) {
+            merged.addAll(secondary);
+        }
+        return dedupeSearchQueries(merged);
+    }
+
+    private List<String> dedupeSearchQueries(List<String> queries) {
+        if (queries == null || queries.isEmpty()) {
+            return new ArrayList<>();
+        }
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        for (String query : queries) {
+            if (query == null || query.isBlank()) {
+                continue;
+            }
+            seen.add(query.trim());
+        }
+        return new ArrayList<>(seen);
+    }
+
+    private List<WebSearchService.SearchResult> mergeSearchResults(List<WebSearchService.SearchResult> primary,
+                                                                   List<WebSearchService.SearchResult> secondary) {
+        List<WebSearchService.SearchResult> merged = new ArrayList<>();
+        if (primary != null) {
+            merged.addAll(primary);
+        }
+        if (secondary != null) {
+            merged.addAll(secondary);
+        }
+        return dedupeSearchResults(merged);
+    }
+
+    private List<WebSearchService.SearchResult> dedupeSearchResults(List<WebSearchService.SearchResult> results) {
+        if (results == null || results.isEmpty()) {
+            return new ArrayList<>();
+        }
+        List<WebSearchService.SearchResult> deduped = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+        for (WebSearchService.SearchResult result : results) {
+            if (result == null) {
+                continue;
+            }
+            if (!seen.add(buildSearchResultKey(result))) {
+                continue;
+            }
+            deduped.add(result);
+        }
+        return deduped;
+    }
+
     private List<String> normalizeSourceFocus(List<String> sourceFocus) {
         LinkedHashSet<String> normalized = new LinkedHashSet<>();
         if (sourceFocus == null) {
@@ -750,7 +910,7 @@ public class MeetingDebateService {
             builder.append("以下判断基于本轮联网搜索结果整理，不做超出证据范围的延伸。").append("\n");
         }
         if (!searchResults.isEmpty()) {
-            builder.append("搜索摘要：").append(searchResults.get(0).snippet != null ? searchResults.get(0).snippet.trim() : "已抓到联网结果，但摘要信息有限。").append("\n");
+            builder.append(buildFallbackResultSummary(searchResults.get(0))).append("\n");
             builder.append("关键来源：").append("\n");
             int limit = Math.min(searchResults.size(), 3);
             for (int i = 0; i < limit; i++) {
@@ -766,12 +926,100 @@ public class MeetingDebateService {
         if (searchPlan != null && searchPlan.targetYear != null) {
             builder.append("本轮优先关注目标年份：").append(searchPlan.targetYear).append("。").append("\n");
         }
-        builder.append("由于主模型本轮未返回稳定答案");
+        builder.append(resolveFallbackReasonLead(chatResult));
         if (failureNote != null && !failureNote.isBlank()) {
             builder.append("（").append(failureNote).append("）");
         }
         builder.append("，当前结论仅为联网结果整理稿，后续仍应继续复核原始来源。");
         return builder.toString();
+    }
+
+    private String resolveFallbackReasonLead(ChatResult chatResult) {
+        if (chatResult == null) {
+            return "由于主模型本轮未返回可用正文";
+        }
+        String status = chatResult.searchStatus != null ? chatResult.searchStatus.toLowerCase(Locale.ROOT) : "";
+        if (status.contains("strict_grounding_fallback")) {
+            return "由于主模型正文未通过事实边界审计";
+        }
+        if (status.contains("search_backed_fallback")) {
+            return "由于主模型调用失败，已改用联网结果兜底";
+        }
+        if (isGenerationDegraded(chatResult)) {
+            return "由于主模型结果未满足本轮证据边界";
+        }
+        String modelStatus = chatResult.modelStatus != null ? chatResult.modelStatus.toLowerCase(Locale.ROOT) : "";
+        if ("success".equals(modelStatus) || "ok".equals(modelStatus)) {
+            return "由于主模型正文需要进一步事实复核";
+        }
+        return "由于主模型本轮未返回稳定答案";
+    }
+
+    private String buildFallbackResultSummary(WebSearchService.SearchResult result) {
+        if (result == null) {
+            return "搜索摘要：已抓到联网结果，但摘要信息有限。";
+        }
+        if ("STRUCTURED_DATA".equalsIgnoreCase(result.sourceType)) {
+            String summary = summarizeStructuredSearchResult(result);
+            if (summary != null && !summary.isBlank()) {
+                return "结构化行情摘要：" + summary;
+            }
+        }
+        String snippet = result.snippet != null ? result.snippet.trim() : "";
+        if (snippet.isBlank()) {
+            return "搜索摘要：已抓到联网结果，但摘要信息有限。";
+        }
+        return "搜索摘要：" + limitText(snippet, 360);
+    }
+
+    private String summarizeStructuredSearchResult(WebSearchService.SearchResult result) {
+        if (result == null || result.snippet == null || result.snippet.isBlank()) {
+            return null;
+        }
+        try {
+            JSONObject payload = JSON.parseObject(result.snippet);
+            if (payload == null || payload.isEmpty()) {
+                return null;
+            }
+            List<String> parts = new ArrayList<>();
+            StockRef ref = parseStockRef(firstNonBlank(result.source, result.url, ""), null);
+            String symbol = firstNonBlank(payload.getString("symbol"), ref != null ? ref.symbol : null);
+            String market = firstNonBlank(payload.getString("market"), "");
+            if (symbol != null && !symbol.isBlank()) {
+                parts.add("标的 " + symbol + (market.isBlank() ? "" : "." + market));
+            }
+            addStructuredSummaryNumber(parts, payload, "quote.price", "最新价", "元");
+            addStructuredSummaryNumber(parts, payload, "quote.changePercent", "涨跌幅", "%");
+            addStructuredSummaryNumber(parts, payload, "quote.volumeRatio", "量比", "");
+            addStructuredSummaryNumber(parts, payload, "quote.turnover", "换手率", "%");
+            addStructuredSummaryNumber(parts, payload, "technicalIndicators.ma20", "MA20", "");
+            addStructuredSummaryNumber(parts, payload, "technicalIndicators.rsi6", "RSI6", "");
+            addStructuredSummaryNumber(parts, payload, "technicalIndicators.rsi", "RSI", "");
+            addStructuredSummaryNumber(parts, payload, "technicalIndicators.macd", "MACD", "");
+            addStructuredSummaryNumber(parts, payload, "anchorFacts.technicalIndicators.ma20", "MA20", "");
+            addStructuredSummaryNumber(parts, payload, "anchorFacts.technicalIndicators.rsi14", "RSI14", "");
+            addStructuredSummaryNumber(parts, payload, "anchorFacts.technicalIndicators.macdDif", "MACD_DIF", "");
+            addStructuredSummaryNumber(parts, payload, "anchorFacts.technicalIndicators.macdHistogram", "MACD柱", "");
+            addStructuredSummaryNumber(parts, payload, "anchorFacts.technicalIndicators.priceVsMa20Pct", "相对MA20偏离", "%");
+            addStructuredSummaryNumber(parts, payload, "stockDetail.dynamicPe", "动态PE", "倍");
+            addStructuredSummaryNumber(parts, payload, "stockDetail.roe", "ROE", "%");
+            return parts.isEmpty() ? null : String.join("，", parts) + "。";
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void addStructuredSummaryNumber(List<String> parts,
+                                            JSONObject payload,
+                                            String path,
+                                            String label,
+                                            String unit) {
+        Object raw = readJsonPath(payload, path);
+        Double value = parseNumericValue(raw);
+        if (value == null) {
+            return;
+        }
+        parts.add(label + " " + formatFactNumber(value) + firstNonBlank(unit, ""));
     }
 
     private ChatResult retryWithCompactSearchContext(Long meetingId,
@@ -906,6 +1154,185 @@ public class MeetingDebateService {
         return conflictPrompt + "\n【强制修正要求】你上一版回答没有充分处理这些冲突。请重写整段发言：必须明确指出冲突，若引用相关数字，只能采用你本轮搜索核验到的值，并说明为何不采纳前序主张。";
     }
 
+    private ChatResult enforceSearchEvidenceGrounding(AiMeetingMember member,
+                                                      String systemPrompt,
+                                                      String context,
+                                                      String modelType,
+                                                      List<String> searchQueries,
+                                                      List<WebSearchService.SearchResult> searchResults,
+                                                      SearchPlan searchPlan,
+                                                      ChatResult current) {
+        if (!shouldRetryForUnsupportedStockClaims(current, searchResults, searchPlan)) {
+            return current;
+        }
+        log.warn("Generated opinion contains unsupported stock claims. member={}, model={}, fields={}",
+                member != null ? member.getMemberName() : "unknown",
+                modelType,
+                searchPlan != null ? searchPlan.eastmoneyFields : null);
+        ChatResult revised = retryWithStrictEvidenceGrounding(
+                systemPrompt,
+                context,
+                modelType,
+                searchQueries,
+                searchResults,
+                current
+        );
+        if (revised != null
+                && revised.content != null
+                && !revised.content.isBlank()
+                && !shouldRetryForUnsupportedStockClaims(revised, searchResults, searchPlan)) {
+            return revised;
+        }
+        String content = synthesizeExternalSearchFallbackOpinion(member, searchPlan, searchResults, current);
+        return new ChatResult(
+                content,
+                searchQueries,
+                searchResults,
+                current != null ? current.searchMode : "external_search",
+                "strict_grounding_fallback",
+                "检测到正文包含未在本轮证据中出现的股票/量化/财务主张，已降级为仅依据 Provider 原始结果的保守整理稿。",
+                current != null ? current.modelStatus : null,
+                current != null ? current.modelNote : null
+        );
+    }
+
+    private ChatResult retryWithStrictEvidenceGrounding(String systemPrompt,
+                                                        String context,
+                                                        String modelType,
+                                                        List<String> searchQueries,
+                                                        List<WebSearchService.SearchResult> searchResults,
+                                                        ChatResult previousResult) {
+        if (modelType == null || modelType.isBlank() || context == null || context.isBlank()) {
+            return previousResult;
+        }
+        String revisionPrompt = buildStrictGroundingRevisionPrompt();
+        ChatResult revised = orchestrator.callModelEx(modelType, systemPrompt, context + "\n\n" + revisionPrompt);
+        if (revised == null || revised.content == null || revised.content.isBlank()) {
+            return previousResult;
+        }
+        return new ChatResult(
+                revised.content,
+                searchQueries,
+                searchResults,
+                previousResult != null ? previousResult.searchMode : revised.searchMode,
+                "success_after_strict_grounding_retry",
+                "首次正文包含未在本轮证据中出现的股票/量化/财务主张，已按严格证据边界重写。",
+                revised.modelStatus,
+                revised.modelNote
+        );
+    }
+
+    private String buildStrictGroundingRevisionPrompt() {
+        return "【强制事实边界重写】\n"
+                + "你上一版回答包含本轮证据中没有出现的股票/量化/财务主张。请重写整段发言：\n"
+                + "1. 只能引用【Provider原始结果】或【东方财富结构化数据】中逐字可定位的信息。\n"
+                + "2. 不得引用未出现的股票代码、公司、EPS、ROE、Beta、IC值、因子排名、Wind/万得一致预期、自有量化池、业绩预告或未来季度财务预测。\n"
+                + "3. 如果证据不足，必须写“本轮证据未提供/无法核验”，不要为了显得专业而补数。\n"
+                + "4. 可以保留你的角色立场，但所有数字和事实必须有上方证据支撑。\n"
+                + "5. 先输出 JSON 论据，再用 ==REPLY== 分隔正文。";
+    }
+
+    private boolean shouldRetryForUnsupportedStockClaims(ChatResult chatResult,
+                                                         List<WebSearchService.SearchResult> searchResults,
+                                                         SearchPlan searchPlan) {
+        if (chatResult == null || chatResult.content == null || chatResult.content.isBlank()) {
+            return false;
+        }
+        if (!isStockGroundedSearch(searchPlan, searchResults)) {
+            return false;
+        }
+        JSONObject audit = buildClaimAudit(chatResult, searchResults, searchPlan);
+        return isBlockingClaimAudit(audit);
+    }
+
+    private boolean isStockGroundedSearch(SearchPlan searchPlan, List<WebSearchService.SearchResult> searchResults) {
+        if (searchPlan != null) {
+            if (searchPlan.eastmoneySymbol != null && !searchPlan.eastmoneySymbol.isBlank()) {
+                return true;
+            }
+            if (searchPlan.eastmoneyFields != null && !searchPlan.eastmoneyFields.isEmpty()) {
+                return true;
+            }
+        }
+        return hasEastmoneyStructuredResult(searchResults);
+    }
+
+    private boolean hasEastmoneyStructuredResult(List<WebSearchService.SearchResult> searchResults) {
+        if (searchResults == null) {
+            return false;
+        }
+        for (WebSearchService.SearchResult result : searchResults) {
+            if (result != null && result.source != null && result.source.startsWith("东方财富结构化数据")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String buildSearchEvidenceCorpus(List<WebSearchService.SearchResult> searchResults) {
+        if (searchResults == null || searchResults.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (WebSearchService.SearchResult result : searchResults) {
+            if (result == null) {
+                continue;
+            }
+            sb.append(result.source).append('\n')
+                    .append(result.snippet).append('\n')
+                    .append(result.url).append('\n');
+            List<NumericFact> structuredFacts = extractFactsFromStructuredResult(
+                    result,
+                    null,
+                    firstNonBlank(result.source, "东方财富结构化数据")
+            );
+            for (NumericFact fact : structuredFacts) {
+                sb.append(fact.label).append(':').append(fact.rawValue).append('\n');
+                if (fact.path != null) {
+                    sb.append(fact.path).append('=').append(fact.rawValue).append('\n');
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    private String normalizeGroundingText(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.toLowerCase(Locale.ROOT)
+                .replace("Ａ", "a")
+                .replace("ａ", "a")
+                .replace("Ｂ", "b")
+                .replace("ｂ", "b")
+                .replace("Ｒ", "r")
+                .replace("ｒ", "r")
+                .replace("Ｏ", "o")
+                .replace("ｏ", "o")
+                .replace("Ｅ", "e")
+                .replace("ｅ", "e")
+                .replace("Ｉ", "i")
+                .replace("ｉ", "i")
+                .replace("Ｃ", "c")
+                .replace("ｃ", "c")
+                .replace("＝", "=");
+    }
+
+    private Set<String> extractStockCodesWithMarket(String text) {
+        Set<String> codes = new LinkedHashSet<>();
+        if (text == null || text.isBlank()) {
+            return codes;
+        }
+        Matcher matcher = STOCK_CODE_WITH_MARKET_PATTERN.matcher(text);
+        while (matcher.find()) {
+            String code = firstNonBlank(matcher.group(1), matcher.group(2));
+            if (code != null && !code.isBlank()) {
+                codes.add(code);
+            }
+        }
+        return codes;
+    }
+
     private String buildCompactSearchGroundedPrompt(Long meetingId,
                                                     AiMeetingMember member,
                                                     int roundNumber,
@@ -957,6 +1384,7 @@ public class MeetingDebateService {
         }
         prompt.append("【输出要求】请基于以上联网结果给出一段完整发言：")
                 .append("先明确立场，再给出2-3条最关键依据；只使用上面的联网结果，不得伪造实时数据；")
+                .append("不得引用未在上面出现的股票代码、公司、财务指标、估值、Beta、IC值、因子排名或自有量化池；")
                 .append("若证据不足，请明确写出保留意见。输出纯文本正文，不要 JSON。");
         return prompt.toString();
     }
@@ -1117,7 +1545,7 @@ public class MeetingDebateService {
         }
         if (!searchResults.isEmpty()) {
             prompt.append("【你刚查到的最新资讯】\n")
-                  .append(buildSearchContext(searchResults, researchDigest)).append("\n");
+                  .append(buildSearchContext(searchResults, researchDigest, searchPlan)).append("\n");
         }
         String conflictPrompt = buildConflictPrompt(conflictValidation);
         if (conflictPrompt != null && !conflictPrompt.isBlank()) {
@@ -1127,7 +1555,7 @@ public class MeetingDebateService {
         prompt.append("请严格按以下格式回复：\n");
         prompt.append("{\"q\":[\"搜索词\"],\"e\":[{\"s\":\"来源\",\"p\":\"你引用的核心论据\"}]}\n");
         prompt.append("==REPLY==\n");
-        prompt.append("深度回应内容（充分展开论证，引用具体数据和来源）");
+        prompt.append("深度回应内容（只引用上方资讯中可定位的数据和来源；证据不足时明确说明，不得补数）");
 
         String generationModelType = resolveGenerationModelType(member.getModelType(), preferWebSearchProvider, searchResults);
         String rawResponse = orchestrator.callModel(generationModelType, systemPrompt, prompt.toString());
@@ -1197,6 +1625,7 @@ public class MeetingDebateService {
                     }
                 });
             }
+            applyEastmoneyPlanFields(plan, obj);
             if (plan.queries.isEmpty() && !plan.sourceFocus.isEmpty()) {
                 List<String> fallbackQueries = new ArrayList<>();
                 String title = resolveMeetingTitle(meetingId);
@@ -1213,6 +1642,42 @@ public class MeetingDebateService {
         return plan;
     }
 
+    private void applyEastmoneyPlanFields(SearchPlan plan, JSONObject obj) {
+        if (plan == null || obj == null) {
+            return;
+        }
+        String symbol = obj.getString("eastmoneySymbol");
+        String market = obj.getString("eastmoneyMarket");
+        JSONArray fields = obj.getJSONArray("eastmoneyFields");
+
+        JSONObject nested = obj.getJSONObject("eastmoney");
+        if (nested != null && (nested.getBooleanValue("need") || nested.containsKey("fields"))) {
+            symbol = firstNonBlank(nested.getString("symbol"), symbol);
+            market = firstNonBlank(nested.getString("market"), market);
+            JSONArray nestedFields = nested.getJSONArray("fields");
+            if (nestedFields != null) {
+                fields = nestedFields;
+            }
+        }
+        if (symbol != null && !symbol.isBlank()) {
+            StockRef ref = parseStockRef(symbol, market);
+            if (ref != null) {
+                plan.eastmoneySymbol = ref.symbol;
+                plan.eastmoneyMarket = ref.market;
+            }
+        }
+        if (fields != null) {
+            for (Object item : fields) {
+                if (item != null) {
+                    plan.eastmoneyFields.add(String.valueOf(item));
+                }
+            }
+            plan.eastmoneyFields = normalizeEastmoneyFields(plan.eastmoneyFields, plan.intent);
+        } else if (nested != null && nested.getBooleanValue("need")) {
+            plan.eastmoneyFields = defaultEastmoneyFields(plan.intent);
+        }
+    }
+
     // ── 构建最终存储的 evidence JSON ──
 
     private String buildEvidenceJson(Long meetingId,
@@ -1227,24 +1692,33 @@ public class MeetingDebateService {
                                      WebSearchService.ResearchDigest researchDigest,
                                      JSONObject conflictValidation) {
         JSONObject ev = new JSONObject();
-        boolean keepAiEvidence = shouldKeepAiEvidence(chatResult, realResults, searchPlan);
+        List<String> storedQueries = dedupeSearchQueries(queries);
+        List<WebSearchService.SearchResult> storedResults = dedupeSearchResults(realResults);
+        boolean keepAiEvidence = shouldKeepAiEvidence(chatResult, storedResults, searchPlan);
+        boolean storedAiEvidence = false;
 
-        // AI 自己提炼的论据
+        // AI 自己提炼的论据不是 provider 原始结果；只在没有真实搜索结果时作为未验证自述保留。
         if (aiEvidencePart != null && keepAiEvidence) {
             try {
                 int s = aiEvidencePart.indexOf('{'), e = aiEvidencePart.lastIndexOf('}');
                 if (s >= 0 && e > s) {
                     JSONObject parsed = JSON.parseObject(aiEvidencePart.substring(s, e + 1));
                     if (parsed.containsKey("q")) ev.put("q", parsed.get("q"));
-                    if (parsed.containsKey("e")) ev.put("e", parsed.get("e"));
+                    if (parsed.containsKey("e")) {
+                        ev.put("e", parsed.get("e"));
+                        storedAiEvidence = true;
+                    }
                 }
             } catch (Exception ignored) {}
         }
+        if (storedAiEvidence) {
+            ev.put("aiEvidenceUnverified", true);
+        }
 
         // 实际搜索的关键词（覆盖 AI 自述的搜索词）
-        if (!queries.isEmpty()) {
+        if (!storedQueries.isEmpty()) {
             JSONArray qArr = new JSONArray();
-            queries.forEach(qArr::add);
+            storedQueries.forEach(qArr::add);
             ev.put("q", qArr);
         }
         if (searchPlan != null && !searchPlan.isEmpty()) {
@@ -1257,37 +1731,67 @@ public class MeetingDebateService {
                 searchPlan.sourceFocus.forEach(sourceArr::add);
                 planObj.put("sourceFocus", sourceArr);
             }
+            if (searchPlan.eastmoneySymbol != null && !searchPlan.eastmoneySymbol.isBlank()) {
+                planObj.put("eastmoneySymbol", searchPlan.eastmoneySymbol);
+                planObj.put("eastmoneyMarket", searchPlan.eastmoneyMarket);
+            }
+            if (searchPlan.eastmoneyFields != null && !searchPlan.eastmoneyFields.isEmpty()) {
+                JSONArray fieldsArr = new JSONArray();
+                searchPlan.eastmoneyFields.forEach(fieldsArr::add);
+                planObj.put("eastmoneyFields", fieldsArr);
+            }
             ev.put("searchPlan", planObj);
         }
-        JSONObject searchMeta = buildStoredSearchMeta(queries, realResults, chatResult, webSearchMeta);
+        JSONObject searchMeta = buildStoredSearchMeta(storedQueries, storedResults, chatResult, webSearchMeta);
         if (searchMeta != null) {
             ev.put("searchMeta", searchMeta);
         }
         if (researchDigest != null) {
             ev.put("researchDigest", researchDigest.toJson());
         }
-        if (conflictValidation == null && realResults != null && !realResults.isEmpty()) {
-            conflictValidation = buildConflictValidation(meetingId, memberId, roundNumber, realResults);
+        if (conflictValidation == null && !storedResults.isEmpty()) {
+            conflictValidation = buildConflictValidation(meetingId, memberId, roundNumber, storedResults);
         }
         if (conflictValidation != null && !conflictValidation.isEmpty()) {
             ev.put("conflictValidation", conflictValidation);
         }
+        JSONObject claimAudit = buildClaimAudit(chatResult, storedResults, searchPlan);
+        if (claimAudit != null && !claimAudit.isEmpty()) {
+            ev.put("claimAudit", claimAudit);
+        }
+        JSONObject factCatalog = buildFactCatalog(storedResults);
+        if (factCatalog != null && !factCatalog.isEmpty()) {
+            ev.put("factCatalog", factCatalog);
+        }
 
         // 真实搜索结果
-        if (!realResults.isEmpty()) {
+        if (!storedResults.isEmpty()) {
             JSONArray arr = new JSONArray();
-            for (WebSearchService.SearchResult r : realResults) {
+            for (WebSearchService.SearchResult r : storedResults) {
                 JSONObject item = new JSONObject();
                 item.put("source", r.source);
-                item.put("snippet", r.snippet != null && r.snippet.length() > 100
-                        ? r.snippet.substring(0, 100) + "…" : r.snippet);
+                item.put("snippet", limitText(r.snippet,
+                        "STRUCTURED_DATA".equalsIgnoreCase(r.sourceType) ? 1200 : 240));
                 item.put("url", r.url);
+                item.put("provider", r.provider);
+                item.put("sourceType", r.sourceType);
+                item.put("query", r.query);
+                item.put("fetchedAt", r.fetchedAt);
+                item.put("rawHash", r.rawHash);
+                JSONObject sourceTrace = buildStructuredDataSourceTrace(r);
+                if (sourceTrace != null && !sourceTrace.isEmpty()) {
+                    item.put("sourceTrace", sourceTrace);
+                }
+                JSONArray facts = buildResultFacts(r, 12);
+                if (!facts.isEmpty()) {
+                    item.put("facts", facts);
+                }
                 item.put("score", scoreSearchResult(r, searchPlan));
                 item.put("year", extractYear(r));
                 arr.add(item);
             }
             ev.put("results", arr);
-            ev.put("validation", buildValidationSummary(realResults, searchPlan));
+            ev.put("validation", buildValidationSummary(storedResults, searchPlan));
         } else if (chatResult != null) {
             JSONObject validation = buildMissingLiveValidation(searchPlan, chatResult);
             if (!validation.isEmpty()) {
@@ -1297,6 +1801,335 @@ public class MeetingDebateService {
 
         if (ev.isEmpty()) return null;
         return ev.toJSONString();
+    }
+
+    private JSONObject buildClaimAudit(ChatResult chatResult,
+                                       List<WebSearchService.SearchResult> searchResults,
+                                       SearchPlan searchPlan) {
+        if (chatResult == null || chatResult.content == null || chatResult.content.isBlank()) {
+            return null;
+        }
+        boolean strictEvidenceRequired = isStockGroundedSearch(searchPlan, searchResults);
+        if (!strictEvidenceRequired) {
+            return null;
+        }
+        String normalizedContent = normalizeGroundingText(chatResult.content);
+        String normalizedEvidence = normalizeGroundingText(buildSearchEvidenceCorpus(searchResults));
+        if (normalizedContent.isBlank()) {
+            return null;
+        }
+
+        JSONArray unsupportedNumericClaims = findUnsupportedNumericClaims(normalizedContent, normalizedEvidence, searchPlan);
+        JSONArray guardedTermViolations = findUnsupportedGuardedTerms(normalizedContent, normalizedEvidence);
+        JSONArray stockCodeViolations = findUnsupportedStockCodeClaims(normalizedContent, normalizedEvidence, searchPlan);
+        JSONArray targetMismatchViolations = findTargetMismatchViolations(searchResults, searchPlan);
+        int totalViolations = unsupportedNumericClaims.size()
+                + guardedTermViolations.size()
+                + stockCodeViolations.size()
+                + targetMismatchViolations.size();
+
+        JSONObject audit = new JSONObject(true);
+        audit.put("strictEvidenceRequired", true);
+        audit.put("status", totalViolations > 0 ? "unsupported_claims" : "ok");
+        audit.put("numericClaimCount", countNumericClaims(normalizedContent, searchPlan));
+        audit.put("unsupportedNumericClaimCount", unsupportedNumericClaims.size());
+        audit.put("guardedTermViolationCount", guardedTermViolations.size());
+        audit.put("stockCodeViolationCount", stockCodeViolations.size());
+        audit.put("targetMismatchViolationCount", targetMismatchViolations.size());
+        audit.put("unsupportedNumericClaims", unsupportedNumericClaims);
+        audit.put("guardedTermViolations", guardedTermViolations);
+        audit.put("stockCodeViolations", stockCodeViolations);
+        audit.put("targetMismatchViolations", targetMismatchViolations);
+        audit.put("note", totalViolations > 0
+                ? "正文存在未在本轮 Provider/东方财富证据中定位到的数字或受控事实，不能直接当作已核验结论。"
+                : "正文中的受控事实与硬数字未发现明显脱离本轮证据。");
+        return audit;
+    }
+
+    private boolean isBlockingClaimAudit(JSONObject audit) {
+        return audit != null && "unsupported_claims".equalsIgnoreCase(audit.getString("status"));
+    }
+
+    private JSONArray findUnsupportedGuardedTerms(String normalizedContent, String normalizedEvidence) {
+        JSONArray violations = new JSONArray();
+        for (String[] guard : GUARDED_STOCK_TERMS) {
+            String trigger = guard[0];
+            if (!containsGuardedTerm(normalizedContent, trigger)) {
+                continue;
+            }
+            boolean supported = false;
+            for (int i = 1; i < guard.length; i++) {
+                if (containsGuardedTerm(normalizedEvidence, guard[i])) {
+                    supported = true;
+                    break;
+                }
+            }
+            if (!supported) {
+                JSONObject item = new JSONObject(true);
+                item.put("term", trigger);
+                item.put("reason", "not_found_in_provider_evidence");
+                violations.add(item);
+            }
+        }
+        return violations;
+    }
+
+    private boolean containsGuardedTerm(String normalizedText, String rawTerm) {
+        if (normalizedText == null || normalizedText.isBlank() || rawTerm == null || rawTerm.isBlank()) {
+            return false;
+        }
+        String term = normalizeGroundingText(rawTerm);
+        if (term.isBlank()) {
+            return false;
+        }
+        if (isAsciiLettersOnly(term)) {
+            Pattern pattern = Pattern.compile("(?<![a-z])" + Pattern.quote(term) + "(?![a-z])");
+            return pattern.matcher(normalizedText).find();
+        }
+        return normalizedText.contains(term);
+    }
+
+    private boolean isAsciiLettersOnly(String value) {
+        if (value == null || value.isBlank()) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char ch = value.charAt(i);
+            if (ch < 'a' || ch > 'z') {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private JSONArray findUnsupportedNumericClaims(String normalizedContent,
+                                                   String normalizedEvidence,
+                                                   SearchPlan searchPlan) {
+        JSONArray claims = new JSONArray();
+        Set<String> seen = new LinkedHashSet<>();
+        Matcher matcher = GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(normalizedContent);
+        while (matcher.find()) {
+            String raw = matcher.group();
+            String normalizedRaw = raw.replaceAll("\\s+", "");
+            String numberOnly = normalizedRaw.replaceAll("(?:%|亿|万元|元|倍|bp|bps)$", "");
+            if (numberOnly.isBlank()) {
+                continue;
+            }
+            if (searchPlan != null && searchPlan.eastmoneySymbol != null && numberOnly.equals(searchPlan.eastmoneySymbol)) {
+                continue;
+            }
+            if (normalizedEvidence.contains(normalizedRaw)
+                    || evidenceContainsEquivalentNumericClaim(normalizedEvidence, normalizedRaw, numberOnly)) {
+                continue;
+            }
+            if (!seen.add(normalizedRaw)) {
+                continue;
+            }
+            JSONObject item = new JSONObject(true);
+            item.put("claim", normalizedRaw);
+            item.put("number", numberOnly);
+            item.put("reason", "not_found_in_provider_evidence");
+            claims.add(item);
+            if (claims.size() >= 10) {
+                break;
+            }
+        }
+        return claims;
+    }
+
+    private boolean evidenceContainsEquivalentNumericClaim(String normalizedEvidence, String normalizedRaw, String numberOnly) {
+        if (normalizedEvidence == null || normalizedEvidence.isBlank() || numberOnly == null || numberOnly.isBlank()) {
+            return false;
+        }
+        Double target = parseNumericValue(numberOnly);
+        if (target == null || !Double.isFinite(target)) {
+            return false;
+        }
+        String targetUnit = normalizedRaw == null ? "" : normalizedRaw.replace(numberOnly, "");
+        Matcher matcher = GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(normalizedEvidence);
+        while (matcher.find()) {
+            String candidateRaw = matcher.group().replaceAll("\\s+", "");
+            String candidateNumber = candidateRaw.replaceAll("(?:%|亿|万元|元|倍|bp|bps)$", "");
+            String candidateUnit = candidateRaw.replace(candidateNumber, "");
+            if (!targetUnit.equals(candidateUnit)) {
+                continue;
+            }
+            Double candidate = parseNumericValue(candidateNumber);
+            if (candidate == null || !Double.isFinite(candidate)) {
+                continue;
+            }
+            double tolerance = Math.max(1e-6d, Math.abs(target) * 1e-6d);
+            if (Math.abs(candidate - target) <= tolerance) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private JSONArray findUnsupportedStockCodeClaims(String normalizedContent,
+                                                     String normalizedEvidence,
+                                                     SearchPlan searchPlan) {
+        JSONArray claims = new JSONArray();
+        if (searchPlan == null || searchPlan.eastmoneySymbol == null || searchPlan.eastmoneySymbol.isBlank()) {
+            return claims;
+        }
+        Set<String> mentionedCodes = extractStockCodesWithMarket(normalizedContent);
+        if (mentionedCodes.isEmpty()) {
+            return claims;
+        }
+        String target = searchPlan.eastmoneySymbol.trim();
+        boolean correctionCue = normalizedContent.contains("不符")
+                || normalizedContent.contains("无关")
+                || normalizedContent.contains("错");
+        for (String code : mentionedCodes) {
+            if (target.equals(code) || correctionCue) {
+                continue;
+            }
+            if (!normalizedEvidence.contains(code)) {
+                continue;
+            }
+            JSONObject item = new JSONObject(true);
+            item.put("claim", code);
+            item.put("target", target);
+            item.put("reason", "different_stock_code_mentioned");
+            claims.add(item);
+        }
+        return claims;
+    }
+
+    private int countNumericClaims(String normalizedContent, SearchPlan searchPlan) {
+        int count = 0;
+        Matcher matcher = GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(normalizedContent);
+        while (matcher.find()) {
+            String normalizedRaw = matcher.group().replaceAll("\\s+", "");
+            String numberOnly = normalizedRaw.replaceAll("(?:%|亿|万元|元|倍|bp|bps)$", "");
+            if (numberOnly.isBlank()) {
+                continue;
+            }
+            if (searchPlan != null && searchPlan.eastmoneySymbol != null && numberOnly.equals(searchPlan.eastmoneySymbol)) {
+                continue;
+            }
+            count++;
+        }
+        return count;
+    }
+
+    private JSONObject buildStructuredDataSourceTrace(WebSearchService.SearchResult result) {
+        if (result == null
+                || !"STRUCTURED_DATA".equalsIgnoreCase(result.sourceType)
+                || result.snippet == null
+                || result.snippet.isBlank()) {
+            return null;
+        }
+        try {
+            JSONObject payload = JSON.parseObject(result.snippet);
+            JSONObject dataQuality = payload == null ? null : payload.getJSONObject("dataQuality");
+            JSONObject sourceStatus = dataQuality == null ? null : dataQuality.getJSONObject("sourceStatus");
+            if (dataQuality == null && sourceStatus == null) {
+                return null;
+            }
+            JSONObject trace = new JSONObject(true);
+            if (dataQuality != null) {
+                trace.put("canPredict", dataQuality.get("canPredict"));
+                trace.put("requiredMissing", dataQuality.get("requiredMissing"));
+                trace.put("optionalMissing", dataQuality.get("optionalMissing"));
+            }
+            if (sourceStatus != null && !sourceStatus.isEmpty()) {
+                JSONArray sources = new JSONArray();
+                for (String name : sourceStatus.keySet()) {
+                    JSONObject status = sourceStatus.getJSONObject(name);
+                    if (status == null) {
+                        continue;
+                    }
+                    JSONObject item = new JSONObject(true);
+                    item.put("name", name);
+                    item.put("ok", status.get("ok"));
+                    item.put("sourceType", status.get("sourceType"));
+                    item.put("durationMs", status.get("durationMs"));
+                    item.put("count", status.get("count"));
+                    item.put("requestCount", status.get("requestCount"));
+                    item.put("lastUrl", status.get("lastUrl"));
+                    item.put("lastParamsHash", status.get("lastParamsHash"));
+                    item.put("lastResponseHash", status.get("lastResponseHash"));
+                    item.put("reason", status.get("reason"));
+                    sources.add(item);
+                }
+                trace.put("sources", sources);
+            }
+            return trace;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private JSONObject buildFactCatalog(List<WebSearchService.SearchResult> results) {
+        List<NumericFact> facts = extractFactsFromSearchResults(results, "current_search", null);
+        if (facts.isEmpty()) {
+            return null;
+        }
+        JSONObject catalog = new JSONObject(true);
+        JSONArray factArr = new JSONArray();
+        Set<String> seen = new LinkedHashSet<>();
+        int structuredCount = 0;
+        for (NumericFact fact : facts) {
+            if (fact == null || fact.label == null || fact.rawValue == null) {
+                continue;
+            }
+            if (fact.path != null && !fact.path.isBlank()) {
+                structuredCount++;
+            }
+            String key = String.join("|",
+                    firstNonBlank(fact.labelKey, fact.label),
+                    firstNonBlank(fact.rawValue, ""),
+                    firstNonBlank(fact.path, ""),
+                    firstNonBlank(fact.source, "")
+            );
+            if (!seen.add(key)) {
+                continue;
+            }
+            factArr.add(toFactJson(fact));
+            if (factArr.size() >= 60) {
+                break;
+            }
+        }
+        if (factArr.isEmpty()) {
+            return null;
+        }
+        catalog.put("factCount", factArr.size());
+        catalog.put("structuredFactCount", structuredCount);
+        catalog.put("facts", factArr);
+        catalog.put("note", "结构化事实来自 Provider/东方财富字段路径，供正文事实审计与冲突检测复用。");
+        return catalog;
+    }
+
+    private JSONArray buildResultFacts(WebSearchService.SearchResult result, int limit) {
+        JSONArray arr = new JSONArray();
+        List<NumericFact> facts = extractFactsFromStructuredResult(
+                result,
+                null,
+                result == null ? null : result.source
+        );
+        for (NumericFact fact : facts) {
+            arr.add(toFactJson(fact));
+            if (arr.size() >= limit) {
+                break;
+            }
+        }
+        return arr;
+    }
+
+    private JSONObject toFactJson(NumericFact fact) {
+        JSONObject item = new JSONObject(true);
+        item.put("label", fact.label);
+        item.put("path", fact.path);
+        item.put("value", fact.value);
+        item.put("unit", fact.unit);
+        item.put("rawValue", fact.rawValue);
+        item.put("owner", fact.owner);
+        item.put("source", fact.source);
+        item.put("sourceType", fact.sourceType);
+        item.put("rawHash", fact.rawHash);
+        return item;
     }
 
     private JSONObject buildStoredSearchMeta(List<String> queries,
@@ -1333,6 +2166,12 @@ public class MeetingDebateService {
             meta.put("generationNote", chatResult.searchNote);
             meta.put("modelStatus", chatResult.modelStatus);
             meta.put("modelNote", chatResult.modelNote);
+            boolean generationDegraded = isGenerationDegraded(chatResult);
+            meta.put("generationDegraded", generationDegraded);
+            if (generationDegraded) {
+                meta.put("degraded", true);
+                meta.put("degradedReason", firstNonBlank(chatResult.searchNote, chatResult.modelNote, chatResult.searchStatus));
+            }
         }
         if (hasWebMeta) {
             meta.put("provider", webSearchMeta.provider);
@@ -1367,11 +2206,440 @@ public class MeetingDebateService {
         return meta;
     }
 
+    private boolean isGenerationDegraded(ChatResult chatResult) {
+        if (chatResult == null) {
+            return false;
+        }
+        String status = chatResult.searchStatus != null ? chatResult.searchStatus.toLowerCase(Locale.ROOT) : "";
+        if (status.contains("strict_grounding_fallback") || status.contains("search_backed_fallback")) {
+            return true;
+        }
+        if (status.contains("fallback") && !status.startsWith("success_after")) {
+            return true;
+        }
+        String modelStatus = chatResult.modelStatus != null ? chatResult.modelStatus.toLowerCase(Locale.ROOT) : "";
+        return !modelStatus.isBlank()
+                && !containsAny(modelStatus, "success", "ok")
+                && containsAny(modelStatus, "timeout", "error", "failed", "incomplete", "fallback");
+    }
+
+    private List<WebSearchService.SearchResult> fetchEastmoneyResults(Long meetingId, SearchPlan searchPlan) {
+        if (searchPlan == null) {
+            return Collections.emptyList();
+        }
+        List<String> fields = normalizeEastmoneyFields(searchPlan.eastmoneyFields, searchPlan.intent);
+        if (fields.isEmpty()) {
+            return Collections.emptyList();
+        }
+        StockRef ref = resolveEastmoneyStockRef(meetingId, searchPlan);
+        if (ref == null) {
+            log.warn("Eastmoney structured data requested but stock ref is missing. meetingId={}, fields={}",
+                    meetingId, fields);
+            return Collections.emptyList();
+        }
+        try {
+            EastmoneyMarketDataService.MarketDataBundle bundle =
+                    eastmoneyMarketDataService.buildBundle(ref.symbol, ref.market, "DAY");
+            Map<String, Object> compact = compactEastmoneyPayload(bundle.getPayload(), fields);
+            if (compact.isEmpty()) {
+                return Collections.emptyList();
+            }
+            WebSearchService.SearchResult result = new WebSearchService.SearchResult();
+            result.source = "东方财富结构化数据 " + ref.symbol + "." + ref.market + " " + String.join(",", fields);
+            result.url = "https://quote.eastmoney.com/" + ref.market + ref.symbol + ".html";
+            String rawPayload = JSON.toJSONString(compact);
+            result.snippet = limitText(rawPayload, 7000);
+            result.withTrace("eastmoney", "STRUCTURED_DATA",
+                    buildEastmoneyQueryLabel(searchPlan, Collections.singletonList(result)), rawPayload);
+            log.info("Eastmoney structured data fetched for meetingId={} stock={}.{} fields={}",
+                    meetingId, ref.symbol, ref.market, fields);
+            return Collections.singletonList(result);
+        } catch (Exception e) {
+            log.warn("Eastmoney structured data fetch failed. meetingId={} stock={}.{} fields={} error={}",
+                    meetingId, ref.symbol, ref.market, fields, e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    private String buildEastmoneyQueryLabel(SearchPlan searchPlan, List<WebSearchService.SearchResult> results) {
+        String ref = "";
+        if (searchPlan != null && searchPlan.eastmoneySymbol != null) {
+            ref = searchPlan.eastmoneySymbol + "." + firstNonBlank(searchPlan.eastmoneyMarket, inferMarket(searchPlan.eastmoneySymbol));
+        } else if (results != null && !results.isEmpty() && results.get(0).source != null) {
+            ref = results.get(0).source;
+        }
+        List<String> fields = searchPlan != null ? normalizeEastmoneyFields(searchPlan.eastmoneyFields, searchPlan.intent) : Collections.emptyList();
+        return "EASTMONEY:" + firstNonBlank(ref, "stock") + ":" + String.join(",", fields);
+    }
+
+    private StockRef resolveEastmoneyStockRef(Long meetingId, SearchPlan searchPlan) {
+        boolean allowProjectMetadataTarget = shouldAllowProjectMetadataTarget(searchPlan);
+        StockRef meetingTarget = resolveMeetingTargetStockRef(meetingId, allowProjectMetadataTarget);
+        if (meetingTarget != null) {
+            if (searchPlan != null) {
+                searchPlan.eastmoneySymbol = meetingTarget.symbol;
+                searchPlan.eastmoneyMarket = meetingTarget.market;
+            }
+            return meetingTarget;
+        }
+        if (searchPlan != null && searchPlan.eastmoneySymbol != null && !searchPlan.eastmoneySymbol.isBlank()) {
+            StockRef ref = parseStockRef(searchPlan.eastmoneySymbol, searchPlan.eastmoneyMarket);
+            if (ref != null) {
+                searchPlan.eastmoneySymbol = ref.symbol;
+                searchPlan.eastmoneyMarket = ref.market;
+                return ref;
+            }
+        }
+        String searchText = resolveMeetingSearchText(meetingId, allowProjectMetadataTarget);
+        StockRef fromText = parseStockRef(searchText, null);
+        if (fromText != null) {
+            if (searchPlan != null) {
+                searchPlan.eastmoneySymbol = fromText.symbol;
+                searchPlan.eastmoneyMarket = fromText.market;
+            }
+            return fromText;
+        }
+        StockRef known = resolveKnownAshareRef(searchText);
+        if (known != null) {
+            if (searchPlan != null) {
+                searchPlan.eastmoneySymbol = known.symbol;
+                searchPlan.eastmoneyMarket = known.market;
+            }
+            return known;
+        }
+        StockRef watched = resolveWatchedStockRef(searchText);
+        if (watched != null) {
+            if (searchPlan != null) {
+                searchPlan.eastmoneySymbol = watched.symbol;
+                searchPlan.eastmoneyMarket = watched.market;
+            }
+            return watched;
+        }
+        return null;
+    }
+
+    private StockRef resolveMeetingTargetStockRef(Long meetingId) {
+        return resolveMeetingTargetStockRef(meetingId, true);
+    }
+
+    private StockRef resolveMeetingTargetStockRef(Long meetingId, boolean allowProjectMetadataTarget) {
+        if (meetingId == null) {
+            return null;
+        }
+        try {
+            AiMeetingRoom room = roomMapper.selectById(meetingId);
+            if (room == null) {
+                return null;
+            }
+            StockRef fromDescription = parseStockRefFromDescriptionJson(room.getDescription());
+            if (fromDescription != null) {
+                return fromDescription;
+            }
+            if (allowProjectMetadataTarget) {
+                StockRef fromProjectKey = parseStockRef(room.getProjectKey(), null);
+                if (fromProjectKey != null) {
+                    return fromProjectKey;
+                }
+            }
+            return parseStockRef(room.getTitle(), null);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean shouldAllowProjectMetadataTarget(SearchPlan searchPlan) {
+        return searchPlan == null || !"technical_indicator_research".equalsIgnoreCase(searchPlan.intent);
+    }
+
+    private StockRef parseStockRefFromDescriptionJson(String description) {
+        if (description == null || description.isBlank()) {
+            return null;
+        }
+        try {
+            JSONObject obj = JSON.parseObject(description);
+            String symbol = firstNonBlank(
+                    obj.getString("symbol"),
+                    obj.getString("stockSymbol"),
+                    obj.getString("eastmoneySymbol")
+            );
+            String market = firstNonBlank(
+                    obj.getString("market"),
+                    obj.getString("stockMarket"),
+                    obj.getString("eastmoneyMarket")
+            );
+            StockRef ref = parseStockRef(symbol, market);
+            if (ref != null) {
+                return ref;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private StockRef resolveWatchedStockRef(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        try {
+            String normalized = text.toLowerCase(Locale.ROOT);
+            List<StockWatchItem> items = stockWatchItemMapper.selectEnabled();
+            if (items == null) {
+                return null;
+            }
+            for (StockWatchItem item : items) {
+                if (item == null || item.getSymbol() == null) {
+                    continue;
+                }
+                String symbol = item.getSymbol();
+                String market = firstNonBlank(item.getMarket(), inferMarket(symbol));
+                String name = firstNonBlank(item.getStockName(), "");
+                if (normalized.contains(symbol.toLowerCase(Locale.ROOT))
+                        || (!name.isBlank() && normalized.contains(name.toLowerCase(Locale.ROOT)))) {
+                    return new StockRef(symbol, market);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    private StockRef resolveKnownAshareRef(String text) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        String value = text.toLowerCase(Locale.ROOT);
+        if (value.contains("宁德时代") || value.contains("catl")) return new StockRef("300750", "sz");
+        if (value.contains("昊华科技")) return new StockRef("600378", "sh");
+        if (value.contains("绿的谐波")) return new StockRef("688017", "sh");
+        if (value.contains("迈瑞医疗")) return new StockRef("300760", "sz");
+        if (value.contains("比亚迪")) return new StockRef("002594", "sz");
+        if (value.contains("雷赛智能")) return new StockRef("002979", "sz");
+        return null;
+    }
+
+    private StockRef parseStockRef(String rawSymbol, String rawMarket) {
+        if (rawSymbol == null) {
+            return null;
+        }
+        String value = rawSymbol.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
+        if (value.isEmpty()) {
+            return null;
+        }
+        Matcher prefixed = Pattern.compile(".*?(sh|sz|bj)[._-]?(\\d{6}).*").matcher(value);
+        if (prefixed.matches()) {
+            return new StockRef(prefixed.group(2), prefixed.group(1));
+        }
+        Matcher suffixed = Pattern.compile(".*?(\\d{6})(?:[._-]?(sh|sz|bj))?.*").matcher(value);
+        if (!suffixed.matches()) {
+            return null;
+        }
+        String symbol = suffixed.group(1);
+        String market = firstNonBlank(rawMarket, suffixed.group(2), inferMarket(symbol)).toLowerCase(Locale.ROOT);
+        return new StockRef(symbol, market);
+    }
+
+    private String inferMarket(String symbol) {
+        if (symbol == null || symbol.isBlank()) {
+            return "sz";
+        }
+        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
+        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
+        return "sz";
+    }
+
+    private List<String> normalizeEastmoneyFields(List<String> rawFields, String intent) {
+        if (rawFields == null || rawFields.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<String> fields = new LinkedHashSet<>();
+        for (String raw : rawFields) {
+            String field = raw == null ? "" : raw.trim();
+            if (field.isBlank()) {
+                continue;
+            }
+            String normalized = field.toLowerCase(Locale.ROOT)
+                    .replace("-", "")
+                    .replace("_", "");
+            if ("all".equals(normalized) || "full".equals(normalized)) {
+                fields.addAll(defaultEastmoneyFields(intent));
+                continue;
+            }
+            String canonical = canonicalEastmoneyField(normalized);
+            if (canonical != null) {
+                fields.add(canonical);
+            }
+        }
+        return new ArrayList<>(fields);
+    }
+
+    private String canonicalEastmoneyField(String normalized) {
+        switch (normalized) {
+            case "quote":
+            case "realtime":
+            case "price":
+            case "fundflow":
+                return "quote";
+            case "stockdetail":
+            case "detail":
+            case "marketcap":
+                return "stockDetail";
+            case "anchorfacts":
+            case "anchor":
+                return "anchorFacts";
+            case "technicalindicators":
+            case "technical":
+            case "indicator":
+            case "indicators":
+                return "technicalIndicators";
+            case "dailykline":
+            case "kline":
+            case "daily":
+            case "bars":
+                return "dailyKline";
+            case "minutetrends5d":
+            case "minutetrends":
+            case "intraday":
+                return "minuteTrends5d";
+            case "intradayfundflow":
+            case "flow":
+            case "capitalflow":
+                return "intradayFundFlow";
+            case "valuation":
+            case "pe":
+            case "pb":
+                return "valuation";
+            case "financials":
+            case "financial":
+            case "fundamental":
+                return "financials";
+            case "announcements":
+            case "announcement":
+            case "notice":
+                return "announcements";
+            case "latestnews":
+            case "news":
+                return "latestNews";
+            case "shareholdercounts":
+            case "shareholder":
+            case "holders":
+                return "shareholderCounts";
+            case "marketbenchmark":
+            case "benchmark":
+                return "marketBenchmark";
+            default:
+                return null;
+        }
+    }
+
+    private List<String> defaultEastmoneyFields(String intent) {
+        List<String> fields = new ArrayList<>();
+        fields.add("quote");
+        fields.add("stockDetail");
+        fields.add("anchorFacts");
+        fields.add("technicalIndicators");
+        fields.add("dailyKline");
+        if ("forecast_outlook".equalsIgnoreCase(intent)) {
+            fields.addAll(Arrays.asList("valuation", "financials", "latestNews", "shareholderCounts"));
+        } else if ("latest_news".equalsIgnoreCase(intent)) {
+            fields.addAll(Arrays.asList("latestNews", "announcements"));
+        } else if ("realtime_price".equalsIgnoreCase(intent)) {
+            fields.addAll(Arrays.asList("minuteTrends5d", "intradayFundFlow", "marketBenchmark"));
+        }
+        return fields;
+    }
+
+    private Map<String, Object> compactEastmoneyPayload(Map<String, Object> raw, List<String> fields) {
+        Map<String, Object> compact = new LinkedHashMap<>();
+        if (raw == null || raw.isEmpty() || fields == null || fields.isEmpty()) {
+            return compact;
+        }
+        copyIfPresent(raw, compact, "asOf");
+        copyIfPresent(raw, compact, "symbol");
+        copyIfPresent(raw, compact, "market");
+        copyIfPresent(raw, compact, "periodType");
+        for (String field : fields) {
+            if (!raw.containsKey(field)) {
+                continue;
+            }
+            compact.put(field, compactEastmoneyValue(field, raw.get(field)));
+        }
+        if (raw.containsKey("dataQuality")) {
+            compact.put("dataQuality", raw.get("dataQuality"));
+        }
+        Map<String, Object> packing = new LinkedHashMap<>();
+        packing.put("mode", "compact_for_meeting_search_context");
+        packing.put("requestedFields", fields);
+        compact.put("dataPacking", packing);
+        return compact;
+    }
+
+    private Object compactEastmoneyValue(String field, Object value) {
+        List<Object> values = toObjectList(value);
+        if (values.isEmpty()) {
+            return value;
+        }
+        if ("dailyKline".equals(field)) return tailObjects(values, 40);
+        if ("minuteTrends5d".equals(field)) return tailObjects(values, 25);
+        if ("intradayFundFlow".equals(field)) return tailObjects(values, 25);
+        if ("financials".equals(field)) return headObjects(values, 4);
+        if ("announcements".equals(field)) return headObjects(values, 6);
+        if ("latestNews".equals(field)) return headObjects(values, 6);
+        if ("shareholderCounts".equals(field)) return headObjects(values, 4);
+        return values;
+    }
+
+    private void copyIfPresent(Map<String, Object> source, Map<String, Object> target, String key) {
+        if (source != null && source.containsKey(key)) {
+            target.put(key, source.get(key));
+        }
+    }
+
+    private List<Object> toObjectList(Object value) {
+        if (value instanceof List) {
+            return new ArrayList<>((List<?>) value);
+        }
+        if (value instanceof JSONArray) {
+            JSONArray array = (JSONArray) value;
+            List<Object> values = new ArrayList<>();
+            for (int i = 0; i < array.size(); i++) {
+                values.add(array.get(i));
+            }
+            return values;
+        }
+        return Collections.emptyList();
+    }
+
+    private List<Object> headObjects(List<Object> values, int count) {
+        if (values == null || values.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(values.subList(0, Math.min(count, values.size())));
+    }
+
+    private List<Object> tailObjects(List<Object> values, int count) {
+        if (values == null || values.isEmpty()) {
+            return Collections.emptyList();
+        }
+        return new ArrayList<>(values.subList(Math.max(0, values.size() - count), values.size()));
+    }
+
+    private String limitText(String text, int limit) {
+        if (text == null || limit <= 0 || text.length() <= limit) {
+            return text;
+        }
+        return text.substring(0, limit) + "…";
+    }
+
     private WebSearchService.ResearchDigest buildResearchDigest(Long meetingId,
                                                                 SearchPlan searchPlan,
                                                                 List<String> searchQueries,
                                                                 List<WebSearchService.SearchResult> searchResults) {
         if (searchResults == null || searchResults.isEmpty()) {
+            return null;
+        }
+        if (isStockGroundedSearch(searchPlan, searchResults)) {
+            // 股票场景里原始结构化数据比“摘要代理”更可靠。摘要代理一旦串公司，
+            // 下游主模型会把错误摘要当事实扩写，所以这里直接跳过。
             return null;
         }
         com.aimeeting.room.entity.AiMeetingRoom room = roomMapper.selectById(meetingId);
@@ -1386,23 +2654,53 @@ public class MeetingDebateService {
     }
 
     private String buildSearchContext(List<WebSearchService.SearchResult> searchResults,
-                                      WebSearchService.ResearchDigest researchDigest) {
-        if (researchDigest != null) {
-            String digestContext = webSearch.formatResearchDigestForPrompt(researchDigest);
-            if (digestContext != null && !digestContext.isBlank()) {
-                return digestContext;
-            }
-        }
-        return searchResults == null || searchResults.isEmpty()
+                                      WebSearchService.ResearchDigest researchDigest,
+                                      SearchPlan searchPlan) {
+        String rawContext = searchResults == null || searchResults.isEmpty()
                 ? null
                 : webSearch.formatResultsForPrompt(searchResults);
+        boolean hasRawContext = rawContext != null && !rawContext.isBlank();
+        String digestContext = null;
+        if (researchDigest != null) {
+            digestContext = webSearch.formatResearchDigestForPrompt(researchDigest);
+        }
+        boolean hasDigestContext = digestContext != null && !digestContext.isBlank();
+        if (!hasRawContext && !hasDigestContext) {
+            return null;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        if (isStockGroundedSearch(searchPlan, searchResults)) {
+            sb.append("【股票事实来源边界】\n")
+                    .append("- 下方 Provider 原始结果和东方财富结构化数据是唯一可直接引用的事实来源。\n")
+                    .append("- 不得引用未在下方出现的股票代码、公司、财务数字、估值、Beta、IC值、因子排名、Wind/万得一致预期或自有量化池结论。\n")
+                    .append("- 如果某个网页结果明显属于其他公司或其他股票代码，必须判为无效，不能基于它继续推演。\n")
+                    .append("- 缺少的数据请写“本轮证据未提供/无法核验”，不要补数。\n\n");
+        } else {
+            sb.append("【事实来源边界】优先使用下方 Provider 原始结果；没有在原始结果中出现的最新数据，不得自行补充。\n\n");
+        }
+
+        if (hasRawContext) {
+            sb.append("【Provider原始结果】\n").append(rawContext.trim()).append("\n");
+        }
+        if (hasDigestContext) {
+            sb.append("\n【研究摘要代理线索（不可直接当作事实）】\n")
+                    .append("下面内容只能帮助理解检索结果，不得直接引用其中未能在 Provider 原始结果定位到的数字或结论。\n")
+                    .append(digestContext.trim()).append("\n");
+        }
+        return sb.toString();
     }
 
-    private String firstNonBlank(String primary, String fallback) {
-        if (primary != null && !primary.isBlank()) {
-            return primary;
+    private String firstNonBlank(String... values) {
+        if (values == null) {
+            return null;
         }
-        return fallback;
+        for (String value : values) {
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return null;
     }
 
     private boolean shouldKeepAiEvidence(ChatResult chatResult,
@@ -1412,7 +2710,7 @@ public class MeetingDebateService {
             return true;
         }
         if (realResults != null && !realResults.isEmpty()) {
-            return true;
+            return false;
         }
         boolean freshnessSensitive = searchPlan != null
                 && ("realtime_price".equalsIgnoreCase(searchPlan.intent)
@@ -1451,7 +2749,13 @@ public class MeetingDebateService {
             return rawResults;
         }
         SearchPlan effectivePlan = searchPlan != null ? searchPlan : defaultSearchPlan(meetingId);
-        List<WebSearchService.SearchResult> sorted = new ArrayList<>(rawResults);
+        StockRef targetRef = resolveEastmoneyStockRef(meetingId, effectivePlan);
+        List<WebSearchService.SearchResult> sorted = rawResults.stream()
+                .filter(result -> !isClearlyWrongStockResult(result, targetRef))
+                .collect(Collectors.toCollection(ArrayList::new));
+        if (sorted.isEmpty()) {
+            sorted = new ArrayList<>(rawResults);
+        }
         sorted.sort(Comparator.comparingInt((WebSearchService.SearchResult r) -> scoreSearchResult(r, effectivePlan)).reversed());
         List<WebSearchService.SearchResult> deduped = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
@@ -1465,6 +2769,20 @@ public class MeetingDebateService {
             }
         }
         return deduped;
+    }
+
+    private boolean isClearlyWrongStockResult(WebSearchService.SearchResult result, StockRef targetRef) {
+        if (result == null || targetRef == null || targetRef.symbol == null || targetRef.symbol.isBlank()) {
+            return false;
+        }
+        String text = normalizeGroundingText(firstNonBlank(result.source, "") + " "
+                + firstNonBlank(result.snippet, "") + " "
+                + firstNonBlank(result.url, ""));
+        Set<String> codes = extractStockCodesWithMarket(text);
+        if (codes.isEmpty()) {
+            return false;
+        }
+        return !codes.contains(targetRef.symbol);
     }
 
     private String buildSearchResultKey(WebSearchService.SearchResult result) {
@@ -1485,12 +2803,14 @@ public class MeetingDebateService {
 
     private JSONObject buildValidationSummary(List<WebSearchService.SearchResult> results, SearchPlan searchPlan) {
         JSONObject validation = new JSONObject();
+        List<WebSearchService.SearchResult> effectiveResults = dedupeSearchResults(results);
         Set<String> domains = new LinkedHashSet<>();
         int targetYearHits = 0;
         int freshHits = 0;
         int highQualityHits = 0;
         int weakSourceHits = 0;
-        for (WebSearchService.SearchResult result : results) {
+        int topicRelevantHits = 0;
+        for (WebSearchService.SearchResult result : effectiveResults) {
             String domain = extractDomain(result.url);
             if (domain != null) {
                 domains.add(domain);
@@ -1508,24 +2828,106 @@ public class MeetingDebateService {
             if (isFreshEnough(result, searchPlan)) {
                 freshHits++;
             }
+            if (isTopicRelevantResult(result, searchPlan)) {
+                topicRelevantHits++;
+            }
         }
-        JSONObject factValidation = buildFactValidation(results);
+        JSONObject factValidation = buildFactValidation(effectiveResults);
         int verifiedFactCount = factValidation.getIntValue("verifiedFactCount");
         int conflictingFactCount = factValidation.getIntValue("conflictingFactCount");
         int singleSourceFactCount = factValidation.getIntValue("singleSourceFactCount");
-        boolean crossVerified = (verifiedFactCount > 0 && conflictingFactCount == 0)
-                || (domains.size() >= 2 && freshHits >= 2 && highQualityHits >= 1);
-        int preferredSourceHits = countPreferredSourceHits(results, searchPlan);
+        JSONArray targetMismatchViolations = findTargetMismatchViolations(effectiveResults, searchPlan);
+        boolean targetMismatch = !targetMismatchViolations.isEmpty();
+        boolean requiresTopicRelevance = requiresTopicRelevance(searchPlan);
+        boolean topicRelevant = !requiresTopicRelevance || topicRelevantHits > 0;
+        boolean topicRelevanceEnough = !requiresTopicRelevance || topicRelevantHits >= Math.min(2, Math.max(1, effectiveResults.size()));
+        boolean crossVerified = !targetMismatch && topicRelevanceEnough && ((verifiedFactCount > 0 && conflictingFactCount == 0)
+                || (domains.size() >= 2 && freshHits >= 2 && highQualityHits >= 1));
+        int preferredSourceHits = countPreferredSourceHits(effectiveResults, searchPlan);
         validation.put("crossVerified", crossVerified);
+        validation.put("targetMismatch", targetMismatch);
+        if (targetMismatch) {
+            validation.put("targetMismatchViolations", targetMismatchViolations);
+        }
         validation.put("distinctSources", domains.size());
         validation.put("freshResultCount", freshHits);
         validation.put("targetYearHitCount", targetYearHits);
         validation.put("preferredSourceHitCount", preferredSourceHits);
         validation.put("highQualitySourceCount", highQualityHits);
         validation.put("weakSourceCount", weakSourceHits);
+        validation.put("topicRelevanceRequired", requiresTopicRelevance);
+        validation.put("topicRelevant", topicRelevant);
+        validation.put("topicRelevantResultCount", topicRelevantHits);
         validation.put("factValidation", factValidation);
-        validation.put("note", buildValidationNote(crossVerified, preferredSourceHits, factValidation, weakSourceHits));
+        validation.put("note", targetMismatch
+                ? "搜索结果中存在明确异股证据，当前不能视为目标股票的交叉验证结果。"
+                : !topicRelevant
+                ? "搜索结果来源质量可能较高，但与本轮问题主题不匹配，不能视为有效交叉验证。"
+                : buildValidationNote(crossVerified, preferredSourceHits, factValidation, weakSourceHits));
         return validation;
+    }
+
+    private boolean requiresTopicRelevance(SearchPlan searchPlan) {
+        return searchPlan != null && "technical_indicator_research".equalsIgnoreCase(searchPlan.intent);
+    }
+
+    private boolean isTopicRelevantResult(WebSearchService.SearchResult result, SearchPlan searchPlan) {
+        if (!requiresTopicRelevance(searchPlan)) {
+            return true;
+        }
+        if (result == null) {
+            return false;
+        }
+        String text = ((result.source != null ? result.source : "") + " "
+                + (result.snippet != null ? result.snippet : "") + " "
+                + (result.url != null ? result.url : "")).toLowerCase(Locale.ROOT);
+        return containsAny(text,
+                "技术指标", "技术面", "technicalindicators", "indicator", "macd", "rsi", "kdj",
+                "均线", "ma20", "ma5", "量价", "背离", "假突破", "趋势", "支撑", "阻力",
+                "回测", "胜率", "有效性", "失效", "震荡");
+    }
+
+    private JSONArray findTargetMismatchViolations(List<WebSearchService.SearchResult> results, SearchPlan searchPlan) {
+        JSONArray violations = new JSONArray();
+        if (results == null || results.isEmpty()
+                || searchPlan == null
+                || searchPlan.eastmoneySymbol == null
+                || searchPlan.eastmoneySymbol.isBlank()) {
+            return violations;
+        }
+        String target = searchPlan.eastmoneySymbol.trim();
+        Set<String> seen = new LinkedHashSet<>();
+        for (WebSearchService.SearchResult result : results) {
+            if (result == null) {
+                continue;
+            }
+            String text = normalizeGroundingText(firstNonBlank(result.source, "") + " "
+                    + firstNonBlank(result.snippet, "") + " "
+                    + firstNonBlank(result.url, ""));
+            Set<String> codes = extractStockCodesWithMarket(text);
+            if (codes.isEmpty() || codes.contains(target)) {
+                continue;
+            }
+            String key = firstNonBlank(result.url, result.source, result.query, codes.toString());
+            if (!seen.add(key)) {
+                continue;
+            }
+            JSONObject item = new JSONObject(true);
+            item.put("target", target);
+            JSONArray codeArr = new JSONArray();
+            codes.forEach(codeArr::add);
+            item.put("codes", codeArr);
+            item.put("source", result.source);
+            item.put("url", result.url);
+            item.put("sourceType", result.sourceType);
+            item.put("query", result.query);
+            item.put("reason", "result_points_to_different_stock");
+            violations.add(item);
+            if (violations.size() >= 6) {
+                break;
+            }
+        }
+        return violations;
     }
 
     private JSONObject buildConflictValidation(Long meetingId,
@@ -1668,6 +3070,12 @@ public class MeetingDebateService {
         String text = ((result.source != null ? result.source : "") + " " +
                 (result.snippet != null ? result.snippet : "") + " " +
                 (result.url != null ? result.url : "")).toLowerCase();
+        if (result.source != null && result.source.startsWith("东方财富结构化数据")) {
+            score += 30;
+        }
+        if (containsAny(text, "tavily 智能摘要")) {
+            score -= 30;
+        }
         if (searchPlan != null) {
             if ("realtime_price".equalsIgnoreCase(searchPlan.intent)) {
                 if (containsAny(text, "price", "spot", "future", "comex", "lbma", "现货", "期货", "报价")) score += 4;
@@ -1766,7 +3174,11 @@ public class MeetingDebateService {
     }
 
     private boolean hasExtractableNumericFacts(WebSearchService.SearchResult result) {
-        return result != null && !extractFactsFromText(result.snippet, null, result.source).isEmpty();
+        if (result == null) {
+            return false;
+        }
+        return !extractFactsFromStructuredResult(result, null, result.source).isEmpty()
+                || !extractFactsFromText(result.snippet, null, result.source).isEmpty();
     }
 
     private int sourceQualityScore(WebSearchService.SearchResult result) {
@@ -1780,6 +3192,9 @@ public class MeetingDebateService {
         }
         if (domain != null && containsAny(domain, "reuters.com", "bloomberg.com", "wsj.com", "gold.org", "cmegroup.com", "lbma.org.uk", "who.int", "fda.gov")) {
             return 5;
+        }
+        if (domain != null && containsAny(domain, "caifuhao.eastmoney.com", "guba.eastmoney.com")) {
+            return -4;
         }
         if (domain != null && containsAny(domain, "eastmoney.com", "10jqka.com.cn", "finance.sina.com.cn", "stcn.com", "cls.cn", "investing.com", "tradingeconomics.com")) {
             return 4;
@@ -1838,6 +3253,11 @@ public class MeetingDebateService {
                 continue;
             }
             String source = firstNonBlank(result.source, fallbackSource);
+            List<NumericFact> structuredFacts = extractFactsFromStructuredResult(result, owner, source);
+            if (!structuredFacts.isEmpty()) {
+                facts.addAll(structuredFacts);
+                continue;
+            }
             facts.addAll(extractFactsFromText(result.snippet, owner, source));
         }
         return facts;
@@ -1861,18 +3281,307 @@ public class MeetingDebateService {
                 }
             }
             JSONArray results = evidence.getJSONArray("results");
+            int factCountBeforeResults = facts.size();
             if (results != null) {
                 for (int i = 0; i < results.size(); i++) {
                     JSONObject item = results.getJSONObject(i);
                     if (item == null) {
                         continue;
                     }
+                    JSONArray itemFacts = item.getJSONArray("facts");
+                    if (itemFacts != null && !itemFacts.isEmpty()) {
+                        facts.addAll(extractFactsFromFactJsonArray(itemFacts, owner, item.getString("source")));
+                        continue;
+                    }
                     facts.addAll(extractFactsFromText(item.getString("snippet"), owner, item.getString("source")));
+                }
+            }
+            if (facts.size() == factCountBeforeResults) {
+                JSONObject factCatalog = evidence.getJSONObject("factCatalog");
+                JSONArray catalogFacts = factCatalog == null ? null : factCatalog.getJSONArray("facts");
+                if (catalogFacts != null && !catalogFacts.isEmpty()) {
+                    facts.addAll(extractFactsFromFactJsonArray(catalogFacts, owner, null));
                 }
             }
         } catch (Exception ignored) {
         }
         return facts;
+    }
+
+    private List<NumericFact> extractFactsFromStructuredResult(WebSearchService.SearchResult result,
+                                                               String owner,
+                                                               String fallbackSource) {
+        List<NumericFact> facts = new ArrayList<>();
+        if (result == null
+                || !"STRUCTURED_DATA".equalsIgnoreCase(result.sourceType)
+                || result.snippet == null
+                || result.snippet.isBlank()) {
+            return facts;
+        }
+        try {
+            JSONObject payload = JSON.parseObject(result.snippet);
+            if (payload == null || payload.isEmpty()) {
+                return facts;
+            }
+            String source = firstNonBlank(result.source, fallbackSource, "东方财富结构化数据");
+
+            addStructuredFact(facts, payload, "quote.price", "最新价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "quote.changePercent", "涨跌幅", "%", owner, source, result);
+            addStructuredFact(facts, payload, "quote.changeAmount", "涨跌额", "元", owner, source, result);
+            addStructuredFact(facts, payload, "quote.volumeRatio", "量比", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "quote.turnover", "换手率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "quote.amount", "成交额", "元", owner, source, result);
+            addStructuredFact(facts, payload, "quote.mainInflow", "主力净流入", "元", owner, source, result);
+            addStructuredFact(facts, payload, "quote.mainInflowRatio", "主力净流入占比", "%", owner, source, result);
+
+            addStructuredFact(facts, payload, "anchorFacts.priceYuan", "最新价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.changePercent", "涨跌幅", "%", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.amountYuan", "成交额", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.turnoverPercent", "换手率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.volumeRatio", "量比", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.mainInflowYuan", "主力净流入", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.mainInflowRatioPercent", "主力净流入占比", "%", owner, source, result);
+
+            addStructuredFact(facts, payload, "stockDetail.price", "盘口价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.open", "今开", "元", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.high", "最高价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.low", "最低价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.previousClose", "昨收", "元", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.dynamicPe", "动态PE", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.pb", "PB", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.turnover", "盘口换手率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.changePercent", "盘口涨跌幅", "%", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.amplitude", "振幅", "%", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.roe", "最新ROE", "%", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.marketCap", "总市值", "元", owner, source, result);
+            addStructuredFact(facts, payload, "stockDetail.freeFloatMarketCap", "流通市值", "元", owner, source, result);
+
+            addStructuredFact(facts, payload, "valuation.close", "估值收盘价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.peTtm", "PE_TTM", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.pbMrq", "PB_MRQ", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.peg", "PEG", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.psTtm", "PS_TTM", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.pcfTtm", "PCF_TTM", "倍", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.pePercentile1y", "PE一年分位", "%", owner, source, result);
+            addStructuredFact(facts, payload, "valuation.pbPercentile1y", "PB一年分位", "%", owner, source, result);
+
+            addStructuredFact(facts, payload, "financials[0].eps", "最新财报EPS", "元", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].revenue", "最新财报营收", "元", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].revenueYoyPct", "最新财报营收同比", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].netProfit", "最新财报归母净利润", "元", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].netProfitYoyPct", "最新财报归母净利润同比", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].netProfitExNonRecurring", "最新财报扣非净利润", "元", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].roePct", "最新财报ROE", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].grossMarginPct", "最新财报毛利率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].netMarginPct", "最新财报净利率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].cashToRevenuePct", "经营现金流营收比", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].debtRatioPct", "资产负债率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].receivableTurnover", "应收账款周转率", "次", owner, source, result);
+            addStructuredFact(facts, payload, "financials[0].inventoryTurnover", "存货周转率", "次", owner, source, result);
+
+            addStructuredFact(facts, payload, "shareholderCounts[0].holderNum", "最新股东户数", "户", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].preHolderNum", "上期股东户数", "户", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].holderNumChange", "股东户数变化", "户", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].holderNumRatioPct", "股东户数变化率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].intervalPriceChangePct", "股东户数区间涨跌幅", "%", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].avgHoldNum", "户均持股", "股", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].avgMarketCap", "户均持仓市值", "元", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].totalMarketCap", "股东户数期末总市值", "元", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].totalAShares", "A股总股本", "股", owner, source, result);
+            addStructuredFact(facts, payload, "shareholderCounts[0].closePrice", "股东户数期末收盘价", "元", owner, source, result);
+
+            addStructuredFact(facts, payload, "technicalIndicators.close", "技术收盘价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.ma5", "MA5", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.ma10", "MA10", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.ma20", "MA20", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.ma60", "MA60", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.macdDif", "MACD_DIF", "", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.macdDea", "MACD_DEA", "", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.macdHistogram", "MACD柱", "", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.rsi14", "RSI14", "", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.atr14", "ATR14", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.bollMiddle", "BOLL中轨", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.bollUpper", "BOLL上轨", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.bollLower", "BOLL下轨", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.historicalVolatility20Pct", "20日历史波动率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.return5Pct", "5日收益率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.return20Pct", "20日收益率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.support20", "20日支撑位", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.resistance20", "20日压力位", "元", owner, source, result);
+            addStructuredFact(facts, payload, "technicalIndicators.priceVsMa20Pct", "相对MA20偏离", "%", owner, source, result);
+
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.close", "技术收盘价", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.ma5", "MA5", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.ma10", "MA10", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.ma20", "MA20", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.ma60", "MA60", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.macdDif", "MACD_DIF", "", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.macdDea", "MACD_DEA", "", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.macdHistogram", "MACD柱", "", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.rsi14", "RSI14", "", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.atr14", "ATR14", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.historicalVolatility20Pct", "20日历史波动率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.return5Pct", "5日收益率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.return20Pct", "20日收益率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.support20", "20日支撑位", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.resistance20", "20日压力位", "元", owner, source, result);
+            addStructuredFact(facts, payload, "anchorFacts.technicalIndicators.priceVsMa20Pct", "相对MA20偏离", "%", owner, source, result);
+
+            addStructuredFact(facts, payload, "marketBenchmark.return5Pct", "基准5日收益率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "marketBenchmark.return20Pct", "基准20日收益率", "%", owner, source, result);
+            addStructuredFact(facts, payload, "marketBenchmark.relativeStrength20Pct", "20日相对强弱", "%", owner, source, result);
+        } catch (Exception ignored) {
+        }
+        return facts;
+    }
+
+    private void addStructuredFact(List<NumericFact> facts,
+                                   JSONObject payload,
+                                   String path,
+                                   String label,
+                                   String unit,
+                                   String owner,
+                                   String source,
+                                   WebSearchService.SearchResult result) {
+        Double value = parseNumericValue(readJsonPath(payload, path));
+        if (value == null || !Double.isFinite(value)) {
+            return;
+        }
+        NumericFact fact = new NumericFact();
+        fact.label = label;
+        fact.labelKey = normalizeFactLabel(label);
+        fact.value = value;
+        fact.unit = unit == null ? "" : unit;
+        fact.rawValue = formatFactNumber(value) + fact.unit;
+        fact.owner = owner;
+        fact.source = source;
+        fact.path = path;
+        fact.sourceType = result == null ? null : result.sourceType;
+        fact.rawHash = result == null ? null : result.rawHash;
+        facts.add(fact);
+    }
+
+    private Object readJsonPath(Object root, String path) {
+        if (root == null || path == null || path.isBlank()) {
+            return null;
+        }
+        Object current = root;
+        for (String segment : path.split("\\.")) {
+            if (current == null || segment == null || segment.isBlank()) {
+                return null;
+            }
+            String key = segment;
+            Integer index = null;
+            int bracket = segment.indexOf('[');
+            if (bracket >= 0 && segment.endsWith("]")) {
+                key = segment.substring(0, bracket);
+                try {
+                    index = Integer.parseInt(segment.substring(bracket + 1, segment.length() - 1));
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+            if (!key.isBlank()) {
+                if (current instanceof JSONObject) {
+                    current = ((JSONObject) current).get(key);
+                } else if (current instanceof Map<?, ?>) {
+                    current = ((Map<?, ?>) current).get(key);
+                } else {
+                    return null;
+                }
+            }
+            if (index != null) {
+                if (current instanceof JSONArray) {
+                    JSONArray arr = (JSONArray) current;
+                    current = index >= 0 && index < arr.size() ? arr.get(index) : null;
+                } else if (current instanceof List<?>) {
+                    List<?> list = (List<?>) current;
+                    current = index >= 0 && index < list.size() ? list.get(index) : null;
+                } else {
+                    return null;
+                }
+            }
+        }
+        return current;
+    }
+
+    private List<NumericFact> extractFactsFromFactJsonArray(JSONArray arr, String owner, String fallbackSource) {
+        List<NumericFact> facts = new ArrayList<>();
+        if (arr == null || arr.isEmpty()) {
+            return facts;
+        }
+        for (int i = 0; i < arr.size(); i++) {
+            JSONObject item = arr.getJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            String label = item.getString("label");
+            if (label == null || label.isBlank()) {
+                continue;
+            }
+            Double value = parseNumericValue(item.get("value"));
+            if (value == null) {
+                value = parseNumericValue(item.getString("rawValue"));
+            }
+            if (value == null || !Double.isFinite(value)) {
+                continue;
+            }
+            NumericFact fact = new NumericFact();
+            fact.label = label;
+            fact.labelKey = normalizeFactLabel(label);
+            fact.value = value;
+            fact.unit = firstNonBlank(item.getString("unit"), "");
+            fact.rawValue = firstNonBlank(item.getString("rawValue"), formatFactNumber(value) + fact.unit);
+            fact.owner = firstNonBlank(owner, item.getString("owner"));
+            fact.source = firstNonBlank(item.getString("source"), fallbackSource);
+            fact.path = item.getString("path");
+            fact.sourceType = item.getString("sourceType");
+            fact.rawHash = item.getString("rawHash");
+            facts.add(fact);
+        }
+        return facts;
+    }
+
+    private Double parseNumericValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (value instanceof Number) {
+            return ((Number) value).doubleValue();
+        }
+        String text = String.valueOf(value).trim();
+        if (text.isBlank() || "-".equals(text) || "--".equals(text) || "null".equalsIgnoreCase(text)) {
+            return null;
+        }
+        text = text.replace(",", "")
+                .replace("%", "")
+                .replace("元", "")
+                .replace("倍", "")
+                .replace("户", "")
+                .replace("股", "")
+                .replace("次", "")
+                .replace("万元", "")
+                .replace("亿", "");
+        Matcher matcher = Pattern.compile("[-+]?\\d+(?:\\.\\d+)?").matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        try {
+            return Double.parseDouble(matcher.group());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private String formatFactNumber(double value) {
+        if (!Double.isFinite(value)) {
+            return String.valueOf(value);
+        }
+        BigDecimal decimal = BigDecimal.valueOf(value).stripTrailingZeros();
+        if (decimal.scale() < 0) {
+            decimal = decimal.setScale(0);
+        }
+        return decimal.toPlainString();
     }
 
     private List<NumericFact> extractFactsFromText(String text, String owner, String source) {
@@ -1907,7 +3616,9 @@ public class MeetingDebateService {
     private boolean shouldIgnoreFactLabel(String label) {
         String normalized = normalizeFactLabel(label);
         return normalized.isBlank()
-                || containsAny(normalized, "日期", "时间", "年份", "year", "round", "来源", "链接", "作者", "评分");
+                || containsAny(normalized,
+                "日期", "时间", "年份", "year", "round", "来源", "链接", "作者", "评分",
+                "电话", "热线", "邮箱", "字号", "字体", "应用", "客户端", "浏览量");
     }
 
     private String normalizeFactLabel(String label) {
@@ -2009,7 +3720,7 @@ public class MeetingDebateService {
     private String resolveMeetingTitle(Long meetingId) {
         try {
             if (meetingId != null) {
-                com.aimeeting.room.entity.AiMeetingRoom room = roomMapper.selectById(meetingId);
+                AiMeetingRoom room = roomMapper.selectById(meetingId);
                 if (room != null && room.getTitle() != null) {
                     return room.getTitle().trim();
                 }
@@ -2017,6 +3728,30 @@ public class MeetingDebateService {
         } catch (Exception ignored) {
         }
         return "";
+    }
+
+    private String resolveMeetingSearchText(Long meetingId) {
+        return resolveMeetingSearchText(meetingId, true);
+    }
+
+    private String resolveMeetingSearchText(Long meetingId, boolean includeProjectMetadata) {
+        try {
+            if (meetingId == null) {
+                return "";
+            }
+            AiMeetingRoom room = roomMapper.selectById(meetingId);
+            if (room == null) {
+                return "";
+            }
+            return String.join(" ",
+                    firstNonBlank(room.getTitle(), ""),
+                    firstNonBlank(room.getDescription(), ""),
+                    includeProjectMetadata ? firstNonBlank(room.getProjectKey(), "") : "",
+                    includeProjectMetadata ? firstNonBlank(room.getProjectContext(), "") : ""
+            ).trim();
+        } catch (Exception ignored) {
+            return "";
+        }
     }
 
     private Integer extractYear(String text) {
@@ -2038,12 +3773,27 @@ public class MeetingDebateService {
         private Integer targetYear;
         private List<String> sourceFocus = new ArrayList<>();
         private List<String> queries = new ArrayList<>();
+        private String eastmoneySymbol;
+        private String eastmoneyMarket;
+        private List<String> eastmoneyFields = new ArrayList<>();
 
         private boolean isEmpty() {
             return (intent == null || intent.isBlank())
                     && freshnessDays == null
                     && targetYear == null
-                    && (sourceFocus == null || sourceFocus.isEmpty());
+                    && (sourceFocus == null || sourceFocus.isEmpty())
+                    && (eastmoneySymbol == null || eastmoneySymbol.isBlank())
+                    && (eastmoneyFields == null || eastmoneyFields.isEmpty());
+        }
+    }
+
+    private static class StockRef {
+        private final String symbol;
+        private final String market;
+
+        private StockRef(String symbol, String market) {
+            this.symbol = symbol;
+            this.market = market;
         }
     }
 
@@ -2055,6 +3805,9 @@ public class MeetingDebateService {
         private String rawValue;
         private String owner;
         private String source;
+        private String path;
+        private String sourceType;
+        private String rawHash;
     }
 
     // ── 解析 ==REPLY== 分隔符 ──
@@ -2186,8 +3939,8 @@ public class MeetingDebateService {
         return String.format(
                 "你是「%s」，正在参与一场多方深度讨论。你的立场/背景：%s\n\n" +
                 "发言要求：\n" +
-                "1. 【必须引用真实信息】优先引用上方【最新实时资讯】中的内容（如果有）；如无实时资讯，则明确引用你所知道的最新数据和事件，并注明大致时间（如「2024年底」「2025年初」）\n" +
-                "2. 必须包含具体数字、百分比、机构名称、事件名称等可验证的信息，不得使用模糊表达\n" +
+                "1. 【必须引用真实信息】优先引用上方【最新实时资讯】中的内容（如果有）；如无实时资讯，只能引用你能明确标注时间边界的稳定背景信息\n" +
+                "2. 只有当上方证据明确出现时，才可以引用具体数字、百分比、机构名称、事件名称；没有证据时必须写“本轮证据未提供/无法核验”，不得为了显得专业而补数\n" +
                 "3. 其他成员的发言和论据只能视为待核验主张，不能直接当作事实复述；若你本轮搜索结果与前文冲突，必须明确指出冲突并说明你采用哪一侧及原因\n" +
                 "4. 对其他成员的具体论据发起有针对性的挑战或补充，不得泛泛而谈\n" +
                 "5. 【最高优先级】如果主持人发布了指令或矫正，必须以此为核心重新定向你的整个发言方向\n" +

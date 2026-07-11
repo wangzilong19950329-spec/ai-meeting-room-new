@@ -1,0 +1,6 @@
+{
+  "query": "你是A股技术预测分析员。请只基于下面明确提供的真实行情快照做可事后评分的预测，不要把当前日期之后尚未提供的数据当成已知事实，也不要编造缺失指标。\n\n标的：中船特气（688146.SH）\n行情来源：Eastmoney quote\n行情截止：2026-06-18 16:11（这是当前系统能够取得的最新快照，不代表2026-06-19盘中行情）\n最新价/收盘参考价：364.00\n前收：339.70\n开盘：332.00\n最高：365.00\n最低：323.36\n涨跌幅：+7.15%\n成交量：156310\n成交额：53.64485787亿元\n换手率：10.78%\n量比：0.70\n主力净流入：5982.2752万元\n\n任务：\n1. 预测下一交易日收盘相对364.00的方向，方向只能是UP、DOWN、SIDEWAYS；SIDEWAYS定义为涨跌幅绝对值小于1%。\n2. 给出下一交易日可能收盘区间、概率和使该判断失效的价格。\n3. 预测未来5个交易日结束时相对364.00的方向，并给出期间合理价格区间、概率和失效价格。\n4. 概率必须是0到1之间的小数；区间、预期收益范围和失效价格必须互相一致。\n5. 缺少日线历史、均线、估值或新闻时，写入missingData，不允许补造。\n\n只输出一个JSON对象，不要Markdown、代码块或前后解释。字段固定为：\n{\"asOf\":\"string\",\"sourcePrice\":number,\"summary\":\"string\",\"forecasts\":[{\"horizon\":\"T+1_CLOSE或T+5_CLOSE\",\"direction\":\"UP或DOWN或SIDEWAYS\",\"probability\":number,\"targetLow\":number,\"targetHigh\":number,\"expectedReturnLowPct\":number,\"expectedReturnHighPct\":number,\"invalidationPrice\":number,\"rationale\":[\"string\"]}],\"risks\":[\"string\"],\"missingData\":[\"string\"]}",
+  "sessionKey": "stock-watch-forecast-probe-sh-688146-v1",
+  "forceNewSession": true,
+  "closeTargetAfter": false
+}

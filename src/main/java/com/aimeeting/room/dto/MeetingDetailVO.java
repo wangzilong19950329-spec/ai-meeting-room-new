@@ -232,6 +232,11 @@ public class MeetingDetailVO {
         private String source;
         private String snippet;
         private String url;
+        private String provider;
+        private String sourceType;
+        private String query;
+        private String fetchedAt;
+        private String rawHash;
     }
 
     @Data

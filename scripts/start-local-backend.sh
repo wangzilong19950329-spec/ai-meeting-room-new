@@ -26,4 +26,5 @@ else
 fi
 
 cd "$ROOT_DIR"
+echo "[info] stock-watch full stack command: scripts/start-stock-watch-stack.sh" >&2
 exec mvn -q spring-boot:run -Dspring-boot.run.arguments="--server.port=${PORT}"

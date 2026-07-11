@@ -111,7 +111,7 @@ public class NotificationService {
         try {
             mailSender.send(message);
             String messageId = "stock-watch-" + UUID.randomUUID();
-            log.info("股票盯盘邮件发送成功: subject={}, recipients={}", message.getSubject(), normalizedRecipients);
+            log.info("股票盯盘邮件发送成功: subject={}, recipients={}", message.getSubject(), maskRecipients(normalizedRecipients));
             return EmailSendResult.ok(messageId);
         } catch (Exception e) {
             log.warn("股票盯盘邮件发送失败: {}", e.getMessage());
@@ -157,7 +157,7 @@ public class NotificationService {
 
         try {
             mailSender.send(message);
-            log.info("邮件通知发送成功: subject={}, recipients={}", message.getSubject(), recipients);
+            log.info("邮件通知发送成功: subject={}, recipients={}", message.getSubject(), maskRecipients(recipients));
             return true;
         } catch (Exception e) {
             log.warn("邮件通知发送失败: {}", e.getMessage());
@@ -250,6 +250,30 @@ public class NotificationService {
 
     private String safeText(String value) {
         return value == null ? "" : value;
+    }
+
+    private List<String> maskRecipients(List<String> recipients) {
+        if (recipients == null || recipients.isEmpty()) {
+            return List.of();
+        }
+        return recipients.stream()
+                .map(this::maskEmail)
+                .collect(Collectors.toList());
+    }
+
+    private String maskEmail(String email) {
+        if (email == null || email.isBlank()) {
+            return "";
+        }
+        String trimmed = email.trim();
+        int at = trimmed.indexOf('@');
+        if (at <= 0) {
+            return trimmed.length() <= 2 ? "**" : trimmed.charAt(0) + "***";
+        }
+        String local = trimmed.substring(0, at);
+        String domain = trimmed.substring(at);
+        String visible = local.length() <= 2 ? local.substring(0, 1) : local.substring(0, Math.min(3, local.length()));
+        return visible + "***" + domain;
     }
 
     private boolean isBlank(String value) {

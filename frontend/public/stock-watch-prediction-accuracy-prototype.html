@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stock Watch - DeepSeek 预测复盘</title>
+  <style>
+    :root {
+      --ink: #0c172b;
+      --muted: #66748a;
+      --line: #dfe6ed;
+      --paper: #ffffff;
+      --canvas: #eef3f6;
+      --blue: #1268d7;
+      --blue-soft: #eaf3ff;
+      --teal: #0d7b68;
+      --teal-soft: #dcf6ed;
+      --red: #d94037;
+      --red-soft: #ffebe7;
+      --green: #11976d;
+      --green-soft: #e0f6ed;
+      --amber: #b86a16;
+      --amber-soft: #fff1d8;
+      --shadow: 0 20px 55px rgba(34, 58, 82, .09);
+      --radius: 30px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-width: 1180px;
+      background:
+        radial-gradient(circle at 10% -8%, rgba(111, 220, 183, .22), transparent 25%),
+        radial-gradient(circle at 91% 5%, rgba(82, 146, 225, .18), transparent 23%),
+        linear-gradient(180deg, #f8fbfc 0%, var(--canvas) 100%);
+      color: var(--ink);
+      font-family: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+    }
+
+    button { font: inherit; }
+
+    .page {
+      width: min(1540px, calc(100% - 54px));
+      margin: 28px auto 72px;
+    }
+
+    .hero,
+    .score-card,
+    .chart-card,
+    .pending-card,
+    .calibration-card,
+    .breakdown-card,
+    .ledger-card {
+      border: 1px solid rgba(207, 219, 229, .86);
+      background: rgba(255, 255, 255, .94);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      min-height: 168px;
+      padding: 34px 38px;
+      border-radius: var(--radius);
+    }
+
+    .hero::after {
+      position: absolute;
+      right: 16%;
+      top: -115px;
+      width: 380px;
+      height: 380px;
+      border: 1px solid rgba(18, 104, 215, .13);
+      border-radius: 50%;
+      box-shadow: 0 0 0 52px rgba(18, 104, 215, .035), 0 0 0 104px rgba(13, 123, 104, .025);
+      content: "";
+    }
+
+    .eyebrow {
+      margin: 0 0 9px;
+      color: var(--teal);
+      font-size: 13px;
+      font-weight: 900;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      margin-bottom: 10px;
+      font-size: 37px;
+      line-height: 1.08;
+      letter-spacing: -.035em;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    .hero-actions {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-chip,
+    .filter,
+    .segment button,
+    .outline-button,
+    .dark-button {
+      border-radius: 14px;
+      font-weight: 800;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 16px;
+      background: var(--teal-soft);
+      color: var(--teal);
+    }
+
+    .status-chip i {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--teal);
+      box-shadow: 0 0 0 5px rgba(13, 123, 104, .12);
+    }
+
+    .outline-button,
+    .dark-button {
+      padding: 13px 18px;
+      border: 1px solid #cbd6e1;
+      background: white;
+      color: #344258;
+      text-decoration: none;
+    }
+
+    .dark-button {
+      border-color: #101c2f;
+      background: #101c2f;
+      color: white;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 22px 0;
+      padding: 10px 12px 10px 20px;
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      background: rgba(255,255,255,.72);
+      backdrop-filter: blur(12px);
+    }
+
+    .scope-note {
+      color: #56657b;
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .scope-note strong { color: var(--ink); }
+
+    .filters { display: flex; gap: 10px; }
+
+    .filter {
+      padding: 10px 14px;
+      border: 1px solid #d3dde6;
+      background: #fff;
+      color: #45536a;
+    }
+
+    .segment {
+      display: flex;
+      gap: 4px;
+      padding: 4px;
+      border: 1px solid #d3dde6;
+      border-radius: 16px;
+      background: #f5f8fa;
+    }
+
+    .segment button {
+      padding: 7px 13px;
+      border: 0;
+      background: transparent;
+      color: #68768a;
+    }
+
+    .segment .active {
+      background: #132036;
+      color: #fff;
+      box-shadow: 0 6px 16px rgba(19, 32, 54, .16);
+    }
+
+    .metric-grid {
+      display: grid;
+      grid-template-columns: 1.23fr repeat(4, 1fr);
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    .metric {
+      min-height: 142px;
+      padding: 23px 24px;
+      border: 1px solid var(--line);
+      border-radius: 23px;
+      background: rgba(255,255,255,.92);
+      box-shadow: 0 12px 32px rgba(47, 67, 87, .055);
+    }
+
+    .metric.featured {
+      color: white;
+      border-color: #123044;
+      background: linear-gradient(135deg, #0e1a2d 0%, #123b3a 100%);
+    }
+
+    .metric-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: #728096;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .featured .metric-label { color: #a9d6c9; }
+
+    .metric strong {
+      display: block;
+      margin: 13px 0 5px;
+      font-size: 37px;
+      line-height: 1;
+      letter-spacing: -.045em;
+    }
+
+    .metric small {
+      color: #738196;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .featured small { color: #c0d5d1; }
+
+    .delta {
+      color: #6ee0b7;
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .primary-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.75fr) minmax(350px, .82fr);
+      gap: 16px;
+    }
+
+    .chart-card,
+    .pending-card,
+    .calibration-card,
+    .breakdown-card,
+    .ledger-card {
+      border-radius: var(--radius);
+    }
+
+    .chart-card,
+    .pending-card { min-height: 420px; }
+
+    .card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      padding: 25px 27px 0;
+    }
+
+    .card-head h2 {
+      margin-bottom: 5px;
+      font-size: 22px;
+      letter-spacing: -.02em;
+    }
+
+    .card-head p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .legend { display: flex; gap: 17px; color: #657388; font-size: 12px; font-weight: 800; }
+    .legend span { display: flex; align-items: center; gap: 7px; }
+    .legend i { width: 18px; height: 3px; border-radius: 4px; background: var(--blue); }
+    .legend .baseline i { background: #9aa7b8; border-top: 1px dashed #9aa7b8; }
+
+    .chart-wrap { padding: 12px 24px 18px; }
+
+    .pending-body { padding: 19px 25px 24px; }
+
+    .pending-item {
+      position: relative;
+      padding: 19px 18px;
+      border: 1px solid #dfe7ee;
+      border-radius: 19px;
+      background: #f9fbfc;
+    }
+
+    .pending-item + .pending-item { margin-top: 12px; }
+
+    .pending-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 11px; }
+
+    .direction {
+      display: inline-flex;
+      padding: 6px 10px;
+      border-radius: 10px;
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .direction.up { color: var(--red); background: var(--red-soft); }
+    .direction.down { color: var(--green); background: var(--green-soft); }
+    .direction.flat { color: var(--amber); background: var(--amber-soft); }
+
+    .pending-item time { color: #8491a2; font-size: 12px; font-weight: 800; }
+    .pending-item h3 { margin-bottom: 8px; font-size: 17px; }
+    .pending-item p { margin-bottom: 13px; color: #637188; font-size: 13px; line-height: 1.65; }
+
+    .pending-meta { display: flex; gap: 7px; }
+    .pending-meta span {
+      padding: 6px 9px;
+      border-radius: 9px;
+      background: white;
+      color: #59677d;
+      font-size: 11px;
+      font-weight: 850;
+      box-shadow: inset 0 0 0 1px #e0e7ed;
+    }
+
+    .secondary-grid {
+      display: grid;
+      grid-template-columns: 1.24fr .76fr;
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .calibration-card,
+    .breakdown-card { min-height: 330px; }
+    .calibration-body { padding: 22px 28px 26px; }
+
+    .bar-row {
+      display: grid;
+      grid-template-columns: 72px minmax(0, 1fr) 56px;
+      align-items: center;
+      gap: 13px;
+      margin-bottom: 16px;
+      font-size: 12px;
+      font-weight: 800;
+      color: #68758a;
+    }
+
+    .track {
+      position: relative;
+      height: 25px;
+      overflow: hidden;
+      border-radius: 8px;
+      background: #edf2f6;
+    }
+
+    .track::after {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: var(--expected);
+      border-left: 2px dashed rgba(24, 40, 62, .34);
+      content: "";
+    }
+
+    .track span {
+      display: block;
+      width: var(--actual);
+      height: 100%;
+      border-radius: 8px;
+      background: linear-gradient(90deg, #8ab9f5 0%, var(--blue) 100%);
+    }
+
+    .bar-row strong { color: var(--ink); text-align: right; }
+
+    .breakdown-body { padding: 18px 25px 24px; }
+
+    .breakdown-row {
+      display: grid;
+      grid-template-columns: 58px 1fr 66px;
+      align-items: center;
+      gap: 13px;
+      padding: 14px 0;
+      border-bottom: 1px solid #edf1f4;
+    }
+
+    .breakdown-row:last-child { border-bottom: 0; }
+    .breakdown-row > span { font-size: 13px; font-weight: 900; }
+    .mini-track { height: 8px; border-radius: 7px; background: #edf2f5; }
+    .mini-track i { display: block; width: var(--value); height: 100%; border-radius: inherit; background: var(--teal); }
+    .breakdown-row strong { text-align: right; font-size: 15px; }
+    .breakdown-row small { display: block; color: #8a96a6; font-size: 11px; }
+
+    .ledger-card { margin-top: 16px; overflow: hidden; }
+
+    .ledger-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 25px 27px 19px;
+      border-bottom: 1px solid #e7edf1;
+    }
+
+    .ledger-toolbar h2 { margin: 0 0 4px; font-size: 22px; }
+    .ledger-toolbar p { margin: 0; color: var(--muted); font-size: 13px; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      padding: 14px 17px;
+      background: #f5f8fa;
+      color: #778498;
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: .07em;
+      text-align: left;
+      text-transform: uppercase;
+    }
+
+    td {
+      padding: 18px 17px;
+      border-top: 1px solid #edf1f4;
+      color: #354258;
+      font-size: 13px;
+      font-weight: 700;
+      vertical-align: middle;
+    }
+
+    tbody tr:hover { background: #fbfcfd; }
+    .prediction-title { color: var(--ink); font-size: 14px; font-weight: 900; }
+    .prediction-title small { display: block; margin-top: 5px; color: #8793a3; font-size: 11px; font-weight: 700; }
+
+    .result-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 9px;
+      border-radius: 9px;
+      font-size: 11px;
+      font-weight: 900;
+    }
+
+    .result-chip.hit { color: #075fb5; background: #e7f2ff; }
+    .result-chip.miss { color: #9c5614; background: #fff0d8; }
+    .result-chip.wait { color: #6c788a; background: #edf1f5; }
+
+    .trace-link { color: var(--blue); font-weight: 900; text-decoration: none; }
+    .footnote { padding: 15px 27px 19px; border-top: 1px solid #e7edf1; color: #778498; font-size: 11px; line-height: 1.6; }
+
+    @media (max-width: 1280px) {
+      .page { width: calc(100% - 36px); }
+      .metric-grid { grid-template-columns: repeat(5, 1fr); }
+      .metric strong { font-size: 32px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">deepseek forecast audit</p>
+        <h1>中船特气 · 预测复盘</h1>
+        <p class="subtitle">真实预测已生成并冻结；到期后按真实行情自动评分，当前处于首批样本等待期。</p>
+      </div>
+      <div class="hero-actions">
+        <span class="status-chip"><i></i>DeepSeek 网页预测已跑通</span>
+        <button class="outline-button">导出评估报告</button>
+        <a class="dark-button" href="https://chat.deepseek.com/a/chat/s/6f837667-5a79-4c75-bd94-93be54b2cc81" target="_blank" rel="noreferrer">查看真实会话 ↗</a>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <div class="scope-note"><strong>真实行情：</strong>364.00 元 · +7.15% · 东方财富快照截止 2026-06-18 16:11；当前没有到期样本。</div>
+      <div class="filters">
+        <button class="filter">近 90 天⌄</button>
+        <div class="segment" aria-label="分析周期">
+          <button class="active">全部</button><button>日内</button><button>周</button><button>月</button>
+        </div>
+        <button class="filter">全部预测类型⌄</button>
+      </div>
+    </section>
+
+    <section class="metric-grid">
+      <article class="metric featured">
+        <div class="metric-label"><span>方向准确率</span><span class="delta">等待首批到期</span></div>
+        <strong>—</strong>
+        <small>0 条已评估 · 暂不能计算</small>
+      </article>
+      <article class="metric">
+        <div class="metric-label"><span>有效样本</span><span>待评估 2</span></div>
+        <strong>0</strong>
+        <small>T+1 与 T+5 各 1 条待到期</small>
+      </article>
+      <article class="metric">
+        <div class="metric-label"><span>价格区间命中</span><span>收盘口径</span></div>
+        <strong>—</strong>
+        <small>到期收盘尚未产生</small>
+      </article>
+      <article class="metric">
+        <div class="metric-label"><span>平均绝对误差</span><span>目标中位值</span></div>
+        <strong>—</strong>
+        <small>需要预测值与实际值配对</small>
+      </article>
+      <article class="metric">
+        <div class="metric-label"><span>Brier 概率分</span><span>概率校准</span></div>
+        <strong>—</strong>
+        <small>至少 20 条到期样本后展示</small>
+      </article>
+    </section>
+
+    <section class="primary-grid">
+      <article class="chart-card">
+        <div class="card-head">
+          <div><h2>首批真实预测区间</h2><p>基准价 364.00；区间与失效价均来自本次 DeepSeek 网页预测</p></div>
+          <div class="legend"><span><i></i>预测中心</span><span class="baseline"><i></i>基准价</span></div>
+        </div>
+        <div class="chart-wrap">
+          <svg viewBox="0 0 920 310" width="100%" height="310" role="img" aria-label="真实预测价格区间图">
+            <g stroke="#e5ebef" stroke-width="1">
+              <line x1="72" y1="35" x2="888" y2="35"/><line x1="72" y1="95" x2="888" y2="95"/>
+              <line x1="72" y1="155" x2="888" y2="155"/><line x1="72" y1="215" x2="888" y2="215"/>
+            </g>
+            <g fill="#8390a1" font-size="11" font-weight="700">
+              <text x="20" y="39">380</text><text x="20" y="99">365</text><text x="20" y="159">350</text><text x="20" y="219">335</text><text x="20" y="267">320</text>
+              <text x="145" y="295">快照 06/18</text><text x="445" y="295">T+1 收盘</text><text x="742" y="295">T+5 收盘</text>
+            </g>
+            <line x1="72" y1="99" x2="888" y2="99" stroke="#98a5b5" stroke-width="2" stroke-dasharray="8 8"/>
+            <text x="82" y="88" fill="#738196" font-size="12" font-weight="800">基准价 364.00</text>
+            <circle cx="190" cy="99" r="9" fill="#fff" stroke="#0d7b68" stroke-width="5"/>
+            <line x1="500" y1="101" x2="500" y2="155" stroke="#11976d" stroke-width="16" stroke-linecap="round" opacity=".28"/>
+            <circle cx="500" cy="128" r="9" fill="#11976d"/>
+            <line x1="790" y1="115" x2="790" y2="235" stroke="#11976d" stroke-width="16" stroke-linecap="round" opacity=".28"/>
+            <circle cx="790" cy="175" r="9" fill="#11976d"/>
+            <g transform="translate(430,39)"><rect width="140" height="37" rx="11" fill="#e0f6ed"/><text x="16" y="24" fill="#087656" font-size="13" font-weight="900">看跌 40% · 350–363.5</text></g>
+            <g transform="translate(715,47)"><rect width="152" height="37" rx="11" fill="#e0f6ed"/><text x="16" y="24" fill="#087656" font-size="13" font-weight="900">看跌 35% · 330–360</text></g>
+            <text x="432" y="188" fill="#748196" font-size="12" font-weight="800">失效价 368</text>
+            <text x="722" y="258" fill="#748196" font-size="12" font-weight="800">失效价 370</text>
+          </svg>
+        </div>
+      </article>
+
+      <aside class="pending-card">
+        <div class="card-head">
+          <div><h2>等待结果</h2><p>到期后自动补齐行情并评分</p></div>
+          <span class="result-chip wait">2 条待评估</span>
+        </div>
+        <div class="pending-body">
+          <article class="pending-item">
+            <div class="pending-top"><span class="direction down">看跌 40%</span><time>06/18 16:11</time></div>
+            <h3>T+1 收盘方向</h3>
+            <p>预测区间 350.00–363.50 元；若价格站上 368.00 元，原判断失效。</p>
+            <div class="pending-meta"><span>基准价 364.00</span><span>下一交易日收盘评估</span></div>
+          </article>
+          <article class="pending-item">
+            <div class="pending-top"><span class="direction down">看跌 35%</span><time>06/18 16:11</time></div>
+            <h3>T+5 区间 330.00–360.00</h3>
+            <p>预期收益 -9.34% 至 -1.10%；若价格站上 370.00 元，原判断失效。</p>
+            <div class="pending-meta"><span>未来第 5 个交易日评估</span><span>真实网页会话</span></div>
+          </article>
+        </div>
+      </aside>
+    </section>
+
+    <section class="secondary-grid">
+      <article class="calibration-card">
+        <div class="card-head">
+          <div><h2>置信度校准</h2><p>首批预测尚未到期，当前只展示预测置信度，不伪造实际命中率</p></div>
+          <span class="result-chip wait">至少 20 条后启用</span>
+        </div>
+        <div class="calibration-body">
+          <div class="bar-row"><span>30–40%</span><div class="track" style="--actual:0%;--expected:37%"><span></span></div><strong>2 条待评估</strong></div>
+          <div class="bar-row"><span>40–50%</span><div class="track" style="--actual:0%;--expected:45%"><span></span></div><strong>0 条</strong></div>
+          <div class="bar-row"><span>50–70%</span><div class="track" style="--actual:0%;--expected:60%"><span></span></div><strong>0 条</strong></div>
+          <div class="bar-row"><span>70%+</span><div class="track" style="--actual:0%;--expected:75%"><span></span></div><strong>0 条</strong></div>
+        </div>
+      </article>
+
+      <article class="breakdown-card">
+        <div class="card-head"><div><h2>按预测周期拆分</h2><p>不同周期不混算，样本不足时不排名</p></div></div>
+        <div class="breakdown-body">
+          <div class="breakdown-row"><span>T+1</span><div class="mini-track"><i style="--value:0%"></i></div><strong>—<small>待评估 1</small></strong></div>
+          <div class="breakdown-row"><span>T+5</span><div class="mini-track"><i style="--value:0%"></i></div><strong>—<small>待评估 1</small></strong></div>
+          <div class="breakdown-row"><span>月度</span><div class="mini-track"><i style="--value:0%;background:#c58a29"></i></div><strong>—<small>尚无预测</small></strong></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="ledger-card">
+      <div class="ledger-toolbar">
+        <div><h2>预测账本</h2><p>预测快照不可修改；每个评分都保留行情证据、规则版本和原 DeepSeek 会话。</p></div>
+        <button class="outline-button">筛选与对比⌄</button>
+      </div>
+      <table>
+        <thead><tr><th>生成时间 / 周期</th><th>原预测</th><th>置信度</th><th>实际结果</th><th>评分</th><th>行情证据</th><th>溯源</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>06/18 16:11<br><span class="direction down">T+1 看跌</span></td>
+            <td><span class="prediction-title">350.00–363.50 元<small>预期收益 -3.85% 至 -0.14% · 失效 368.00</small></span></td>
+            <td>40%</td><td>—</td><td><span class="result-chip wait">等待下一交易日收盘</span></td><td>东方财富 364.00</td><td><a class="trace-link" href="https://chat.deepseek.com/a/chat/s/6f837667-5a79-4c75-bd94-93be54b2cc81" target="_blank" rel="noreferrer">原会话 ↗</a></td>
+          </tr>
+          <tr>
+            <td>06/18 16:11<br><span class="direction down">T+5 看跌</span></td>
+            <td><span class="prediction-title">330.00–360.00 元<small>预期收益 -9.34% 至 -1.10% · 失效 370.00</small></span></td>
+            <td>35%</td><td>—</td><td><span class="result-chip wait">等待第 5 个交易日收盘</span></td><td>东方财富 364.00</td><td><a class="trace-link" href="https://chat.deepseek.com/a/chat/s/6f837667-5a79-4c75-bd94-93be54b2cc81" target="_blank" rel="noreferrer">原会话 ↗</a></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="footnote">本次真实缺失数据：日线历史及均线、估值与行业对比、大盘及板块走势。模型明确将其写入 missingData，因此当前预测置信度仅 35%–40%。准确率、区间命中、平均误差和 Brier 分必须等预测到期后才能计算。</div>
+    </section>
+  </div>
+</body>
+</html>

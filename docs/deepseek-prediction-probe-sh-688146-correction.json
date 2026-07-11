@@ -1,0 +1,6 @@
+{
+  "query": "上一版预测未通过结构化校验，请纠正后重新输出完整JSON：\n1. 5982.2752万元等于0.59822752亿元，不是5.98亿元；请修正相关理由。\n2. 我已经定义SIDEWAYS为到期涨跌幅绝对值小于1%。上一版T+1区间350-370（-3.85%到+1.65%）和T+5区间330-380（-9.34%到+4.40%）不能整体支持SIDEWAYS。请重新选择与预测中心和概率一致的UP、DOWN或SIDEWAYS；区间可以表示不确定性，但direction必须代表概率最高的到期方向。\n3. targetLow/targetHigh与expectedReturnLowPct/expectedReturnHighPct必须按sourcePrice=364.00重新核算并保持一致。\n4. 不得引入新行情、历史数据或新闻。\n\n只输出修正后的完整JSON对象，不要Markdown、代码块或解释，字段结构保持上一版完全相同。",
+  "sessionKey": "stock-watch-forecast-probe-sh-688146-v1",
+  "forceNewSession": false,
+  "closeTargetAfter": false
+}

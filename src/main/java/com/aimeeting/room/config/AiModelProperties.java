@@ -34,5 +34,17 @@ public class AiModelProperties {
         private int baseReward = 100;
         private int basePenalty = 50;
         private double dissentPenaltyFactor = 0.3;
+        private DeepSeekWebBridgeConfig deepseekWebBridge = new DeepSeekWebBridgeConfig();
+    }
+
+    @Data
+    public static class DeepSeekWebBridgeConfig {
+        private boolean enabled = false;
+        private String bridgeUrl = "http://127.0.0.1:8789/search";
+        private int connectTimeoutSeconds = 10;
+        private int readTimeoutSeconds = 480;
+        private String mode = "expert";
+        private String searchMode = "fast";
+        private boolean serialized = true;
     }
 }

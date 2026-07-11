@@ -11,6 +11,7 @@ const CHROME_LOG_PATH = process.env.DEEPSEEK_WEB_CHROME_LOG
   || path.join(os.tmpdir(), 'deepseek-web-chrome.log');
 const SESSION_STORE_PATH = process.env.DEEPSEEK_WEB_SESSION_STORE
   || path.join(os.homedir(), '.aimeeting-room', 'deepseek-web-sessions.json');
+const SESSION_STORE_META_KEY = '__meta';
 const SOURCE_CHROME_DIR = path.join(os.homedir(), 'Library/Application Support/Google/Chrome');
 const WAIT_TIMEOUT_MS = Number(process.env.DEEPSEEK_WEB_WAIT_TIMEOUT_MS || 120000);
 const QUICK_RETURN_BUDGET_MS = Number(process.env.DEEPSEEK_WEB_QUICK_RETURN_BUDGET_MS || 12000);
@@ -56,6 +57,60 @@ function saveSessionStore(store) {
     fs.mkdirSync(path.dirname(SESSION_STORE_PATH), { recursive: true });
     fs.writeFileSync(SESSION_STORE_PATH, JSON.stringify(store || {}, null, 2));
   } catch (_) {}
+}
+
+function sessionStoreEntries(store) {
+  return Object.entries(store || {})
+    .filter(([key, value]) => key !== SESSION_STORE_META_KEY && value && typeof value === 'object');
+}
+
+function isReusableConversationUrl(url) {
+  try {
+    const parsed = new URL(String(url || ''));
+    return parsed.origin === 'https://chat.deepseek.com'
+      && /^\/a\/chat\/s\/[^/]+\/?$/.test(parsed.pathname);
+  } catch (_) {
+    return false;
+  }
+}
+
+function selectSharedTarget(matches, store, preferredSessionKey = '') {
+  const available = Array.isArray(matches) ? matches : [];
+  const byId = new Map(available.map(item => [item.id, item]));
+  const metaTargetId = store && store[SESSION_STORE_META_KEY]
+    ? store[SESSION_STORE_META_KEY].workerTargetId
+    : '';
+  if (metaTargetId && byId.has(metaTargetId)) {
+    return byId.get(metaTargetId);
+  }
+
+  const preferred = preferredSessionKey && store ? store[preferredSessionKey] : null;
+  if (preferred && preferred.targetId && byId.has(preferred.targetId)) {
+    return byId.get(preferred.targetId);
+  }
+
+  const recentMapped = sessionStoreEntries(store)
+    .map(([, value]) => value)
+    .filter(value => value.targetId && byId.has(value.targetId))
+    .sort((left, right) => String(right.updatedAt || '').localeCompare(String(left.updatedAt || '')));
+  if (recentMapped.length > 0) {
+    return byId.get(recentMapped[0].targetId);
+  }
+  return available[0] || null;
+}
+
+function bindSessionStoreToSharedTarget(store, targetId) {
+  const next = { ...(store || {}) };
+  next[SESSION_STORE_META_KEY] = {
+    ...(next[SESSION_STORE_META_KEY] || {}),
+    mode: 'single_worker',
+    workerTargetId: targetId,
+    updatedAt: new Date().toISOString()
+  };
+  for (const [key, value] of sessionStoreEntries(next)) {
+    next[key] = { ...value, targetId };
+  }
+  return next;
 }
 
 function updateSessionStore(sessionKey, patch) {
@@ -196,6 +251,7 @@ class CdpClient {
     this.ws = new WebSocket(wsUrl);
     this.id = 0;
     this.pending = new Map();
+    this.eventListeners = new Map();
     this.ws.addEventListener('message', (event) => {
       const data = JSON.parse(event.data.toString());
       if (data.id && this.pending.has(data.id)) {
@@ -203,6 +259,13 @@ class CdpClient {
         this.pending.delete(data.id);
         if (data.error) reject(new Error(JSON.stringify(data.error)));
         else resolve(data.result);
+      }
+      if (data.method && this.eventListeners.has(data.method)) {
+        for (const handler of this.eventListeners.get(data.method)) {
+          try {
+            handler(data.params || {});
+          } catch (_) {}
+        }
       }
     });
   }
@@ -232,6 +295,14 @@ class CdpClient {
     return result.result ? result.result.value : null;
   }
 
+  on(method, handler) {
+    if (!this.eventListeners.has(method)) {
+      this.eventListeners.set(method, new Set());
+    }
+    this.eventListeners.get(method).add(handler);
+    return () => this.eventListeners.get(method)?.delete(handler);
+  }
+
   close() {
     try {
       this.ws.close();
@@ -239,6 +310,8 @@ class CdpClient {
   }
 }
 
+// Bridge requests are serialized, so logical sessions can safely share one Chrome page.
+// Conversation continuity comes from the saved DeepSeek URL instead of a permanent tab.
 async function openPageTarget(options = {}) {
   const targets = await listTargets();
   const matches = targets.filter((item) =>
@@ -248,39 +321,63 @@ async function openPageTarget(options = {}) {
     && (item.url || '').includes('chat.deepseek.com')
   );
   const sessionKey = normalizeSessionKey(options.sessionKey);
-  if (sessionKey && !options.forceNewSession) {
-    const store = loadSessionStore();
-    const saved = store[sessionKey];
-    const savedTarget = saved && saved.targetId
-      ? matches.find(item => item.id === saved.targetId)
-      : null;
-    if (savedTarget) {
-      return {
-        targetId: savedTarget.id,
-        webSocketDebuggerUrl: savedTarget.webSocketDebuggerUrl,
-        reused: true,
-        isolatedSession: false,
-        sessionKey
-      };
-    }
+  const store = loadSessionStore();
+  const savedSession = sessionKey ? store[sessionKey] : null;
+  const requestedMode = normalizeBridgeMode(options.mode || options.webMode || DEFAULT_BRIDGE_MODE);
+  const savedBridgeMode = String(savedSession && savedSession.bridgeMode || '').toLowerCase();
+  const resumeUrl = sessionKey
+    && !options.forceNewSession
+    && savedSession
+    && isReusableConversationUrl(savedSession.url)
+    && !(requestedMode === 'expert' && savedBridgeMode !== 'expert')
+    ? savedSession.url
+    : '';
+  let target = selectSharedTarget(matches, store, sessionKey);
+  const reused = !!target;
+  if (!target) {
+    target = await fetchJson(`http://127.0.0.1:${DEBUG_PORT}/json/new?https://chat.deepseek.com/`, { method: 'PUT' });
   }
-  if (!sessionKey && !options.isolatedSession && matches.length > 0) {
-    return { targetId: matches[0].id, webSocketDebuggerUrl: matches[0].webSocketDebuggerUrl, reused: true, isolatedSession: false };
-  }
-  const target = await fetchJson(`http://127.0.0.1:${DEBUG_PORT}/json/new?https://chat.deepseek.com/`, { method: 'PUT' });
+
+  const duplicateTargets = matches.filter(item => item.id !== target.id);
+  await Promise.all(duplicateTargets.map(item => closeTarget(item.id)));
+  saveSessionStore(bindSessionStoreToSharedTarget(store, target.id));
   if (sessionKey) {
     updateSessionStore(sessionKey, {
       targetId: target.id,
-      url: target.url || 'https://chat.deepseek.com/',
       forceNewSession: !!options.forceNewSession
     });
   }
   return {
     targetId: target.id,
     webSocketDebuggerUrl: target.webSocketDebuggerUrl,
-    reused: false,
+    reused,
     isolatedSession: !!options.isolatedSession,
-    sessionKey
+    sessionKey,
+    resumeUrl,
+    sharedTarget: true,
+    closedDuplicateTargets: duplicateTargets.length
+  };
+}
+
+async function ensureDebuggerAvailable() {
+  let debuggerVersion = await getExistingDebuggerVersion();
+  if (!debuggerVersion) {
+    ensureAutomationProfile();
+    const chrome = launchChrome();
+    chrome.unref();
+    debuggerVersion = await waitForDebugger();
+  }
+  return debuggerVersion;
+}
+
+async function prepareSharedTarget() {
+  await ensureDebuggerAvailable();
+  const target = await openPageTarget({ prepareOnly: true });
+  return {
+    mode: 'single_worker',
+    targetId: target.targetId,
+    reused: target.reused,
+    closedDuplicateTargets: target.closedDuplicateTargets
   };
 }
 
@@ -289,6 +386,16 @@ async function resetConversationSurface(client) {
     await client.send('Page.navigate', { url: 'https://chat.deepseek.com/' });
   } catch (_) {}
   await sleepWithJitter(PAGE_RESET_SETTLE_MS);
+}
+
+async function restoreConversationSurface(client, url) {
+  const currentUrl = await client.eval('location.href').catch(() => '');
+  if (currentUrl === url) {
+    return { restored: true, navigated: false, url };
+  }
+  await client.send('Page.navigate', { url });
+  await sleepWithJitter(PAGE_RESET_SETTLE_MS);
+  return { restored: true, navigated: true, url };
 }
 
 async function tryStartFreshConversation(client) {
@@ -344,85 +451,213 @@ async function waitForComposer(client) {
   throw new Error('DeepSeek composer textarea did not appear; login may be required');
 }
 
-// 默认 fast：经实测，DeepSeek 网页的 expert 模式不会真正触发联网搜索（newLinkCount 持续为 0），
-// 只有 fast（默认对话模式）才能拿到真实搜索结果与可点击 URL。
-// 如需 expert（仅做综合推理、不需要联网），显式设置 DEEPSEEK_WEB_MODE=expert。
-const BRIDGE_MODE = (process.env.DEEPSEEK_WEB_MODE || 'fast').toLowerCase() === 'expert' ? 'expert' : 'fast';
+// 默认 fast：经实测，DeepSeek 网页的 expert 模式不适合作为通用联网搜索入口，
+// 只有 fast（默认对话模式）更稳定拿到真实搜索结果与可点击 URL。
+// 需要专业/专家模式的调用方可以在单次请求里传 mode=expert，避免影响其它搜索链路。
+function normalizeBridgeMode(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  return value === 'expert' || value === 'professional' ? 'expert' : 'fast';
+}
+
+const DEFAULT_BRIDGE_MODE = normalizeBridgeMode(process.env.DEEPSEEK_WEB_MODE || 'fast');
 
 function buildToggleJs(mode) {
   const wantExpert = mode === 'expert';
   return `
     (() => {
       const updates = [];
-      const expert = document.querySelector('[role="radio"][data-model-type="expert"]');
-      const quick = document.querySelector('[role="radio"][data-model-type="default"]');
       const wantExpert = ${wantExpert ? 'true' : 'false'};
+      const textOf = (el) => ((el && (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'))) || '').trim();
+      const classOf = (el) => String((el && el.className) || '');
+      const rectOf = (el) => {
+        if (!el || !el.getBoundingClientRect) return { x: 0, y: 0, width: 0, height: 0 };
+        return el.getBoundingClientRect();
+      };
+      const isVisible = (el) => {
+        if (!el || !el.getBoundingClientRect) return false;
+        const rect = rectOf(el);
+        const style = getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+      };
+      const isSelected = (el) => {
+        if (!el) return false;
+        const checked = String(el.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+        const pressed = String(el.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+        const selected = String(el.getAttribute('aria-selected') || '').toLowerCase() === 'true';
+        const className = classOf(el);
+        return checked || pressed || selected || className.includes('selected') || className.includes('--active') || className.includes('active');
+      };
+      const isModeText = (text, aliases) => {
+        const normalized = String(text || '').replace(/\\s+/g, '');
+        if (!normalized || !aliases.some(alias => normalized.includes(alias.replace(/\\s+/g, '')))) return false;
+        const modeHits = ['快速模式', '专家模式', '专业模式', '识图模式'].filter(label => normalized.includes(label)).length;
+        return modeHits <= 1;
+      };
+      const isLikelyClickable = (el) => {
+        if (!el || el === document.body || el === document.documentElement) return false;
+        const tag = String(el.tagName || '').toLowerCase();
+        const role = String(el.getAttribute('role') || '').toLowerCase();
+        const className = classOf(el);
+        const tabIndex = el.getAttribute('tabindex');
+        const cursor = getComputedStyle(el).cursor;
+        return tag === 'button'
+          || role === 'button'
+          || role === 'radio'
+          || el.hasAttribute('data-model-type')
+          || el.hasAttribute('aria-pressed')
+          || el.hasAttribute('aria-checked')
+          || el.hasAttribute('aria-selected')
+          || tabIndex === '0'
+          || className.includes('toggle')
+          || className.includes('button')
+          || className.includes('segment')
+          || className.includes('mode')
+          || cursor === 'pointer';
+      };
+      const clickableAncestor = (node, stopAt = null) => {
+        let current = node;
+        let fallback = null;
+        while (current && current !== document.body && current !== stopAt) {
+          if (isVisible(current)) {
+            const rect = rectOf(current);
+            if (!fallback && rect.width >= 48 && rect.height >= 20 && rect.width <= 360 && rect.height <= 90) {
+              fallback = current;
+            }
+            if (isLikelyClickable(current)) return current;
+          }
+          current = current.parentElement;
+        }
+        return fallback || node;
+      };
+      const controls = Array.from(document.querySelectorAll(
+        'button,[role="button"],[role="radio"],[aria-pressed],[aria-checked],[data-model-type],.ds-toggle-button'
+      )).filter(isVisible);
+      const visibleNodes = Array.from(document.querySelectorAll(
+        'button,div,span,[role="button"],[role="radio"],[aria-pressed],[aria-checked],[aria-selected],[data-model-type],.ds-toggle-button'
+      )).filter(isVisible);
+      const modeContainer = visibleNodes.find((el) => {
+        const text = textOf(el).replace(/\\s+/g, '');
+        const rect = rectOf(el);
+        return text.includes('快速模式')
+          && (text.includes('专家模式') || text.includes('专业模式'))
+          && text.includes('识图模式')
+          && rect.width <= 760
+          && rect.height <= 140;
+      });
+      const findByModelType = (types) => controls.find((el) => {
+        const value = String(el.getAttribute('data-model-type') || '').toLowerCase();
+        return types.includes(value);
+      });
+      const findByText = (aliases) => visibleNodes.find((el) => {
+        const text = textOf(el);
+        return isModeText(text, aliases);
+      });
+      const findInModeContainer = (aliases) => {
+        if (!modeContainer) return null;
+        const descendants = Array.from(modeContainer.querySelectorAll('button,div,span,[role="button"],[role="radio"],[data-model-type],[aria-selected],[aria-checked]'))
+          .filter(isVisible);
+        const exact = descendants.find((el) => aliases.some(alias => textOf(el).replace(/\\s+/g, '') === alias.replace(/\\s+/g, '')));
+        const loose = exact || descendants.find((el) => isModeText(textOf(el), aliases));
+        return loose ? clickableAncestor(loose, modeContainer) : null;
+      };
+      const findModeOption = (aliases, modelTypes) => {
+        const byType = findByModelType(modelTypes);
+        if (byType) return byType;
+        const inContainer = findInModeContainer(aliases);
+        if (inContainer) return inContainer;
+        const byText = findByText(aliases);
+        return byText ? clickableAncestor(byText) : null;
+      };
+      const modeFromText = () => {
+        const compactBody = (document.body.innerText || '').replace(/\\s+/g, '');
+        if (compactBody.includes('使用专家模式开始对话') || compactBody.includes('使用专业模式开始对话')) return 'expert';
+        if (compactBody.includes('使用快速模式开始对话')) return 'fast';
+        const headerMode = visibleNodes
+          .map((el) => ({ el, text: textOf(el), rect: rectOf(el) }))
+          .filter(item => item.rect.y >= 0 && item.rect.y <= 110)
+          .find(item => ['快速模式', '专家模式', '专业模式', '识图模式'].includes(item.text));
+        if (!headerMode) return '';
+        if (headerMode.text === '专家模式' || headerMode.text === '专业模式') return 'expert';
+        if (headerMode.text === '快速模式') return 'fast';
+        if (headerMode.text === '识图模式') return 'vision';
+        return '';
+      };
+      const expert = findModeOption(['专家模式', '专业模式'], ['expert', 'professional']);
+      const quick = findModeOption(['快速模式'], ['default', 'fast', 'quick']);
+
       if (wantExpert) {
         if (expert) {
-          const selected = String(expert.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+          const selected = isSelected(expert);
           if (!selected) {
             expert.click();
           }
-          updates.push({ label: '专家模式', found: true, selectedBefore: selected, selectedAfter: String(expert.getAttribute('aria-checked') || '').toLowerCase() === 'true' });
+          updates.push({ label: '专家模式', found: true, selectedBefore: selected, selectedAfter: isSelected(expert), text: textOf(expert).slice(0, 80) });
         } else {
           updates.push({ label: '专家模式', found: false });
         }
         if (quick) {
-          updates.push({ label: '快速模式', found: true, selected: String(quick.getAttribute('aria-checked') || '').toLowerCase() === 'true' });
+          updates.push({ label: '快速模式', found: true, selected: isSelected(quick), text: textOf(quick).slice(0, 80) });
         }
       } else {
         if (quick) {
-          const selected = String(quick.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+          const selected = isSelected(quick);
           if (!selected) {
             quick.click();
           }
-          updates.push({ label: '快速模式', found: true, selectedBefore: selected, selectedAfter: String(quick.getAttribute('aria-checked') || '').toLowerCase() === 'true' });
+          updates.push({ label: '快速模式', found: true, selectedBefore: selected, selectedAfter: isSelected(quick), text: textOf(quick).slice(0, 80) });
         } else {
           updates.push({ label: '快速模式', found: false });
         }
         if (expert) {
-          updates.push({ label: '专家模式', found: true, selected: String(expert.getAttribute('aria-checked') || '').toLowerCase() === 'true' });
+          updates.push({ label: '专家模式', found: true, selected: isSelected(expert), text: textOf(expert).slice(0, 80) });
         }
       }
 
-      // Only manipulate deep think / search toggles in expert mode.
+      // Only manipulate deep think / search toggles in expert mode. DeepSeek currently renders
+      // these controls as div.ds-toggle-button with aria-pressed, not always as real buttons.
       if (wantExpert) {
         const targets = [
           { label: '深度思考', aliases: ['深度思考'] },
           { label: '智能搜索', aliases: ['智能搜索', '联网搜索'] }
         ];
-        const buttons = Array.from(document.querySelectorAll('button,[role="button"]'));
         for (const target of targets) {
-          const button = buttons.find((el) => {
-            const text = (el.innerText || el.getAttribute('aria-label') || '').trim();
-            return text && target.aliases.some(alias => text.includes(alias));
-          });
+          const button = controls.find((el) => target.aliases.some(alias => textOf(el).includes(alias)));
           if (!button) {
             updates.push({ label: target.label, found: false, pressedAfter: 'false' });
             continue;
           }
-          const pressed = (button.getAttribute('aria-pressed') || '').toLowerCase() === 'true'
-            || (button.className || '').includes('ds-toggle-button--selected');
+          const pressed = isSelected(button);
           if (!pressed) {
             button.click();
           }
-          const pressedAfter = (button.getAttribute('aria-pressed') || '').toLowerCase() === 'true'
-            || (button.className || '').includes('ds-toggle-button--selected');
+          const pressedAfter = isSelected(button);
           updates.push({ label: target.label, found: true, changed: !pressed, pressedAfter: String(pressedAfter) });
         }
       }
+      const detectedMode = modeFromText()
+        || (expert && isSelected(expert) ? 'expert' : '')
+        || (quick && isSelected(quick) ? 'fast' : '');
+      const requestedMode = wantExpert ? 'expert' : 'fast';
+      updates.push({
+        label: '页面模式',
+        found: !!detectedMode,
+        mode: detectedMode || 'unknown',
+        requestedMode,
+        modeVerified: detectedMode === requestedMode
+      });
       return updates;
     })()
   `;
 }
 
-async function ensureToggleModes(client) {
-  const js = buildToggleJs(BRIDGE_MODE);
+async function ensureToggleModes(client, mode = DEFAULT_BRIDGE_MODE) {
+  const bridgeMode = normalizeBridgeMode(mode);
+  const js = buildToggleJs(bridgeMode);
   let lastResult = [];
   for (let i = 0; i < 12; i++) {
     const result = await client.eval(js);
     lastResult = Array.isArray(result) ? result : [];
-    if (BRIDGE_MODE === 'fast') {
+    if (bridgeMode === 'fast') {
       const quick = lastResult.find(item => item.label === '快速模式');
       if (quick && quick.found && quick.selectedAfter) {
         break;
@@ -431,10 +666,12 @@ async function ensureToggleModes(client) {
       const expert = lastResult.find(item => item.label === '专家模式');
       const deep = lastResult.find(item => item.label === '深度思考');
       const search = lastResult.find(item => item.label === '智能搜索');
-      const expertReady = expert && expert.found && expert.selectedAfter;
+      const pageMode = lastResult.find(item => item.label === '页面模式');
+      const expertReady = expert && expert.found && (expert.selectedAfter || expert.selected || pageMode?.mode === 'expert');
+      const modeReady = pageMode && pageMode.modeVerified === true;
       const deepReady = deep && deep.found && String(deep.pressedAfter).toLowerCase() === 'true';
-      const searchReady = search && search.found && String(search.pressedAfter).toLowerCase() === 'true';
-      if (expertReady && deepReady && searchReady) {
+      const searchReady = !search || !search.found || String(search.pressedAfter).toLowerCase() === 'true';
+      if (expertReady && modeReady && deepReady && searchReady) {
         break;
       }
     }
@@ -531,33 +768,94 @@ async function submitQuery(client, query) {
   `);
 }
 
-async function captureSearchState(client) {
+function buildTurnSignature(text) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  let hash = 2166136261;
+  for (let index = 0; index < normalized.length; index += 1) {
+    hash ^= normalized.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${normalized.length}:${(hash >>> 0).toString(16)}`;
+}
+
+async function captureSearchState(client, expectedTurnSignature = '') {
+  const serializedExpectedTurnSignature = JSON.stringify(expectedTurnSignature || '');
   return client.eval(`
     (() => {
-      const assistantBlocks = Array.from(document.querySelectorAll('.ds-assistant-message-main-content, .ds-markdown.ds-assistant-message-main-content'))
-        .map(node => ({
+      const assistantSelector = '.ds-assistant-message-main-content, .ds-markdown.ds-assistant-message-main-content';
+      const expectedTurnSignature = ${serializedExpectedTurnSignature};
+      const buildTurnSignature = (text) => {
+        const normalized = String(text || '').replace(/\\s+/g, ' ').trim();
+        if (!normalized) return '';
+        let hash = 2166136261;
+        for (let index = 0; index < normalized.length; index += 1) {
+          hash ^= normalized.charCodeAt(index);
+          hash = Math.imul(hash, 16777619);
+        }
+        return normalized.length + ':' + (hash >>> 0).toString(16);
+      };
+      const toAssistantItem = (node) => ({
           text: (node.innerText || '').trim(),
           html: (node.outerHTML || '').slice(0, 300),
           className: node.className || ''
-        }))
-        .filter(item => item.text);
-      const lastAssistantBlock = Array.from(document.querySelectorAll('.ds-assistant-message-main-content, .ds-markdown.ds-assistant-message-main-content')).slice(-1)[0] || null;
+        });
+      const allAssistantNodes = Array.from(document.querySelectorAll(assistantSelector));
+      const messageContainers = Array.from(document.querySelectorAll('.ds-message'));
+      let matchedUserIndex = -1;
+      if (expectedTurnSignature) {
+        for (let index = messageContainers.length - 1; index >= 0; index -= 1) {
+          const container = messageContainers[index];
+          if (container.querySelector(assistantSelector)) continue;
+          if (buildTurnSignature(container.innerText || '') === expectedTurnSignature) {
+            matchedUserIndex = index;
+            break;
+          }
+        }
+      }
+      const turnAssistantNodes = [];
+      const seenTurnNodes = new Set();
+      if (matchedUserIndex >= 0) {
+        for (const container of messageContainers.slice(matchedUserIndex + 1)) {
+          for (const node of container.querySelectorAll(assistantSelector)) {
+            if (!seenTurnNodes.has(node)) {
+              seenTurnNodes.add(node);
+              turnAssistantNodes.push(node);
+            }
+          }
+        }
+      }
+      // Once the submitted user turn is visible, only inspect assistant blocks after it.
+      // This avoids treating a repeated structured answer as historical content merely
+      // because its class name and opening text match the previous turn.
+      const submittedTurnMatched = matchedUserIndex >= 0;
+      const selectedAssistantNodes = submittedTurnMatched ? turnAssistantNodes : allAssistantNodes;
+      const assistantBlocks = selectedAssistantNodes.map(toAssistantItem).filter(item => item.text);
+      const lastAssistantBlock = selectedAssistantNodes.slice(-1)[0] || null;
       const lastMessageContainer = lastAssistantBlock
-        ? lastAssistantBlock.closest('[class*="assistant"], [class*="message"]') || lastAssistantBlock.parentElement || lastAssistantBlock
+        ? lastAssistantBlock.closest('.ds-message') || lastAssistantBlock.parentElement || lastAssistantBlock
         : null;
       const bodyText = lastMessageContainer
         ? (lastMessageContainer.innerText || '').trim()
         : '';
-      const anchors = Array.from((lastAssistantBlock || document).querySelectorAll('a[href^="http"]'))
+      const anchors = Array.from((lastAssistantBlock || document.createElement('div')).querySelectorAll('a[href^="http"]'))
         .map(a => ({ text: (a.innerText || '').trim(), href: a.href }))
         .filter(item => item.href && !item.href.startsWith('https://chat.deepseek.com'));
       const searchCountMatch = bodyText.match(/搜索到\\s*(\\d+)\\s*个网页/);
+      const actionButtons = Array.from(document.querySelectorAll('button,[role="button"]'));
+      const generationActive = actionButtons.some(button => {
+        const label = (button.innerText || button.getAttribute('aria-label') || button.getAttribute('title') || '').trim();
+        return /停止生成|停止回答|stop generating|stop response/i.test(label);
+      });
       return {
         bodyText,
         searchCount: searchCountMatch ? Number(searchCountMatch[1]) : null,
         links: anchors.slice(-30),
         candidateTexts: assistantBlocks,
-        assistantBlockCount: assistantBlocks.length
+        assistantBlockCount: assistantBlocks.length,
+        allAssistantBlockCount: allAssistantNodes.length,
+        submittedTurnMatched,
+        generationActive
       };
     })()
   `);
@@ -565,6 +863,12 @@ async function captureSearchState(client) {
 
 function diffSearchState(state, baseline = null) {
   if (!baseline) return state;
+  if (state && state.submittedTurnMatched) {
+    return {
+      ...state,
+      bodyDelta: state.bodyText || ''
+    };
+  }
   const buildSignature = (item) => {
     if (!item) return '';
     const text = (item.text || '').trim().slice(0, 240);
@@ -594,28 +898,192 @@ function diffSearchState(state, baseline = null) {
     searchCount: state.searchCount,
     links: (state.links || []).filter(item => item && item.href && !baselineLinks.has(item.href)),
     candidateTexts: changedCandidateTexts,
-    assistantBlockCount: Math.max(0, Number(state.assistantBlockCount || 0) - Number(baseline.assistantBlockCount || 0))
+    assistantBlockCount: Math.max(0, Number(state.assistantBlockCount || 0) - Number(baseline.assistantBlockCount || 0)),
+    generationActive: !!state.generationActive
   };
 }
 
-function buildModeState(toggleUpdates) {
+function buildModeState(toggleUpdates, mode = DEFAULT_BRIDGE_MODE) {
   const updates = Array.isArray(toggleUpdates) ? toggleUpdates : [];
   const find = (label) => updates.find(item => item && item.label === label);
   const expert = find('专家模式');
   const quick = find('快速模式');
   const deep = find('深度思考');
   const search = find('智能搜索');
+  const pageMode = find('页面模式');
   const isPressed = (item) => !!(item && item.found && String(item.pressedAfter).toLowerCase() === 'true');
+  const bridgeMode = normalizeBridgeMode(mode);
+  const expertExplicit = !!(expert && expert.found && (expert.selectedAfter === true || expert.selected === true));
+  const quickExplicit = !!(quick && quick.found && (quick.selectedAfter === true || quick.selected === true));
+  const deepThinkEnabled = isPressed(deep);
+  const headerMode = pageMode && pageMode.found ? pageMode.mode : null;
+  const modeVerified = pageMode && pageMode.modeVerified === true
+    ? true
+    : (bridgeMode === 'expert' ? expertExplicit : quickExplicit);
   return {
-    bridgeMode: BRIDGE_MODE,
-    expertMode: !!(expert && expert.found && (expert.selectedAfter === true || expert.selected === true)),
-    quickMode: !!(quick && quick.found && (quick.selectedAfter === true || quick.selected === true)),
-    deepThinkEnabled: isPressed(deep),
+    bridgeMode,
+    expertMode: bridgeMode === 'expert' && (expertExplicit || headerMode === 'expert'),
+    quickMode: quickExplicit || headerMode === 'fast',
+    headerMode,
+    modeVerified,
+    deepThinkEnabled,
     searchEnabled: isPressed(search)
   };
 }
 
-async function waitForAnswer(client, baseline) {
+function hasCompleteJson(text) {
+  if (!text || !text.trim()) return false;
+  let value = text.trim().replace(/^```[a-zA-Z]*\s*/, '').replace(/\s*```$/, '').trim();
+  try {
+    JSON.parse(value);
+    return true;
+  } catch (_) {}
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+  if (start < 0 || end <= start) return false;
+  try {
+    JSON.parse(value.slice(start, end + 1));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function parseDeepSeekCompletionSse(body) {
+  let answerText = '';
+  let activeFragmentType = '';
+  let activePatchPath = '';
+  let finished = false;
+  const appendFragment = (fragment) => {
+    if (!fragment || typeof fragment !== 'object') return;
+    activeFragmentType = String(fragment.type || '').toUpperCase();
+    if (activeFragmentType === 'RESPONSE' && typeof fragment.content === 'string') {
+      answerText += fragment.content;
+    }
+  };
+  const inspectBatch = (items) => {
+    for (const item of Array.isArray(items) ? items : []) {
+      if (!item || typeof item !== 'object') continue;
+      if ((item.p === 'status' || item.p === 'quasi_status') && String(item.v || '').toUpperCase() === 'FINISHED') {
+        finished = true;
+      }
+    }
+  };
+
+  for (const rawLine of String(body || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === 'event: close') {
+      finished = true;
+      continue;
+    }
+    if (!line.startsWith('data:')) continue;
+    const serialized = line.slice(5).trim();
+    if (!serialized || serialized === '[DONE]') continue;
+    let payload;
+    try {
+      payload = JSON.parse(serialized);
+    } catch (_) {
+      continue;
+    }
+
+    const response = payload && payload.v && payload.v.response;
+    if (response && typeof response === 'object') {
+      for (const fragment of response.fragments || []) appendFragment(fragment);
+      if (String(response.status || response.quasi_status || '').toUpperCase() === 'FINISHED') finished = true;
+    }
+
+    if (payload && typeof payload.p === 'string') {
+      activePatchPath = payload.p;
+      if (payload.p === 'response/fragments') {
+        for (const fragment of Array.isArray(payload.v) ? payload.v : [payload.v]) appendFragment(fragment);
+      } else if (payload.p.endsWith('/content') && activeFragmentType === 'RESPONSE' && typeof payload.v === 'string') {
+        answerText += payload.v;
+      } else if (payload.p === 'response/status' && String(payload.v || '').toUpperCase() === 'FINISHED') {
+        finished = true;
+      } else if (payload.p === 'response' && payload.o === 'BATCH') {
+        inspectBatch(payload.v);
+      }
+    } else if (activePatchPath.endsWith('/content') && activeFragmentType === 'RESPONSE' && typeof payload.v === 'string') {
+      answerText += payload.v;
+    }
+  }
+
+  return { answerText, finished };
+}
+
+function createDeepSeekCompletionCapture(client) {
+  const trackedRequestIds = new Set();
+  const state = {
+    answerText: '',
+    completed: false,
+    responseStatus: null,
+    error: ''
+  };
+
+  client.on('Network.responseReceived', (params) => {
+    const response = params && params.response;
+    if (!response || !String(response.url || '').includes('/api/v0/chat/completion')) return;
+    trackedRequestIds.add(params.requestId);
+    state.responseStatus = Number(response.status || 0);
+    if (state.responseStatus >= 400) {
+      state.error = `DeepSeek completion HTTP ${state.responseStatus}`;
+    }
+  });
+  client.on('Network.loadingFailed', (params) => {
+    if (!params || !trackedRequestIds.has(params.requestId)) return;
+    state.completed = true;
+    state.error = `DeepSeek completion network failed: ${params.errorText || 'unknown_error'}`;
+  });
+  client.on('Network.loadingFinished', (params) => {
+    if (!params || !trackedRequestIds.has(params.requestId)) return;
+    client.send('Network.getResponseBody', { requestId: params.requestId })
+      .then((result) => {
+        const parsed = parseDeepSeekCompletionSse(result && result.body || '');
+        state.answerText = parsed.answerText;
+        state.completed = true;
+        if (!state.answerText && !state.error) {
+          state.error = 'DeepSeek completion stream finished without response content';
+        }
+      })
+      .catch((error) => {
+        state.completed = true;
+        state.error = `DeepSeek completion body unavailable: ${error && error.message ? error.message : error}`;
+      });
+  });
+  return state;
+}
+
+function isFatalCompletionCaptureError(error) {
+  const message = String(error || '').toLowerCase();
+  if (!message) return false;
+  return message.includes('http 4')
+    || message.includes('http 5')
+    || message.includes('network failed');
+}
+
+function resolveNonJsonCompletionReason({
+  hasTextSignal,
+  hasLinkOnlySignal,
+  stableCount,
+  generationActive,
+  networkAnswerComplete,
+  firstContentAt,
+  firstLinkOnlyAt,
+  quickDeadline,
+  now
+}) {
+  if (networkAnswerComplete && hasTextSignal) return 'complete_network';
+  if (generationActive) return null;
+  if (hasTextSignal && stableCount >= 2) return 'stable_signal';
+  if (hasTextSignal && firstContentAt && now - firstContentAt >= 6000) return 'signal_budget_reached';
+  if (hasTextSignal && now >= quickDeadline) return 'quick_budget_reached';
+  if (hasLinkOnlySignal && firstLinkOnlyAt && now - firstLinkOnlyAt >= LINK_ONLY_RETURN_BUDGET_MS) {
+    return 'link_only_budget_reached';
+  }
+  return null;
+}
+
+async function waitForAnswer(client, baseline, options = {}) {
   const deadline = Date.now() + WAIT_TIMEOUT_MS;
   const startedAt = Date.now();
   let stableCount = 0;
@@ -630,7 +1098,33 @@ async function waitForAnswer(client, baseline) {
     completionReason
   });
   while (Date.now() < deadline) {
-    const state = diffSearchState(await captureSearchState(client), baseline);
+    let state = diffSearchState(
+      await captureSearchState(client, options.submittedTurnSignature || ''),
+      baseline
+    );
+    const completionCapture = options.completionCapture;
+    const networkAnswerComplete = !!(
+      completionCapture
+      && completionCapture.completed
+      && completionCapture.answerText
+      && completionCapture.answerText.trim()
+    );
+    if (networkAnswerComplete) {
+      const networkAnswer = completionCapture.answerText.trim();
+      state = {
+        ...state,
+        bodyText: networkAnswer,
+        bodyDelta: networkAnswer,
+        candidateTexts: [{
+          text: networkAnswer,
+          html: '',
+          className: 'deepseek-completion-stream'
+        }],
+        assistantBlockCount: 1,
+        generationActive: false,
+        networkAnswerCaptured: true
+      };
+    }
     lastState = state;
     const digest = JSON.stringify({
       bodyTail: (state.bodyDelta || state.bodyText || '').slice(-1000),
@@ -643,7 +1137,10 @@ async function waitForAnswer(client, baseline) {
     const hasEnoughLinks = Array.isArray(state.links) && state.links.length >= 2;
     const hasSearchCount = /搜索到\s*\d+\s*个网页/.test(state.bodyText || '');
     const hasBodyDelta = ((state.bodyDelta || '').trim().length >= 80);
-    const hasTextSignal = hasCandidateText || hasBodyDelta || hasSearchCount;
+    const hasTextSignal = hasCandidateText || hasBodyDelta || hasSearchCount || networkAnswerComplete;
+    const answerCandidate = (state.candidateTexts || []).map(item => item && item.text || '').filter(Boolean).slice(-1)[0]
+      || state.bodyDelta || state.bodyText || '';
+    const jsonComplete = options.expectedJson === true && hasCompleteJson(answerCandidate);
     const hasLinkOnlySignal = !hasTextSignal && hasEnoughLinks;
     if (hasTextSignal && !firstContentAt) {
       firstContentAt = Date.now();
@@ -651,13 +1148,39 @@ async function waitForAnswer(client, baseline) {
     if (hasLinkOnlySignal && !firstLinkOnlyAt) {
       firstLinkOnlyAt = Date.now();
     }
-    if (hasTextSignal && stableCount >= 1) return finalize(state, 'stable_signal');
-    if (hasTextSignal && firstContentAt && Date.now() - firstContentAt >= 6000) return finalize(state, 'signal_budget_reached');
-    if (Date.now() >= quickDeadline && lastState && hasTextSignal) return finalize(lastState, 'quick_budget_reached');
-    if (firstLinkOnlyAt && Date.now() - firstLinkOnlyAt >= LINK_ONLY_RETURN_BUDGET_MS) return finalize(lastState, 'link_only_budget_reached');
+    if (options.expectedJson === true) {
+      if (completionCapture
+        && completionCapture.completed
+        && completionCapture.error
+        && !completionCapture.answerText
+        && isFatalCompletionCaptureError(completionCapture.error)) {
+        throw new Error(completionCapture.error);
+      }
+      if (completionCapture && completionCapture.completed && jsonComplete && state.networkAnswerCaptured) {
+        return finalize({ ...state, jsonComplete: true }, 'complete_json_network');
+      }
+      if (jsonComplete && !state.generationActive && stableCount >= 2) return finalize({ ...state, jsonComplete: true }, 'complete_json_stable');
+      await sleepWithJitter(POLL_INTERVAL_MS, 800);
+      continue;
+    }
+    const nonJsonCompletionReason = resolveNonJsonCompletionReason({
+      hasTextSignal,
+      hasLinkOnlySignal,
+      stableCount,
+      generationActive: !!state.generationActive,
+      networkAnswerComplete,
+      firstContentAt,
+      firstLinkOnlyAt,
+      quickDeadline,
+      now: Date.now()
+    });
+    if (nonJsonCompletionReason) return finalize(state, nonJsonCompletionReason);
     await sleepWithJitter(POLL_INTERVAL_MS, 800);
   }
-  if (lastState) return finalize(lastState, 'timeout_with_last_state');
+  if (lastState) return finalize({ ...lastState, jsonComplete: hasCompleteJson(
+    (lastState.candidateTexts || []).map(item => item && item.text || '').filter(Boolean).slice(-1)[0]
+      || lastState.bodyDelta || lastState.bodyText || ''
+  ) }, options.expectedJson === true ? 'timeout_incomplete_json' : 'timeout_with_last_state');
   throw new Error('Timed out waiting for DeepSeek web answer');
 }
 
@@ -677,7 +1200,7 @@ function normalizeResult(raw) {
   let answerSource = 'empty';
   let text = '';
   if (answerFromCandidate) {
-    answerSource = 'new_assistant_block';
+    answerSource = raw.networkAnswerCaptured ? 'completion_stream' : 'new_assistant_block';
     text = answerFromCandidate;
   } else if (answerFromDelta) {
     answerSource = 'body_delta';
@@ -688,6 +1211,9 @@ function normalizeResult(raw) {
   }
   let contentStatus = 'success';
   let contentNote = '已抓到提交后的新增回答块。';
+  if (raw.networkAnswerCaptured) {
+    contentNote = '网页消息区未稳定渲染，已从完成的 DeepSeek completion 流恢复回答。';
+  }
   if (!text && uniqueLinks.length === 0) {
     contentStatus = 'empty';
     contentNote = '未抓到新增回答内容或引用链接。';
@@ -701,6 +1227,13 @@ function normalizeResult(raw) {
   } else if (answerSource === 'page_fallback') {
     contentStatus = 'possible_history_pollution';
     contentNote = '未抓到新增回答块，已回退到整段页面文本，存在历史会话污染风险。';
+  }
+  if (raw.expectedJson && !raw.jsonComplete) {
+    contentStatus = 'incomplete';
+    contentNote = '结构化JSON尚未完整生成，当前内容不作为成功结果。';
+  } else if (raw.completionReason === 'timeout_with_last_state' && raw.generationActive) {
+    contentStatus = 'incomplete';
+    contentNote = 'DeepSeek 网页仍在生成时已达到等待上限，当前正文可能截断，不作为成功结果。';
   }
   return {
     searchCount: raw.searchCount,
@@ -721,7 +1254,14 @@ function normalizeResult(raw) {
     bodyDeltaLength: answerFromDelta.length,
     waitDurationMs: raw.waitDurationMs || null,
     completionReason: raw.completionReason || null,
-    answerLength: text.length
+    answerLength: text.length,
+    jsonComplete: !!raw.jsonComplete,
+    networkAnswerCaptured: !!raw.networkAnswerCaptured,
+    generationActive: !!raw.generationActive,
+    submittedTurnMatched: !!raw.submittedTurnMatched,
+    allAssistantBlockCount: Number(raw.allAssistantBlockCount || 0),
+    targetReuseMode: raw.targetReuseMode || null,
+    conversationRestored: !!raw.conversationRestored
   };
 }
 
@@ -729,27 +1269,30 @@ async function searchQuery(query, options = {}) {
   if (!query || !query.trim()) {
     throw new Error('Query is required');
   }
-  let debuggerVersion = await getExistingDebuggerVersion();
-  if (!debuggerVersion) {
-    ensureAutomationProfile();
-    const chrome = launchChrome();
-    chrome.unref();
-    debuggerVersion = await waitForDebugger();
-  }
+  const bridgeMode = normalizeBridgeMode(options.mode || options.webMode || DEFAULT_BRIDGE_MODE);
+  await ensureDebuggerAvailable();
   const target = await openPageTarget(options);
   const client = new CdpClient(target.webSocketDebuggerUrl);
+  let conversationSurface = null;
   try {
     await client.open();
     await client.send('Page.enable');
     await client.send('Runtime.enable');
-    if (!target.reused || options.isolatedSession || options.forceNewSession) {
+    await client.send('Network.enable');
+    const completionCapture = createDeepSeekCompletionCapture(client);
+    if (target.resumeUrl) {
+      conversationSurface = await restoreConversationSurface(client, target.resumeUrl);
+    } else {
       await resetConversationSurface(client);
-      if (options.isolatedSession || options.sessionKey || options.forceNewSession) {
-        await tryStartFreshConversation(client);
-      }
+      const fresh = await tryStartFreshConversation(client);
+      conversationSurface = { restored: false, fresh };
     }
     await waitForComposer(client);
-    const toggleUpdates = await ensureToggleModes(client);
+    const toggleUpdates = await ensureToggleModes(client, bridgeMode);
+    const modeState = buildModeState(toggleUpdates, bridgeMode);
+    if (bridgeMode === 'expert' && !modeState.modeVerified) {
+      throw new Error(`DeepSeek expert mode was not verified before submit: ${JSON.stringify(modeState)}`);
+    }
     const baseline = await captureSearchState(client);
     const searchStartedAt = Date.now();
     await sleepWithJitter(PRE_SUBMIT_DELAY_MS);
@@ -758,27 +1301,39 @@ async function searchQuery(query, options = {}) {
       throw new Error(`Failed to submit query: ${JSON.stringify(submit)}`);
     }
     await sleepWithJitter(POST_SUBMIT_SETTLE_MS, 600);
-    const raw = await waitForAnswer(client, baseline);
+    const raw = await waitForAnswer(client, baseline, {
+      ...options,
+      submittedTurnSignature: buildTurnSignature(query.trim()),
+      completionCapture
+    });
     const finalUrl = await client.eval('location.href').catch(() => '');
     if (options.sessionKey) {
       updateSessionStore(options.sessionKey, {
         targetId: target.targetId || null,
         url: finalUrl || null,
+        bridgeMode: modeState.bridgeMode,
+        modeVerified: modeState.modeVerified,
+        headerMode: modeState.headerMode,
+        expertMode: modeState.expertMode,
+        quickMode: modeState.quickMode,
         lastAnswerAt: new Date().toISOString()
       });
     }
     return normalizeResult({
       ...raw,
       providerTimingMs: Date.now() - searchStartedAt,
-      modeState: buildModeState(toggleUpdates),
+      modeState,
       isolatedSession: !!options.isolatedSession,
       targetId: target.targetId || null,
       sessionKey: options.sessionKey || target.sessionKey || null,
-      finalUrl: finalUrl || null
+      finalUrl: finalUrl || null,
+      expectedJson: options.expectedJson === true,
+      targetReuseMode: 'single_worker',
+      conversationRestored: !!(conversationSurface && conversationSurface.restored)
     });
   } finally {
     client.close();
-    if (options.closeTargetAfter && target && target.targetId) {
+    if (options.closeTargetAfter && target && target.targetId && !target.sharedTarget) {
       await closeTarget(target.targetId);
     }
   }
@@ -786,7 +1341,22 @@ async function searchQuery(query, options = {}) {
 
 module.exports = {
   searchQuery,
+  prepareSharedTarget,
   DEBUG_PORT,
   WAIT_TIMEOUT_MS,
-  CHROME_LOG_PATH
+  CHROME_LOG_PATH,
+  _internals: {
+    isReusableConversationUrl,
+    selectSharedTarget,
+    bindSessionStoreToSharedTarget,
+    buildTurnSignature,
+    diffSearchState,
+    hasCompleteJson,
+    parseDeepSeekCompletionSse,
+    resolveNonJsonCompletionReason,
+    normalizeResult,
+    normalizeBridgeMode,
+    buildModeState,
+    isFatalCompletionCaptureError
+  }
 };

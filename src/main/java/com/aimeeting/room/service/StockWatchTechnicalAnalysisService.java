@@ -35,10 +35,12 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
@@ -50,6 +52,7 @@ public class StockWatchTechnicalAnalysisService {
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final MediaType JSON_TYPE = MediaType.get("application/json; charset=utf-8");
     private static final DateTimeFormatter SLOT_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
+    private static final DateTimeFormatter BATCH_ID_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMddHHmmss");
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE;
     private static final DateTimeFormatter MONTH_DAY_FORMATTER = DateTimeFormatter.ofPattern("MM/dd");
     private static final DateTimeFormatter YEAR_MONTH_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM");
@@ -65,8 +68,19 @@ public class StockWatchTechnicalAnalysisService {
             LocalTime.of(14, 30),
             LocalTime.of(15, 0)
     );
+    private static final List<String> MAIN_FORCE_INTENTS = Arrays.asList(
+            "ACCUMULATE", "DISTRIBUTE", "WASH", "PULL_UP", "SUPPORT", "SUPPRESS", "ROTATE", "NEUTRAL", "UNKNOWN"
+    );
+    private static final List<String> MAIN_FORCE_WINDOWS = Arrays.asList("INTRADAY", "THREE_DAY", "FIVE_DAY", "TWENTY_DAY");
+    private static final Set<String> STRONG_MAIN_FORCE_INTENTS = new LinkedHashSet<>(Arrays.asList(
+            "ACCUMULATE", "DISTRIBUTE", "WASH", "PULL_UP", "SUPPORT", "SUPPRESS", "ROTATE"
+    ));
+    private static final java.util.regex.Pattern EVIDENCE_PATH_PATTERN = java.util.regex.Pattern.compile(
+            "(?:evidenceSignals|marketData)\\.[A-Za-z0-9_.$\\[\\]-]+"
+    );
 
-    private final StockQuoteService stockQuoteService;
+    private final EastmoneyMarketDataService marketDataService;
+    private final StockWatchPredictionService predictionService;
     private final StockWatchListService watchListService;
     private final StockWatchTechnicalSessionMapper sessionMapper;
     private final StockWatchTechnicalAnalysisMapper analysisMapper;
@@ -102,11 +116,13 @@ public class StockWatchTechnicalAnalysisService {
     private volatile ZonedDateTime lastRunAt;
     private volatile String lastRunStatus = "never";
 
-    public StockWatchTechnicalAnalysisService(StockQuoteService stockQuoteService,
+    public StockWatchTechnicalAnalysisService(EastmoneyMarketDataService marketDataService,
+                                              StockWatchPredictionService predictionService,
                                               StockWatchListService watchListService,
                                               StockWatchTechnicalSessionMapper sessionMapper,
                                               StockWatchTechnicalAnalysisMapper analysisMapper) {
-        this.stockQuoteService = stockQuoteService;
+        this.marketDataService = marketDataService;
+        this.predictionService = predictionService;
         this.watchListService = watchListService;
         this.sessionMapper = sessionMapper;
         this.analysisMapper = analysisMapper;
@@ -117,7 +133,12 @@ public class StockWatchTechnicalAnalysisService {
             initialDelayString = "${stock-watch.technical-analysis.initial-delay-ms:90000}"
     )
     public void scheduledAnalyze() {
-        if (!enabled || !running.compareAndSet(false, true)) {
+        if (!enabled) {
+            log.info("stock-watch technical analysis scheduled skip reason=disabled");
+            return;
+        }
+        if (!running.compareAndSet(false, true)) {
+            log.info("stock-watch technical analysis scheduled skip reason=already_running");
             return;
         }
         try {
@@ -194,7 +215,7 @@ public class StockWatchTechnicalAnalysisService {
         String periodType = normalizePeriodType(text(request.get("periodType"), "DAY"));
         boolean forceNewSession = bool(request.get("forceNewSession"), false);
         boolean ignoreTradingHours = bool(request.get("ignoreTradingHours"), true);
-        StockWatchTechnicalAnalysis record = runAnalysis(ref, name, "manual_api", forceNewSession, ignoreTradingHours, periodType);
+        StockWatchTechnicalAnalysis record = runAnalysis(ref, name, "manual_api", forceNewSession, ignoreTradingHours, periodType, false);
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("record", toRecordPayload(record));
         payload.put("session", toSessionPayload(sessionMapper.selectById(record.getSessionId()), ref, record.getPeriodType()));
@@ -202,54 +223,79 @@ public class StockWatchTechnicalAnalysisService {
     }
 
     private void runScheduledBatch() {
+        long batchStartedAt = System.nanoTime();
         ZonedDateTime now = ZonedDateTime.now(CHINA_ZONE);
+        String batchId = now.format(BATCH_ID_FORMATTER);
         lastRunAt = now;
         boolean tradingSession = isTradingSession(now.toLocalTime());
         boolean weeklyDue = isWeeklyDue(now);
         boolean monthlyDue = isMonthlyDue(now);
+        String daySlot = tradingSession ? currentRunSlot(now, false) : "";
+        List<StockRef> refs = scheduledRefs();
+        BatchStats stats = new BatchStats();
+        log.info("stock-watch technical analysis batch start batchId={} now={} refs={} tradingSession={} daySlot={} weeklyDue={} monthlyDue={}",
+                batchId, now, refs.size(), tradingSession, daySlot, weeklyDue, monthlyDue);
         if (tradingHoursOnly && !tradingSession && !weeklyDue && !monthlyDue) {
             lastRunStatus = "skipped_non_trading_session";
+            log.info("stock-watch technical analysis batch end batchId={} status=skipped reason=non_trading_session refs={} elapsedMs={}",
+                    batchId, refs.size(), elapsedMillis(batchStartedAt));
             return;
         }
-        List<StockRef> refs = scheduledRefs();
         for (StockRef ref : refs) {
             try {
                 if (tradingSession) {
-                    runPeriodIfMissing(ref, now, "DAY", "scheduled", false);
+                    stats.record(runPeriodIfMissing(ref, now, "DAY", "scheduled", false, batchId));
                 }
                 if (weeklyDue) {
-                    runPeriodIfMissing(ref, now, "WEEK", "scheduled_weekly", true);
+                    stats.record(runPeriodIfMissing(ref, now, "WEEK", "scheduled_weekly", true, batchId));
                 }
                 if (monthlyDue) {
-                    runPeriodIfMissing(ref, now, "MONTH", "scheduled_monthly", true);
+                    stats.record(runPeriodIfMissing(ref, now, "MONTH", "scheduled_monthly", true, batchId));
                 }
             } catch (Exception e) {
-                log.warn("stock-watch technical analysis skipped symbol={}.{} error={}",
-                        ref.symbol, ref.market, e.getMessage());
+                stats.recordFailure();
+                log.warn("stock-watch technical analysis symbol aborted batchId={} symbol={} reason={} error={}",
+                        batchId, stockLabel(ref), classifySkipReason(e), diagnosticMessage(e));
             }
         }
         lastRunStatus = "success";
+        log.info("stock-watch technical analysis batch end batchId={} status=success refs={} attempted={} completed={} skipped={} failed={} elapsedMs={}",
+                batchId, refs.size(), stats.attempted, stats.completed, stats.skipped, stats.failed,
+                elapsedMillis(batchStartedAt));
     }
 
-    private void runPeriodIfMissing(StockRef ref,
-                                    ZonedDateTime now,
-                                    String periodType,
-                                    String reason,
-                                    boolean ignoreTradingHours) {
+    private PeriodRunResult runPeriodIfMissing(StockRef ref,
+                                               ZonedDateTime now,
+                                               String periodType,
+                                               String reason,
+                                               boolean ignoreTradingHours,
+                                               String batchId) {
+        long stockStartedAt = System.nanoTime();
         PeriodWindow window = currentPeriodWindow(periodType, now.toLocalDate());
         String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours) : periodType;
-        StockWatchTechnicalAnalysis existing = analysisMapper.selectLatestBySymbolDateSlot(
-                ref.symbol,
-                ref.market,
-                Date.valueOf(now.toLocalDate()),
-                runSlot,
-                periodType,
-                window.key
-        );
-        if (existing != null && "SUCCESS".equalsIgnoreCase(existing.getStatus())) {
-            return;
+        String symbol = stockLabel(ref);
+        log.info("stock-watch technical analysis stock start batchId={} symbol={} period={} slot={} periodKey={} reason={}",
+                batchId, symbol, periodType, runSlot, window.key, reason);
+        try {
+            StockWatchTechnicalAnalysis record = runAnalysis(ref, ref.symbol, reason, false, ignoreTradingHours, periodType, true);
+            String recordStatus = text(record.getStatus(), "UNKNOWN");
+            String outcome = "SUCCESS".equalsIgnoreCase(recordStatus) ? "completed" : "failed";
+            log.info("stock-watch technical analysis stock end batchId={} symbol={} period={} slot={} recordSlot={} periodKey={} outcome={} recordStatus={} recordId={} elapsedMs={}",
+                    batchId, symbol, periodType, runSlot, record.getRunSlot(), window.key, outcome,
+                    recordStatus, record.getId(), elapsedMillis(stockStartedAt));
+            return PeriodRunResult.completed(recordStatus);
+        } catch (ExistingAnalysisSkippedException e) {
+            StockWatchTechnicalAnalysis existing = e.existing;
+            log.info("stock-watch technical analysis stock skip batchId={} symbol={} period={} slot={} periodKey={} sourceDate={} reason=existing_success recordId={} elapsedMs={}",
+                    batchId, symbol, periodType, existing.getRunSlot(), existing.getPeriodKey(), existing.getAnalysisDate(),
+                    existing.getId(), elapsedMillis(stockStartedAt));
+            return PeriodRunResult.skipped();
+        } catch (Exception e) {
+            log.warn("stock-watch technical analysis stock skip batchId={} symbol={} period={} slot={} periodKey={} reason={} error={} elapsedMs={}",
+                    batchId, symbol, periodType, runSlot, window.key, classifySkipReason(e),
+                    diagnosticMessage(e), elapsedMillis(stockStartedAt));
+            throw e;
         }
-        runAnalysis(ref, ref.symbol, reason, false, ignoreTradingHours, periodType);
     }
 
     private StockWatchTechnicalAnalysis runAnalysis(StockRef ref,
@@ -257,43 +303,79 @@ public class StockWatchTechnicalAnalysisService {
                                                     String reason,
                                                     boolean forceNewSession,
                                                     boolean ignoreTradingHours,
-                                                    String rawPeriodType) {
+                                                    String rawPeriodType,
+                                                    boolean skipExistingSuccess) {
         String periodType = normalizePeriodType(rawPeriodType);
         ZonedDateTime now = ZonedDateTime.now(CHINA_ZONE);
         if ("DAY".equals(periodType) && tradingHoursOnly && !ignoreTradingHours && !isTradingSession(now.toLocalTime())) {
             throw new IllegalStateException("非交易时段，已跳过自动技术面分析");
         }
-        PeriodWindow window = currentPeriodWindow(periodType, now.toLocalDate());
 
-        List<Map<String, Object>> quotes = stockQuoteService.fetchQuotes(ref.symbol + "." + ref.market);
-        Map<String, Object> quote = quotes.isEmpty() ? Collections.emptyMap() : quotes.get(0);
-        if (!bool(quote.get("ok"), false)) {
-            throw new IllegalStateException("行情抓取失败：" + text(quote.get("reason"), "unknown"));
+        EastmoneyMarketDataService.MarketDataBundle marketData = marketDataService.buildBundle(ref.symbol, ref.market, periodType);
+        if (!marketData.canPredict()) {
+            throw new IllegalStateException("预测必需数据未就绪：" + String.join("；", marketData.getRequiredMissing()));
         }
+        @SuppressWarnings("unchecked")
+        Map<String, Object> quote = (Map<String, Object>) marketData.getPayload().getOrDefault("quote", Collections.emptyMap());
         String stockName = text(quote.get("name"), requestedName);
+        LocalDate sourceTradeDate = sourceTradeDate(marketData.getPayload(), now.toLocalDate());
+        PeriodWindow window = currentPeriodWindow(periodType, sourceTradeDate);
+        String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours) : periodType;
+        if (skipExistingSuccess) {
+            StockWatchTechnicalAnalysis existing = analysisMapper.selectLatestBySymbolDateSlot(
+                    ref.symbol,
+                    ref.market,
+                    Date.valueOf(sourceTradeDate),
+                    runSlot,
+                    periodType,
+                    window.key
+            );
+            if (existing != null && "SUCCESS".equalsIgnoreCase(existing.getStatus())) {
+                throw new ExistingAnalysisSkippedException(existing);
+            }
+        }
+        Map<String, Object> evidenceSignals = buildEvidenceSignals(marketData.getPayload(), periodType);
         StockWatchTechnicalSession session = getOrCreateSession(ref, stockName, forceNewSession, periodType);
         List<StockWatchTechnicalAnalysis> sourceRecords = sourceRecordsForPeriod(ref, periodType, window);
-        String prompt = buildPrompt(ref, stockName, quote, session, reason, periodType, window, sourceRecords);
+        String prompt = buildPrompt(ref, stockName, marketData, evidenceSignals, session, reason, periodType, window, sourceRecords);
         String promptHash = sha256(prompt).substring(0, 24);
-        String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours) : periodType;
 
-        BridgeResult bridgeResult;
+        BridgeResult bridgeResult = null;
         AnalysisPayload parsed;
+        IntentValidationResult intentValidation = IntentValidationResult.invalid("mainForceIntent_not_checked");
         StockWatchTechnicalAnalysis record = new StockWatchTechnicalAnalysis();
         record.setSessionId(session.getId());
         record.setSymbol(ref.symbol);
         record.setMarket(ref.market);
         record.setStockName(stockName);
-        record.setAnalysisDate(Date.valueOf(now.toLocalDate()));
+        record.setAnalysisDate(Date.valueOf(sourceTradeDate));
         record.setRunSlot(runSlot);
         record.setPeriodType(periodType);
         record.setPeriodKey(window.key);
         record.setSourceRecordIds(sourceRecordIdsJson(sourceRecords));
+        record.setEvidenceSignalJson(JSON.toJSONString(evidenceSignals));
         record.setProvider("deepseek_web_bridge");
         record.setPromptHash(promptHash);
         try {
-            bridgeResult = callDeepSeekBridge(prompt, session, forceNewSession);
+            bridgeResult = callDeepSeekBridgeWithRetry(prompt, session, forceNewSession, periodType);
             parsed = parseAnalysisPayload(bridgeResult.answerText, stockName);
+            intentValidation = validateMainForceIntent(parsed.mainForceIntent, evidenceSignals);
+            if (!hasRequiredForecasts(parsed.forecasts, periodType) || !intentValidation.valid) {
+                bridgeResult = callDeepSeekBridge(structuredRetryPrompt(periodType, intentValidation.problems), session, false);
+                parsed = parseAnalysisPayload(bridgeResult.answerText, stockName);
+                intentValidation = validateMainForceIntent(parsed.mainForceIntent, evidenceSignals);
+            }
+            if (!hasRequiredForecasts(parsed.forecasts, periodType)) {
+                throw new ModelResponseSchemaException("DeepSeek 返回JSON缺少当前周期要求的完整 forecasts，未保存不完整预测"
+                        + schemaWarningSuffix(parsed));
+            }
+            if (!intentValidation.valid) {
+                throw new ModelResponseSchemaException("DeepSeek 返回JSON缺少可校验的 mainForceIntent，未保存不完整主力意图："
+                        + String.join("；", intentValidation.problems) + schemaWarningSuffix(parsed));
+            }
+            parsed.missingData = new ArrayList<>();
+            parsed.missingData.addAll(marketData.getRequiredMissing());
+            parsed.missingData.addAll(marketData.getOptionalMissing());
             record.setStatus("SUCCESS");
             record.setStance(parsed.stance);
             record.setTone(parsed.tone);
@@ -301,11 +383,19 @@ public class StockWatchTechnicalAnalysisService {
             record.setTitle(parsed.title);
             record.setConclusion(parsed.conclusion);
             record.setEvidenceJson(JSON.toJSONString(parsed.evidence));
+            record.setMissingDataJson(JSON.toJSONString(parsed.missingData));
+            record.setMainForceIntentJson(intentValidation.intent.toJSONString());
+            record.setMainForceIntentStatus(intentValidation.status);
+            record.setMainForceIntentWarningsJson(JSON.toJSONString(intentValidation.warnings));
+            record.setDataSnapshotJson(marketData.toJson());
             record.setRawResponse(bridgeResult.answerText);
             record.setBridgeTargetId(bridgeResult.targetId);
             record.setConversationUrl(bridgeResult.finalUrl);
+            record.setErrorMessage(schemaWarningSummary(parsed));
             record.setContextCharsDelta(prompt.length() + text(bridgeResult.answerText, "").length());
             analysisMapper.insert(record);
+            predictionService.savePredictions(record.getId(), ref.symbol, ref.market, stockName, sourceTradeDate,
+                    number(quote.get("price"), null), parsed.forecasts, marketData.toJson());
             updateSessionAfterRun(session, stockName, bridgeResult, record, null);
             return record;
         } catch (Exception e) {
@@ -314,13 +404,20 @@ public class StockWatchTechnicalAnalysisService {
             record.setTone("red");
             record.setConfidence(0.0);
             record.setTitle(stockName + " 技术面分析失败");
-            record.setConclusion("DeepSeek 网页 provider 调用失败：" + e.getMessage());
+            record.setConclusion(failureConclusion(e));
             record.setEvidenceJson("[]");
-            record.setRawResponse("");
-            record.setErrorMessage(e.getMessage());
-            record.setContextCharsDelta(prompt.length());
+            record.setMissingDataJson(JSON.toJSONString(marketData.getRequiredMissing()));
+            record.setMainForceIntentJson(intentValidation.intent == null ? null : intentValidation.intent.toJSONString());
+            record.setMainForceIntentStatus(intentValidation.status);
+            record.setMainForceIntentWarningsJson(JSON.toJSONString(intentValidation.warnings));
+            record.setDataSnapshotJson(marketData.toJson());
+            record.setRawResponse(bridgeResult == null ? "" : text(bridgeResult.answerText, ""));
+            record.setBridgeTargetId(bridgeResult == null ? null : bridgeResult.targetId);
+            record.setConversationUrl(bridgeResult == null ? null : bridgeResult.finalUrl);
+            record.setErrorMessage(diagnosticMessage(e));
+            record.setContextCharsDelta(prompt.length() + (bridgeResult == null ? 0 : text(bridgeResult.answerText, "").length()));
             analysisMapper.insert(record);
-            updateSessionAfterRun(session, stockName, null, record, e.getMessage());
+            updateSessionAfterRun(session, stockName, bridgeResult, record, diagnosticMessage(e));
             return record;
         }
     }
@@ -420,6 +517,8 @@ public class StockWatchTechnicalAnalysisService {
         body.put("sessionKey", session.getSessionKey());
         body.put("forceNewSession", forceNewSession);
         body.put("closeTargetAfter", false);
+        body.put("expectedJson", true);
+        body.put("mode", "expert");
 
         OkHttpClient client = new OkHttpClient.Builder()
                 .connectTimeout(Math.max(5, connectTimeoutSeconds), TimeUnit.SECONDS)
@@ -454,11 +553,60 @@ public class StockWatchTechnicalAnalysisService {
                 bridgeResult.finalUrl = lookupChromeTargetUrl(bridgeResult.targetId);
             }
             bridgeResult.contentStatus = text(result.get("contentStatus"), "");
+            bridgeResult.completionReason = text(result.get("completionReason"), "");
+            if ("incomplete".equalsIgnoreCase(bridgeResult.contentStatus)) {
+                throw new IllegalStateException("DeepSeek 网页回答未完整生成，completionReason=" + bridgeResult.completionReason);
+            }
             if (!StringUtils.hasText(bridgeResult.answerText)) {
                 throw new IllegalStateException("DeepSeek 网页未返回分析正文，状态=" + bridgeResult.contentStatus);
             }
             return bridgeResult;
         }
+    }
+
+    private BridgeResult callDeepSeekBridgeWithRetry(String prompt,
+                                                     StockWatchTechnicalSession session,
+                                                     boolean forceNewSession,
+                                                     String periodType) throws Exception {
+        try {
+            return callDeepSeekBridge(prompt, session, forceNewSession);
+        } catch (Exception e) {
+            String message = text(e.getMessage(), "").toLowerCase(Locale.ROOT);
+            if (!message.contains("未完整生成") && !message.contains("incomplete_json")) {
+                throw e;
+            }
+            log.warn("DeepSeek structured response incomplete; retrying in same session key={}", session.getSessionKey());
+            return callDeepSeekBridge(structuredRetryPrompt(periodType, Collections.singletonList("response_incomplete_json")), session, false);
+        }
+    }
+
+    private String structuredRetryPrompt(String periodType, List<String> schemaProblems) {
+        String horizons = "WEEK".equals(periodType) ? "W1"
+                : ("MONTH".equals(periodType) ? "M1" : "T1和T5");
+        String problems = schemaProblems == null || schemaProblems.isEmpty()
+                ? "未通过结构化校验"
+                : String.join("；", schemaProblems);
+        return "上一条结构化回答不完整。不要重新搜索，不要解释，只根据上一条任务输入重新输出一个完整、可解析的JSON对象；"
+                + "必须包含stance、tone、confidence、title、conclusion、evidence、missingData、mainForceIntent、forecasts，forecasts必须包含" + horizons + "。"
+                + "mainForceIntent必须包含intent/timeWindow/confidence/evidence/counterEvidence/assumptions/risk/watchPoints；"
+                + "mainForceIntent.evidence和counterEvidence必须引用上一条输入中evidenceSignals.citationPaths里的完整路径。"
+                + "本轮未通过项：" + problems + "。";
+    }
+
+    private boolean hasRequiredForecasts(JSONArray forecasts, String periodType) {
+        if (forecasts == null || forecasts.isEmpty()) return false;
+        List<String> required = "WEEK".equals(periodType) ? Collections.singletonList("W1")
+                : ("MONTH".equals(periodType) ? Collections.singletonList("M1") : Arrays.asList("T1", "T5"));
+        List<String> found = new ArrayList<>();
+        for (int i = 0; i < forecasts.size(); i++) {
+            JSONObject forecast = asJsonObject(forecasts.get(i));
+            if (forecast == null) continue;
+            String horizon = text(forecast.get("horizon"), "").toUpperCase(Locale.ROOT).replace("+", "");
+            Double targetLow = number(forecast.get("targetLow"), null);
+            Double targetHigh = number(forecast.get("targetHigh"), null);
+            if (targetLow != null && targetHigh != null && targetLow > 0 && targetLow <= targetHigh) found.add(horizon);
+        }
+        return found.containsAll(required);
     }
 
     private String lookupChromeTargetUrl(String targetId) {
@@ -493,16 +641,16 @@ public class StockWatchTechnicalAnalysisService {
 
     private String buildPrompt(StockRef ref,
                                String stockName,
-                               Map<String, Object> quote,
+                               EastmoneyMarketDataService.MarketDataBundle marketData,
+                               Map<String, Object> evidenceSignals,
                                StockWatchTechnicalSession session,
                                String reason,
                                String periodType,
                                PeriodWindow window,
                                List<StockWatchTechnicalAnalysis> sourceRecords) {
-        Map<String, Object> derived = buildDerivedTechnicalFields(quote);
-        List<Map<String, Object>> recent = analysisMapper.selectRecentBySymbol(ref.symbol, ref.market, periodType, 5)
+        List<Map<String, Object>> recent = analysisMapper.selectRecentBySymbol(ref.symbol, ref.market, periodType, 2)
                 .stream()
-                .map(this::toCompactRecordPayload)
+                .map(this::toPromptRecordPayload)
                 .collect(Collectors.toList());
 
         JSONObject payload = new JSONObject(true);
@@ -512,10 +660,10 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("periodWindow", window.toPayload());
         payload.put("stock", stockName + " " + ref.symbol + "." + ref.market);
         payload.put("timestamp", ZonedDateTime.now(CHINA_ZONE).toString());
-        payload.put("quote", quote);
-        payload.put("derivedTechnicalFields", derived);
+        payload.put("marketData", toPromptMarketDataPayload(marketData.getPayload(), periodType));
+        payload.put("evidenceSignals", evidenceSignals);
         payload.put("sourceDailyAnalyses", sourceRecords.stream()
-                .map(this::toSourceRecordPayload)
+                .map(this::toPromptSourceRecordPayload)
                 .collect(Collectors.toList()));
         payload.put("recentSamePeriodAnalysis", recent);
         Map<String, Object> sessionPayload = new LinkedHashMap<>();
@@ -534,39 +682,522 @@ public class StockWatchTechnicalAnalysisService {
             periodInstruction = "你是A股盘中技术面分析员。请基于我提供的行情快照和派生字段做30分钟级别技术面分析。";
         }
 
+        String forecastInstruction = "DAY".equals(periodType)
+                ? "forecasts必须包含T1和T5两项。"
+                : ("WEEK".equals(periodType) ? "forecasts必须包含W1一项。" : "forecasts必须包含M1一项。");
         return String.join("\n",
                 periodInstruction,
-                "允许结合你当前网页版能力自行判断是否需要补充搜索，但不要编造我没有提供的实时行情字段。",
-                "如果周/月 sourceDailyAnalyses 不足，请明确写入 missingData，并降低 confidence；不要为了显得完整而编造K线、成交量或资金数据。",
+                "本轮行情、K线摘要、资金流、估值、财务摘要、公告、最近新闻、股东户数和本地技术指标都在marketData中；不得用会话历史覆盖本轮结构化数据。",
+                "本轮股票分析以marketData为唯一事实源，不需要额外联网搜索；如网页专业模式自动检索，也只能作为辅助线索，禁止覆盖marketData事实。",
+                "marketData.anchorFacts是程序校验后的事实锚点。涉及现价、涨跌幅、成交额、资金净额、资金占比和技术指标时必须原样引用anchorFacts，禁止自行换算单位或重算比例。",
+                "marketData.latestNews是必须参考的最近新闻；marketData.shareholderCounts是股东户数变化线索。若相关字段为空，只能在missingData复制dataQuality.requiredMissing或optionalMissing里的对应项。",
+                "marketData.dataPacking说明本轮为节省上下文已截取最近序列；完整原始行情快照由系统另存，不要抱怨未提供更早原始明细。",
+                "evidenceSignals是程序从marketData派生的资金流、价量、位置和证据覆盖信号。你必须强制分析mainForceIntent，但只能解释这些信号，不能把模型猜测当成事实。",
+                "mainForceIntent是“主力意图的模型推断”，不是事实标签；intent只能取ACCUMULATE/DISTRIBUTE/WASH/PULL_UP/SUPPORT/SUPPRESS/ROTATE/NEUTRAL/UNKNOWN。",
+                "mainForceIntent字段固定为：intent(string), timeWindow(string: INTRADAY/THREE_DAY/FIVE_DAY/TWENTY_DAY), confidence(number 0-1), evidence(array string), counterEvidence(array string), assumptions(array string), risk(string), watchPoints(array string)。",
+                "mainForceIntent.evidence和counterEvidence每条都必须引用evidenceSignals.citationPaths里的至少一个完整路径，例如evidenceSignals.fundFlowEvidence.anchorMainInflowYuan；证据不足时intent必须为NEUTRAL或UNKNOWN，confidence不得高于0.55。",
+                "dataQuality.sourceStatus是采集器真实状态；missingData只能复制dataQuality.requiredMissing与optionalMissing，禁止自行臆测已提供字段仍然缺失。",
                 "输出必须是一个JSON对象，不要Markdown，不要代码块，不要前后解释。",
-                "JSON字段固定为：stance(string), tone(string: green/blue/amber/red), confidence(number 0-1), title(string), conclusion(string), evidence(array string), missingData(array string)。",
+                "JSON字段固定为：stance(string), tone(string: green/blue/amber/red), confidence(number 0-1), title(string), conclusion(string), evidence(array string), missingData(array string), mainForceIntent(object), forecasts(array)。",
+                "每个forecast字段固定为：horizon(T1/T5/W1/M1), direction(UP/DOWN/SIDEWAYS), probability(0-1), targetLow, targetHigh, expectedReturnLow, expectedReturnHigh, invalidationPrice, rationale。",
+                forecastInstruction,
+                "direction定义：到期收益>=1%为UP，<=-1%为DOWN，其余为SIDEWAYS；targetLow不得大于targetHigh，价格与收益率必须和source price算术一致。",
                 "结论要短，优先说明当前周期技术状态、下一周期需要验证的价量条件、风险边界。",
                 "输入数据：",
                 payload.toJSONString()
         );
     }
 
-    private Map<String, Object> buildDerivedTechnicalFields(Map<String, Object> quote) {
-        Map<String, Object> fields = new LinkedHashMap<>();
-        Double price = number(quote.get("price"), null);
-        Double open = number(quote.get("open"), null);
-        Double high = number(quote.get("high"), null);
-        Double low = number(quote.get("low"), null);
-        Double previousClose = number(quote.get("previousClose"), null);
-        if (price != null && high != null && low != null && high > low) {
-            fields.put("intradayPosition", (price - low) / (high - low));
+    private Map<String, Object> toPromptMarketDataPayload(Map<String, Object> raw, String periodType) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        if (raw == null || raw.isEmpty()) {
+            return payload;
         }
-        if (price != null && open != null && open > 0) {
-            fields.put("priceVsOpenPct", (price - open) / open);
+        copyIfPresent(raw, payload, "asOf");
+        copyIfPresent(raw, payload, "sourceTradeDate");
+        copyIfPresent(raw, payload, "sourceTradeDateQuality");
+        copyIfPresent(raw, payload, "symbol");
+        copyIfPresent(raw, payload, "market");
+        copyIfPresent(raw, payload, "periodType");
+        copyIfPresent(raw, payload, "quote");
+        copyIfPresent(raw, payload, "stockDetail");
+        copyIfPresent(raw, payload, "anchorFacts");
+        copyIfPresent(raw, payload, "technicalIndicators");
+        copyIfPresent(raw, payload, "valuation");
+        copyIfPresent(raw, payload, "marketBenchmark");
+
+        String normalizedPeriod = normalizePeriodType(periodType);
+        int dailyCount = "DAY".equals(normalizedPeriod) ? 20 : 50;
+        int intradayCount = "DAY".equals(normalizedPeriod) ? 15 : 10;
+        payload.put("dailyKline", tailObjects(raw.get("dailyKline"), dailyCount));
+        if (raw.containsKey("periodKline")) {
+            payload.put("periodKline", tailObjects(raw.get("periodKline"), 30));
         }
-        if (high != null && low != null && previousClose != null && previousClose > 0) {
-            fields.put("amplitudePct", (high - low) / previousClose);
+        payload.put("minuteTrends5d", tailObjects(raw.get("minuteTrends5d"), intradayCount));
+        payload.put("intradayFundFlow", tailObjects(raw.get("intradayFundFlow"), intradayCount));
+        payload.put("financials", headObjects(raw.get("financials"), 3));
+        payload.put("announcements", headObjects(raw.get("announcements"), 5));
+        payload.put("latestNews", compactNews(raw.get("latestNews"), 6));
+        payload.put("shareholderCounts", headObjects(raw.get("shareholderCounts"), 3));
+        copyIfPresent(raw, payload, "dataQuality");
+
+        Map<String, Object> packing = new LinkedHashMap<>();
+        packing.put("mode", "compact_for_deepseek_prompt");
+        packing.put("fullSnapshotSavedBySystem", true);
+        packing.put("dailyKlineTailCount", dailyCount);
+        packing.put("minuteTrendsTailCount", intradayCount);
+        packing.put("intradayFundFlowTailCount", intradayCount);
+        packing.put("financialsLatestCount", 3);
+        packing.put("announcementsLatestCount", 5);
+        packing.put("latestNewsCount", 6);
+        packing.put("shareholderCountsLatestCount", 3);
+        payload.put("dataPacking", packing);
+        return payload;
+    }
+
+    private Map<String, Object> buildEvidenceSignals(Map<String, Object> raw, String periodType) {
+        Map<String, Object> signals = new LinkedHashMap<>();
+        List<String> citationPaths = new ArrayList<>();
+        Map<String, Object> fundFlow = buildFundFlowEvidence(raw, citationPaths);
+        Map<String, Object> priceVolume = buildPriceVolumeSignal(raw, citationPaths);
+        Map<String, Object> position = buildPositionSignal(raw, citationPaths);
+        Map<String, Object> coverage = buildEvidenceCoverage(fundFlow, priceVolume, position);
+        signals.put("schema", "stock_watch_evidence_signals_v1");
+        signals.put("periodType", normalizePeriodType(periodType));
+        signals.put("fundFlowEvidence", fundFlow);
+        signals.put("priceVolumeSignal", priceVolume);
+        signals.put("positionSignal", position);
+        signals.put("evidenceCoverage", coverage);
+        signals.put("citationPaths", citationPaths);
+        signals.put("usagePolicy", "DeepSeek必须解释这些程序派生信号；不得把mainForceIntent当作事实标签或触发规则。");
+        return signals;
+    }
+
+    private Map<String, Object> buildFundFlowEvidence(Map<String, Object> raw, List<String> citationPaths) {
+        JSONObject quote = asJsonObject(raw == null ? null : raw.get("quote"));
+        JSONObject anchorFacts = asJsonObject(raw == null ? null : raw.get("anchorFacts"));
+        List<Object> intradayFlow = toObjectList(raw == null ? null : raw.get("intradayFundFlow"));
+        JSONObject latestFlow = lastObject(intradayFlow);
+        Map<String, Object> signal = new LinkedHashMap<>();
+        List<String> limitations = new ArrayList<>();
+        Double anchorMain = number(anchorFacts == null ? null : anchorFacts.get("mainInflowYuan"), null);
+        Double anchorRatio = number(anchorFacts == null ? null : anchorFacts.get("mainInflowRatioPercent"), null);
+        Double amount = number(anchorFacts == null ? null : anchorFacts.get("amountYuan"), number(quote == null ? null : quote.get("amount"), null));
+        Double latestMain = number(latestFlow == null ? null : latestFlow.get("main"), null);
+        Double latestSuperLarge = number(latestFlow == null ? null : latestFlow.get("superLarge"), null);
+        Double latestLarge = number(latestFlow == null ? null : latestFlow.get("large"), null);
+        Double latestSmall = number(latestFlow == null ? null : latestFlow.get("small"), null);
+        Double tailMainSum = sumTail(intradayFlow, "main", Math.min(15, intradayFlow.size()));
+        Double tailSuperLargeSum = sumTail(intradayFlow, "superLarge", Math.min(15, intradayFlow.size()));
+        Double tailLargeSum = sumTail(intradayFlow, "large", Math.min(15, intradayFlow.size()));
+        Double selectedMain = firstNumber(anchorMain, latestMain, tailMainSum);
+        String direction = fundFlowDirection(selectedMain, latestSuperLarge, latestLarge, latestSmall);
+        String strength = fundFlowStrength(selectedMain, anchorRatio, amount);
+        String pattern = fundFlowPattern(direction, strength, latestSuperLarge, latestLarge, latestSmall);
+        putSignal(signal, "fundFlowEvidence", "direction", direction, citationPaths);
+        putSignal(signal, "fundFlowEvidence", "strength", strength, citationPaths);
+        putSignal(signal, "fundFlowEvidence", "pattern", pattern, citationPaths);
+        putSignal(signal, "fundFlowEvidence", "anchorMainInflowYuan", roundNullable(anchorMain), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "anchorMainInflowRatioPercent", roundNullable(anchorRatio), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "amountYuan", roundNullable(amount), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "latestMainInflowYuan", roundNullable(latestMain), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "latestSuperLargeInflowYuan", roundNullable(latestSuperLarge), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "latestLargeInflowYuan", roundNullable(latestLarge), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "latestSmallInflowYuan", roundNullable(latestSmall), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "tail15MainSumYuan", roundNullable(tailMainSum), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "tail15SuperLargeSumYuan", roundNullable(tailSuperLargeSum), citationPaths);
+        putSignal(signal, "fundFlowEvidence", "tail15LargeSumYuan", roundNullable(tailLargeSum), citationPaths);
+        signal.put("window", "intraday");
+        if (anchorMain == null && latestMain == null && tailMainSum == null) {
+            limitations.add("资金流主力净额不可用，不能支撑强主力意图。");
         }
-        fields.put("hasPositiveChange", number(quote.get("changePercent"), 0.0) >= 0);
-        fields.put("hasPositiveMainInflow", number(quote.get("mainInflow"), 0.0) >= 0);
-        fields.put("volumeRatio", quote.get("volumeRatio"));
-        fields.put("turnover", quote.get("turnover"));
-        return fields;
+        if (intradayFlow.isEmpty()) {
+            limitations.add("intradayFundFlow为空，无法观察盘中资金流形态。");
+        }
+        signal.put("limitations", limitations);
+        return signal;
+    }
+
+    private Map<String, Object> buildPriceVolumeSignal(Map<String, Object> raw, List<String> citationPaths) {
+        JSONObject quote = asJsonObject(raw == null ? null : raw.get("quote"));
+        JSONObject anchorFacts = asJsonObject(raw == null ? null : raw.get("anchorFacts"));
+        Map<String, Object> signal = new LinkedHashMap<>();
+        List<String> limitations = new ArrayList<>();
+        Double price = number(anchorFacts == null ? null : anchorFacts.get("priceYuan"), number(quote == null ? null : quote.get("price"), null));
+        Double changePct = number(anchorFacts == null ? null : anchorFacts.get("changePercent"), number(quote == null ? null : quote.get("changePercent"), null));
+        Double amount = number(anchorFacts == null ? null : anchorFacts.get("amountYuan"), number(quote == null ? null : quote.get("amount"), null));
+        Double turnover = number(anchorFacts == null ? null : anchorFacts.get("turnoverPercent"), number(quote == null ? null : quote.get("turnover"), null));
+        Double volumeRatio = number(anchorFacts == null ? null : anchorFacts.get("volumeRatio"), number(quote == null ? null : quote.get("volumeRatio"), null));
+        Double high = number(quote == null ? null : quote.get("high"), null);
+        Double low = number(quote == null ? null : quote.get("low"), null);
+        Double dayRangePositionPct = rangePosition(price, low, high);
+        String priceDirection = priceDirection(changePct);
+        String activity = activityLevel(changePct, volumeRatio, turnover);
+        putSignal(signal, "priceVolumeSignal", "priceDirection", priceDirection, citationPaths);
+        putSignal(signal, "priceVolumeSignal", "activity", activity, citationPaths);
+        putSignal(signal, "priceVolumeSignal", "priceYuan", roundNullable(price), citationPaths);
+        putSignal(signal, "priceVolumeSignal", "changePercent", roundNullable(changePct), citationPaths);
+        putSignal(signal, "priceVolumeSignal", "amountYuan", roundNullable(amount), citationPaths);
+        putSignal(signal, "priceVolumeSignal", "turnoverPercent", roundNullable(turnover), citationPaths);
+        putSignal(signal, "priceVolumeSignal", "volumeRatio", roundNullable(volumeRatio), citationPaths);
+        putSignal(signal, "priceVolumeSignal", "dayRangePositionPct", roundNullable(dayRangePositionPct), citationPaths);
+        if (price == null || changePct == null) {
+            limitations.add("实时价或涨跌幅不可用，价量信号不完整。");
+        }
+        if (volumeRatio == null && turnover == null && amount == null) {
+            limitations.add("成交额、换手率和量比均不可用，不能判断量能。");
+        }
+        signal.put("limitations", limitations);
+        return signal;
+    }
+
+    private Map<String, Object> buildPositionSignal(Map<String, Object> raw, List<String> citationPaths) {
+        JSONObject indicators = asJsonObject(raw == null ? null : raw.get("technicalIndicators"));
+        List<Object> dailyBars = toObjectList(raw == null ? null : raw.get("dailyKline"));
+        Map<String, Object> signal = new LinkedHashMap<>();
+        List<String> limitations = new ArrayList<>();
+        JSONObject latestBar = lastObject(dailyBars);
+        Double close = number(latestBar == null ? null : latestBar.get("close"), null);
+        Double high20 = maxTail(dailyBars, "high", Math.min(20, dailyBars.size()));
+        Double low20 = minTail(dailyBars, "low", Math.min(20, dailyBars.size()));
+        Double return5Pct = returnFromTail(dailyBars, 5);
+        Double return20Pct = returnFromTail(dailyBars, 20);
+        Double ma5 = number(indicators == null ? null : indicators.get("ma5"), null);
+        Double ma20 = number(indicators == null ? null : indicators.get("ma20"), null);
+        Double position20 = rangePosition(close, low20, high20);
+        String location = positionLocation(position20);
+        String trend = positionTrend(return5Pct, return20Pct, close, ma5, ma20);
+        putSignal(signal, "positionSignal", "location", location, citationPaths);
+        putSignal(signal, "positionSignal", "trend", trend, citationPaths);
+        putSignal(signal, "positionSignal", "closeYuan", roundNullable(close), citationPaths);
+        putSignal(signal, "positionSignal", "high20Yuan", roundNullable(high20), citationPaths);
+        putSignal(signal, "positionSignal", "low20Yuan", roundNullable(low20), citationPaths);
+        putSignal(signal, "positionSignal", "closePosition20dPct", roundNullable(position20), citationPaths);
+        putSignal(signal, "positionSignal", "return5Pct", roundNullable(return5Pct), citationPaths);
+        putSignal(signal, "positionSignal", "return20Pct", roundNullable(return20Pct), citationPaths);
+        putSignal(signal, "positionSignal", "ma5", roundNullable(ma5), citationPaths);
+        putSignal(signal, "positionSignal", "ma20", roundNullable(ma20), citationPaths);
+        if (dailyBars.size() < 20) {
+            limitations.add("dailyKline不足20根，位置和趋势只能低置信参考。");
+        }
+        if (close == null) {
+            limitations.add("最新日K收盘价不可用。");
+        }
+        signal.put("limitations", limitations);
+        return signal;
+    }
+
+    private Map<String, Object> buildEvidenceCoverage(Map<String, Object> fundFlow,
+                                                      Map<String, Object> priceVolume,
+                                                      Map<String, Object> position) {
+        boolean hasFundFlow = hasAnyValue(fundFlow, "anchorMainInflowYuan", "latestMainInflowYuan", "tail15MainSumYuan");
+        boolean hasPriceVolume = hasAnyValue(priceVolume, "priceYuan", "changePercent")
+                && hasAnyValue(priceVolume, "amountYuan", "turnoverPercent", "volumeRatio");
+        boolean hasPosition = hasAnyValue(position, "closePosition20dPct", "return5Pct", "return20Pct");
+        int score = (hasFundFlow ? 1 : 0) + (hasPriceVolume ? 1 : 0) + (hasPosition ? 1 : 0);
+        Map<String, Object> coverage = new LinkedHashMap<>();
+        coverage.put("fundFlow", hasFundFlow);
+        coverage.put("priceVolume", hasPriceVolume);
+        coverage.put("position", hasPosition);
+        coverage.put("score", score);
+        coverage.put("maxScore", 3);
+        coverage.put("strongIntentAllowed", hasFundFlow && hasPriceVolume);
+        coverage.put("highConfidenceAllowed", hasFundFlow && hasPriceVolume && hasPosition);
+        return coverage;
+    }
+
+    private void putSignal(Map<String, Object> target,
+                           String section,
+                           String key,
+                           Object value,
+                           List<String> citationPaths) {
+        if (value == null) {
+            return;
+        }
+        target.put(key, value);
+        citationPaths.add("evidenceSignals." + section + "." + key);
+    }
+
+    private JSONObject lastObject(List<Object> values) {
+        if (values == null || values.isEmpty()) {
+            return null;
+        }
+        return asJsonObject(values.get(values.size() - 1));
+    }
+
+    private Double firstNumber(Double... values) {
+        if (values == null) {
+            return null;
+        }
+        for (Double value : values) {
+            if (value != null && Double.isFinite(value)) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private Double sumTail(List<Object> rows, String key, int count) {
+        if (rows == null || rows.isEmpty() || count <= 0) {
+            return null;
+        }
+        int start = Math.max(0, rows.size() - count);
+        double sum = 0;
+        boolean found = false;
+        for (int i = start; i < rows.size(); i++) {
+            JSONObject row = asJsonObject(rows.get(i));
+            Double value = number(row == null ? null : row.get(key), null);
+            if (value != null && Double.isFinite(value)) {
+                sum += value;
+                found = true;
+            }
+        }
+        return found ? sum : null;
+    }
+
+    private Double maxTail(List<Object> rows, String key, int count) {
+        Double value = null;
+        if (rows == null || rows.isEmpty() || count <= 0) {
+            return null;
+        }
+        int start = Math.max(0, rows.size() - count);
+        for (int i = start; i < rows.size(); i++) {
+            JSONObject row = asJsonObject(rows.get(i));
+            Double next = number(row == null ? null : row.get(key), null);
+            if (next != null && Double.isFinite(next)) {
+                value = value == null ? next : Math.max(value, next);
+            }
+        }
+        return value;
+    }
+
+    private Double minTail(List<Object> rows, String key, int count) {
+        Double value = null;
+        if (rows == null || rows.isEmpty() || count <= 0) {
+            return null;
+        }
+        int start = Math.max(0, rows.size() - count);
+        for (int i = start; i < rows.size(); i++) {
+            JSONObject row = asJsonObject(rows.get(i));
+            Double next = number(row == null ? null : row.get(key), null);
+            if (next != null && Double.isFinite(next)) {
+                value = value == null ? next : Math.min(value, next);
+            }
+        }
+        return value;
+    }
+
+    private Double returnFromTail(List<Object> rows, int periods) {
+        if (rows == null || rows.size() <= periods) {
+            return null;
+        }
+        JSONObject latest = asJsonObject(rows.get(rows.size() - 1));
+        JSONObject base = asJsonObject(rows.get(rows.size() - 1 - periods));
+        Double latestClose = number(latest == null ? null : latest.get("close"), null);
+        Double baseClose = number(base == null ? null : base.get("close"), null);
+        if (latestClose == null || baseClose == null || baseClose == 0) {
+            return null;
+        }
+        return (latestClose / baseClose - 1.0) * 100.0;
+    }
+
+    private Double rangePosition(Double value, Double low, Double high) {
+        if (value == null || low == null || high == null || high <= low) {
+            return null;
+        }
+        return Math.max(0.0, Math.min(100.0, (value - low) * 100.0 / (high - low)));
+    }
+
+    private String fundFlowDirection(Double main, Double superLarge, Double large, Double small) {
+        if (main == null || Math.abs(main) < 1.0) {
+            return "UNKNOWN";
+        }
+        double institutional = safe(superLarge) + safe(large);
+        if (main > 0 && institutional >= 0) {
+            return "NET_INFLOW";
+        }
+        if (main < 0 && institutional <= 0) {
+            return "NET_OUTFLOW";
+        }
+        if (main > 0 && small != null && small < 0) {
+            return "NET_INFLOW";
+        }
+        if (main < 0 && small != null && small > 0) {
+            return "NET_OUTFLOW";
+        }
+        return "MIXED";
+    }
+
+    private String fundFlowStrength(Double main, Double ratioPct, Double amount) {
+        if (main == null) {
+            return "UNKNOWN";
+        }
+        double abs = Math.abs(main);
+        double ratio = ratioPct != null ? Math.abs(ratioPct)
+                : (amount == null || amount == 0 ? 0 : Math.abs(main / amount * 100.0));
+        if (abs >= 100_000_000.0 || ratio >= 5.0) {
+            return "STRONG";
+        }
+        if (abs >= 30_000_000.0 || ratio >= 2.0) {
+            return "MEDIUM";
+        }
+        return "WEAK";
+    }
+
+    private String fundFlowPattern(String direction, String strength, Double superLarge, Double large, Double small) {
+        if ("UNKNOWN".equals(direction)) {
+            return "UNKNOWN";
+        }
+        double big = safe(superLarge) + safe(large);
+        if ("NET_INFLOW".equals(direction) && big > 0 && "STRONG".equals(strength)) {
+            return "ACCUMULATION_LIKE";
+        }
+        if ("NET_OUTFLOW".equals(direction) && big < 0 && "STRONG".equals(strength)) {
+            return "DISTRIBUTION_LIKE";
+        }
+        if ("NET_INFLOW".equals(direction) && small != null && small < 0) {
+            return "PULL_UP_LIKE";
+        }
+        if ("NET_OUTFLOW".equals(direction) && small != null && small > 0) {
+            return "WASH_LIKE";
+        }
+        return "NEUTRAL";
+    }
+
+    private String priceDirection(Double changePct) {
+        if (changePct == null) {
+            return "UNKNOWN";
+        }
+        if (changePct >= 1.0) {
+            return "UP";
+        }
+        if (changePct <= -1.0) {
+            return "DOWN";
+        }
+        return "SIDEWAYS";
+    }
+
+    private String activityLevel(Double changePct, Double volumeRatio, Double turnover) {
+        double absChange = changePct == null ? 0.0 : Math.abs(changePct);
+        double ratio = volumeRatio == null ? 0.0 : volumeRatio;
+        double turn = turnover == null ? 0.0 : turnover;
+        if (absChange >= 5.0 || ratio >= 2.0 || turn >= 8.0) {
+            return "HIGH";
+        }
+        if (absChange >= 2.0 || ratio >= 1.2 || turn >= 3.0) {
+            return "MEDIUM";
+        }
+        return "LOW";
+    }
+
+    private String positionLocation(Double positionPct) {
+        if (positionPct == null) {
+            return "UNKNOWN";
+        }
+        if (positionPct >= 75.0) {
+            return "NEAR_HIGH";
+        }
+        if (positionPct <= 25.0) {
+            return "NEAR_LOW";
+        }
+        return "MID_RANGE";
+    }
+
+    private String positionTrend(Double return5Pct, Double return20Pct, Double close, Double ma5, Double ma20) {
+        if (return5Pct != null && return20Pct != null) {
+            if (return5Pct > 3.0 && return20Pct > 5.0) {
+                return "UP";
+            }
+            if (return5Pct < -3.0 && return20Pct < -5.0) {
+                return "DOWN";
+            }
+        }
+        if (close != null && ma5 != null && ma20 != null) {
+            if (close > ma5 && ma5 > ma20) {
+                return "UP";
+            }
+            if (close < ma5 && ma5 < ma20) {
+                return "DOWN";
+            }
+            return "SIDEWAYS";
+        }
+        return "UNKNOWN";
+    }
+
+    private boolean hasAnyValue(Map<String, Object> source, String... keys) {
+        if (source == null || keys == null) {
+            return false;
+        }
+        for (String key : keys) {
+            if (source.get(key) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private double safe(Double value) {
+        return value == null || !Double.isFinite(value) ? 0.0 : value;
+    }
+
+    private Double roundNullable(Double value) {
+        if (value == null || !Double.isFinite(value)) {
+            return null;
+        }
+        return Math.round(value * 10000.0) / 10000.0;
+    }
+
+    private void copyIfPresent(Map<String, Object> source, Map<String, Object> target, String key) {
+        if (source.containsKey(key)) {
+            target.put(key, source.get(key));
+        }
+    }
+
+    private List<Object> tailObjects(Object raw, int count) {
+        List<Object> values = toObjectList(raw);
+        if (values.isEmpty()) return Collections.emptyList();
+        return new ArrayList<>(values.subList(Math.max(0, values.size() - count), values.size()));
+    }
+
+    private List<Object> headObjects(Object raw, int count) {
+        List<Object> values = toObjectList(raw);
+        if (values.isEmpty()) return Collections.emptyList();
+        return new ArrayList<>(values.subList(0, Math.min(count, values.size())));
+    }
+
+    private List<Object> compactNews(Object raw, int count) {
+        List<Object> values = headObjects(raw, count);
+        List<Object> compact = new ArrayList<>();
+        for (Object value : values) {
+            if (!(value instanceof Map)) {
+                compact.add(value);
+                continue;
+            }
+            Map<?, ?> item = (Map<?, ?>) value;
+            Map<String, Object> news = new LinkedHashMap<>();
+            news.put("title", item.get("title"));
+            news.put("showTime", item.get("showTime"));
+            news.put("source", item.get("source"));
+            news.put("summary", truncate(text(item.get("summary"), ""), 180));
+            news.put("url", item.get("url"));
+            compact.add(news);
+        }
+        return compact;
+    }
+
+    private List<Object> toObjectList(Object raw) {
+        if (raw instanceof List) {
+            return new ArrayList<>((List<?>) raw);
+        }
+        if (raw instanceof JSONArray) {
+            JSONArray array = (JSONArray) raw;
+            List<Object> values = new ArrayList<>();
+            for (int i = 0; i < array.size(); i++) {
+                values.add(array.get(i));
+            }
+            return values;
+        }
+        return Collections.emptyList();
     }
 
     private AnalysisPayload parseAnalysisPayload(String raw, String stockName) {
@@ -579,6 +1210,8 @@ public class StockWatchTechnicalAnalysisService {
             fallback.title = stockName + " 技术面分析";
             fallback.conclusion = truncate(text(raw, "DeepSeek 网页返回内容不可解析。"), 1200);
             fallback.evidence = Collections.singletonList("raw_response_unparsed");
+            fallback.missingData = Collections.singletonList("model_response_invalid_json");
+            fallback.forecasts = new JSONArray();
             return fallback;
         }
         AnalysisPayload payload = new AnalysisPayload();
@@ -587,11 +1220,181 @@ public class StockWatchTechnicalAnalysisService {
         payload.confidence = normalizeConfidence(parsed.get("confidence"));
         payload.title = text(parsed.get("title"), stockName + " 技术面分析");
         payload.conclusion = text(parsed.get("conclusion"), "");
-        payload.evidence = toStringList(parsed.getJSONArray("evidence"));
+        payload.evidence = toStringListField(parsed.get("evidence"), "evidence", payload.schemaWarnings);
+        payload.missingData = toStringListField(parsed.get("missingData"), "missingData", payload.schemaWarnings);
+        payload.mainForceIntent = asJsonObject(parsed.get("mainForceIntent"));
+        if (parsed.containsKey("mainForceIntent") && payload.mainForceIntent == null) {
+            payload.schemaWarnings.add("mainForceIntent expected JSONObject but got " + jsonTypeName(parsed.get("mainForceIntent")));
+        }
+        payload.forecasts = toForecastArray(parsed.get("forecasts"), payload.schemaWarnings);
         if (payload.evidence.isEmpty()) {
             payload.evidence.add("DeepSeek 网页技术面分析");
         }
         return payload;
+    }
+
+    private IntentValidationResult validateMainForceIntent(JSONObject raw, Map<String, Object> evidenceSignals) {
+        List<String> problems = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+        JSONObject normalized = new JSONObject(true);
+        if (raw == null || raw.isEmpty()) {
+            problems.add("mainForceIntent_missing");
+            return IntentValidationResult.invalid(normalized, problems, warnings);
+        }
+        String intent = normalizeEnum(text(raw.get("intent"), ""), MAIN_FORCE_INTENTS, "UNKNOWN");
+        String rawIntent = text(raw.get("intent"), "");
+        if (!MAIN_FORCE_INTENTS.contains(rawIntent.toUpperCase(Locale.ROOT))) {
+            problems.add("mainForceIntent.intent_invalid:" + rawIntent);
+        }
+        String timeWindow = normalizeEnum(text(raw.get("timeWindow"), ""), MAIN_FORCE_WINDOWS, "INTRADAY");
+        String rawWindow = text(raw.get("timeWindow"), "");
+        if (!MAIN_FORCE_WINDOWS.contains(rawWindow.toUpperCase(Locale.ROOT))) {
+            problems.add("mainForceIntent.timeWindow_invalid:" + rawWindow);
+        }
+        boolean confidencePresent = raw.containsKey("confidence");
+        double confidence = normalizeConfidence(raw.get("confidence"));
+        if (!confidencePresent) {
+            problems.add("mainForceIntent.confidence_missing");
+        }
+        List<String> evidence = strictStringList(raw, "evidence", true, problems);
+        List<String> counterEvidence = strictStringList(raw, "counterEvidence", false, problems);
+        List<String> assumptions = strictStringList(raw, "assumptions", false, problems);
+        List<String> watchPoints = strictStringList(raw, "watchPoints", false, problems);
+        String risk = text(raw.get("risk"), "");
+        if (!raw.containsKey("risk")) {
+            problems.add("mainForceIntent.risk_missing");
+        }
+
+        Set<String> allowedPaths = citationPathSet(evidenceSignals);
+        Set<String> citedPaths = validEvidencePaths(evidence, allowedPaths, warnings, problems, "evidence");
+        citedPaths.addAll(validEvidencePaths(counterEvidence, allowedPaths, warnings, problems, "counterEvidence"));
+        boolean strongIntent = STRONG_MAIN_FORCE_INTENTS.contains(intent);
+        boolean strongAllowed = coverageFlag(evidenceSignals, "strongIntentAllowed");
+        boolean highConfidenceAllowed = coverageFlag(evidenceSignals, "highConfidenceAllowed");
+        if (strongIntent && !strongAllowed) {
+            problems.add("strong_intent_requires_fund_flow_and_price_volume_coverage");
+        }
+        if (strongIntent && citedPaths.isEmpty()) {
+            problems.add("strong_intent_requires_valid_evidence_path");
+        }
+        if (confidence > 0.55 && !highConfidenceAllowed) {
+            problems.add("confidence_above_0.55_requires_fund_flow_price_volume_position_coverage");
+        }
+        if ((evidence.isEmpty() || citedPaths.isEmpty()) && ("NEUTRAL".equals(intent) || "UNKNOWN".equals(intent)) && confidence > 0.55) {
+            problems.add("neutral_or_unknown_without_valid_evidence_confidence_must_not_exceed_0.55");
+        }
+
+        normalized.put("intent", intent);
+        normalized.put("timeWindow", timeWindow);
+        normalized.put("confidence", roundNullable(confidence));
+        normalized.put("evidence", toJsonArray(evidence));
+        normalized.put("counterEvidence", toJsonArray(counterEvidence));
+        normalized.put("assumptions", toJsonArray(assumptions));
+        normalized.put("risk", risk);
+        normalized.put("watchPoints", toJsonArray(watchPoints));
+        normalized.put("validatedEvidencePaths", toJsonArray(new ArrayList<>(citedPaths)));
+        normalized.put("disclaimer", "模型推断，非事实标签，不参与异动触发。");
+        if (!problems.isEmpty()) {
+            return IntentValidationResult.invalid(normalized, problems, warnings);
+        }
+        return IntentValidationResult.valid(normalized, warnings);
+    }
+
+    private List<String> strictStringList(JSONObject object, String field, boolean requireNonEmpty, List<String> problems) {
+        if (object == null || !object.containsKey(field)) {
+            problems.add("mainForceIntent." + field + "_missing");
+            return new ArrayList<>();
+        }
+        Object raw = object.get(field);
+        List<String> values = new ArrayList<>();
+        if (raw instanceof JSONArray) {
+            values = toStringList((JSONArray) raw);
+        } else if (raw instanceof List) {
+            for (Object item : (List<?>) raw) {
+                String value = text(item, "");
+                if (StringUtils.hasText(value)) {
+                    values.add(value);
+                }
+            }
+        } else {
+            problems.add("mainForceIntent." + field + "_must_be_array");
+        }
+        if (requireNonEmpty && values.isEmpty()) {
+            problems.add("mainForceIntent." + field + "_empty");
+        }
+        return values;
+    }
+
+    private String normalizeEnum(String raw, List<String> allowed, String fallback) {
+        String value = text(raw, "").trim().toUpperCase(Locale.ROOT);
+        return allowed.contains(value) ? value : fallback;
+    }
+
+    private Set<String> citationPathSet(Map<String, Object> evidenceSignals) {
+        Set<String> paths = new LinkedHashSet<>();
+        if (evidenceSignals == null) {
+            return paths;
+        }
+        for (Object value : toObjectList(evidenceSignals.get("citationPaths"))) {
+            String path = text(value, "");
+            if (StringUtils.hasText(path)) {
+                paths.add(path);
+            }
+        }
+        return paths;
+    }
+
+    private Set<String> validEvidencePaths(List<String> evidence,
+                                           Set<String> allowedPaths,
+                                           List<String> warnings,
+                                           List<String> problems,
+                                           String fieldName) {
+        Set<String> valid = new LinkedHashSet<>();
+        if (evidence == null || evidence.isEmpty()) {
+            return valid;
+        }
+        int index = 0;
+        for (String item : evidence) {
+            java.util.regex.Matcher matcher = EVIDENCE_PATH_PATTERN.matcher(item);
+            boolean foundPath = false;
+            boolean foundValid = false;
+            while (matcher.find()) {
+                foundPath = true;
+                String path = matcher.group();
+                if (allowedPaths.contains(path)) {
+                    valid.add(path);
+                    foundValid = true;
+                }
+            }
+            if (!foundPath) {
+                String message = "mainForceIntent." + fieldName + "[" + index + "] has no parseable path: " + truncate(item, 80);
+                warnings.add(message);
+                problems.add("mainForceIntent." + fieldName + "[" + index + "]_missing_valid_evidence_path");
+            } else if (!foundValid) {
+                String message = "mainForceIntent." + fieldName + "[" + index + "] path not in citationPaths: " + truncate(item, 80);
+                warnings.add(message);
+                problems.add("mainForceIntent." + fieldName + "[" + index + "]_invalid_evidence_path");
+            }
+            index++;
+        }
+        return valid;
+    }
+
+    private boolean coverageFlag(Map<String, Object> evidenceSignals, String key) {
+        JSONObject coverage = asJsonObject(evidenceSignals == null ? null : evidenceSignals.get("evidenceCoverage"));
+        Object value = coverage == null ? null : coverage.get(key);
+        if (value instanceof Boolean) {
+            return (Boolean) value;
+        }
+        return "true".equalsIgnoreCase(String.valueOf(value));
+    }
+
+    private JSONArray toJsonArray(List<String> values) {
+        JSONArray array = new JSONArray();
+        if (values != null) {
+            array.addAll(values);
+        }
+        return array;
     }
 
     private JSONObject extractJsonObject(String raw) {
@@ -620,6 +1423,162 @@ public class StockWatchTechnicalAnalysisService {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private List<String> toStringListField(Object raw, String fieldName, List<String> schemaWarnings) {
+        if (raw == null) {
+            return new ArrayList<>();
+        }
+        if (raw instanceof JSONArray) {
+            return toStringList((JSONArray) raw);
+        }
+        if (schemaWarnings != null) {
+            schemaWarnings.add(fieldName + " expected JSONArray but got " + jsonTypeName(raw));
+        }
+        List<String> values = new ArrayList<>();
+        if (raw instanceof List) {
+            for (Object item : (List<?>) raw) {
+                String value = text(item, "");
+                if (StringUtils.hasText(value)) {
+                    values.add(value);
+                }
+            }
+            return values;
+        }
+        String value = raw instanceof JSONObject || raw instanceof Map ? JSON.toJSONString(raw) : text(raw, "");
+        if (StringUtils.hasText(value)) {
+            values.add(value);
+        }
+        return values;
+    }
+
+    private JSONArray toForecastArray(Object raw, List<String> schemaWarnings) {
+        JSONArray result = new JSONArray();
+        if (raw == null) {
+            return result;
+        }
+        if (raw instanceof JSONArray) {
+            JSONArray array = (JSONArray) raw;
+            for (int i = 0; i < array.size(); i++) {
+                addForecastItem(result, array.get(i), "", schemaWarnings);
+            }
+            return result;
+        }
+        if (schemaWarnings != null) {
+            schemaWarnings.add("forecasts expected JSONArray but got " + jsonTypeName(raw));
+        }
+        if (raw instanceof JSONObject) {
+            JSONObject object = (JSONObject) raw;
+            if (looksLikeForecast(object)) {
+                addForecastItem(result, object, "", schemaWarnings);
+                return result;
+            }
+            for (Map.Entry<String, Object> entry : object.entrySet()) {
+                addForecastItem(result, entry.getValue(), normalizeForecastHorizon(entry.getKey()), schemaWarnings);
+            }
+            return result;
+        }
+        if (raw instanceof List) {
+            for (Object item : (List<?>) raw) {
+                addForecastItem(result, item, "", schemaWarnings);
+            }
+            return result;
+        }
+        addForecastItem(result, raw, "", schemaWarnings);
+        return result;
+    }
+
+    private void addForecastItem(JSONArray result, Object raw, String fallbackHorizon, List<String> schemaWarnings) {
+        if (raw == null) {
+            return;
+        }
+        if (raw instanceof JSONArray) {
+            JSONArray array = (JSONArray) raw;
+            for (int i = 0; i < array.size(); i++) {
+                addForecastItem(result, array.get(i), fallbackHorizon, schemaWarnings);
+            }
+            return;
+        }
+        JSONObject item = asJsonObject(raw);
+        if (item == null) {
+            if (schemaWarnings != null) {
+                schemaWarnings.add("forecasts item ignored: " + jsonTypeName(raw));
+            }
+            return;
+        }
+        if (!StringUtils.hasText(text(item.get("horizon"), "")) && StringUtils.hasText(fallbackHorizon)) {
+            item.put("horizon", fallbackHorizon);
+        }
+        result.add(item);
+    }
+
+    private JSONObject asJsonObject(Object raw) {
+        if (raw instanceof JSONObject) {
+            return (JSONObject) raw;
+        }
+        if (raw instanceof Map) {
+            JSONObject object = new JSONObject(true);
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) raw).entrySet()) {
+                object.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+            return object;
+        }
+        if (raw instanceof String) {
+            return parseObject((String) raw);
+        }
+        return null;
+    }
+
+    private boolean looksLikeForecast(JSONObject object) {
+        return object.containsKey("horizon")
+                || object.containsKey("direction")
+                || object.containsKey("probability")
+                || object.containsKey("targetLow")
+                || object.containsKey("targetHigh");
+    }
+
+    private String normalizeForecastHorizon(String raw) {
+        return text(raw, "").toUpperCase(Locale.ROOT).replace("+", "").replaceAll("\\s+", "");
+    }
+
+    private String jsonTypeName(Object raw) {
+        if (raw == null) {
+            return "null";
+        }
+        if (raw instanceof JSONArray) {
+            return "JSONArray";
+        }
+        if (raw instanceof JSONObject) {
+            return "JSONObject";
+        }
+        return raw.getClass().getSimpleName();
+    }
+
+    private String schemaWarningSummary(AnalysisPayload payload) {
+        if (payload == null || payload.schemaWarnings == null || payload.schemaWarnings.isEmpty()) {
+            return null;
+        }
+        return "DeepSeek JSON schema coerced: " + String.join("; ", payload.schemaWarnings);
+    }
+
+    private String schemaWarningSuffix(AnalysisPayload payload) {
+        String summary = schemaWarningSummary(payload);
+        return StringUtils.hasText(summary) ? "；" + summary : "";
+    }
+
+    private String failureConclusion(Exception e) {
+        String message = diagnosticMessage(e);
+        if (e instanceof ModelResponseSchemaException) {
+            return "DeepSeek 网页返回结构解析失败：" + message;
+        }
+        return "DeepSeek 网页 provider 调用失败：" + message;
+    }
+
+    private String diagnosticMessage(Exception e) {
+        if (e == null) {
+            return "unknown_error";
+        }
+        return text(e.getMessage(), e.getClass().getName());
     }
 
     private Map<String, Object> toSessionPayload(StockWatchTechnicalSession session, StockRef fallbackRef) {
@@ -671,6 +1630,7 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("conversationUrl", record.getConversationUrl());
         payload.put("bridgeTargetId", record.getBridgeTargetId());
         payload.put("traceable", isTraceableUrl(record.getConversationUrl()));
+        payload.put("evidenceSignals", parseObject(record.getEvidenceSignalJson()));
         return payload;
     }
 
@@ -690,6 +1650,10 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("title", record.getTitle());
         payload.put("conclusion", record.getConclusion());
         payload.put("evidence", parseEvidence(record.getEvidenceJson()));
+        payload.put("missingData", parseEvidence(record.getMissingDataJson()));
+        payload.put("mainForceIntent", parseObject(record.getMainForceIntentJson()));
+        payload.put("mainForceIntentStatus", record.getMainForceIntentStatus());
+        payload.put("mainForceIntentWarnings", parseEvidence(record.getMainForceIntentWarningsJson()));
         payload.put("promptHash", record.getPromptHash());
         return payload;
     }
@@ -705,7 +1669,47 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("title", record.getTitle());
         payload.put("conclusion", truncate(record.getConclusion(), 360));
         payload.put("evidence", parseEvidence(record.getEvidenceJson()));
+        payload.put("mainForceIntent", parseObject(record.getMainForceIntentJson()));
         return payload;
+    }
+
+    private Map<String, Object> toPromptRecordPayload(StockWatchTechnicalAnalysis record) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("id", record.getId());
+        payload.put("date", toLocalDate(record.getAnalysisDate()).toString());
+        payload.put("time", record.getRunSlot());
+        payload.put("status", record.getStatus());
+        payload.put("stance", record.getStance());
+        payload.put("tone", record.getTone());
+        payload.put("confidence", formatConfidence(record.getConfidence()));
+        payload.put("title", truncate(record.getTitle(), 80));
+        payload.put("conclusion", truncate(record.getConclusion(), 240));
+        payload.put("evidence", compactEvidence(record.getEvidenceJson(), 3, 120));
+        payload.put("missingData", compactEvidence(record.getMissingDataJson(), 3, 120));
+        payload.put("mainForceIntent", parseObject(record.getMainForceIntentJson()));
+        return payload;
+    }
+
+    private Map<String, Object> toPromptSourceRecordPayload(StockWatchTechnicalAnalysis record) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("id", record.getId());
+        payload.put("date", toLocalDate(record.getAnalysisDate()).toString());
+        payload.put("time", record.getRunSlot());
+        payload.put("stance", record.getStance());
+        payload.put("tone", record.getTone());
+        payload.put("confidence", record.getConfidence());
+        payload.put("title", truncate(record.getTitle(), 80));
+        payload.put("conclusion", truncate(record.getConclusion(), 240));
+        payload.put("evidence", compactEvidence(record.getEvidenceJson(), 3, 120));
+        payload.put("mainForceIntent", parseObject(record.getMainForceIntentJson()));
+        return payload;
+    }
+
+    private List<String> compactEvidence(String evidenceJson, int maxItems, int maxChars) {
+        return parseEvidence(evidenceJson).stream()
+                .limit(Math.max(0, maxItems))
+                .map(value -> truncate(value, maxChars))
+                .collect(Collectors.toList());
     }
 
     private List<String> parseEvidence(String evidenceJson) {
@@ -798,6 +1802,34 @@ public class StockWatchTechnicalAnalysisService {
             return currentPeriodWindow(periodType, endDate.minusMonths(periods - 1L)).start;
         }
         return endDate.minusDays(periods - 1L);
+    }
+
+    private LocalDate sourceTradeDate(Map<String, Object> payload, LocalDate fallback) {
+        LocalDate source = parseLocalDate(payload == null ? null : payload.get("sourceTradeDate"));
+        if (source != null) {
+            return source;
+        }
+        JSONObject anchorFacts = asJsonObject(payload == null ? null : payload.get("anchorFacts"));
+        source = parseLocalDate(anchorFacts == null ? null : anchorFacts.get("sourceTradeDate"));
+        if (source != null) {
+            return source;
+        }
+        List<Object> dailyBars = toObjectList(payload == null ? null : payload.get("dailyKline"));
+        JSONObject latest = lastObject(dailyBars);
+        source = parseLocalDate(latest == null ? null : latest.get("date"));
+        return source == null ? fallback : source;
+    }
+
+    private LocalDate parseLocalDate(Object raw) {
+        String value = text(raw, "");
+        if (!StringUtils.hasText(value)) {
+            return null;
+        }
+        try {
+            return LocalDate.parse(value.substring(0, Math.min(10, value.length())));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private PeriodWindow currentPeriodWindow(String periodType, LocalDate date) {
@@ -915,8 +1947,30 @@ public class StockWatchTechnicalAnalysisService {
 
     private List<String> scheduledSymbolLabels() {
         return scheduledRefs().stream()
-                .map(ref -> ref.symbol + "." + ref.market)
+                .map(this::stockLabel)
                 .collect(Collectors.toList());
+    }
+
+    private String stockLabel(StockRef ref) {
+        return ref.symbol + "." + ref.market;
+    }
+
+    private long elapsedMillis(long startedAtNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+    }
+
+    private String classifySkipReason(Exception e) {
+        String message = diagnosticMessage(e);
+        if (message.contains("非交易时段")) {
+            return "non_trading_session";
+        }
+        if (message.contains("预测必需数据未就绪")) {
+            return "required_market_data_missing";
+        }
+        if (message.contains("行情抓取失败")) {
+            return "quote_fetch_failed";
+        }
+        return "exception";
     }
 
     private StockRef normalizeStockRef(String rawSymbol, String rawMarket) {
@@ -1070,11 +2124,53 @@ public class StockWatchTechnicalAnalysisService {
         }
     }
 
+    private static class BatchStats {
+        private int attempted;
+        private int completed;
+        private int skipped;
+        private int failed;
+
+        private void record(PeriodRunResult result) {
+            attempted++;
+            if (result.skipped) {
+                skipped++;
+            } else if ("SUCCESS".equalsIgnoreCase(result.recordStatus)) {
+                completed++;
+            } else {
+                failed++;
+            }
+        }
+
+        private void recordFailure() {
+            attempted++;
+            failed++;
+        }
+    }
+
+    private static class PeriodRunResult {
+        private final boolean skipped;
+        private final String recordStatus;
+
+        private PeriodRunResult(boolean skipped, String recordStatus) {
+            this.skipped = skipped;
+            this.recordStatus = recordStatus;
+        }
+
+        private static PeriodRunResult skipped() {
+            return new PeriodRunResult(true, null);
+        }
+
+        private static PeriodRunResult completed(String recordStatus) {
+            return new PeriodRunResult(false, recordStatus);
+        }
+    }
+
     private static class BridgeResult {
         private String answerText;
         private String targetId;
         private String finalUrl;
         private String contentStatus;
+        private String completionReason;
     }
 
     private static class AnalysisPayload {
@@ -1084,5 +2180,62 @@ public class StockWatchTechnicalAnalysisService {
         private String title;
         private String conclusion;
         private List<String> evidence = new ArrayList<>();
+        private List<String> missingData = new ArrayList<>();
+        private JSONObject mainForceIntent;
+        private JSONArray forecasts = new JSONArray();
+        private List<String> schemaWarnings = new ArrayList<>();
+    }
+
+    private static class IntentValidationResult {
+        private final boolean valid;
+        private final String status;
+        private final JSONObject intent;
+        private final List<String> problems;
+        private final List<String> warnings;
+
+        private IntentValidationResult(boolean valid,
+                                       String status,
+                                       JSONObject intent,
+                                       List<String> problems,
+                                       List<String> warnings) {
+            this.valid = valid;
+            this.status = status;
+            this.intent = intent;
+            this.problems = problems == null ? new ArrayList<>() : new ArrayList<>(problems);
+            this.warnings = warnings == null ? new ArrayList<>() : new ArrayList<>(warnings);
+        }
+
+        private static IntentValidationResult valid(JSONObject intent, List<String> warnings) {
+            return new IntentValidationResult(
+                    true,
+                    warnings == null || warnings.isEmpty() ? "VALID" : "VALID_WITH_WARNINGS",
+                    intent,
+                    Collections.emptyList(),
+                    warnings
+            );
+        }
+
+        private static IntentValidationResult invalid(String problem) {
+            return invalid(new JSONObject(true), Collections.singletonList(problem), Collections.emptyList());
+        }
+
+        private static IntentValidationResult invalid(JSONObject intent, List<String> problems, List<String> warnings) {
+            return new IntentValidationResult(false, "INVALID", intent, problems, warnings);
+        }
+    }
+
+    private static class ExistingAnalysisSkippedException extends RuntimeException {
+        private final StockWatchTechnicalAnalysis existing;
+
+        private ExistingAnalysisSkippedException(StockWatchTechnicalAnalysis existing) {
+            super("existing_success:" + (existing == null ? "" : existing.getId()));
+            this.existing = existing;
+        }
+    }
+
+    private static class ModelResponseSchemaException extends IllegalStateException {
+        private ModelResponseSchemaException(String message) {
+            super(message);
+        }
     }
 }

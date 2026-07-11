@@ -279,11 +279,13 @@ CREATE TABLE IF NOT EXISTS `stock_watch_item` (
     `image_url`  TEXT                                COMMENT '图片 URL，base64 大图仅保留在前端本地',
     `enabled`    TINYINT     NOT NULL DEFAULT 1      COMMENT '是否纳入后端定时分析',
     `source`     VARCHAR(32) NOT NULL DEFAULT 'manual' COMMENT '来源',
+    `group_key`  VARCHAR(32) NOT NULL DEFAULT 'watch' COMMENT '主分组 holding/watch/candidate/archived',
     `gmt_create` DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `gmt_modify` DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
     UNIQUE KEY `uk_sw_item_symbol` (`symbol`, `market`),
-    KEY `idx_sw_item_enabled` (`enabled`, `symbol`, `market`)
+    KEY `idx_sw_item_enabled` (`enabled`, `symbol`, `market`),
+    KEY `idx_sw_item_group` (`group_key`, `enabled`, `symbol`, `market`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘监控列表';
 
 -- 股票盯盘：DeepSeek 网页技术面分析会话
@@ -322,6 +324,10 @@ CREATE TABLE IF NOT EXISTS `stock_watch_technical_analysis` (
     `period_type`         VARCHAR(16)  NOT NULL DEFAULT 'DAY'  COMMENT '周期 DAY/WEEK/MONTH',
     `period_key`          VARCHAR(32)                           COMMENT '周期主键 YYYY-MM-DD/YYYY-Www/YYYY-MM',
     `source_record_ids`   TEXT                                  COMMENT '汇总引用的日内记录ID数组',
+    `evidence_signal_json` MEDIUMTEXT                           COMMENT '程序派生的资金/价量/位置证据信号',
+    `main_force_intent_json` TEXT                                COMMENT 'DeepSeek 主力意图推断JSON',
+    `main_force_intent_status` VARCHAR(32)                       COMMENT '主力意图校验状态',
+    `main_force_intent_warnings_json` TEXT                       COMMENT '主力意图校验告警JSON',
     `status`              VARCHAR(32)  NOT NULL                COMMENT 'SUCCESS/ERROR',
     `stance`              VARCHAR(64)                          COMMENT '技术面立场',
     `tone`                VARCHAR(32)                          COMMENT 'UI色调 green/blue/amber/red',
@@ -329,6 +335,8 @@ CREATE TABLE IF NOT EXISTS `stock_watch_technical_analysis` (
     `title`               VARCHAR(256)                         COMMENT '结论标题',
     `conclusion`          TEXT                                  COMMENT '分析结论',
     `evidence_json`       TEXT                                  COMMENT '证据数组JSON',
+    `missing_data_json`   TEXT                                  COMMENT '确定性数据缺口JSON',
+    `data_snapshot_json`  MEDIUMTEXT                            COMMENT '本轮输入数据快照',
     `raw_response`        MEDIUMTEXT                            COMMENT 'DeepSeek 原始响应',
     `prompt_hash`         VARCHAR(128)                         COMMENT 'prompt哈希',
     `provider`            VARCHAR(64)                          COMMENT 'provider',
@@ -343,6 +351,48 @@ CREATE TABLE IF NOT EXISTS `stock_watch_technical_analysis` (
     KEY `idx_sw_tech_analysis_slot` (`symbol`, `market`, `period_type`, `period_key`, `analysis_date`, `run_slot`),
     KEY `idx_sw_tech_analysis_period` (`symbol`, `market`, `period_type`, `period_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘DeepSeek网页技术面分析';
+
+-- 股票盯盘：结构化预测及到期验真
+CREATE TABLE IF NOT EXISTS `stock_watch_prediction` (
+    `id`                      BIGINT       NOT NULL AUTO_INCREMENT,
+    `analysis_id`             BIGINT       NOT NULL,
+    `symbol`                  VARCHAR(16)  NOT NULL,
+    `market`                  VARCHAR(8)   NOT NULL,
+    `stock_name`              VARCHAR(128),
+    `horizon_code`            VARCHAR(16)  NOT NULL,
+    `horizon_trading_days`    INT          NOT NULL,
+    `forecast_date`           DATE         NOT NULL,
+    `source_price`            DECIMAL(18,4) NOT NULL,
+    `direction`               VARCHAR(16)  NOT NULL,
+    `probability`             DECIMAL(6,5),
+    `target_low`              DECIMAL(18,4),
+    `target_high`             DECIMAL(18,4),
+    `expected_return_low`     DECIMAL(12,6),
+    `expected_return_high`    DECIMAL(12,6),
+    `invalidation_price`      DECIMAL(18,4),
+    `rationale`               TEXT,
+    `input_snapshot_json`     MEDIUMTEXT,
+    `status`                  VARCHAR(24) NOT NULL DEFAULT 'PENDING',
+    `evaluated_trade_date`    DATE,
+    `actual_close`            DECIMAL(18,4),
+    `actual_high`             DECIMAL(18,4),
+    `actual_low`              DECIMAL(18,4),
+    `actual_return_pct`       DECIMAL(12,6),
+    `direction_hit`           TINYINT,
+    `range_close_hit`         TINYINT,
+    `range_touch_hit`         TINYINT,
+    `invalidated`             TINYINT,
+    `absolute_error_pct`      DECIMAL(12,6),
+    `brier_score`             DECIMAL(12,8),
+    `evaluation_note`         TEXT,
+    `evaluated_at`            DATETIME,
+    `gmt_create`              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify`              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_prediction_analysis_horizon` (`analysis_id`, `horizon_code`),
+    KEY `idx_sw_prediction_symbol_date` (`symbol`, `market`, `forecast_date`),
+    KEY `idx_sw_prediction_status` (`status`, `forecast_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票技术预测与到期验真';
 
 -- 股票盯盘：单股邮件推送配置
 CREATE TABLE IF NOT EXISTS `stock_watch_delivery_config` (

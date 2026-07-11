@@ -13,6 +13,7 @@ public class StockWatchItem {
     private String imageUrl;
     private Boolean enabled;
     private String source;
+    private String groupKey;
     private Date gmtCreate;
     private Date gmtModify;
 }

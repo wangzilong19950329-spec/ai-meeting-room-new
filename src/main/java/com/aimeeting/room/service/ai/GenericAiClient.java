@@ -362,6 +362,8 @@ public class GenericAiClient implements AiModelClient {
                             result.source = item.getString("title");
                             result.url = item.getString("url");
                             result.snippet = item.getString("title");
+                            String traceQuery = queries.isEmpty() ? null : queries.get(queries.size() - 1);
+                            result.withTrace("deepseek_builtin_search", "WEB_PAGE", traceQuery, item.toJSONString());
                             results.add(result);
                         }
                     }

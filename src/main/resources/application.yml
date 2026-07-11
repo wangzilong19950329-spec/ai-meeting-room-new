@@ -20,6 +20,14 @@ spring:
       mail.smtp.connectiontimeout: 10000
       mail.smtp.timeout: 15000
       mail.smtp.writetimeout: 15000
+  task:
+    scheduling:
+      thread-name-prefix: aimeeting-scheduler-
+      pool:
+        size: ${AI_MEETING_SCHEDULING_POOL_SIZE:${STOCK_WATCH_SCHEDULING_POOL_SIZE:3}}
+      shutdown:
+        await-termination: true
+        await-termination-period: 30s
 
 mybatis:
   mapper-locations: classpath:mapper/*.xml
@@ -78,7 +86,7 @@ ai:
       api-key: ${TAVILY_API_KEY:}        # 从 https://tavily.com 获取，填入环境变量后启用
       api-url: https://api.tavily.com/search
       search-depth: advanced             # basic / advanced
-      include-answer: true               # 返回智能摘要，用于结果复核
+      include-answer: false              # 金融证据只保留网页原始结果，避免把 Tavily 智能摘要当成事实来源
       country: ""                        # 留空自动判断；可填 china 偏向中文站点
       timeout-seconds: 30
     zhipu:
@@ -94,6 +102,7 @@ ai:
       timeout-seconds: 60
     deepseek-web:
       enabled: false
+      mode: fast
       bridge-url: http://127.0.0.1:8789/search
       node-command: node
       script-path: scripts/deepseek-web-search.js
@@ -109,12 +118,20 @@ ai:
     base-reward: 100
     base-penalty: 50
     dissent-penalty-factor: 0.3
+    deepseek-web-bridge:
+      enabled: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_ENABLED:false}
+      bridge-url: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_URL:${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}}
+      connect-timeout-seconds: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_CONNECT_TIMEOUT_SECONDS:10}
+      read-timeout-seconds: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_READ_TIMEOUT_SECONDS:480}
+      mode: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_MODE:expert}
+      search-mode: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_SEARCH_MODE:fast}
+      serialized: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_SERIALIZED:true}
   tracking:
     refresh:
-      enabled: true
-      batch-size: 2
-      scan-interval-ms: 60000
-      initial-delay-ms: 20000
+      enabled: ${AI_TRACKING_REFRESH_ENABLED:true}
+      batch-size: ${AI_TRACKING_REFRESH_BATCH_SIZE:2}
+      scan-interval-ms: ${AI_TRACKING_REFRESH_SCAN_INTERVAL_MS:60000}
+      initial-delay-ms: ${AI_TRACKING_REFRESH_INITIAL_DELAY_MS:20000}
 
 # 通知配置
 notification:
@@ -133,8 +150,9 @@ stock-watch:
     scan-interval-ms: ${STOCK_WATCH_SCAN_INTERVAL_MS:600000}
     initial-delay-ms: ${STOCK_WATCH_INITIAL_DELAY_MS:30000}
     symbols: ${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}
+    # 旧版价格规则仅在显式配置 STOCK_WATCH_RULES 时启用，禁止注入不可见的演示规则。
     # 格式：symbol.market:ruleId:support:requiredBreakDays:severity
-    rules: ${STOCK_WATCH_RULES:688017.sh:BREAK_287:287:5:risk,300760.sz:BREAK_155:155:3:risk,002594.sz:BREAK_205:205:3:risk}
+    rules: ${STOCK_WATCH_RULES:}
     state-file: ${STOCK_WATCH_STATE_FILE:}
   ai-rules:
     store-file: ${STOCK_WATCH_AI_RULES_FILE:}

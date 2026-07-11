@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchPredictionMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchPrediction">
+        <id column="id" property="id"/>
+        <result column="analysis_id" property="analysisId"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="horizon_code" property="horizonCode"/>
+        <result column="horizon_trading_days" property="horizonTradingDays"/>
+        <result column="forecast_date" property="forecastDate"/>
+        <result column="source_price" property="sourcePrice"/>
+        <result column="direction" property="direction"/>
+        <result column="probability" property="probability"/>
+        <result column="target_low" property="targetLow"/>
+        <result column="target_high" property="targetHigh"/>
+        <result column="expected_return_low" property="expectedReturnLow"/>
+        <result column="expected_return_high" property="expectedReturnHigh"/>
+        <result column="invalidation_price" property="invalidationPrice"/>
+        <result column="rationale" property="rationale"/>
+        <result column="input_snapshot_json" property="inputSnapshotJson"/>
+        <result column="status" property="status"/>
+        <result column="evaluated_trade_date" property="evaluatedTradeDate"/>
+        <result column="actual_close" property="actualClose"/>
+        <result column="actual_high" property="actualHigh"/>
+        <result column="actual_low" property="actualLow"/>
+        <result column="actual_return_pct" property="actualReturnPct"/>
+        <result column="direction_hit" property="directionHit"/>
+        <result column="range_close_hit" property="rangeCloseHit"/>
+        <result column="range_touch_hit" property="rangeTouchHit"/>
+        <result column="invalidated" property="invalidated"/>
+        <result column="absolute_error_pct" property="absoluteErrorPct"/>
+        <result column="brier_score" property="brierScore"/>
+        <result column="evaluation_note" property="evaluationNote"/>
+        <result column="evaluated_at" property="evaluatedAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_prediction
+        (analysis_id, symbol, market, stock_name, horizon_code, horizon_trading_days, forecast_date,
+         source_price, direction, probability, target_low, target_high, expected_return_low,
+         expected_return_high, invalidation_price, rationale, input_snapshot_json, status)
+        VALUES
+        (#{analysisId}, #{symbol}, #{market}, #{stockName}, #{horizonCode}, #{horizonTradingDays}, #{forecastDate},
+         #{sourcePrice}, #{direction}, #{probability}, #{targetLow}, #{targetHigh}, #{expectedReturnLow},
+         #{expectedReturnHigh}, #{invalidationPrice}, #{rationale}, #{inputSnapshotJson}, #{status})
+    </insert>
+
+    <select id="selectByAnalysisId" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_prediction WHERE analysis_id = #{analysisId} ORDER BY horizon_trading_days ASC, id ASC
+    </select>
+
+    <select id="selectRecent" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_prediction
+        WHERE symbol = #{symbol} AND market = #{market}
+        ORDER BY forecast_date DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectPending" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_prediction
+        WHERE status = 'PENDING'
+        ORDER BY forecast_date ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="updateEvaluation">
+        UPDATE stock_watch_prediction
+        SET status = #{status}, evaluated_trade_date = #{evaluatedTradeDate}, actual_close = #{actualClose},
+            actual_high = #{actualHigh}, actual_low = #{actualLow}, actual_return_pct = #{actualReturnPct},
+            direction_hit = #{directionHit}, range_close_hit = #{rangeCloseHit}, range_touch_hit = #{rangeTouchHit},
+            invalidated = #{invalidated}, absolute_error_pct = #{absoluteErrorPct}, brier_score = #{brierScore},
+            evaluation_note = #{evaluationNote}, evaluated_at = #{evaluatedAt}
+        WHERE id = #{id}
+    </update>
+</mapper>

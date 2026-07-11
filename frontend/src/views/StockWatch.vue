@@ -50,6 +50,16 @@
                 {{ tab.label }}
               </button>
             </div>
+            <div class="segmented group-segmented">
+              <button
+                v-for="tab in stockGroupTabs"
+                :key="tab.value"
+                :class="{ active: activeGroupFilter === tab.value }"
+                @click="activeGroupFilter = tab.value"
+              >
+                {{ tab.label }}
+              </button>
+            </div>
           </div>
         </div>
 
@@ -68,6 +78,9 @@
             <div class="stock-name">
               <strong>{{ stock.name }}</strong>
               <small>{{ stock.symbol }} · {{ stock.market }}</small>
+              <span :class="['stock-group-chip', stockGroupTone(stock.groupKey)]">
+                {{ stockGroupLabel(stock.groupKey) }}
+              </span>
             </div>
             <div class="quote-cell">
               <strong>{{ stock.price }}</strong>
@@ -272,6 +285,100 @@
             <small>{{ selectedAnalysisSession.sessionId }}</small>
           </article>
         </div>
+
+        <section class="prediction-review">
+          <div class="prediction-review-head">
+            <div>
+              <p class="section-label">prediction audit</p>
+              <h3>预测复盘</h3>
+              <small>预测生成时冻结输入快照；到达对应交易日后自动验真，不用后见数据改写历史。</small>
+            </div>
+            <button class="plain-button" type="button" :disabled="predictionLoading" @click="loadPredictionHistory">
+              {{ predictionLoading ? '刷新中' : '刷新复盘' }}
+            </button>
+          </div>
+          <div class="prediction-stat-grid">
+            <button
+              :class="['prediction-stat-card', 'clickable', { active: predictionListMode === 'evaluated' }]"
+              type="button"
+              @click="showEvaluatedPredictions"
+            >
+              <span>已验真</span>
+              <strong>{{ predictionSummary.evaluated || 0 }}</strong>
+              <small>点击查看验真结果 · {{ predictionSummary.pending || 0 }} 条等待到期</small>
+            </button>
+            <article class="prediction-stat-card">
+              <span>方向命中率</span>
+              <strong>{{ formatMetricPercent(predictionSummary.directionHitRate) }}</strong>
+              <small>涨 / 跌 / 震荡按 ±1% 统一口径</small>
+            </article>
+            <article class="prediction-stat-card">
+              <span>区间收盘命中</span>
+              <strong>{{ formatMetricPercent(predictionSummary.rangeCloseHitRate) }}</strong>
+              <small>另保留盘中区间触达指标</small>
+            </article>
+            <article class="prediction-stat-card">
+              <span>Brier 分数</span>
+              <strong>{{ formatPredictionNumber(predictionSummary.averageBrierScore, 3) }}</strong>
+              <small>越低越好，同时衡量概率校准</small>
+            </article>
+          </div>
+          <p v-if="predictionError" class="analysis-inline-error">{{ predictionError }}</p>
+          <template v-if="predictionRecords.length">
+            <div class="prediction-list-head">
+              <div>
+                <strong>{{ predictionListTitle }}</strong>
+                <small>
+                  {{ visiblePredictionRecords.length }} / {{ filteredPredictionRecords.length }} 条
+                  <template v-if="filteredPredictionRecords.length !== predictionRecords.length">
+                    · 全部 {{ predictionRecords.length }} 条
+                  </template>
+                  <template v-if="hiddenPredictionCount > 0"> · 已折叠 {{ hiddenPredictionCount }} 条</template>
+                </small>
+              </div>
+              <div class="prediction-list-actions">
+                <button
+                  v-if="hasPredictionOverflow"
+                  class="plain-button compact"
+                  type="button"
+                  @click="togglePredictionListExpanded"
+                >
+                  {{ predictionListExpanded ? '收起' : `展开剩余 ${hiddenPredictionCount} 条` }}
+                </button>
+                <button
+                  v-if="predictionListMode !== 'all'"
+                  class="plain-button compact"
+                  type="button"
+                  @click="showAllPredictions"
+                >
+                  查看全部
+                </button>
+              </div>
+            </div>
+            <div v-if="filteredPredictionRecords.length" class="prediction-list">
+              <article v-for="prediction in visiblePredictionRecords" :key="prediction.id" class="prediction-card">
+                <div class="prediction-card-top">
+                  <span :class="['prediction-direction', predictionDirectionTone(prediction.direction)]">
+                    {{ prediction.horizon }} · {{ predictionDirectionLabel(prediction.direction) }}
+                  </span>
+                  <span :class="['prediction-status', prediction.status === 'EVALUATED' ? (prediction.directionHit ? 'hit' : 'miss') : 'pending']">
+                    {{ predictionStatusLabel(prediction) }}
+                  </span>
+                </div>
+                <strong>{{ prediction.targetLow }} – {{ prediction.targetHigh }}</strong>
+                <p>起点 {{ prediction.sourcePrice }} · 概率 {{ formatMetricPercent((prediction.probability || 0) * 100) }} · 失效线 {{ prediction.invalidationPrice || '--' }}</p>
+                <small>生成时间 {{ prediction.generatedAt || `${prediction.forecastDate} --:--` }}</small>
+                <small v-if="prediction.status === 'EVALUATED'">
+                  {{ prediction.evaluatedTradeDate }} 收盘 {{ prediction.actualClose }}，实际收益 {{ formatSignedPercent(prediction.actualReturnPct) }}
+                  <template v-if="prediction.evaluatedAt"> · 验真时间 {{ prediction.evaluatedAt }}</template>
+                </small>
+                <small v-else>等待第 {{ prediction.tradingDays }} 个后续交易日</small>
+              </article>
+            </div>
+            <article v-else class="prediction-empty">{{ predictionListEmptyText }}</article>
+          </template>
+          <article v-else-if="!predictionLoading" class="prediction-empty">完成一次新版分析后，这里会出现 T+1 / T+5 或周月预测。</article>
+        </section>
         <p v-if="technicalAnalysisError" class="analysis-inline-error">{{ technicalAnalysisError }}</p>
         <p v-else-if="technicalAnalysisLoading" class="analysis-inline-note">正在加载历史结论...</p>
 
@@ -308,8 +415,22 @@
               </div>
               <strong>{{ record.title }}</strong>
               <p>{{ record.conclusion }}</p>
+              <div v-if="record.mainForceIntent" class="analysis-main-force">
+                <div>
+                  <strong>主力意图（模型推断）</strong>
+                  <span>{{ record.mainForceIntent.intentLabel }} · {{ record.mainForceIntent.timeWindowLabel }} · 置信度 {{ record.mainForceIntent.confidence }}</span>
+                </div>
+                <p v-if="record.mainForceIntent.risk">{{ record.mainForceIntent.risk }}</p>
+                <div v-if="record.mainForceIntent.watchPoints.length" class="analysis-main-force-points">
+                  <span v-for="item in record.mainForceIntent.watchPoints" :key="item">{{ item }}</span>
+                </div>
+              </div>
               <div class="analysis-evidence">
                 <span v-for="item in record.evidence" :key="item">{{ item }}</span>
+              </div>
+              <div v-if="record.missingData.length" class="analysis-missing-data">
+                <strong>可选数据缺口</strong>
+                <span v-for="item in record.missingData" :key="item">{{ item }}</span>
               </div>
               <footer class="analysis-record-footer">
                 <small>{{ record.promptHash }}</small>
@@ -381,6 +502,83 @@
               <small>失败源会保留 RETRY，不阻塞邮件配置</small>
             </article>
           </div>
+        </div>
+
+        <div v-else-if="activeConfigTab === 'external'" class="config-section external-evidence-section">
+          <div class="external-evidence-toolbar">
+            <div>
+              <strong>TradingView 外部研究证据</strong>
+              <small>手动交叉校验当前股票，不进入异动触发、调度任务或邮件发送链路。</small>
+            </div>
+            <button class="primary-button" type="button" :disabled="externalEvidenceLoading" @click="loadExternalEvidence(true)">
+              {{ externalEvidenceLoading ? '刷新中' : '刷新外部证据' }}
+            </button>
+          </div>
+
+          <div v-if="externalEvidenceError" class="config-alert error">{{ externalEvidenceError }}</div>
+          <div v-else-if="externalEvidenceNotice" class="config-alert success">{{ externalEvidenceNotice }}</div>
+
+          <article v-if="externalEvidenceLoading && !externalEvidence" class="external-evidence-empty">
+            正在拉取 TradingView 与 Eastmoney 交叉校验结果...
+          </article>
+          <article v-else-if="!externalEvidence" class="external-evidence-empty">
+            点击“刷新外部证据”后，这里会展示 TradingView 技术指标、Eastmoney 主链行情和单位归一后的偏差。
+          </article>
+
+          <template v-else>
+            <div class="config-summary-grid external-summary-grid">
+              <article>
+                <span>交叉校验</span>
+                <strong :class="externalEvidence.status === 'MATCH' ? 'green' : 'amber'">
+                  {{ externalEvidence.status || '--' }}
+                </strong>
+                <small>{{ externalEvidence.comparison?.summary || '暂无对比结论' }}</small>
+              </article>
+              <article>
+                <span>TradingView</span>
+                <strong>{{ externalEvidence.tradingView?.ok ? '可用' : '不可用' }}</strong>
+                <small>{{ externalEvidence.tradingView?.tvSymbol || externalEvidence.tradingView?.symbol || '--' }}</small>
+              </article>
+              <article>
+                <span>Eastmoney</span>
+                <strong>{{ externalEvidence.eastmoney?.ok ? '可用' : '不可用' }}</strong>
+                <small>{{ externalEvidence.eastmoney?.updateTime || externalEvidence.eastmoney?.reason || '--' }}</small>
+              </article>
+            </div>
+
+            <div class="external-compare-grid">
+              <article v-for="row in externalCompareRows" :key="row.label" class="external-compare-card">
+                <span>{{ row.label }}</span>
+                <div>
+                  <strong>{{ row.tradingView }}</strong>
+                  <small>TradingView</small>
+                </div>
+                <div>
+                  <strong>{{ row.eastmoney }}</strong>
+                  <small>Eastmoney</small>
+                </div>
+                <em :class="row.matched ? 'ok' : 'warn'">{{ row.diff }}</em>
+              </article>
+            </div>
+
+            <div class="external-field-grid">
+              <article v-for="field in externalTradingViewFields" :key="field.label">
+                <span>{{ field.label }}</span>
+                <strong>{{ field.value }}</strong>
+                <small>{{ field.note }}</small>
+              </article>
+            </div>
+
+            <section class="external-boundary-panel">
+              <div>
+                <strong>接入边界</strong>
+                <small>{{ externalEvidence.checkedAt || '--' }}</small>
+              </div>
+              <span v-for="item in externalEvidence.boundary || []" :key="item">{{ item }}</span>
+              <span v-if="externalEvidence.comparison?.volumeUnitNote">{{ externalEvidence.comparison.volumeUnitNote }}</span>
+              <span v-for="warning in externalEvidence.warnings || []" :key="warning" class="warn">{{ warning }}</span>
+            </section>
+          </template>
         </div>
 
         <div v-else-if="activeConfigTab === 'llm'" class="config-section">
@@ -710,6 +908,9 @@
                 <strong>{{ record.title }}</strong>
                 <small>#{{ record.id }} · {{ record.date }} {{ record.time }} · 待发送收件人 {{ record.pendingRecipients }}</small>
               </div>
+              <small v-if="record.mainForceIntent" class="delivery-preview-intent">
+                主力意图（模型推断）：{{ record.mainForceIntent.intentLabel }} · {{ record.mainForceIntent.timeWindowLabel }}
+              </small>
               <p>{{ record.conclusion }}</p>
             </article>
           </div>
@@ -822,6 +1023,9 @@
             <strong>{{ rule.desc }}</strong>
             <small>{{ rule.contract }}</small>
           </article>
+          <article v-if="selectedStock.rules.length === 0" class="rule-empty-state">
+            暂无价格触发条件，不会产生价格规则预警邮件。
+          </article>
           <div class="analysis-gate">
             <div>
               <span>analysis auto</span>
@@ -895,6 +1099,18 @@
           <label>
             <span>股票名称 <em>可选，行情刷新后自动补全</em></span>
             <input v-model.trim="addStockForm.name" type="text" placeholder="可留空，例如：绿的谐波" />
+          </label>
+          <label>
+            <span>组别</span>
+            <select v-model="addStockForm.groupKey">
+              <option
+                v-for="group in editableStockGroups"
+                :key="group.value"
+                :value="group.value"
+              >
+                {{ group.label }}
+              </option>
+            </select>
           </label>
           <label>
             <span>图片 URL</span>
@@ -1161,6 +1377,7 @@ const CUSTOM_OBSERVATIONS_KEY = 'stock-watch.custom-observations.v1'
 const CUSTOM_DELETED_EVENTS_KEY = 'stock-watch.deleted-events.v1'
 const QUOTE_REFRESH_INTERVAL_MS = 10 * 60 * 1000
 const ANALYSIS_CONTEXT_ROTATE_THRESHOLD = 85
+const PREDICTION_COLLAPSED_LIMIT = 6
 const ANALYSIS_PERIOD_TABS = [
   { label: '日内', value: 'DAY', desc: '30m', runtime: '交易时段每 30 分钟生成', windowLabel: '最近 30 天' },
   { label: '周度', value: 'WEEK', desc: '周五', runtime: '固定周五收盘后生成周复盘', windowLabel: '最近 12 周' },
@@ -1172,6 +1389,7 @@ const technicalAnalysisHttp = createHttp(360000)
 const viewMode = ref('list')
 const selectedSymbol = ref('688017')
 const activeFilter = ref('all')
+const activeGroupFilter = ref('all')
 const selectedAnalysisDate = ref(analysisDateKey(new Date()))
 const selectedAnalysisPeriodType = ref('DAY')
 const selectedAnalysisPeriodKey = ref(analysisDateKey(new Date()))
@@ -1182,6 +1400,12 @@ const technicalAnalysisError = ref('')
 const analysisPeriods = ref(buildAnalysisPeriods('DAY', {}))
 const selectedAnalysisRecords = ref([])
 const selectedAnalysisSession = ref(defaultAnalysisSession(null))
+const predictionLoading = ref(false)
+const predictionError = ref('')
+const predictionRecords = ref([])
+const predictionSummary = ref({ evaluated: 0, pending: 0, directionHitRate: null, rangeCloseHitRate: null, averageBrierScore: null })
+const predictionListMode = ref('all')
+const predictionListExpanded = ref(false)
 const showAddStockDialog = ref(false)
 const showObservationDialog = ref(false)
 const showAiRuleDialog = ref(false)
@@ -1217,10 +1441,15 @@ const fcCardsImporting = ref(false)
 const fcCardsError = ref('')
 const fcCardsNotice = ref('')
 const selectedFcCardId = ref(null)
+const externalEvidenceLoading = ref(false)
+const externalEvidenceError = ref('')
+const externalEvidenceNotice = ref('')
+const externalEvidence = ref(null)
 
 const addStockForm = reactive({
   code: '',
   name: '',
+  groupKey: 'watch',
   image: '',
   imageFileName: ''
 })
@@ -1293,8 +1522,19 @@ const severityTabs = [
   { label: '等待', value: 'info' }
 ]
 
+const stockGroupTabs = [
+  { label: '全部组别', value: 'all' },
+  { label: '持仓股', value: 'holding' },
+  { label: '观察股', value: 'watch' },
+  { label: '备选股', value: 'candidate' },
+  { label: '归档', value: 'archived' }
+]
+
+const editableStockGroups = stockGroupTabs.filter((group) => group.value !== 'all')
+
 const configTabs = [
   { label: '行情抓取', value: 'quote', kicker: 'quote', desc: '10分钟快照' },
+  { label: '外部证据', value: 'external', kicker: 'external', desc: 'TradingView对照' },
   { label: 'LLM 分析', value: 'llm', kicker: 'llm', desc: 'DeepSeek会话' },
   { label: 'FC卡', value: 'fc', kicker: 'fc', desc: '论点证伪/基线' },
   { label: '触发条件', value: 'rules', kicker: 'rules', desc: '规则过滤' },
@@ -1351,18 +1591,7 @@ const watchlist = reactive([
         { label: '支撑', value: 250, type: 'support' }
       ]
     },
-    rules: [
-      {
-        type: 'A',
-        desc: '回踩区间 + 资金连续 3 日转正',
-        contract: 'price_range=[250,270] · inflow_days=3'
-      },
-      {
-        type: 'BREAK_287',
-        desc: '287 支撑连续 5 日失守',
-        contract: 'support=287 · break_days=5'
-      }
-    ],
+    rules: [],
     sources: [
       { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 10 分钟刷新', ok: true },
       { name: 'Eastmoney kline', desc: '10 分钟 K 线，用于价格技术图', ok: true },
@@ -1417,13 +1646,7 @@ const watchlist = reactive([
         { label: '支撑', value: 155, type: 'support' }
       ]
     },
-    rules: [
-      {
-        type: 'EARNINGS_Q2',
-        desc: '国内采购 Q3 放量验证',
-        contract: 'financial_abstract · quarterly'
-      }
-    ],
+    rules: [],
     sources: [
       { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 10 分钟刷新', ok: true },
       { name: 'Financial abstract', desc: '季度财务摘要，不跟随高频轮询', ok: true },
@@ -1478,13 +1701,7 @@ const watchlist = reactive([
         { label: '支撑', value: 205, type: 'support' }
       ]
     },
-    rules: [
-      {
-        type: 'EARNINGS_Q2',
-        desc: 'Q2 还原经营利润企稳',
-        contract: 'financial_abstract + benefit_ths · quarterly'
-      }
-    ],
+    rules: [],
     sources: [
       { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 10 分钟刷新', ok: true },
       { name: 'Eastmoney kline', desc: '10 分钟 K 线，用于价格技术图', ok: true },
@@ -1539,13 +1756,7 @@ const watchlist = reactive([
         { label: '昨收', value: 58.08, type: 'support' }
       ]
     },
-    rules: [
-      {
-        type: 'AI_ABNORMAL',
-        desc: '涨跌幅 / 量比 / 主力资金异动',
-        contract: 'abs(change_pct)>=5% · volume_ratio>=2 · abs(main_inflow)>=1e8'
-      }
-    ],
+    rules: [],
     sources: [
       { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 30 分钟刷新', ok: true },
       { name: 'AI watch rule', desc: 'DeepSeek 仅基于结构化行情判断是否触发异动邮件', ok: true },
@@ -1645,9 +1856,27 @@ watch(
 watch(
   () => [viewMode.value, selectedSymbol.value],
   () => {
+    predictionListMode.value = 'all'
+    predictionListExpanded.value = false
+    externalEvidence.value = null
+    externalEvidenceError.value = ''
+    externalEvidenceNotice.value = ''
     if (viewMode.value === 'detail') {
       loadDeliveryConfig()
       loadFcCards()
+      loadPredictionHistory()
+      if (activeConfigTab.value === 'external') {
+        loadExternalEvidence(false)
+      }
+    }
+  }
+)
+
+watch(
+  () => activeConfigTab.value,
+  (tab) => {
+    if (viewMode.value === 'detail' && tab === 'external' && !externalEvidence.value) {
+      loadExternalEvidence(false)
     }
   }
 )
@@ -1663,6 +1892,28 @@ const selectedEvents = computed(() => (
     .filter((event) => event.symbol === selectedStock.value.symbol)
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+))
+const filteredPredictionRecords = computed(() => {
+  if (predictionListMode.value === 'evaluated') {
+    return predictionRecords.value.filter((prediction) => prediction.status === 'EVALUATED')
+  }
+  return predictionRecords.value
+})
+const hasPredictionOverflow = computed(() => filteredPredictionRecords.value.length > PREDICTION_COLLAPSED_LIMIT)
+const visiblePredictionRecords = computed(() => {
+  if (predictionListExpanded.value || !hasPredictionOverflow.value) return filteredPredictionRecords.value
+  return filteredPredictionRecords.value.slice(0, PREDICTION_COLLAPSED_LIMIT)
+})
+const hiddenPredictionCount = computed(() => (
+  Math.max(filteredPredictionRecords.value.length - visiblePredictionRecords.value.length, 0)
+))
+const predictionListTitle = computed(() => (
+  predictionListMode.value === 'evaluated' ? '验真结果列表' : '最近预测列表'
+))
+const predictionListEmptyText = computed(() => (
+  predictionListMode.value === 'evaluated'
+    ? '暂无已验真的预测结果。'
+    : '暂无预测记录。'
 ))
 const selectedAiRules = computed(() => aiRules.value.filter((rule) => rule.symbol === selectedStock.value.symbol))
 const selectedFcCards = computed(() => fcCards.value.filter((card) => card.symbol === selectedStock.value.symbol))
@@ -1694,6 +1945,46 @@ const selectedFcCardFields = computed(() => {
     { no: '07', label: '基线读数 + 失效监控', value: `${card.baselineReading || '基线待采'}\n${card.failureMonitor || '失效监控待配置'}`, status: card.activationStatus }
   ]
 })
+const externalCompareRows = computed(() => {
+  const payload = externalEvidence.value || {}
+  const tv = payload.tradingView || {}
+  const em = payload.eastmoney || {}
+  const comparison = payload.comparison || {}
+  return [
+    {
+      label: '最新价',
+      tradingView: formatExternalNumber(tv.price, 2),
+      eastmoney: formatExternalNumber(em.price, 2),
+      diff: formatExternalDiff(comparison.priceDiff, 4),
+      matched: Boolean(comparison.priceMatched)
+    },
+    {
+      label: '涨跌幅',
+      tradingView: formatExternalPercent(tv.changePercent, 4),
+      eastmoney: formatExternalPercent(em.changePercent, 2),
+      diff: formatExternalDiff(comparison.changePercentDiff, 4, ' pct'),
+      matched: Boolean(comparison.changePercentMatched)
+    },
+    {
+      label: '成交量',
+      tradingView: formatExternalVolume(tv.volumeShares),
+      eastmoney: formatExternalVolume(em.volumeShares),
+      diff: formatExternalDiff(comparison.volumeDiffPercent, 4, '%'),
+      matched: Boolean(comparison.volumeMatched)
+    }
+  ]
+})
+const externalTradingViewFields = computed(() => {
+  const tv = externalEvidence.value?.tradingView || {}
+  return [
+    { label: 'Recommend.All', value: formatExternalNumber(tv.recommendAll, 3), note: 'TradingView 综合技术评级，-1 到 1 附近波动' },
+    { label: 'RSI', value: formatExternalNumber(tv.rsi, 2), note: '14周期动量指标，仅作外部参照' },
+    { label: 'MACD', value: formatExternalNumber(tv.macd, 3), note: `Signal ${formatExternalNumber(tv.macdSignal, 3)}` },
+    { label: 'SMA20', value: formatExternalNumber(tv.sma20, 2), note: `EMA20 ${formatExternalNumber(tv.ema20, 2)}` },
+    { label: '英文名称', value: tv.description || '--', note: tv.exchange || tv.source || 'TradingView China scanner' },
+    { label: '市值字段', value: formatExternalMoney(tv.marketCapBasic), note: 'market_cap_basic，按数值字段保留' }
+  ]
+})
 
 watch(
   () => selectedFcCard.value?.id,
@@ -1720,11 +2011,11 @@ const deliveryTriggerSummary = computed(() => {
   if (deliveryForm.keywordsText.trim()) parts.push('关键词')
   return parts.length ? parts.join(' · ') : '所有新结论'
 })
-const filteredWatchlist = computed(() => (
-  activeFilter.value === 'all'
-    ? watchlist
-    : watchlist.filter((item) => item.severity === activeFilter.value)
-))
+const filteredWatchlist = computed(() => watchlist.filter((item) => {
+  const severityMatched = activeFilter.value === 'all' || item.severity === activeFilter.value
+  const groupMatched = activeGroupFilter.value === 'all' || normalizeStockGroupKey(item.groupKey) === activeGroupFilter.value
+  return severityMatched && groupMatched
+}))
 const addStockPreviewText = computed(() => {
   const normalized = normalizeStockCode(addStockForm.code)
   const name = addStockForm.name.trim()
@@ -1739,7 +2030,7 @@ const autoRefreshStatusLabel = computed(() => (
 
 const metrics = computed(() => [
   { label: '今日事件', value: '2', note: '1 机会 / 1 风险', tone: 'green' },
-  { label: '监控标的', value: String(watchlist.length), note: '决策窗口期', tone: 'ink' },
+  { label: '监控标的', value: String(watchlist.length), note: stockGroupSummaryText.value, tone: 'ink' },
   {
     label: '行情刷新',
     value: quoteRefreshing.value ? '...' : (quoteLastRefresh.value || '待刷新'),
@@ -1748,6 +2039,13 @@ const metrics = computed(() => [
   },
   { label: 'AI 闸门', value: plugins.find((p) => p.name === 'analysis')?.enabled ? 'WAIT' : 'OFF', note: 'auto=false', tone: 'purple' }
 ])
+
+const stockGroupSummaryText = computed(() => {
+  const holding = countStockGroup('holding')
+  const watch = countStockGroup('watch')
+  const candidate = countStockGroup('candidate')
+  return `持仓 ${holding} / 观察 ${watch} / 备选 ${candidate}`
+})
 
 const technicalMetrics = computed(() => {
   const t = selectedStock.value.technical
@@ -1815,13 +2113,22 @@ const priceAreaPoints = computed(() => {
 
 const triggerPreview = computed(() => {
   const stock = selectedStock.value
+  const rule = stock.rules[0]
+  if (!rule) {
+    return JSON.stringify({
+      symbol: stock.symbol,
+      name: stock.name,
+      status: 'NO_TRIGGER_RULE',
+      message: '当前股票没有已配置的价格触发条件，不会生成价格规则事件。'
+    }, null, 2)
+  }
   return JSON.stringify({
-    event_id: `${stock.symbol}_20260606_${stock.rules[0].type}`,
+    event_id: `${stock.symbol}_20260606_${rule.type}`,
     timestamp: '2026-06-06T13:30:00',
     symbol: stock.symbol,
     name: stock.name,
-    trigger_type: stock.rules[0].type,
-    trigger_desc: stock.rules[0].desc,
+    trigger_type: rule.type,
+    trigger_desc: rule.desc,
     raw_data: stock.rawData,
     severity: stock.severity
   }, null, 2)
@@ -2257,10 +2564,127 @@ async function runTechnicalAnalysisNow() {
       selectedAnalysisDate.value = record.date
     }
     await loadTechnicalAnalysisHistory()
+    await loadPredictionHistory()
   } catch (error) {
     technicalAnalysisError.value = resolveErrorMessage(error, '立即分析失败，请确认 DeepSeek bridge 已启动且网页版可用')
   } finally {
     technicalAnalysisRunning.value = false
+  }
+}
+
+async function loadPredictionHistory() {
+  const stock = selectedStock.value
+  if (!stock?.symbol || predictionLoading.value) return
+  predictionLoading.value = true
+  predictionError.value = ''
+  try {
+    const response = await stockWatchHttp.get('/stock-watch/technical-analysis/predictions', {
+      params: { symbol: stock.symbol, market: stock.market, limit: 200 },
+      suppressErrorMessage: true
+    })
+    const payload = response?.data || {}
+    predictionSummary.value = {
+      evaluated: Number(payload.summary?.evaluated || 0),
+      pending: Number(payload.summary?.pending || 0),
+      directionHitRate: finiteOrNull(payload.summary?.directionHitRate),
+      rangeCloseHitRate: finiteOrNull(payload.summary?.rangeCloseHitRate),
+      averageBrierScore: finiteOrNull(payload.summary?.averageBrierScore)
+    }
+    predictionRecords.value = Array.isArray(payload.records) ? payload.records : []
+  } catch (error) {
+    predictionError.value = resolveErrorMessage(error, '预测复盘加载失败')
+    predictionRecords.value = []
+  } finally {
+    predictionLoading.value = false
+  }
+}
+
+function finiteOrNull(value) {
+  if (value === null || value === undefined || value === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+function formatMetricPercent(value) {
+  if (value === null || value === undefined || value === '') return '--'
+  const number = Number(value)
+  return Number.isFinite(number) ? `${number.toFixed(1)}%` : '--'
+}
+
+function formatPredictionNumber(value, digits = 2) {
+  if (value === null || value === undefined || value === '') return '--'
+  const number = Number(value)
+  return Number.isFinite(number) ? number.toFixed(digits) : '--'
+}
+
+function formatSignedPercent(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '--'
+  return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`
+}
+
+function predictionDirectionLabel(direction) {
+  if (direction === 'UP') return '看涨'
+  if (direction === 'DOWN') return '看跌'
+  return '震荡'
+}
+
+function predictionDirectionTone(direction) {
+  if (direction === 'UP') return 'up'
+  if (direction === 'DOWN') return 'down'
+  return 'sideways'
+}
+
+function predictionStatusLabel(prediction) {
+  if (prediction.status !== 'EVALUATED') return '待验真'
+  return prediction.directionHit ? '方向命中' : '方向未中'
+}
+
+function showEvaluatedPredictions() {
+  predictionListMode.value = 'evaluated'
+  predictionListExpanded.value = false
+}
+
+function showAllPredictions() {
+  predictionListMode.value = 'all'
+  predictionListExpanded.value = false
+}
+
+function togglePredictionListExpanded() {
+  predictionListExpanded.value = !predictionListExpanded.value
+}
+
+async function loadExternalEvidence(showNotice = true) {
+  const stock = selectedStock.value
+  if (!stock?.symbol || externalEvidenceLoading.value) return
+  externalEvidenceLoading.value = true
+  externalEvidenceError.value = ''
+  if (showNotice) {
+    externalEvidenceNotice.value = ''
+  }
+  try {
+    const response = await stockWatchHttp.get('/stock-watch/external-research/evidence', {
+      params: {
+        symbol: stock.symbol,
+        market: stock.market
+      },
+      suppressErrorMessage: true
+    })
+    const payload = response?.data || {}
+    externalEvidence.value = payload
+    if (showNotice) {
+      if (payload.status === 'MATCH') {
+        externalEvidenceNotice.value = '外部证据已刷新：TradingView 与 Eastmoney 主字段匹配'
+      } else if (payload.ok) {
+        externalEvidenceNotice.value = '外部证据已刷新，请关注偏差项'
+      } else {
+        externalEvidenceNotice.value = '外部证据已返回，但至少一个数据源不可用'
+      }
+    }
+  } catch (error) {
+    externalEvidenceError.value = resolveErrorMessage(error, '外部证据刷新失败')
+  } finally {
+    externalEvidenceLoading.value = false
   }
 }
 
@@ -2445,6 +2869,7 @@ function normalizeDeliveryPreviewRecord(record) {
     time: record?.time || '--',
     title: record?.title || '技术面分析结论',
     conclusion: truncateText(record?.conclusion || '', 180),
+    mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus),
     pendingRecipients: Number(record?.pendingRecipients || 0)
   }
 }
@@ -2512,6 +2937,10 @@ function normalizeAnalysisRecord(record) {
     title: record?.title || '技术面分析结论',
     conclusion: record?.conclusion || record?.rawResponse || '本轮未返回可展示结论。',
     evidence: normalizeEvidence(record?.evidence),
+    missingData: normalizeEvidence(record?.missingData),
+    mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus),
+    mainForceIntentStatus: record?.mainForceIntentStatus || '',
+    mainForceIntentWarnings: normalizeEvidence(record?.mainForceIntentWarnings),
     sourceRecordIds: normalizeEvidence(record?.sourceRecordIds),
     promptHash: record?.promptHash || record?.status || '',
     conversationUrl: record?.conversationUrl || '',
@@ -2534,6 +2963,59 @@ function normalizeAnalysisSession(session, stock = selectedStock.value) {
     traceable: Boolean(session.traceable && session.url),
     url: session.url || ''
   }
+}
+
+function normalizeMainForceIntent(raw, status = 'VALID') {
+  const normalizedStatus = String(status || '').toUpperCase()
+  if (normalizedStatus && !['VALID', 'VALID_WITH_WARNINGS'].includes(normalizedStatus)) return null
+  let value = raw
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw)
+    } catch (error) {
+      value = null
+    }
+  }
+  if (!value || typeof value !== 'object') return null
+  const confidence = Number(value.confidence)
+  const intent = String(value.intent || 'UNKNOWN').toUpperCase()
+  const timeWindow = String(value.timeWindow || 'INTRADAY').toUpperCase()
+  return {
+    intent,
+    intentLabel: mainForceIntentLabel(intent),
+    timeWindow,
+    timeWindowLabel: mainForceWindowLabel(timeWindow),
+    confidence: Number.isFinite(confidence) ? `${Math.round(Math.max(0, Math.min(1, confidence)) * 100)}%` : '--',
+    risk: String(value.risk || '').trim(),
+    watchPoints: normalizeEvidence(value.watchPoints).slice(0, 4),
+    evidence: normalizeEvidence(value.evidence).slice(0, 4),
+    counterEvidence: normalizeEvidence(value.counterEvidence).slice(0, 4)
+  }
+}
+
+function mainForceIntentLabel(intent) {
+  const labels = {
+    ACCUMULATE: '吸筹/承接',
+    DISTRIBUTE: '派发/减仓',
+    WASH: '洗盘',
+    PULL_UP: '拉升',
+    SUPPORT: '护盘',
+    SUPPRESS: '压盘',
+    ROTATE: '轮动换手',
+    NEUTRAL: '中性',
+    UNKNOWN: '未知'
+  }
+  return labels[intent] || intent || '未知'
+}
+
+function mainForceWindowLabel(timeWindow) {
+  const labels = {
+    INTRADAY: '日内',
+    THREE_DAY: '近3日',
+    FIVE_DAY: '近5日',
+    TWENTY_DAY: '近20日'
+  }
+  return labels[timeWindow] || timeWindow || '--'
 }
 
 function normalizeEvidence(evidence) {
@@ -2894,6 +3376,7 @@ async function confirmAddStock() {
     symbol: normalized.symbol,
     market: normalized.market,
     name,
+    groupKey: addStockForm.groupKey,
     image: addStockForm.image.trim()
   })
   addStockSaving.value = true
@@ -2913,6 +3396,7 @@ async function confirmAddStock() {
       desc: `${merged.name} 已加入后端监控列表，后续会纳入定时技术面分析。`
     })
     activeFilter.value = 'all'
+    activeGroupFilter.value = normalizeStockGroupKey(merged.groupKey)
     selectedSymbol.value = merged.symbol
     persistCustomStocks()
     closeAddDialog()
@@ -3022,12 +3506,47 @@ function resolveStockDisplayName(normalized, preferredName = '') {
   return `${normalized.symbol}.${String(normalized.market || inferMarket(normalized.symbol)).toUpperCase()}`
 }
 
-function createManualStock({ symbol, market, name, image = '', createdAt = new Date().toISOString() }) {
+function normalizeStockGroupKey(value) {
+  const raw = String(value || '').trim().toLowerCase()
+  if (['holding', 'position', 'portfolio', 'hold', '持仓', '持仓股'].includes(raw)) return 'holding'
+  if (['candidate', 'candidate_stock', 'pool', '备选', '备选股'].includes(raw)) return 'candidate'
+  if (['archived', 'archive', 'paused', '归档', '暂停'].includes(raw)) return 'archived'
+  return 'watch'
+}
+
+function stockGroupLabel(value) {
+  const groupKey = normalizeStockGroupKey(value)
+  return stockGroupTabs.find((group) => group.value === groupKey)?.label || '观察股'
+}
+
+function stockGroupTone(value) {
+  const groupKey = normalizeStockGroupKey(value)
+  if (groupKey === 'holding') return 'holding'
+  if (groupKey === 'candidate') return 'candidate'
+  if (groupKey === 'archived') return 'archived'
+  return 'watch'
+}
+
+function countStockGroup(groupKey) {
+  return watchlist.filter((stock) => normalizeStockGroupKey(stock.groupKey) === groupKey).length
+}
+
+function createManualStock({
+  symbol,
+  market,
+  name,
+  image = '',
+  groupKey = 'watch',
+  groupKeyExplicit = true,
+  createdAt = new Date().toISOString()
+}) {
   return {
     symbol,
     name,
     market,
     image,
+    groupKey: normalizeStockGroupKey(groupKey),
+    groupKeyExplicit,
     manual: true,
     createdAt,
     price: '待抓取',
@@ -3067,13 +3586,7 @@ function createManualStock({ symbol, market, name, image = '', createdAt = new D
         { label: '压力', value: 0, type: 'pressure' }
       ]
     },
-    rules: [
-      {
-        type: 'MANUAL',
-        desc: '手动加入监控，等待规则配置',
-        contract: 'source=manual · quote=pending'
-      }
-    ],
+    rules: [],
     sources: [
       { name: 'Manual watchlist', desc: '用户手动添加', ok: true },
       { name: 'Quote source', desc: '待接入行情抓取', ok: false }
@@ -3098,6 +3611,8 @@ async function loadSavedStocks() {
           market: normalized.market,
           name: resolveStockDisplayName(normalized, item.name),
           image: String(item.image || ''),
+          groupKey: item.groupKey,
+          groupKeyExplicit: Boolean(String(item.groupKey || '').trim()),
           createdAt: item.createdAt || new Date().toISOString()
         })
         localStocks.push(stock)
@@ -3125,6 +3640,8 @@ async function loadBackendWatchlist() {
         market: normalized.market,
         name: resolveStockDisplayName(normalized, item.name || item.stockName),
         image: String(item.image || item.imageUrl || ''),
+        groupKey: item.groupKey,
+        groupKeyExplicit: Boolean(String(item.groupKey || '').trim()),
         createdAt: item.createdAt || new Date().toISOString()
       }))
     })
@@ -3137,28 +3654,34 @@ async function syncLocalStocksToBackend(stocks) {
   if (!Array.isArray(stocks) || stocks.length === 0) return
   for (const stock of stocks) {
     try {
-      await saveBackendWatchStock(stock)
+      await saveBackendWatchStock(stock, { includeGroupKey: Boolean(stock.groupKeyExplicit) })
     } catch (error) {
       console.warn('Failed to sync local watch stock', stock.symbol, error)
     }
   }
 }
 
-async function saveBackendWatchStock(stock) {
-  const response = await stockWatchHttp.post('/stock-watch/watchlist', {
+async function saveBackendWatchStock(stock, options = {}) {
+  const payload = {
     symbol: stock.symbol,
     market: stock.market,
     name: stock.name,
     imageUrl: stock.image && !stock.image.startsWith('data:') ? stock.image : '',
     enabled: true,
     source: 'manual'
-  }, { suppressErrorMessage: true })
-  const payload = response?.data || {}
+  }
+  if (options.includeGroupKey !== false) {
+    payload.groupKey = normalizeStockGroupKey(stock.groupKey)
+  }
+  const response = await stockWatchHttp.post('/stock-watch/watchlist', payload, { suppressErrorMessage: true })
+  const saved = response?.data || {}
   return createManualStock({
-    symbol: payload.symbol || stock.symbol,
-    market: payload.market || stock.market,
-    name: payload.name || payload.stockName || stock.name,
-    image: payload.image || payload.imageUrl || stock.image,
+    symbol: saved.symbol || stock.symbol,
+    market: saved.market || stock.market,
+    name: saved.name || saved.stockName || stock.name,
+    image: saved.image || saved.imageUrl || stock.image,
+    groupKey: saved.groupKey || stock.groupKey,
+    groupKeyExplicit: true,
     createdAt: stock.createdAt || new Date().toISOString()
   })
 }
@@ -3169,6 +3692,8 @@ function mergeWatchStock(stock) {
     const existing = watchlist[index]
     existing.name = stock.name || existing.name
     existing.image = stock.image || existing.image
+    existing.groupKey = normalizeStockGroupKey(stock.groupKey || existing.groupKey)
+    existing.groupKeyExplicit = existing.groupKeyExplicit || stock.groupKeyExplicit
     existing.manual = existing.manual || stock.manual
     existing.createdAt = existing.createdAt || stock.createdAt
     return existing
@@ -3185,6 +3710,7 @@ function persistCustomStocks() {
       market: stock.market,
       name: stock.name,
       image: stock.image,
+      groupKey: normalizeStockGroupKey(stock.groupKey),
       createdAt: stock.createdAt
     }))
   window.localStorage.setItem(CUSTOM_WATCHLIST_KEY, JSON.stringify(customStocks))
@@ -3302,6 +3828,7 @@ function normalizeSeverity(severity) {
 function resetAddForm() {
   addStockForm.code = ''
   addStockForm.name = ''
+  addStockForm.groupKey = activeGroupFilter.value === 'all' ? 'watch' : normalizeStockGroupKey(activeGroupFilter.value)
   addStockForm.image = ''
   addStockForm.imageFileName = ''
   addStockError.value = ''
@@ -3476,6 +4003,50 @@ function formatSignedMoney(value) {
   }
   const formatted = formatMoney(Math.abs(Number(value)))
   return `${Number(value) >= 0 ? '+' : '-'}${formatted}`
+}
+
+function formatExternalNumber(value, digits = 2) {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return '--'
+  }
+  return Number(value).toFixed(digits)
+}
+
+function formatExternalPercent(value, digits = 2) {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return '--'
+  }
+  return `${Number(value).toFixed(digits)}%`
+}
+
+function formatExternalDiff(value, digits = 2, suffix = '') {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return '--'
+  }
+  const number = Number(value)
+  return `${number >= 0 ? '+' : ''}${number.toFixed(digits)}${suffix}`
+}
+
+function formatExternalVolume(value) {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return '--'
+  }
+  const number = Number(value)
+  const abs = Math.abs(number)
+  if (abs >= 100000000) {
+    return `${(number / 100000000).toFixed(2)}亿股`
+  }
+  if (abs >= 10000) {
+    return `${(number / 10000).toFixed(2)}万股`
+  }
+  return `${number.toFixed(0)}股`
+}
+
+function formatExternalMoney(value) {
+  if (value == null || !Number.isFinite(Number(value))) {
+    return '--'
+  }
+  return formatMoney(value)
 }
 
 function pointX(index, total) {
@@ -4338,6 +4909,48 @@ svg {
   gap: 6px;
 }
 
+.analysis-main-force {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #f8fbff;
+}
+
+.analysis-main-force > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+}
+
+.analysis-main-force strong {
+  color: #1d4ed8;
+  font-size: 12px;
+}
+
+.analysis-main-force span,
+.delivery-preview-intent {
+  color: #475569;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.analysis-main-force-points {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.analysis-main-force-points span {
+  padding: 4px 7px;
+  border-radius: 6px;
+  color: #1e3a8a;
+  background: #e0f2fe;
+  font-size: 12px;
+}
+
 .analysis-evidence span {
   min-height: 26px;
   padding: 5px 8px;
@@ -4357,6 +4970,190 @@ svg {
   place-items: center;
   min-height: 220px;
   text-align: center;
+}
+
+.prediction-review {
+  margin: 0 18px 16px;
+  padding: 16px;
+  border: 1px solid #dfe7ef;
+  border-radius: 14px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(14, 116, 144, .08), transparent 34%),
+    linear-gradient(135deg, #fbfefe 0%, #f7fafc 100%);
+}
+
+.prediction-review-head,
+.prediction-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.prediction-review-head h3 {
+  margin: 3px 0;
+  color: #101828;
+  font-size: 20px;
+}
+
+.prediction-review-head small,
+.prediction-card small,
+.prediction-card p {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.prediction-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.prediction-stat-card {
+  padding: 12px;
+  border: 1px solid #e4e9f0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .86);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.prediction-stat-card.clickable {
+  cursor: pointer;
+  transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+
+.prediction-stat-card.clickable:hover,
+.prediction-stat-card.clickable.active {
+  border-color: #14b8a6;
+  box-shadow: 0 10px 24px rgba(20, 184, 166, .12);
+  transform: translateY(-1px);
+}
+
+.prediction-stat-card.clickable.active {
+  background: linear-gradient(135deg, #f0fdfa 0%, #ffffff 100%);
+}
+
+.prediction-stat-grid span,
+.prediction-stat-grid small {
+  display: block;
+  color: #667085;
+  font-size: 11px;
+}
+
+.prediction-stat-grid strong {
+  display: block;
+  margin: 5px 0;
+  color: #0f172a;
+  font-size: 24px;
+}
+
+.prediction-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.prediction-list-head strong,
+.prediction-list-head small {
+  display: block;
+}
+
+.prediction-list-head strong {
+  color: #101828;
+  font-size: 14px;
+}
+
+.prediction-list-head small {
+  margin-top: 2px;
+  color: #667085;
+  font-size: 11px;
+}
+
+.prediction-list-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.plain-button.compact {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.prediction-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.prediction-card {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid #e4e9f0;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.prediction-card > strong {
+  color: #101828;
+  font-size: 18px;
+}
+
+.prediction-card p {
+  margin: 0;
+}
+
+.prediction-direction,
+.prediction-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.prediction-direction.up { color: #b42318; background: #fee4e2; }
+.prediction-direction.down { color: #047857; background: #dff8ec; }
+.prediction-direction.sideways { color: #92400e; background: #fef3c7; }
+.prediction-status.hit { color: #047857; background: #ecfdf3; }
+.prediction-status.miss { color: #b42318; background: #fff1f0; }
+.prediction-status.pending { color: #475467; background: #f2f4f7; }
+
+.prediction-empty {
+  margin-top: 12px;
+  padding: 24px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+  color: #667085;
+  text-align: center;
+}
+
+.analysis-missing-data {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  color: #92400e;
+  background: #fffbeb;
+  font-size: 11px;
+}
+
+.analysis-missing-data strong {
+  margin-right: 4px;
 }
 
 .stock-config-panel {
@@ -4388,7 +5185,7 @@ svg {
 
 .config-tabbar {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   border-bottom: 1px solid #edf1f5;
 }
 
@@ -4770,6 +5567,17 @@ svg {
   color: #1d4ed8;
   font-size: 12px;
   font-weight: 800;
+}
+
+.rule-empty-state {
+  margin: 8px 12px;
+  padding: 14px;
+  border: 1px dashed #cbd5e1;
+  border-radius: 10px;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.6;
+  background: #f8fafc;
 }
 
 .analysis-gate {
@@ -5200,6 +6008,11 @@ pre {
     grid-template-columns: 1fr;
   }
 
+  .prediction-stat-grid,
+  .prediction-list {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .config-tabbar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -5474,6 +6287,19 @@ pre {
   gap: 18px;
 }
 
+.quote-panel,
+.chart-panel,
+.ai-analysis-panel,
+.stock-config-panel,
+.contract-panel {
+  grid-column: 1 / 2;
+}
+
+.detail-layout > .side-stack {
+  grid-column: 2 / 3;
+  grid-row: 1 / span 5;
+}
+
 .side-stack {
   gap: 18px;
 }
@@ -5515,6 +6341,10 @@ pre {
   color: #ffffff;
   background: #111827;
   box-shadow: 0 8px 18px rgba(15, 23, 42, .16);
+}
+
+.group-segmented button {
+  padding: 0 12px;
 }
 
 .watch-table {
@@ -5623,6 +6453,40 @@ pre {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.stock-group-chip {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 22px;
+  margin-top: 6px;
+  padding: 0 8px;
+  border-radius: 999px;
+  color: #334155;
+  background: #eef2f7;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.stock-group-chip.holding {
+  color: #047857;
+  background: #dcfce7;
+}
+
+.stock-group-chip.watch {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.stock-group-chip.candidate {
+  color: #b45309;
+  background: #fef3c7;
+}
+
+.stock-group-chip.archived {
+  color: #64748b;
+  background: #f1f5f9;
 }
 
 .refresh-cell {
@@ -5830,7 +6694,7 @@ pre {
 
 .config-tabbar {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
   padding: 14px 18px;
   border-bottom-color: rgba(148, 163, 184, .16);
@@ -5876,6 +6740,180 @@ pre {
   margin: 8px 0;
   font-size: 22px;
   font-weight: 950;
+}
+
+.external-evidence-section {
+  display: grid;
+  gap: 16px;
+}
+
+.external-evidence-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid rgba(14, 165, 233, .22);
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(14, 165, 233, .10), transparent 34%),
+    linear-gradient(135deg, #ffffff 0%, #f4fbff 100%);
+}
+
+.external-evidence-toolbar strong {
+  display: block;
+  color: #0f172a;
+  font-size: 24px;
+  font-weight: 950;
+  letter-spacing: -.04em;
+}
+
+.external-evidence-toolbar small {
+  display: block;
+  margin-top: 6px;
+  color: #64748b;
+  line-height: 1.6;
+}
+
+.external-evidence-empty {
+  display: grid;
+  min-height: 118px;
+  place-content: center;
+  padding: 22px;
+  border: 1px dashed rgba(148, 163, 184, .5);
+  border-radius: 22px;
+  color: #64748b;
+  background: rgba(255, 255, 255, .78);
+  text-align: center;
+}
+
+.external-summary-grid {
+  margin-top: 0;
+}
+
+.external-compare-grid,
+.external-field-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.external-compare-card,
+.external-field-grid article {
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, .22);
+  border-radius: 20px;
+  background: #ffffff;
+}
+
+.external-compare-card {
+  display: grid;
+  grid-template-columns: 1fr 1fr auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.external-compare-card > span {
+  grid-column: 1 / -1;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.external-compare-card strong,
+.external-field-grid strong {
+  display: block;
+  color: #0f172a;
+  font-size: 20px;
+  font-weight: 950;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.external-compare-card small,
+.external-field-grid span,
+.external-field-grid small {
+  display: block;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.external-compare-card em {
+  align-self: center;
+  min-height: 30px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.external-compare-card em.ok {
+  color: #047857;
+  background: #dff8ec;
+}
+
+.external-compare-card em.warn {
+  color: #92400e;
+  background: #fef3c7;
+}
+
+.external-field-grid article {
+  display: grid;
+  gap: 7px;
+}
+
+.external-field-grid span {
+  font-weight: 900;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.external-boundary-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 16px;
+  border: 1px solid rgba(148, 163, 184, .22);
+  border-radius: 20px;
+  background: #f8fafc;
+}
+
+.external-boundary-panel > div {
+  flex: 0 0 100%;
+}
+
+.external-boundary-panel strong,
+.external-boundary-panel small {
+  display: block;
+}
+
+.external-boundary-panel small {
+  margin-top: 4px;
+  color: #64748b;
+}
+
+.external-boundary-panel span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 5px 9px;
+  border-radius: 999px;
+  color: #075985;
+  background: #e0f2fe;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.external-boundary-panel span.warn {
+  color: #92400e;
+  background: #fef3c7;
 }
 
 .observation-inline-panel {
@@ -6443,6 +7481,23 @@ pre {
 }
 
 @media (max-width: 900px) {
+  .list-layout,
+  .detail-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-layout > .side-stack,
+  .source-panel,
+  .quote-panel,
+  .chart-panel,
+  .ai-analysis-panel,
+  .stock-config-panel,
+  .event-panel,
+  .contract-panel {
+    grid-column: auto;
+    grid-row: auto;
+  }
+
   .watch-header::after {
     display: none;
   }
@@ -6466,6 +7521,11 @@ pre {
   }
 
   .delivery-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .external-compare-grid,
+  .external-field-grid {
     grid-template-columns: 1fr;
   }
 
@@ -6507,7 +7567,8 @@ pre {
   }
 
   .fc-toolbar,
-  .fc-gate-head {
+  .fc-gate-head,
+  .external-evidence-toolbar {
     flex-direction: column;
     align-items: stretch;
   }
@@ -6526,6 +7587,21 @@ pre {
 
   .analysis-calendar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .prediction-review {
+    margin: 0 10px 12px;
+    padding: 12px;
+  }
+
+  .prediction-review-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .prediction-stat-grid,
+  .prediction-list {
+    grid-template-columns: 1fr;
   }
 }
 </style>

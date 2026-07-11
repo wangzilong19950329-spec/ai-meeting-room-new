@@ -451,6 +451,8 @@ public class StockWatchDeliveryService {
         item.put("tone", analysis.getTone());
         item.put("confidence", analysis.getConfidence());
         item.put("conclusion", firstNonBlank(analysis.getConclusion(), analysis.getRawResponse()));
+        item.put("mainForceIntent", validMainForceIntent(analysis));
+        item.put("mainForceIntentStatus", analysis.getMainForceIntentStatus());
         item.put("pendingRecipients", pendingRecipients);
         return item;
     }
@@ -487,19 +489,45 @@ public class StockWatchDeliveryService {
         appendSection(builder, "三、DeepSeek 分析建议");
         appendParagraph(builder, firstNonBlank(cleanAnalysisText(analysis.getConclusion()),
                 cleanAnalysisText(analysis.getRawResponse()), "本轮无可展示结论。"), "  ");
+        int sectionIndex = 4;
+        if (appendMainForceIntentBlock(builder, analysis, sectionIndex)) {
+            sectionIndex++;
+        }
 
         List<String> evidence = parseEvidence(analysis.getEvidenceJson());
         if (!evidence.isEmpty()) {
-            appendSection(builder, "四、关键依据");
+            appendSection(builder, chineseSection(sectionIndex++) + "、关键依据");
             for (String item : evidence) {
                 appendParagraph(builder, item, "  - ");
             }
         }
 
         if (StringUtils.hasText(analysis.getConversationUrl())) {
-            appendSection(builder, "五、溯源");
+            appendSection(builder, chineseSection(sectionIndex) + "、溯源");
             appendLine(builder, "DeepSeek 原会话", analysis.getConversationUrl());
         }
+    }
+
+    private boolean appendMainForceIntentBlock(StringBuilder builder, StockWatchTechnicalAnalysis analysis, int sectionIndex) {
+        JSONObject intent = validMainForceIntent(analysis);
+        if (intent == null || intent.isEmpty()) {
+            return false;
+        }
+        appendSection(builder, chineseSection(sectionIndex) + "、主力意图识别（模型推断，非事实标签）");
+        appendLine(builder, "意图", firstNonBlank(intent.getString("intent"), "UNKNOWN"));
+        appendLine(builder, "窗口", firstNonBlank(intent.getString("timeWindow"), "--"));
+        appendLine(builder, "置信度", intent.get("confidence") == null ? "--" : String.valueOf(intent.get("confidence")));
+        appendLine(builder, "校验状态", firstNonBlank(analysis.getMainForceIntentStatus(), "--"));
+        if (StringUtils.hasText(intent.getString("risk"))) {
+            appendParagraph(builder, intent.getString("risk"), "  风险：");
+        }
+        JSONArray watchPoints = intent.getJSONArray("watchPoints");
+        if (watchPoints != null && !watchPoints.isEmpty()) {
+            for (int i = 0; i < watchPoints.size(); i++) {
+                appendParagraph(builder, watchPoints.getString(i), "  - ");
+            }
+        }
+        return true;
     }
 
     private void appendTitle(StringBuilder builder, String title) {
@@ -509,6 +537,18 @@ public class StockWatchDeliveryService {
 
     private void appendSection(StringBuilder builder, String title) {
         builder.append("\n").append(title).append("\n");
+    }
+
+    private String chineseSection(int index) {
+        switch (index) {
+            case 1: return "一";
+            case 2: return "二";
+            case 3: return "三";
+            case 4: return "四";
+            case 5: return "五";
+            case 6: return "六";
+            default: return String.valueOf(index);
+        }
     }
 
     private void appendLine(StringBuilder builder, String label, Object value) {
@@ -554,6 +594,28 @@ public class StockWatchDeliveryService {
             return value.substring(0, jsonStart).trim();
         }
         return value;
+    }
+
+    private JSONObject parseObject(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return null;
+        }
+        try {
+            return JSON.parseObject(raw);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private JSONObject validMainForceIntent(StockWatchTechnicalAnalysis analysis) {
+        if (analysis == null || !StringUtils.hasText(analysis.getMainForceIntentStatus())) {
+            return null;
+        }
+        String status = analysis.getMainForceIntentStatus();
+        if (!"VALID".equalsIgnoreCase(status) && !"VALID_WITH_WARNINGS".equalsIgnoreCase(status)) {
+            return null;
+        }
+        return parseObject(analysis.getMainForceIntentJson());
     }
 
     private List<String> parseEvidence(String evidenceJson) {

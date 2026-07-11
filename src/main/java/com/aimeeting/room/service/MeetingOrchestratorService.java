@@ -30,6 +30,9 @@ public class MeetingOrchestratorService {
     private AiModelRouter aiModelRouter;
 
     @Autowired
+    private MeetingDeepSeekWebBridgeService meetingDeepSeekWebBridgeService;
+
+    @Autowired
     private AiMeetingRoomMapper roomMapper;
 
     @Autowired
@@ -110,15 +113,45 @@ public class MeetingOrchestratorService {
     }
 
     public String callModel(String modelType, String systemPrompt, String userPrompt) {
+        ChatResult bridgeResult = routeMeetingDeepSeekBridge(modelType, systemPrompt, userPrompt, null);
+        if (bridgeResult != null) {
+            return bridgeResult.content;
+        }
         return aiModelRouter.chat(modelType, systemPrompt, userPrompt);
     }
 
     public String callModel(String modelType, String systemPrompt, String userPrompt, Integer maxTokens) {
+        ChatResult bridgeResult = routeMeetingDeepSeekBridge(modelType, systemPrompt, userPrompt, maxTokens);
+        if (bridgeResult != null) {
+            return bridgeResult.content;
+        }
         return aiModelRouter.chat(modelType, systemPrompt, userPrompt, maxTokens);
     }
 
     public ChatResult callModelEx(String modelType, String systemPrompt, String userPrompt) {
+        ChatResult bridgeResult = routeMeetingDeepSeekBridge(modelType, systemPrompt, userPrompt, null);
+        if (bridgeResult != null) {
+            return bridgeResult;
+        }
         return aiModelRouter.chatEx(modelType, systemPrompt, userPrompt);
+    }
+
+    private ChatResult routeMeetingDeepSeekBridge(String modelType,
+                                                  String systemPrompt,
+                                                  String userPrompt,
+                                                  Integer maxTokens) {
+        if (meetingDeepSeekWebBridgeService == null) {
+            return null;
+        }
+        MeetingDeepSeekWebBridgeService.RouteDecision decision =
+                meetingDeepSeekWebBridgeService.routeDecision(modelType);
+        if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.BRIDGE) {
+            return meetingDeepSeekWebBridgeService.chat(modelType, systemPrompt, userPrompt, maxTokens);
+        }
+        if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.FAIL_CLOSED) {
+            return meetingDeepSeekWebBridgeService.failClosedResult(modelType);
+        }
+        return null;
     }
 
     public String buildDebateContext(Long meetingId, Long memberId, int roundNumber) {
@@ -148,6 +181,10 @@ public class MeetingOrchestratorService {
         // 注入真实搜索结果（如果有）
         if (searchContext != null && !searchContext.isBlank()) {
             sb.append("【最新实时资讯（来自网络搜索）】\n").append(searchContext).append("\n\n");
+            sb.append("【实时资讯使用硬规则】")
+                    .append("你只能把上方 Provider 原始结果、结构化数据中能定位到的内容当作最新事实。")
+                    .append("不得引用未在上方出现的公司、股票代码、财务数字、估值、Beta、IC值、因子排名、Wind/万得一致预期、自有量化池或未来季度预测。")
+                    .append("如果证据不足，必须明确写“本轮证据未提供/无法核验”，不要补数。\n\n");
         }
         sb.append("【事实核验规则】其他议员的发言、论据摘要、历史结论都只能视为待核验主张，不得直接当作事实继承。")
                 .append("你必须以自己本轮搜索拿到的结果独立判断；若你的搜索结果与前文主张冲突，必须明确指出冲突并优先采用你本轮已核验的信息。\n\n");
@@ -242,7 +279,7 @@ public class MeetingOrchestratorService {
         sb.append("\n\n请严格按以下格式回复（两部分都要有）：\n");
         sb.append("{\"q\":[\"搜索词1\",\"搜索词2\"],\"e\":[{\"s\":\"来源\",\"p\":\"核心论据\"}]}\n");
         sb.append("==REPLY==\n");
-        sb.append("深度分析内容（充分展开论证，引用具体数据和来源，不限字数）");
+        sb.append("深度分析内容（只引用上方实时资讯/结构化数据中可定位的信息；证据不足时明确说明，不得补数）");
 
         return sb.toString();
     }
@@ -400,7 +437,9 @@ public class MeetingOrchestratorService {
         sb.append("如果需要搜索，请先决定你最需要核验的事实类型，再指定优先来源域名 sourceFocus，例如路透、彭博、监管网站、交易所公告、统计局、行业协会、公司公告站点。\n");
         sb.append("查询词要体现“最新时间窗口 + 目标年份 + 关键指标 + 优先来源”。sourceFocus 里放域名，不要写自然语言描述。\n");
         sb.append("当你确定某个事实只该从特定站点取证（如交易所/统计局/公司公告/指定财经媒体，例如 eastmoney.com、stats.gov.cn），就把该域名放进 sourceFocus，系统会定向只检索这些站点；也可直接在查询词里写 site:域名。不确定来源时 sourceFocus 留空即可。\n");
-        sb.append("若需要，返回：{\"need\":true,\"intent\":\"forecast_outlook\",\"freshnessDays\":30,\"targetYear\":2026,\"sourceFocus\":[\"reuters.com\",\"stats.gov.cn\"],\"q\":[\"搜索词1\",\"搜索词2\"]}\n");
+        sb.append("如果议题是A股个股，你还可以要求系统调用东方财富结构化数据。可选 eastmoneyFields：quote（实时行情/资金流）、stockDetail（估值与市值）、dailyKline（日K）、technicalIndicators（均线/MACD/RSI/波动）、valuation（估值分位）、financials（财报）、announcements（公告）、latestNews（个股新闻）、shareholderCounts（股东户数）、marketBenchmark（相对指数强弱）。\n");
+        sb.append("使用东方财富时请尽量给出股票代码和市场，例如宁德时代为 300750.sz；如果不确定代码，可以只返回网络搜索计划。\n");
+        sb.append("若需要，返回：{\"need\":true,\"intent\":\"forecast_outlook\",\"freshnessDays\":30,\"targetYear\":2026,\"sourceFocus\":[\"eastmoney.com\",\"cninfo.com.cn\"],\"q\":[\"搜索词1\",\"搜索词2\"],\"eastmoneySymbol\":\"300750\",\"eastmoneyMarket\":\"sz\",\"eastmoneyFields\":[\"quote\",\"dailyKline\",\"technicalIndicators\",\"valuation\",\"financials\",\"latestNews\",\"shareholderCounts\"]}\n");
         sb.append("若不需要，返回：{\"need\":false}\n");
         sb.append("只返回JSON，不要其他内容。");
         return sb.toString();

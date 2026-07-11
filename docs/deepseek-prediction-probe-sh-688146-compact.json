@@ -1,0 +1,6 @@
+{
+  "query": "上一条修正版在Bridge抓取时被截断。请基于已经确认的同一份2026-06-18 16:11行情重新输出一份完整、紧凑、单行JSON，全文控制在700个中文字符以内。不得使用新数据。保留字段asOf、sourcePrice、summary、forecasts、risks、missingData；forecasts必须同时包含T+1_CLOSE和T+5_CLOSE，每项保留direction、probability、targetLow、targetHigh、expectedReturnLowPct、expectedReturnHighPct、invalidationPrice、rationale；每个rationale只保留1条不超过25字，risks最多2条，missingData最多3条。确保5982.2752万元写成0.598亿元，且UP/DOWN/SIDEWAYS与收益区间一致。只输出完整JSON，不要Markdown或解释。",
+  "sessionKey": "stock-watch-forecast-probe-sh-688146-v1",
+  "forceNewSession": false,
+  "closeTargetAfter": false
+}

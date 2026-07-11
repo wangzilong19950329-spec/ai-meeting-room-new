@@ -10,15 +10,16 @@
         <result column="image_url" property="imageUrl"/>
         <result column="enabled" property="enabled"/>
         <result column="source" property="source"/>
+        <result column="group_key" property="groupKey"/>
         <result column="gmt_create" property="gmtCreate"/>
         <result column="gmt_modify" property="gmtModify"/>
     </resultMap>
 
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO stock_watch_item
-        (symbol, market, stock_name, image_url, enabled, source)
+        (symbol, market, stock_name, image_url, enabled, source, group_key)
         VALUES
-        (#{symbol}, #{market}, #{stockName}, #{imageUrl}, #{enabled}, #{source})
+        (#{symbol}, #{market}, #{stockName}, #{imageUrl}, #{enabled}, #{source}, #{groupKey})
     </insert>
 
     <update id="update">
@@ -27,6 +28,7 @@
             image_url = #{imageUrl},
             enabled = #{enabled},
             source = #{source},
+            group_key = #{groupKey},
             gmt_modify = NOW()
         WHERE id = #{id}
     </update>
@@ -43,6 +45,12 @@
         SELECT *
         FROM stock_watch_item
         WHERE enabled = 1
-        ORDER BY gmt_create ASC, id ASC
+        ORDER BY CASE group_key
+            WHEN 'holding' THEN 1
+            WHEN 'watch' THEN 2
+            WHEN 'candidate' THEN 3
+            WHEN 'archived' THEN 4
+            ELSE 5
+        END, gmt_create ASC, id ASC
     </select>
 </mapper>

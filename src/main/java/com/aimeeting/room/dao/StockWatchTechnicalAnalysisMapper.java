@@ -36,6 +36,11 @@ public interface StockWatchTechnicalAnalysisMapper {
                                                            @Param("periodType") String periodType,
                                                            @Param("limit") int limit);
 
+    StockWatchTechnicalAnalysis selectLatestSuccessfulBySymbolSince(@Param("symbol") String symbol,
+                                                                    @Param("market") String market,
+                                                                    @Param("periodType") String periodType,
+                                                                    @Param("since") Date since);
+
     List<StockWatchTechnicalAnalysis> selectSuccessfulByDateRange(@Param("symbol") String symbol,
                                                                   @Param("market") String market,
                                                                   @Param("startDate") Date startDate,

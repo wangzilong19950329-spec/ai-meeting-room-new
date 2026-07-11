@@ -154,6 +154,9 @@
                               <el-tag v-if="parsedEvidence(op.evidence).searchMeta.status" size="small" type="info" effect="plain" style="margin:0 4px 4px 0">
                                 {{ parsedEvidence(op.evidence).searchMeta.status }}
                               </el-tag>
+                              <el-tag v-if="parsedEvidence(op.evidence).searchMeta.degraded || parsedEvidence(op.evidence).searchMeta.generationDegraded" size="small" type="danger" effect="plain" style="margin:0 4px 4px 0">
+                                已降级
+                              </el-tag>
                               <el-tag v-if="parsedEvidence(op.evidence).searchMeta.modelStatus" size="small" type="danger" effect="plain" style="margin:0 4px 4px 0">
                                 {{ parsedEvidence(op.evidence).searchMeta.modelStatus }}
                               </el-tag>
@@ -206,6 +209,9 @@
                             <div v-if="parsedEvidence(op.evidence).searchMeta?.contentNote" class="evidence-note">
                               {{ parsedEvidence(op.evidence).searchMeta.contentNote }}
                             </div>
+                            <div v-if="parsedEvidence(op.evidence).searchMeta?.degradedReason" class="evidence-note evidence-note-danger">
+                              降级原因：{{ parsedEvidence(op.evidence).searchMeta.degradedReason }}
+                            </div>
                             <div v-if="parsedEvidence(op.evidence).searchMeta?.modelNote" class="evidence-note">
                               {{ parsedEvidence(op.evidence).searchMeta.modelNote }}
                             </div>
@@ -241,8 +247,12 @@
                                 {{ q }}
                               </el-tag>
                             </div>
-                            <!-- AI 论据 -->
+                            <div v-if="parsedEvidence(op.evidence).suppressedAiEvidenceCount" class="evidence-note evidence-note-danger">
+                              已隐藏 {{ parsedEvidence(op.evidence).suppressedAiEvidenceCount }} 条模型自述论据；下方仅展示 provider 原始结果，避免把未验证数字当作接口数据。
+                            </div>
+                            <!-- 模型自述论据：仅在没有真实搜索结果时展示，且明确标记未验证 -->
                             <div v-if="parsedEvidence(op.evidence).evidence?.length" class="evidence-items">
+                              <div class="evidence-label" style="margin-bottom:4px">⚠️ 模型自述论据（未验证）：</div>
                               <div v-for="(e, i) in parsedEvidence(op.evidence).evidence" :key="i" class="evidence-item">
                                 <span class="evidence-source">
                                   <template v-if="e.url || e.link">
@@ -264,10 +274,60 @@
                                   <template v-else>{{ r.source }}</template>
                                 </span>
                                 <span class="evidence-point">{{ r.snippet }}</span>
+                                <div v-if="r.provider || r.sourceType || r.query || r.rawHash" class="evidence-trace">
+                                  <span v-if="r.provider">provider={{ r.provider }}</span>
+                                  <span v-if="r.sourceType">type={{ r.sourceType }}</span>
+                                  <span v-if="r.query">query={{ r.query }}</span>
+                                  <span v-if="r.fetchedAt">at={{ r.fetchedAt }}</span>
+                                  <span v-if="r.rawHash">hash={{ shortTraceHash(r.rawHash) }}</span>
+                                </div>
+                                <div v-if="r.sourceTrace?.sources?.length" class="evidence-source-trace">
+                                  <span
+                                    v-for="source in r.sourceTrace.sources"
+                                    :key="`${i}-${source.name}`"
+                                    :class="{ 'is-failed': source.ok === false }">
+                                    {{ source.name }}={{ source.ok === false ? 'fail' : 'ok' }}
+                                    <template v-if="source.lastResponseHash">#{{ shortTraceHash(source.lastResponseHash) }}</template>
+                                  </span>
+                                </div>
+                                <div v-if="r.facts?.length" class="evidence-facts">
+                                  <span
+                                    v-for="fact in r.facts.slice(0, 10)"
+                                    :key="`${i}-${fact.path || fact.label}`"
+                                    :title="fact.path ? `${fact.path}${fact.rawHash ? ' · ' + shortTraceHash(fact.rawHash) : ''}` : ''"
+                                  >
+                                    {{ fact.label }}={{ fact.rawValue }}
+                                  </span>
+                                </div>
                               </div>
+                            </div>
+                            <div v-if="parsedEvidence(op.evidence).factCatalog?.note" class="evidence-note">
+                              事实库：{{ parsedEvidence(op.evidence).factCatalog.note }}
                             </div>
                             <div v-if="parsedEvidence(op.evidence).validation?.note" class="evidence-note">
                               {{ parsedEvidence(op.evidence).validation.note }}
+                            </div>
+                            <div
+                              v-if="parsedEvidence(op.evidence).claimAudit?.note"
+                              class="evidence-note"
+                              :class="{ 'evidence-note-danger': parsedEvidence(op.evidence).claimAudit.status === 'unsupported_claims' }"
+                            >
+                              正文事实审计：{{ parsedEvidence(op.evidence).claimAudit.note }}
+                            </div>
+                            <div
+                              v-if="parsedEvidence(op.evidence).claimAudit?.unsupportedNumericClaims?.length"
+                              class="evidence-items"
+                              style="margin-top:6px"
+                            >
+                              <div class="evidence-label" style="margin-bottom:4px">⚠️ 未在证据中定位到的正文数字：</div>
+                              <div
+                                v-for="(claim, i) in parsedEvidence(op.evidence).claimAudit.unsupportedNumericClaims"
+                                :key="'claim'+i"
+                                class="evidence-item"
+                              >
+                                <span class="evidence-source">claim</span>
+                                <span class="evidence-point">{{ claim.claim || claim.number }}</span>
+                              </div>
                             </div>
                             <div v-if="parsedEvidence(op.evidence).conflictValidation?.note" class="evidence-note evidence-note-danger">
                               {{ parsedEvidence(op.evidence).conflictValidation.note }}
@@ -766,6 +826,13 @@
                               <a v-if="result.url" :href="result.url" target="_blank" rel="noopener" class="evidence-link">{{ result.source }} <el-icon size="10"><ArrowRight /></el-icon></a>
                               <span v-else>{{ result.source }}</span>
                               <div class="workflow-search-result-snippet">{{ result.snippet }}</div>
+                              <div v-if="result.provider || result.sourceType || result.query || result.rawHash" class="workflow-search-result-trace">
+                                <span v-if="result.provider">provider={{ result.provider }}</span>
+                                <span v-if="result.sourceType">type={{ result.sourceType }}</span>
+                                <span v-if="result.query">query={{ result.query }}</span>
+                                <span v-if="result.fetchedAt">at={{ result.fetchedAt }}</span>
+                                <span v-if="result.rawHash">hash={{ shortTraceHash(result.rawHash) }}</span>
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -1433,21 +1500,39 @@ function parsedEvidence(raw) {
   if (evidenceCache.has(raw)) return evidenceCache.get(raw)
   try {
     const r = JSON.parse(raw)
+    const rawResults = r.results || []
+    const realResults = rawResults.filter(item => !isSyntheticEvidenceResult(item))
+    const modelEvidence = r.e || r.evidence || []
+    const hasRealResults = realResults.length > 0
     const result = {
       queries:     r.q  || r.queries  || [],
-      evidence:    r.e  || r.evidence || [],
-      realResults: r.results || [],
-      searchPlan:  r.searchPlan || null,
-      searchMeta:  r.searchMeta || null,
-      validation:  r.validation || null,
-      conflictValidation: r.conflictValidation || null
-    }
+      evidence:    hasRealResults ? [] : modelEvidence,
+      realResults,
+      aiEvidenceUnverified: !!r.aiEvidenceUnverified || (!hasRealResults && modelEvidence.length > 0),
+      suppressedAiEvidenceCount: hasRealResults ? modelEvidence.length : 0,
+	      searchPlan:  r.searchPlan || null,
+	      searchMeta:  r.searchMeta || null,
+	      validation:  r.validation || null,
+	      factCatalog: r.factCatalog || null,
+	      claimAudit:  r.claimAudit || null,
+	      conflictValidation: r.conflictValidation || null
+	    }
     evidenceCache.set(raw, result)
     return result
   } catch {
     evidenceCache.set(raw, {})
     return {}
   }
+}
+
+function isSyntheticEvidenceResult(item) {
+  const source = String(item?.source || '').toLowerCase()
+  return source.includes('tavily 智能摘要'.toLowerCase())
+}
+
+function shortTraceHash(value) {
+  if (!value) return ''
+  return String(value).replace(/^sha256:/, '').slice(0, 12)
 }
 
 function hasEvidence(raw) {
@@ -1458,6 +1543,8 @@ function hasEvidence(raw) {
     || !!ev.searchPlan
     || !!ev.searchMeta
     || !!ev.validation
+    || !!ev.factCatalog
+    || !!ev.claimAudit
     || !!ev.conflictValidation
 }
 
@@ -2000,6 +2087,52 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 }
 .evidence-link .el-icon { margin-left: 2px; vertical-align: 0; }
 .evidence-point { color: #374151; line-height: 1.5; }
+.evidence-trace {
+  flex-basis: 100%;
+  margin-top: 2px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: #64748b;
+  font-size: 10px;
+  line-height: 1.4;
+}
+.evidence-trace span {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #f1f5f9;
+}
+.evidence-source-trace {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 10px;
+  color: #475569;
+}
+.evidence-source-trace span {
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: #ecfdf5;
+}
+.evidence-source-trace span.is-failed {
+  color: #991b1b;
+  background: #fee2e2;
+}
+.evidence-facts {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 10px;
+  color: #1f2937;
+}
+.evidence-facts span {
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+}
 
 /* 用户输入区 */
 .input-area {
@@ -2309,6 +2442,19 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .workflow-search-result-snippet {
   margin-top: 2px;
   color: #64748b;
+}
+.workflow-search-result-trace {
+  margin-top: 2px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  color: #64748b;
+  font-size: 11px;
+}
+.workflow-search-result-trace span {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: #eef2ff;
 }
 @keyframes workflowPulse {
   0%, 100% { transform: scale(1); box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.24); }

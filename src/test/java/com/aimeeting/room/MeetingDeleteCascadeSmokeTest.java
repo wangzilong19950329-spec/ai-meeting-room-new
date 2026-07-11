@@ -16,7 +16,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * 删除会议级联清理 + 议员模版占用计数 的冒烟测试。
  * 跑在 H2 内存库（MySQL 兼容模式）+ schema-local.sql 之上，验证：
  *  1. deleteMeeting 把会议涉及的全部子表数据一并清除；
- *  2. 进行中/修订中的会议不允许删除；
+ *  2. 进行中/修订中的会议删除时会先停止，再执行同一套级联清理；
  *  3. countByMemberName 正确反映模版被会议引用的次数。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
@@ -71,6 +71,20 @@ class MeetingDeleteCascadeSmokeTest {
         return jdbc.queryForObject("SELECT COUNT(*) FROM " + table + " WHERE meeting_id = ?", Integer.class, meetingId);
     }
 
+    private void assertMeetingRowsRemoved(long meetingId) {
+        assertEquals(0, countFor("ai_meeting_member", meetingId));
+        assertEquals(0, countFor("ai_meeting_opinion", meetingId));
+        assertEquals(0, countFor("ai_meeting_vote", meetingId));
+        assertEquals(0, countFor("ai_meeting_conclusion_cluster", meetingId));
+        assertEquals(0, countFor("ai_meeting_score_log", meetingId));
+        assertEquals(0, countFor("ai_workflow_run", meetingId));
+        assertEquals(0, countFor("ai_workflow_stage_run", meetingId));
+        assertEquals(0, countFor("ai_workflow_stage_submission", meetingId));
+        assertEquals(0, countFor("ai_meeting_tracking_item", meetingId));
+        assertEquals(0, countFor("ai_meeting_tracking_update", meetingId));
+        assertNull(roomMapper.selectById(meetingId));
+    }
+
     @Test
     void cascadeDeleteRemovesAllChildRows() {
         long meetingId = seedFullMeeting(MeetingStatusEnum.CONCLUDED.getCode(), "议员-级联");
@@ -91,33 +105,22 @@ class MeetingDeleteCascadeSmokeTest {
         meetingRoomService.deleteMeeting(meetingId);
 
         // 删除后：全部清零，主表也没了
-        assertEquals(0, countFor("ai_meeting_member", meetingId));
-        assertEquals(0, countFor("ai_meeting_opinion", meetingId));
-        assertEquals(0, countFor("ai_meeting_vote", meetingId));
-        assertEquals(0, countFor("ai_meeting_conclusion_cluster", meetingId));
-        assertEquals(0, countFor("ai_meeting_score_log", meetingId));
-        assertEquals(0, countFor("ai_workflow_run", meetingId));
-        assertEquals(0, countFor("ai_workflow_stage_run", meetingId));
-        assertEquals(0, countFor("ai_workflow_stage_submission", meetingId));
-        assertEquals(0, countFor("ai_meeting_tracking_item", meetingId));
-        assertEquals(0, countFor("ai_meeting_tracking_update", meetingId));
-        assertNull(roomMapper.selectById(meetingId));
+        assertMeetingRowsRemoved(meetingId);
     }
 
     @Test
-    void inProgressMeetingCannotBeDeleted() {
-        long meetingId = seedFullMeeting(MeetingStatusEnum.IN_PROGRESS.getCode(), "议员-守卫");
+    void activeMeetingCanBeStoppedAndCascadeDeleted() {
+        int[] activeStatuses = {
+                MeetingStatusEnum.IN_PROGRESS.getCode(),
+                MeetingStatusEnum.REOPENED.getCode()
+        };
+        for (int status : activeStatuses) {
+            long meetingId = seedFullMeeting(status, "议员-运行中-" + status);
 
-        IllegalStateException ex = assertThrows(IllegalStateException.class,
-                () -> meetingRoomService.deleteMeeting(meetingId));
-        assertTrue(ex.getMessage().contains("终止") || ex.getMessage().contains("取消"),
-                "异常信息应提示先终止或取消，实际：" + ex.getMessage());
+            meetingRoomService.deleteMeeting(meetingId);
 
-        // 数据应原样保留
-        assertNotNull(roomMapper.selectById(meetingId));
-        assertEquals(2, countFor("ai_meeting_member", meetingId));
-        assertEquals(1, countFor("ai_workflow_run", meetingId));
-        assertEquals(1, countFor("ai_meeting_tracking_item", meetingId));
+            assertMeetingRowsRemoved(meetingId);
+        }
     }
 
     @Test

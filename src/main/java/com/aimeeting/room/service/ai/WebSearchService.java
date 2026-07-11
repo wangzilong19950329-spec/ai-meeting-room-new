@@ -14,11 +14,15 @@ import java.io.File;
 import java.io.InputStreamReader;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -82,6 +86,8 @@ public class WebSearchService {
     private int deepseekWebConnectTimeoutSeconds;
     @Value("${ai.search.deepseek-web.read-timeout-seconds:180}")
     private int deepseekWebReadTimeoutSeconds;
+    @Value("${ai.search.deepseek-web.mode:fast}")
+    private String deepseekWebMode;
 
     private static final MediaType JSON_TYPE = MediaType.get("application/json; charset=utf-8");
 
@@ -363,16 +369,8 @@ public class WebSearchService {
                 }
                 JSONObject payload = parseJsonObject(responseBody);
                 JSONArray organic = payload != null ? payload.getJSONArray("results") : null;
-                String answer = payload != null ? payload.getString("answer") : null;
 
                 List<SearchResult> results = new ArrayList<>();
-                if (answer != null && !answer.isBlank()) {
-                    SearchResult summary = new SearchResult();
-                    summary.source = "Tavily 智能摘要";
-                    summary.snippet = answer.length() > 12000 ? answer.substring(0, 12000) + "…" : answer;
-                    summary.url = (organic != null && !organic.isEmpty()) ? organic.getJSONObject(0).getString("url") : null;
-                    results.add(summary);
-                }
                 if (organic != null) {
                     for (int i = 0; i < organic.size() && results.size() < maxResults + 1; i++) {
                         JSONObject item = organic.getJSONObject(i);
@@ -384,6 +382,7 @@ public class WebSearchService {
                         r.source = title != null && !title.isBlank() ? title : "Tavily 搜索结果";
                         r.snippet = content;
                         r.url = item.getString("url");
+                        r.withTrace("tavily", "WEB_PAGE", normalizedQuery, item.toJSONString());
                         results.add(r);
                     }
                 }
@@ -497,6 +496,7 @@ public class WebSearchService {
                     result.url = (link != null && !link.isBlank())
                             ? link
                             : buildFallbackSearchUrl(title, media, content, normalizedQuery);
+                    result.withTrace("zhipu_web_search", "WEB_PAGE", normalizedQuery, item.toJSONString());
                     results.add(result);
                 }
 
@@ -549,6 +549,7 @@ public class WebSearchService {
                     r.source  = item.getString("title");
                     r.snippet = item.getString("snippet");
                     r.url     = item.getString("link");
+                    r.withTrace("serper", "WEB_PAGE", normalizedQuery, item.toJSONString());
                     if (r.snippet != null && !r.snippet.isBlank()) results.add(r);
                 }
                 log.info("Serper search '{}' -> {} results", normalizedQuery, results.size());
@@ -568,6 +569,10 @@ public class WebSearchService {
             body.put("query", normalizedQuery);
             body.put("isolatedSession", isolatedDeepSeekSession);
             body.put("closeTargetAfter", isolatedDeepSeekSession);
+            String bridgeMode = normalizeDeepSeekWebMode(deepseekWebMode);
+            if (!bridgeMode.isBlank()) {
+                body.put("mode", bridgeMode);
+            }
             OkHttpClient bridgeClient = httpClient.newBuilder()
                     .connectTimeout(Math.max(5, deepseekWebConnectTimeoutSeconds), TimeUnit.SECONDS)
                     .readTimeout(Math.max(30, deepseekWebReadTimeoutSeconds), TimeUnit.SECONDS)
@@ -596,7 +601,8 @@ public class WebSearchService {
                 }
                 JSONObject result = payload.getJSONObject("result");
                 String contentStatus = result != null ? result.getString("contentStatus") : null;
-                List<SearchResult> parsed = parseDeepSeekWebResult(result, maxResults, shouldIncludeSummary(result));
+                List<SearchResult> parsed = parseDeepSeekWebResult(result, maxResults, shouldIncludeSummary(result),
+                        "deepseek_web_bridge", normalizedQuery);
                 enrichMeta(
                         maxResults,
                         result != null ? result.getInteger("searchCount") : null,
@@ -621,6 +627,20 @@ public class WebSearchService {
             markMeta("deepseek_web_bridge", "error", "DeepSeek 网页搜索 bridge 异常：" + e.getMessage());
             return Collections.emptyList();
         }
+    }
+
+    private String normalizeDeepSeekWebMode(String rawMode) {
+        if (rawMode == null || rawMode.isBlank()) {
+            return "";
+        }
+        String mode = rawMode.trim().toLowerCase(Locale.ROOT);
+        if ("expert".equals(mode) || "professional".equals(mode) || "pro".equals(mode)) {
+            return "expert";
+        }
+        if ("fast".equals(mode) || "quick".equals(mode) || "default".equals(mode)) {
+            return "fast";
+        }
+        return "";
     }
 
     private List<SearchResult> searchViaDeepSeekWebScript(String normalizedQuery, int maxResults) {
@@ -664,7 +684,8 @@ public class WebSearchService {
                 markMeta("deepseek_web_script", "empty", "DeepSeek 网页搜索未返回可解析结果。");
                 return Collections.emptyList();
             }
-            List<SearchResult> results = parseDeepSeekWebResult(response, maxResults, shouldIncludeSummary(response));
+            List<SearchResult> results = parseDeepSeekWebResult(response, maxResults, shouldIncludeSummary(response),
+                    "deepseek_web_script", normalizedQuery);
             log.info("DeepSeek web search '{}' -> {} synthetic results", normalizedQuery, results.size());
             enrichContentMeta(response);
             String contentStatus = response.getString("contentStatus");
@@ -679,7 +700,11 @@ public class WebSearchService {
         }
     }
 
-    private List<SearchResult> parseDeepSeekWebResult(JSONObject response, int maxResults, boolean includeSummary) {
+    private List<SearchResult> parseDeepSeekWebResult(JSONObject response,
+                                                      int maxResults,
+                                                      boolean includeSummary,
+                                                      String provider,
+                                                      String normalizedQuery) {
         if (response == null) {
             return Collections.emptyList();
         }
@@ -691,6 +716,7 @@ public class WebSearchService {
             summary.source = "DeepSeek 网页智能搜索摘要";
             summary.snippet = answerText.length() > 12000 ? answerText.substring(0, 12000) + "…" : answerText;
             summary.url = links != null && !links.isEmpty() ? links.getJSONObject(0).getString("href") : null;
+            summary.withTrace(provider, "MODEL_SUMMARY", normalizedQuery, answerText);
             results.add(summary);
         }
         if (links != null) {
@@ -706,6 +732,7 @@ public class WebSearchService {
                 }
                 result.snippet = "来自 DeepSeek 网页智能搜索引用来源";
                 result.url = href;
+                result.withTrace(provider, "WEB_PAGE", normalizedQuery, item.toJSONString());
                 results.add(result);
             }
         }
@@ -861,6 +888,61 @@ public class WebSearchService {
         public String source;
         public String snippet;
         public String url;
+        public String provider;
+        public String sourceType;
+        public String query;
+        public String fetchedAt;
+        public String rawHash;
+
+        private static final ZoneId TRACE_ZONE = ZoneId.of("Asia/Shanghai");
+
+        public SearchResult withTrace(String provider, String sourceType, String query, String rawPayload) {
+            if (provider != null && !provider.isBlank()) {
+                this.provider = provider.trim();
+            }
+            if (sourceType != null && !sourceType.isBlank()) {
+                this.sourceType = sourceType.trim();
+            }
+            if (query != null && !query.isBlank()) {
+                this.query = query.trim();
+            }
+            if (this.fetchedAt == null || this.fetchedAt.isBlank()) {
+                this.fetchedAt = ZonedDateTime.now(TRACE_ZONE).toString();
+            }
+            String fingerprint = fingerprint(rawPayload);
+            if (fingerprint != null) {
+                this.rawHash = fingerprint;
+            }
+            return this;
+        }
+
+        public void copyTraceFrom(SearchResult source) {
+            if (source == null) {
+                return;
+            }
+            this.provider = source.provider;
+            this.sourceType = source.sourceType;
+            this.query = source.query;
+            this.fetchedAt = source.fetchedAt;
+            this.rawHash = source.rawHash;
+        }
+
+        public static String fingerprint(String rawPayload) {
+            if (rawPayload == null || rawPayload.isBlank()) {
+                return null;
+            }
+            try {
+                MessageDigest digest = MessageDigest.getInstance("SHA-256");
+                byte[] bytes = digest.digest(rawPayload.getBytes(StandardCharsets.UTF_8));
+                StringBuilder sb = new StringBuilder("sha256:");
+                for (byte b : bytes) {
+                    sb.append(String.format("%02x", b));
+                }
+                return sb.toString();
+            } catch (Exception e) {
+                return null;
+            }
+        }
     }
 
     public static class ResearchDigest {
@@ -1435,6 +1517,7 @@ public class WebSearchService {
             copy.source = original.source;
             copy.snippet = original.snippet;
             copy.url = original.url;
+            copy.copyTraceFrom(original);
             limited.add(copy);
         }
         return limited;

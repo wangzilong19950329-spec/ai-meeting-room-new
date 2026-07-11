@@ -13,6 +13,10 @@
         <result column="period_type" property="periodType"/>
         <result column="period_key" property="periodKey"/>
         <result column="source_record_ids" property="sourceRecordIds"/>
+        <result column="evidence_signal_json" property="evidenceSignalJson"/>
+        <result column="main_force_intent_json" property="mainForceIntentJson"/>
+        <result column="main_force_intent_status" property="mainForceIntentStatus"/>
+        <result column="main_force_intent_warnings_json" property="mainForceIntentWarningsJson"/>
         <result column="status" property="status"/>
         <result column="stance" property="stance"/>
         <result column="tone" property="tone"/>
@@ -20,6 +24,8 @@
         <result column="title" property="title"/>
         <result column="conclusion" property="conclusion"/>
         <result column="evidence_json" property="evidenceJson"/>
+        <result column="missing_data_json" property="missingDataJson"/>
+        <result column="data_snapshot_json" property="dataSnapshotJson"/>
         <result column="raw_response" property="rawResponse"/>
         <result column="prompt_hash" property="promptHash"/>
         <result column="provider" property="provider"/>
@@ -33,13 +39,15 @@
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO stock_watch_technical_analysis
         (session_id, symbol, market, stock_name, analysis_date, run_slot, period_type, period_key, source_record_ids,
+         evidence_signal_json, main_force_intent_json, main_force_intent_status, main_force_intent_warnings_json,
          status, stance, tone, confidence,
-         title, conclusion, evidence_json, raw_response, prompt_hash, provider, bridge_target_id,
+         title, conclusion, evidence_json, missing_data_json, data_snapshot_json, raw_response, prompt_hash, provider, bridge_target_id,
          conversation_url, context_chars_delta, error_message)
         VALUES
         (#{sessionId}, #{symbol}, #{market}, #{stockName}, #{analysisDate}, #{runSlot}, #{periodType}, #{periodKey},
-         #{sourceRecordIds}, #{status}, #{stance},
-         #{tone}, #{confidence}, #{title}, #{conclusion}, #{evidenceJson}, #{rawResponse}, #{promptHash},
+         #{sourceRecordIds}, #{evidenceSignalJson}, #{mainForceIntentJson}, #{mainForceIntentStatus}, #{mainForceIntentWarningsJson},
+         #{status}, #{stance},
+         #{tone}, #{confidence}, #{title}, #{conclusion}, #{evidenceJson}, #{missingDataJson}, #{dataSnapshotJson}, #{rawResponse}, #{promptHash},
          #{provider}, #{bridgeTargetId}, #{conversationUrl}, #{contextCharsDelta}, #{errorMessage})
     </insert>
 
@@ -95,6 +103,17 @@
           AND COALESCE(period_type, 'DAY') = #{periodType}
         ORDER BY gmt_create DESC, id DESC
         LIMIT #{limit}
+    </select>
+
+    <select id="selectLatestSuccessfulBySymbolSince" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND status = 'SUCCESS'
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+          AND gmt_create &gt;= #{since}
+        ORDER BY gmt_create DESC, id DESC
+        LIMIT 1
     </select>
 
     <select id="selectSuccessfulByDateRange" resultMap="BaseResultMap">

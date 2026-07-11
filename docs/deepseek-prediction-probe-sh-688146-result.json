@@ -1,0 +1,71 @@
+{
+  "testStatus": "PASSED_WITH_VALIDATION_RETRY",
+  "symbol": "688146",
+  "market": "sh",
+  "stockName": "中船特气",
+  "quote": {
+    "source": "Eastmoney quote",
+    "asOf": "2026-06-18 16:11",
+    "price": 364.0,
+    "previousClose": 339.7,
+    "open": 332.0,
+    "high": 365.0,
+    "low": 323.36,
+    "changePercent": 7.15,
+    "turnover": 10.78,
+    "volumeRatio": 0.7,
+    "mainInflowYuan": 59822752.0
+  },
+  "prediction": {
+    "asOf": "2026-06-18T16:11:00+08:00",
+    "sourcePrice": 364.0,
+    "summary": "缩量上涨且主力净流入仅0.598亿元，短期回调压力较大，震荡偏空。",
+    "forecasts": [
+      {
+        "horizon": "T+1_CLOSE",
+        "direction": "DOWN",
+        "probability": 0.4,
+        "targetLow": 350.0,
+        "targetHigh": 363.5,
+        "expectedReturnLowPct": -3.85,
+        "expectedReturnHighPct": -0.14,
+        "invalidationPrice": 368.0,
+        "rationale": ["量比0.70显示买盘不足，获利回吐概率高"]
+      },
+      {
+        "horizon": "T+5_CLOSE",
+        "direction": "DOWN",
+        "probability": 0.35,
+        "targetLow": 330.0,
+        "targetHigh": 360.0,
+        "expectedReturnLowPct": -9.34,
+        "expectedReturnHighPct": -1.1,
+        "invalidationPrice": 370.0,
+        "rationale": ["无趋势支撑，缩量新高后均值回归向下"]
+      }
+    ],
+    "risks": ["缺少历史波动率，区间估计偏差大", "突发消息可能逆转短期方向"],
+    "missingData": ["日线历史及均线", "估值与行业对比", "大盘及板块走势"]
+  },
+  "bridge": {
+    "sessionKey": "stock-watch-forecast-probe-sh-688146-v1",
+    "conversationUrl": "https://chat.deepseek.com/a/chat/s/6f837667-5a79-4c75-bd94-93be54b2cc81",
+    "contentStatus": "success",
+    "completionReason": "stable_signal",
+    "answerLength": 651,
+    "mode": "fast",
+    "expertMode": false,
+    "searchEnabled": false
+  },
+  "validationNotes": [
+    "首次回答将5982.2752万元错误换算为5.98亿元，校验后已纠正为0.598亿元",
+    "首次回答的SIDEWAYS方向与超过正负1%的区间冲突，校验后改为DOWN",
+    "第一次修正版被Bridge提前截断，压缩为700字以内后以stable_signal完整抓取"
+  ],
+  "unavailableMetrics": {
+    "directionAccuracy": "预测尚未到期，没有实际方向",
+    "rangeHitRate": "预测尚未到期，没有到期收盘价",
+    "meanAbsoluteError": "缺少预测值与实际值配对",
+    "brierScore": "至少需要一条已到期预测；用于稳定展示建议累计20条以上"
+  }
+}

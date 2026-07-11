@@ -296,12 +296,14 @@ CREATE TABLE IF NOT EXISTS stock_watch_item (
     image_url CLOB,
     enabled TINYINT DEFAULT 1 NOT NULL,
     source VARCHAR(32) DEFAULT 'manual' NOT NULL,
+    group_key VARCHAR(32) DEFAULT 'watch' NOT NULL,
     gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uk_sw_item_symbol ON stock_watch_item(symbol, market);
 CREATE INDEX IF NOT EXISTS idx_sw_item_enabled ON stock_watch_item(enabled, symbol, market);
+CREATE INDEX IF NOT EXISTS idx_sw_item_group ON stock_watch_item(group_key, enabled, symbol, market);
 
 CREATE TABLE IF NOT EXISTS stock_watch_technical_session (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -337,6 +339,10 @@ CREATE TABLE IF NOT EXISTS stock_watch_technical_analysis (
     period_type VARCHAR(16) DEFAULT 'DAY' NOT NULL,
     period_key VARCHAR(32),
     source_record_ids CLOB,
+    evidence_signal_json CLOB,
+    main_force_intent_json CLOB,
+    main_force_intent_status VARCHAR(32),
+    main_force_intent_warnings_json CLOB,
     status VARCHAR(32) NOT NULL,
     stance VARCHAR(64),
     tone VARCHAR(32),
@@ -344,6 +350,8 @@ CREATE TABLE IF NOT EXISTS stock_watch_technical_analysis (
     title VARCHAR(256),
     conclusion CLOB,
     evidence_json CLOB,
+    missing_data_json CLOB,
+    data_snapshot_json CLOB,
     raw_response CLOB,
     prompt_hash VARCHAR(128),
     provider VARCHAR(64),
@@ -358,6 +366,46 @@ CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_symbol_date ON stock_watch_techn
 CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_session ON stock_watch_technical_analysis(session_id);
 CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_slot ON stock_watch_technical_analysis(symbol, market, period_type, period_key, analysis_date, run_slot);
 CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_period ON stock_watch_technical_analysis(symbol, market, period_type, period_key);
+
+CREATE TABLE IF NOT EXISTS stock_watch_prediction (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    analysis_id BIGINT NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    stock_name VARCHAR(128),
+    horizon_code VARCHAR(16) NOT NULL,
+    horizon_trading_days INT NOT NULL,
+    forecast_date DATE NOT NULL,
+    source_price DECIMAL(18,4) NOT NULL,
+    direction VARCHAR(16) NOT NULL,
+    probability DECIMAL(6,5),
+    target_low DECIMAL(18,4),
+    target_high DECIMAL(18,4),
+    expected_return_low DECIMAL(12,6),
+    expected_return_high DECIMAL(12,6),
+    invalidation_price DECIMAL(18,4),
+    rationale CLOB,
+    input_snapshot_json CLOB,
+    status VARCHAR(24) DEFAULT 'PENDING' NOT NULL,
+    evaluated_trade_date DATE,
+    actual_close DECIMAL(18,4),
+    actual_high DECIMAL(18,4),
+    actual_low DECIMAL(18,4),
+    actual_return_pct DECIMAL(12,6),
+    direction_hit BOOLEAN,
+    range_close_hit BOOLEAN,
+    range_touch_hit BOOLEAN,
+    invalidated BOOLEAN,
+    absolute_error_pct DECIMAL(12,6),
+    brier_score DECIMAL(12,8),
+    evaluation_note CLOB,
+    evaluated_at TIMESTAMP,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_prediction_analysis_horizon UNIQUE (analysis_id, horizon_code)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_prediction_symbol_date ON stock_watch_prediction(symbol, market, forecast_date);
+CREATE INDEX IF NOT EXISTS idx_sw_prediction_status ON stock_watch_prediction(status, forecast_date);
 
 CREATE TABLE IF NOT EXISTS stock_watch_delivery_config (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,

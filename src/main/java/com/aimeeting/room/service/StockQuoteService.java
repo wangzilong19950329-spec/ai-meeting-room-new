@@ -10,6 +10,7 @@ import okhttp3.Request;
 import okhttp3.Response;
 import org.springframework.stereotype.Service;
 
+import java.net.Proxy;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -27,12 +28,14 @@ public class StockQuoteService {
     );
     private static final String EASTMONEY_FIELDS = String.join(",",
             "f2", "f3", "f4", "f5", "f6", "f8", "f10", "f12", "f13", "f14",
-            "f15", "f16", "f17", "f18", "f62", "f124", "f152");
+            "f15", "f16", "f17", "f18", "f62", "f66", "f69", "f72", "f75", "f78", "f81",
+            "f84", "f87", "f124", "f152", "f184");
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("MM-dd HH:mm");
 
     private final OkHttpClient http = new OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
             .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(12, TimeUnit.SECONDS)
             .build();
@@ -128,6 +131,15 @@ public class StockQuoteService {
         quote.put("open", readDouble(item.get("f17")));
         quote.put("previousClose", readDouble(item.get("f18")));
         quote.put("mainInflow", readDouble(item.get("f62")));
+        quote.put("mainInflowRatio", readDouble(item.get("f184")));
+        quote.put("superLargeInflow", readDouble(item.get("f66")));
+        quote.put("superLargeInflowRatio", readDouble(item.get("f69")));
+        quote.put("largeInflow", readDouble(item.get("f72")));
+        quote.put("largeInflowRatio", readDouble(item.get("f75")));
+        quote.put("mediumInflow", readDouble(item.get("f78")));
+        quote.put("mediumInflowRatio", readDouble(item.get("f81")));
+        quote.put("smallInflow", readDouble(item.get("f84")));
+        quote.put("smallInflowRatio", readDouble(item.get("f87")));
         quote.put("timestamp", timestamp);
         quote.put("updateTime", formatTime(timestamp, DATE_TIME_FORMATTER));
         quote.put("lastTime", formatTime(timestamp, TIME_FORMATTER));

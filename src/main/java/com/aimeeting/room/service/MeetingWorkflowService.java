@@ -5262,6 +5262,11 @@ public class MeetingWorkflowService {
                 result.setSource(obj.getString("source"));
                 result.setSnippet(obj.getString("snippet"));
                 result.setUrl(obj.getString("url"));
+                result.setProvider(obj.getString("provider"));
+                result.setSourceType(obj.getString("sourceType"));
+                result.setQuery(obj.getString("query"));
+                result.setFetchedAt(obj.getString("fetchedAt"));
+                result.setRawHash(obj.getString("rawHash"));
                 results.add(result);
             }
         }
@@ -5344,6 +5349,11 @@ public class MeetingWorkflowService {
                 result.put("source", item.source);
                 result.put("snippet", item.snippet);
                 result.put("url", item.url);
+                result.put("provider", item.provider);
+                result.put("sourceType", item.sourceType);
+                result.put("query", item.query);
+                result.put("fetchedAt", item.fetchedAt);
+                result.put("rawHash", item.rawHash);
                 results.add(result);
             }
         }

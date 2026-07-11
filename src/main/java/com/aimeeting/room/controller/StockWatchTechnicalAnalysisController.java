@@ -2,6 +2,7 @@ package com.aimeeting.room.controller;
 
 import com.aimeeting.room.common.ApiResponse;
 import com.aimeeting.room.service.StockWatchTechnicalAnalysisService;
+import com.aimeeting.room.service.StockWatchPredictionService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -21,6 +22,7 @@ import java.util.Map;
 public class StockWatchTechnicalAnalysisController {
 
     private final StockWatchTechnicalAnalysisService technicalAnalysisService;
+    private final StockWatchPredictionService predictionService;
 
     @GetMapping
     public ApiResponse<Map<String, Object>> history(@RequestParam("symbol") String symbol,
@@ -36,6 +38,19 @@ public class StockWatchTechnicalAnalysisController {
     @GetMapping("/status")
     public ApiResponse<Map<String, Object>> status() {
         return ApiResponse.ok(technicalAnalysisService.status());
+    }
+
+    @GetMapping("/predictions")
+    public ApiResponse<Map<String, Object>> predictions(@RequestParam("symbol") String symbol,
+                                                        @RequestParam(value = "market", required = false) String market,
+                                                        @RequestParam(value = "limit", defaultValue = "200") int limit) {
+        String normalizedSymbol = symbol == null ? "" : symbol.replaceAll("\\D", "");
+        String normalizedMarket = market == null ? "" : market.toLowerCase();
+        if (normalizedMarket.isEmpty()) {
+            normalizedMarket = normalizedSymbol.startsWith("6") || normalizedSymbol.startsWith("9") ? "sh"
+                    : (normalizedSymbol.startsWith("4") || normalizedSymbol.startsWith("8") ? "bj" : "sz");
+        }
+        return ApiResponse.ok(predictionService.history(normalizedSymbol, normalizedMarket, limit));
     }
 
     @PostMapping("/run")

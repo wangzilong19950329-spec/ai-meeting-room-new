@@ -33,4 +33,22 @@ export DEEPSEEK_WEB_MIN_REQUEST_INTERVAL_MS="${DEEPSEEK_WEB_MIN_REQUEST_INTERVAL
 export DEEPSEEK_WEB_POST_REQUEST_COOLDOWN_MS="${DEEPSEEK_WEB_POST_REQUEST_COOLDOWN_MS:-30000}"
 
 cd "$ROOT_DIR"
-exec node scripts/deepseek-web-bridge.js
+NODE_BIN="${NODE_BIN:-}"
+if [[ -z "$NODE_BIN" ]]; then
+  if command -v node >/dev/null 2>&1; then
+    NODE_BIN="$(command -v node)"
+  elif [[ -x "/opt/homebrew/bin/node" ]]; then
+    NODE_BIN="/opt/homebrew/bin/node"
+  elif [[ -x "/usr/local/bin/node" ]]; then
+    NODE_BIN="/usr/local/bin/node"
+  else
+    NODE_BIN="$(find "$HOME/.nvm/versions/node" -path '*/bin/node' -type f 2>/dev/null | sort | tail -n 1 || true)"
+  fi
+fi
+
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  echo "[error] node runtime not found. Set NODE_BIN=/absolute/path/to/node in $ENV_FILE" >&2
+  exit 127
+fi
+
+exec "$NODE_BIN" scripts/deepseek-web-bridge.js

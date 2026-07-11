@@ -43,6 +43,7 @@ public class StockWatchListService {
         item.setImageUrl(normalizeImageUrl(text(body, "imageUrl", text(body, "image", ""))));
         item.setEnabled(bool(body.get("enabled"), true));
         item.setSource(text(body, "source", existing == null ? "manual" : firstNonBlank(existing.getSource(), "manual")));
+        item.setGroupKey(normalizeGroupKey(text(body, "groupKey", text(body, "group", "")), existing));
         if (existing == null) {
             itemMapper.insert(item);
         } else {
@@ -84,7 +85,57 @@ public class StockWatchListService {
         payload.put("imageUrl", item.getImageUrl());
         payload.put("enabled", Boolean.TRUE.equals(item.getEnabled()));
         payload.put("source", firstNonBlank(item.getSource(), "manual"));
+        payload.put("groupKey", normalizeGroupKey(item.getGroupKey(), null));
+        payload.put("groupName", groupName(item.getGroupKey()));
         return payload;
+    }
+
+    private String normalizeGroupKey(String rawGroupKey, StockWatchItem existing) {
+        String fallback = existing == null ? "watch" : firstNonBlank(existing.getGroupKey(), "watch");
+        String value = firstNonBlank(rawGroupKey, fallback).toLowerCase(Locale.ROOT);
+        switch (value) {
+            case "holding":
+            case "position":
+            case "portfolio":
+            case "hold":
+            case "持仓":
+            case "持仓股":
+                return "holding";
+            case "candidate":
+            case "candidate_stock":
+            case "pool":
+            case "备选":
+            case "备选股":
+                return "candidate";
+            case "archived":
+            case "archive":
+            case "paused":
+            case "归档":
+            case "暂停":
+                return "archived";
+            case "watch":
+            case "observe":
+            case "observation":
+            case "观察":
+            case "观察股":
+                return "watch";
+            default:
+                return "watch";
+        }
+    }
+
+    private String groupName(String groupKey) {
+        switch (normalizeGroupKey(groupKey, null)) {
+            case "holding":
+                return "持仓股";
+            case "candidate":
+                return "备选股";
+            case "archived":
+                return "归档";
+            case "watch":
+            default:
+                return "观察股";
+        }
     }
 
     private StockRef normalizeStockRef(String rawSymbol, String rawMarket) {
