@@ -796,34 +796,8 @@ public class StockWatchDeliveryService {
     }
 
     private StockRef parseStockRef(String symbol, String market) {
-        if (!StringUtils.hasText(symbol)) {
-            throw new IllegalArgumentException("股票代码不能为空");
-        }
-        String cleanSymbol = symbol.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        String cleanMarket = market == null ? "" : market.trim().toLowerCase(Locale.ROOT);
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj)[._-]?(\\d{6})$")
-                .matcher(cleanSymbol);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), prefixed.group(1));
-        }
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$")
-                .matcher(cleanSymbol);
-        if (!suffixed.matches()) {
-            throw new IllegalArgumentException("股票代码格式不正确");
-        }
-        String normalizedSymbol = suffixed.group(1);
-        String normalizedMarket = StringUtils.hasText(suffixed.group(2))
-                ? suffixed.group(2)
-                : (StringUtils.hasText(cleanMarket) ? cleanMarket : inferMarket(normalizedSymbol));
-        return new StockRef(normalizedSymbol, normalizedMarket);
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
+        StockSymbol normalized = StockSymbol.parse(symbol, market);
+        return new StockRef(normalized.getSymbol(), normalized.getMarket());
     }
 
     private String hashEmail(String email) {

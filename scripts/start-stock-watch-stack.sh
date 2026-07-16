@@ -17,14 +17,27 @@ LOG_DIR="${AI_MEETING_LOG_DIR:-$HOME/.aimeeting-room/logs}"
 RUN_DIR="${AI_MEETING_RUN_DIR:-$HOME/.aimeeting-room/run}"
 BACKEND_PORT="${AI_MEETING_BACKEND_PORT:-${BACKEND_PORT:-8127}}"
 FRONTEND_PORT="${AI_MEETING_FRONTEND_PORT:-${FRONTEND_PORT:-3009}}"
-DEEPSEEK_WEB_BRIDGE_PORT="${DEEPSEEK_WEB_BRIDGE_PORT:-8789}"
-DEEPSEEK_WEB_DEBUG_PORT="${DEEPSEEK_WEB_DEBUG_PORT:-9333}"
+STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT="${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT:-8791}"
+STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT="${STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT:-9344}"
+STOCK_WATCH_DEEPSEEK_WEB_SEARCH_URL="${STOCK_WATCH_DEEPSEEK_WEB_SEARCH_URL:-http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}/search}"
+TECH_DEEPSEEK_WEB_BRIDGE_PORT="${TECH_DEEPSEEK_WEB_BRIDGE_PORT:-8789}"
+TECH_DEEPSEEK_WEB_DEBUG_PORT="${TECH_DEEPSEEK_WEB_DEBUG_PORT:-9333}"
+TECH_DEEPSEEK_WEB_SEARCH_URL="${TECH_DEEPSEEK_WEB_SEARCH_URL:-http://127.0.0.1:${TECH_DEEPSEEK_WEB_BRIDGE_PORT}/search}"
 STACK_WATCH_INTERVAL_SECONDS="${STACK_WATCH_INTERVAL_SECONDS:-30}"
 STACK_WAIT_TIMEOUT_SECONDS="${STACK_WAIT_TIMEOUT_SECONDS:-120}"
 
-BRIDGE_HEALTH_URL="http://127.0.0.1:${DEEPSEEK_WEB_BRIDGE_PORT}/health"
+BRIDGE_HEALTH_URL="http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}/health"
+TECH_BRIDGE_HEALTH_URL="http://127.0.0.1:${TECH_DEEPSEEK_WEB_BRIDGE_PORT}/health"
 BACKEND_BASE_URL="http://127.0.0.1:${BACKEND_PORT}"
 FRONTEND_BASE_URL="http://127.0.0.1:${FRONTEND_PORT}"
+
+export STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT
+export STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT
+export TECH_DEEPSEEK_WEB_BRIDGE_PORT
+export TECH_DEEPSEEK_WEB_DEBUG_PORT
+export STOCK_WATCH_TECH_BRIDGE_URL="$TECH_DEEPSEEK_WEB_SEARCH_URL"
+export STOCK_WATCH_AI_RULES_BRIDGE_URL="$STOCK_WATCH_DEEPSEEK_WEB_SEARCH_URL"
+export STOCK_WATCH_TECH_DEBUG_PORT="$TECH_DEEPSEEK_WEB_DEBUG_PORT"
 
 mkdir -p "$LOG_DIR" "$RUN_DIR"
 
@@ -37,7 +50,8 @@ usage() {
 Usage: scripts/start-stock-watch-stack.sh [--watch]
 
 Starts the local stock-watch development stack:
-  - DeepSeek web bridge  : http://127.0.0.1:${DEEPSEEK_WEB_BRIDGE_PORT}/health
+  - Stock DeepSeek bridge: http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}/health
+  - Tech DeepSeek bridge : http://127.0.0.1:${TECH_DEEPSEEK_WEB_BRIDGE_PORT}/health
   - Spring Boot backend  : ${BACKEND_BASE_URL}
   - Vite frontend        : ${FRONTEND_BASE_URL}
 
@@ -47,8 +61,11 @@ Options:
   -h, --help
 
 Environment overrides:
-  AI_MEETING_BACKEND_PORT, AI_MEETING_FRONTEND_PORT, DEEPSEEK_WEB_BRIDGE_PORT,
-  DEEPSEEK_WEB_DEBUG_PORT, AI_MEETING_ENV_FILE, AI_MEETING_LOG_DIR,
+  AI_MEETING_BACKEND_PORT, AI_MEETING_FRONTEND_PORT,
+  STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT, STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT,
+  TECH_DEEPSEEK_WEB_BRIDGE_PORT, TECH_DEEPSEEK_WEB_DEBUG_PORT,
+  STOCK_WATCH_DEEPSEEK_WEB_PROFILE_ROOT, STOCK_WATCH_DEEPSEEK_WEB_SESSION_STORE,
+  STOCK_WATCH_DEEPSEEK_WEB_CHROME_LOG, AI_MEETING_ENV_FILE, AI_MEETING_LOG_DIR,
   AI_MEETING_RUN_DIR, STACK_WATCH_INTERVAL_SECONDS, STACK_WAIT_TIMEOUT_SECONDS.
 USAGE
 }
@@ -118,7 +135,35 @@ http_responds() {
 }
 
 bridge_healthy() {
-  curl -fsS --max-time 2 "$BRIDGE_HEALTH_URL" >/dev/null 2>&1
+  local body
+  body="$(curl -fsS --max-time 2 "$BRIDGE_HEALTH_URL" 2>/dev/null)" || return 1
+  printf '%s' "$body" | python3 -c '
+import json
+import sys
+
+expected = int(sys.argv[1])
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if payload.get("debugPort") == expected else 1)
+' "$STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT"
+}
+
+technical_bridge_healthy() {
+  local body
+  body="$(curl -fsS --max-time 2 "$TECH_BRIDGE_HEALTH_URL" 2>/dev/null)" || return 1
+  printf '%s' "$body" | python3 -c '
+import json
+import sys
+
+expected = int(sys.argv[1])
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+sys.exit(0 if payload.get("debugPort") == expected else 1)
+' "$TECH_DEEPSEEK_WEB_DEBUG_PORT"
 }
 
 wait_until() {
@@ -149,19 +194,39 @@ write_pid() {
 
 start_bridge() {
   if bridge_healthy; then
-    log "DeepSeek bridge already healthy on :${DEEPSEEK_WEB_BRIDGE_PORT}"
+    log "Stock DeepSeek bridge already healthy on :${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT} (Chrome debug :${STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT})"
     return 0
   fi
-  if port_listening "$DEEPSEEK_WEB_BRIDGE_PORT"; then
-    log "WARN: port ${DEEPSEEK_WEB_BRIDGE_PORT} is listening, but ${BRIDGE_HEALTH_URL} is not healthy"
+  if port_listening "$STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT"; then
+    log "WARN: port ${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT} is listening, but ${BRIDGE_HEALTH_URL} is not healthy for stock debug :${STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT}"
     return 1
   fi
 
-  log "starting DeepSeek bridge on :${DEEPSEEK_WEB_BRIDGE_PORT} (Chrome debug :${DEEPSEEK_WEB_DEBUG_PORT})"
+  log "starting Stock DeepSeek bridge on :${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT} (Chrome debug :${STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT})"
   (
     cd "$ROOT_DIR"
-    nohup "$ROOT_DIR/scripts/start-deepseek-web-bridge-safe.sh" >>"${LOG_DIR}/deepseek-web-bridge.log" 2>&1 &
-    write_pid "deepseek-web-bridge" "$!"
+    nohup "$ROOT_DIR/scripts/start-stock-watch-deepseek-bridge-safe.sh" >>"${LOG_DIR}/deepseek-web-stock-bridge.log" 2>&1 &
+    write_pid "deepseek-web-stock-bridge" "$!"
+  )
+}
+
+start_technical_bridge() {
+  if technical_bridge_healthy; then
+    log "Tech DeepSeek bridge already healthy on :${TECH_DEEPSEEK_WEB_BRIDGE_PORT} (Chrome debug :${TECH_DEEPSEEK_WEB_DEBUG_PORT})"
+    return 0
+  fi
+  if port_listening "$TECH_DEEPSEEK_WEB_BRIDGE_PORT"; then
+    log "WARN: port ${TECH_DEEPSEEK_WEB_BRIDGE_PORT} is listening, but ${TECH_BRIDGE_HEALTH_URL} is not healthy for tech debug :${TECH_DEEPSEEK_WEB_DEBUG_PORT}"
+    return 1
+  fi
+
+  log "starting Tech DeepSeek bridge on :${TECH_DEEPSEEK_WEB_BRIDGE_PORT} (Chrome debug :${TECH_DEEPSEEK_WEB_DEBUG_PORT})"
+  (
+    cd "$ROOT_DIR"
+    DEEPSEEK_WEB_BRIDGE_PORT="$TECH_DEEPSEEK_WEB_BRIDGE_PORT" \
+      DEEPSEEK_WEB_DEBUG_PORT="$TECH_DEEPSEEK_WEB_DEBUG_PORT" \
+      nohup "$ROOT_DIR/scripts/start-deepseek-web-bridge-safe.sh" >>"${LOG_DIR}/deepseek-web-primary-bridge.log" 2>&1 &
+    write_pid "deepseek-web-primary-bridge" "$!"
   )
 }
 
@@ -206,10 +271,12 @@ start_frontend() {
 
 ensure_stack_once() {
   start_bridge || true
+  start_technical_bridge || true
   start_backend || true
   start_frontend || true
 
   wait_until "DeepSeek bridge" "bridge_healthy" "$STACK_WAIT_TIMEOUT_SECONDS" || true
+  wait_until "Tech DeepSeek bridge" "technical_bridge_healthy" "$STACK_WAIT_TIMEOUT_SECONDS" || true
   wait_until "backend" "http_responds '${BACKEND_BASE_URL}/api/auth/login'" "$STACK_WAIT_TIMEOUT_SECONDS" || true
   wait_until "frontend" "http_responds '${FRONTEND_BASE_URL}/'" "$STACK_WAIT_TIMEOUT_SECONDS" || true
 
@@ -217,6 +284,7 @@ ensure_stack_once() {
   log "  frontend: ${FRONTEND_BASE_URL}/stock-watch"
   log "  backend : ${BACKEND_BASE_URL}"
   log "  bridge  : ${BRIDGE_HEALTH_URL}"
+  log "  tech    : ${TECH_BRIDGE_HEALTH_URL}"
   log "  logs    : ${LOG_DIR}"
 }
 

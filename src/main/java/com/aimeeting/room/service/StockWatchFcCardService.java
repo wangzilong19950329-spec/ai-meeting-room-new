@@ -21,7 +21,10 @@ public class StockWatchFcCardService {
 
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
-    private static final Pattern STOCK_SECTION_PATTERN = Pattern.compile("^##\\s+(.+?)(?:\\s+|[（(])(\\d{6})(?:[）)])?.*$");
+    private static final Pattern STOCK_SECTION_PATTERN = Pattern.compile(
+            "^##\\s+(.+?)(?:\\s+|[（(])((?:h|hk)?\\d{1,5}(?:[._:-]?hk)?|\\d{6}(?:[._:-]?(?:sh|sz|bj))?)(?:[）)])?.*$",
+            Pattern.CASE_INSENSITIVE
+    );
     private static final Pattern CARD_HEADING_PATTERN = Pattern.compile("^###\\s+(.+)$");
     private static final List<String> REQUIRED_FIELDS = Arrays.asList(
             "thesis", "triggerLogic", "dataSources", "collectionMethod",
@@ -405,27 +408,8 @@ public class StockWatchFcCardService {
     }
 
     private StockRef parseStockRef(String rawSymbol, String rawMarket) {
-        String value = firstNonBlank(rawSymbol, "").trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        String market = firstNonBlank(rawMarket, "").trim().toLowerCase(Locale.ROOT);
-        Matcher prefixed = Pattern.compile("^(sh|sz|bj)[._-]?(\\d{6})$").matcher(value);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), prefixed.group(1));
-        }
-        Matcher suffixed = Pattern.compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$").matcher(value);
-        if (!suffixed.matches()) {
-            throw new IllegalArgumentException("股票编码格式不正确");
-        }
-        String symbol = suffixed.group(1);
-        String effectiveMarket = StringUtils.hasText(market)
-                ? market
-                : (StringUtils.hasText(suffixed.group(2)) ? suffixed.group(2) : inferMarket(symbol));
-        return new StockRef(symbol, effectiveMarket);
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
+        StockSymbol normalized = StockSymbol.parse(rawSymbol, rawMarket);
+        return new StockRef(normalized.getSymbol(), normalized.getMarket());
     }
 
     private boolean bool(Object raw, boolean fallback) {

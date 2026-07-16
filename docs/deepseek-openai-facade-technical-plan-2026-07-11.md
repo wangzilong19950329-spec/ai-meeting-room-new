@@ -1,8 +1,8 @@
-# DeepSeek Web Bridge OpenAI-Compatible Facade 技术方案
+# DeepSeek Web Bridge OpenAI-Compatible Adapter 本地第一版技术方案
 
-更新时间：2026-07-11  
+更新时间：2026-07-12
 目标仓库：`/Users/wangzilong/IdeaProjects/ai-meeting-room-new`  
-目标：让 n8n 和 Langflow 能以 OpenAI-compatible Chat Completions 的方式接入本项目现有 DeepSeek Web Bridge。
+目标：先做本机本地版，让 n8n 和 Langflow 能以 OpenAI-compatible Chat Completions 的方式接入本项目现有 DeepSeek Web Bridge。
 
 ## 1. 背景判断
 
@@ -17,7 +17,7 @@ Chrome 9333 -> DeepSeek Web Bridge 8789 -> Spring Boot -> MySQL
 n8n 和 Langflow 都更自然地接入 OpenAI-compatible chat model，但这个判断有前置条件：
 
 - n8n 的 `OpenAI Chat Model` 节点支持自定义 Base URL，但新版节点默认可能启用 Responses API，且 node-level Base URL override 会经过 credential URL/domain restriction 校验。
-- Langflow 的 `DeepSeek` / `OpenAI` / `LM Studio` 组件都走 `langchain_openai.ChatOpenAI`，并暴露 `api_base` / `base_url`；但 Langflow 默认启用 SSRF protection，会阻止 `127.0.0.1` / `localhost` 这类 loopback 地址，除非配置 allowlist 或调整运行拓扑。
+- Langflow 的 `DeepSeek` / `LM Studio` 组件已确认走 `langchain_openai.ChatOpenAI`，并暴露 `api_base` / `base_url`；但 Langflow 默认启用 SSRF protection，会阻止 `127.0.0.1` / `localhost` 这类 loopback 地址，除非配置 allowlist 或调整运行拓扑。`OpenAI` 组件作为补充路径，需要在 Phase 0.5 单独冒烟确认。
 
 因此推荐先做 OpenAI-compatible adapter，而不是直接改 n8n / Langflow 源码，也不是把 n8n / Langflow 改造成直接调用 `/search`。adapter 的进程拓扑需要在编码前做一个小型 spike：优先比较“同进程挂到现有 bridge”与“独立 Node facade 进程”，再定最终落点。
 
@@ -25,7 +25,7 @@ n8n 和 Langflow 都更自然地接入 OpenAI-compatible chat model，但这个�
 
 ### 2.1 目标
 
-1. 提供本地 OpenAI-compatible `.../v1` 兼容接口；默认候选地址为 `http://127.0.0.1:8790/v1`，最终地址取决于拓扑 spike。
+1. 提供本机 OpenAI-compatible `.../v1` 兼容接口；默认只监听 `127.0.0.1`。本地第一版已选择 T1，默认地址为 `http://127.0.0.1:8789/v1`；只有回退到 T2 时才使用独立端口如 `8790`。
 2. 支持：
    - `GET /v1/models`
    - `POST /v1/chat/completions`
@@ -34,6 +34,7 @@ n8n 和 Langflow 都更自然地接入 OpenAI-compatible chat model，但这个�
 4. 支持普通文本输出和 JSON 输出。
 5. 给 n8n / Langflow 提供明确配置方式。
 6. 对不支持能力给出显式错误，避免假装支持导致 workflow 静默错误。
+7. 第一版只验证同机低频调用：本地 bridge、本地 adapter、本地 n8n/Langflow，或用户明确配置的本地开发容器。
 
 ### 2.2 第一版非目标
 
@@ -42,7 +43,8 @@ n8n 和 Langflow 都更自然地接入 OpenAI-compatible chat model，但这个�
 3. 不支持 embeddings。
 4. 不支持 OpenAI Responses API；n8n 必须关闭 Responses API，或后续补 `/v1/responses`。
 5. 不改 n8n / Langflow 源码。
-6. 不把该 facade 默认加入生产自动化链路；第一版以本地低并发验证为主。
+6. 不把该 adapter 默认加入生产自动化链路；第一版以本地低并发验证为主。
+7. 不默认支持 LAN、公网、多人共享、远程容器编排或高可用部署。
 
 ## 3. 推荐架构
 
@@ -103,7 +105,9 @@ DEEPSEEK_WEB_BRIDGE_URL=http://127.0.0.1:8789/search
    - 启动/停止/health 是否清晰。
    - 单元测试复杂度。
    - 对现有 `/search` 的回归风险。
-4. 如果 T1 能用独立 module 控制改动面，默认优先 T1；如果 T1 对现有 bridge 风险过高，再采用 T2。
+4. 本地第一版默认倾向 T1：如果 T1 能用独立 module 控制改动面，并证明不改变 `/search` / `/health` 行为，优先采用 T1。
+5. T2 只有在出现明确触发证据时胜出：T1 route 注入风险高、测试隔离不清晰、会扰动现有 bridge 生命周期，或确实需要独立 restart/log/security boundary。
+6. Phase 0.5 结束时输出一个小型 decision record：选型、端口/URL、启动命令、回退条件。
 
 ### 3.3 调用链
 
@@ -156,8 +160,8 @@ adapter 只负责协议适配，不负责：
 ```json
 {
   "ok": true,
-  "mode": "deepseek_openai_facade",
-  "facadePort": 8790,
+  "mode": "deepseek_openai_adapter",
+  "adapterPort": 8789,
   "bridgeUrl": "http://127.0.0.1:8789/search",
   "bridge": {
     "ok": true,
@@ -401,25 +405,25 @@ facade 调用现有 bridge：
 }
 ```
 
-## 9. 安全与运行策略
+## 9. 本地运行与安全策略
 
 ### 9.1 绑定地址
 
-默认只监听：
+第一版默认只监听：
 
 ```text
 127.0.0.1
 ```
 
-不默认暴露到 LAN 或公网。
+不默认暴露到 LAN、公网或远程容器网络。n8n / Langflow 也优先按同机本地进程运行来验证。
 
-如果 n8n / Langflow 运行在 Docker 容器中，容器内的 `127.0.0.1` 指向容器自身，不是宿主机 adapter。此时有三种选择：
+如果用户明确要在本机 Docker 容器中运行 n8n / Langflow，要单独处理容器网络：容器内的 `127.0.0.1` 指向容器自身，不是宿主机 adapter。此时有三种选择：
 
 1. 让 adapter 监听宿主机可达地址，并强制配置 `DEEPSEEK_OPENAI_FACADE_API_KEY`。
 2. 在容器中使用 `host.docker.internal` 或宿主网关地址访问 adapter。
 3. 把 adapter 和 n8n / Langflow 放到同一 Docker network，并用 service name 访问。
 
-只要 adapter 不再只绑定 `127.0.0.1`，就必须启用 API key，并明确防火墙/网络边界。
+只要 adapter 不再只绑定 `127.0.0.1`，即使仍是本机开发容器，也必须启用 API key，并明确防火墙/网络边界。
 
 ### 9.2 API key
 
@@ -428,7 +432,7 @@ n8n / Langflow 往往要求填写 API key。facade 支持两种模式：
 1. `DEEPSEEK_OPENAI_FACADE_API_KEY` 未配置：接受任意 bearer token，但只监听 localhost。
 2. 已配置：必须匹配 `Authorization: Bearer <key>`。
 
-这能兼容本地开发，又保留后续安全开关。
+这能兼容本地开发，又保留后续安全开关。第一版默认使用模式 1。
 
 如果采用 T1 同进程 adapter，环境变量名称仍可沿用 `DEEPSEEK_OPENAI_FACADE_API_KEY`，但文档和日志中应称为 adapter API key，避免把进程拓扑和协议角色混在一起。
 
@@ -460,13 +464,13 @@ adapter 日志只记录：
 1. **关闭 `Use Responses API`**。当前 n8n `OpenAI Chat Model` v1.3 默认值是 `true`，第一版 adapter 只支持 Chat Completions。
 2. **优先在 OpenAI credential 里把 Base URL 设置为 adapter 地址**。node-level `options.baseURL` 会经过 credential allowed URL / pinned URL 校验；如果 credential 仍是 `https://api.openai.com/v1`，node-level override 可能被拦。
 3. **不要连接 tool 节点，也不要启用 built-in tools**。第一版 adapter 会明确拒绝 tools/function calling。
-4. 如果 n8n 在 Docker 容器内运行，不要直接填宿主机 `127.0.0.1`，应使用 `host.docker.internal`、宿主网关或同 Docker network 的 service name。
+4. 第一版优先验证本机 n8n 进程；如果 n8n 在 Docker 容器内运行，不要直接填宿主机 `127.0.0.1`，应使用 `host.docker.internal`、宿主网关或同 Docker network 的 service name。
 
 推荐配置：
 
 ```text
 Node: OpenAI Chat Model
-OpenAI credential Base URL: http://127.0.0.1:8790/v1 或 http://host.docker.internal:8790/v1
+OpenAI credential Base URL: http://127.0.0.1:8789/v1
 API Key: local-dev 或 DEEPSEEK_OPENAI_FACADE_API_KEY
 Model: deepseek-web-bridge
 Use Responses API: false
@@ -498,7 +502,7 @@ Langflow 组件有 OpenAI-compatible 接入点，但默认不是“直接填 `12
 LANGFLOW_SSRF_ALLOWED_HOSTS=127.0.0.1,localhost
 ```
 
-3. 如果 Langflow 在 Docker 容器内运行，容器内 `127.0.0.1` 不是宿主机；应使用 `host.docker.internal`、宿主网关地址，或同 Docker network 的 service name，并同步配置 SSRF allowlist。
+3. 第一版优先验证本机 Langflow 进程；如果 Langflow 在 Docker 容器内运行，容器内 `127.0.0.1` 不是宿主机；应使用 `host.docker.internal`、宿主网关地址，或同 Docker network 的 service name，并同步配置 SSRF allowlist。
 4. `Stream` 必须关闭。
 5. Agent 场景不要启用工具调用；第一版只验证文本/JSON model slot。
 
@@ -508,7 +512,7 @@ LANGFLOW_SSRF_ALLOWED_HOSTS=127.0.0.1,localhost
 
 ```text
 Component: DeepSeek
-DeepSeek API Base: http://127.0.0.1:8790/v1 或容器可达地址
+DeepSeek API Base: http://127.0.0.1:8789/v1
 DeepSeek API Key: local-dev 或 DEEPSEEK_OPENAI_FACADE_API_KEY
 Model Name: deepseek-web-bridge 或 deepseek-chat
 Stream: false
@@ -518,7 +522,7 @@ JSON Mode: 按需开启
 ### 11.2 LM Studio / OpenAI 组件
 
 ```text
-Base URL: http://127.0.0.1:8790/v1 或容器可达地址
+Base URL: http://127.0.0.1:8789/v1
 API Key: local-dev
 Model: deepseek-web-bridge
 ```
@@ -541,6 +545,8 @@ Langflow 的优势是后续可通过 `LANGFLOW_COMPONENTS_PATH` 加自定义组�
 
 编码前必须先补这一步，否则 S2/S3/S4 只能算弱支持。
 
+当前状态：已完成本地第一版拓扑决策，见 `docs/deepseek-openai-adapter-decision-record-2026-07-12.md`。结论是采用 T1 同进程 adapter，Base URL 为 `http://127.0.0.1:8789/v1`，T2 保留为明确触发条件下的回退方案。
+
 任务：
 
 1. 做 T1 同进程 adapter module 与 T2 独立 facade 进程的 mock spike。
@@ -551,8 +557,13 @@ Langflow 的优势是后续可通过 `LANGFLOW_COMPONENTS_PATH` 加自定义组�
 3. 用 mock OpenAI-compatible endpoint 验证 Langflow：
    - 默认 SSRF protection 下访问 `127.0.0.1` 是否失败。
    - 加 `LANGFLOW_SSRF_ALLOWED_HOSTS=127.0.0.1,localhost` 后能否访问。
-   - 容器场景使用 `host.docker.internal` 或 service name 的可行性。
-4. 根据 spike 结果决定采用 T1 或 T2。
+   - 如果用户选择本机 Docker，再验证 `host.docker.internal` 或 service name 的可行性；否则不把容器网络作为第一版阻塞项。
+4. 输出 decision record：
+   - `selectedTopology`: T1 或 T2。
+   - `adapterBaseUrl`: 本地 n8n/Langflow 应填写的地址。
+   - `startCommand`: 本地启动命令。
+   - `fallbackCondition`: 何时从 T1 回退到 T2，或从 T2 回退到 T1。
+5. 根据 spike 结果决定采用 T1 或 T2。
 
 Phase 0.5 的通过标准：
 
@@ -562,7 +573,7 @@ OpenAI-compatible adapter 主线保留；
 n8n/Langflow 接入文档从“可配置”变成“已知前置条件 + 已验证路径”。
 ```
 
-### Phase 1：facade 最小可运行
+### Phase 1：adapter 最小可运行
 
 根据 Phase 0.5 决策落地 T1 或 T2。
 
@@ -588,6 +599,13 @@ n8n/Langflow 接入文档从“可配置”变成“已知前置条件 + 已验�
 - 明确拒绝 `/v1/responses`。
 - 错误映射。
 - JSON mode 返回前 parse 校验。
+
+Phase 1 done criteria 必须包含核心协议单测：
+
+1. `/v1/models`。
+2. 普通 chat 请求到 bridge `/search` 的转换。
+3. `stream/tools/responses` 的显式拒绝。
+4. bridge busy/timeout/incomplete 的错误映射。
 
 验收：
 
@@ -650,14 +668,20 @@ n8n：
 5. 运行文本和 JSON 两个样例。
 6. 从 adapter 日志确认 n8n 只调用 `/v1/models` 与 `/v1/chat/completions`。
 
+当前补证状态（2026-07-13）：`scripts/n8n-saved-workflow-runtime-smoke.js` 已经通过 n8n REST runtime 执行保存后的 workflow。mock adapter 下 `executionStatus=success`，`executionFingerprint=3091f1127f77d07c`。DeepSeek 登录后，隔离 bridge `http://host.docker.internal:8790/v1` 下真实 adapter 运行也成功：`executionId=14`，`executionStatus=success`，`savedWorkflowConfig.timeout=480000`，`maxRetries=0`，`responseFormat=json_object`，`workflowImport=Updated saved workflow via n8n REST PATCH`，输出为 `{"ok":true,"source":"n8n-saved-workflow-smoke"}`，`executionFingerprint=0df43f2d66bae81b`。脚本默认只通过 n8n REST 读取保存后的 credential/workflow、校验 workflow 中 OpenAI Chat Model node 的 Base URL/model/Responses API/timeout/retry/responseFormat 配置并执行；已有 workflow 的 refresh 走 REST PATCH，只有 fixture 缺失时才要求显式 `N8N_SMOKE_IMPORT_WITH_CLI=1`。这证明 n8n 保存工作流 node 配置与运行时链路可用，不证明 existing credential-store API key/url 内部会随 REST PATCH 自动轮换；如果后续换非默认 API key，应单独重建 credential fixture 或补 credential refresh 路径。
+
 Langflow：
 
 1. 启动 Langflow。
 2. 配置 `LANGFLOW_SSRF_ALLOWED_HOSTS` 或使用可达 service 地址。
-3. 用 DeepSeek 或 OpenAI component 指向 adapter。
+3. 优先用 DeepSeek 或 LM Studio component 指向 adapter；OpenAI component 作为补充路径单独冒烟。
 4. 运行普通文本和 JSON mode。
 5. 不开启 stream。
 6. 从 adapter 日志确认 Langflow 只调用 `/v1/models` 与 `/v1/chat/completions`。
+
+当前补证状态（2026-07-13）：`scripts/langflow-saved-flow-runtime-smoke.py` 已经通过 Langflow `/api/v1/run/{flow_id}` 执行保存后的 flow，mock adapter 下返回 `{"ok":true,"source":"deepseek-openai-adapter-mock"}`，`outputFingerprint=0d3a1ceb163e0dc7`，`outputSource=deepseek-web-bridge`，`runFingerprint=e37c08e66b03e0c0`。Langflow 保存流里的 `DeepSeekModelComponent.api_key.load_from_db` 必须对本地 literal key 设为 `false`；否则 Langflow 会按全局变量名解析 secret，导致模型节点拿到空 key。这证明 literal local-dev key 的 saved-flow runtime 路径，不证明 Langflow secret/global-variable storage。
+
+真实 adapter readiness（2026-07-13）：新增 `scripts/deepseek-openai-local-real-smoke.js`。登录前运行证明 `http://127.0.0.1:8789/v1/models` 可用，n8n/Langflow Docker 容器也可通过 `http://host.docker.internal:8789/v1/models` 访问真实 adapter；当 DeepSeek Chrome target 位于 `https://chat.deepseek.com/sign_in` 时，脚本以 `rc=2` 返回 `login_required`，且不会继续提交 chat 或刷新 saved workflow fixture。登录后，因会议室 Spring Boot 后端 `8127` 持续调用默认 bridge `8789`，本轮真实链路改用隔离 bridge `8790` + Chrome debug `9344`：direct adapter chat 返回 `mock=false`、文本 `通过`，JSON chat 返回 `{"ok":true,"kind":"json-smoke"}`；n8n saved workflow 与 Langflow saved flow 均通过。默认 `8789` 应视为共享串行资源；若后端同时运行，工具验证应使用隔离端口或先停后端。
 
 ### Phase 5：可选增强
 
@@ -673,8 +697,8 @@ Langflow：
 
 ### 13.1 功能验收
 
-1. n8n 在关闭 Responses API、credential URL 指向 adapter、无 tools 的条件下，能通过 OpenAI Chat Model 调用 DeepSeek Web Bridge 并得到文本。
-2. Langflow 在 SSRF allowlist/网络拓扑配置正确、关闭 stream、无 tools 的条件下，能通过 DeepSeek/OpenAI/LM Studio component 调用 DeepSeek Web Bridge 并得到文本。
+1. 本机 n8n 在关闭 Responses API、credential URL 指向 `http://127.0.0.1:<adapter-port>/v1`、无 tools 的条件下，能通过 OpenAI Chat Model 调用 DeepSeek Web Bridge 并得到文本。
+2. 本机 Langflow 在 SSRF allowlist 配置正确、关闭 stream、无 tools 的条件下，能优先通过 DeepSeek 或 LM Studio component 调用 DeepSeek Web Bridge 并得到文本；OpenAI component 作为补充路径单独冒烟。
 3. JSON mode 下返回可解析 JSON；不完整 JSON 不被标记成功。
 4. bridge busy、未登录、超时都有明确错误。
 5. n8n / Langflow 调用日志显示只访问 `/v1/models` 与 `/v1/chat/completions`。
@@ -705,7 +729,7 @@ Langflow：
 5. token usage 无法真实统计。
 6. JSON mode 依赖 prompt + bridge 的完整 JSON 检测，不能等同 API 级 schema guarantee。
 7. Langflow 默认 SSRF protection 会阻止 loopback/private IP；不配置 allowlist 时本地接入会失败。
-8. Docker 场景中 `127.0.0.1` 容易指错网络命名空间；需要显式说明 host/network 地址。
+8. Docker 场景中 `127.0.0.1` 容易指错网络命名空间；第一版不把 Docker 作为默认路径，需要时再显式说明 host/network 地址。
 9. 独立进程拓扑会增加 start/stop/health/log 管理成本；同进程拓扑会增加现有 bridge 回归风险。
 
 ## 15. 关键替代方案
@@ -743,7 +767,7 @@ Langflow：
 ```json
 {
   "objective": {
-    "primary": "让 n8n 和 Langflow 以最小源码侵入方式接入现有 DeepSeek Web Bridge",
+    "primary": "先做本机本地版，让 n8n 和 Langflow 以最小源码侵入方式接入现有 DeepSeek Web Bridge",
     "secondary": [
       "保护当前会议室和股票盯盘主链不被破坏",
       "清晰暴露不支持能力，避免静默错误",
@@ -753,9 +777,9 @@ Langflow：
   "constraints": [
     "第一版不改 n8n / Langflow 源码",
     "第一版不改变现有 /search 协议",
-    "第一版只支持低并发本地调用",
+    "第一版只支持同机低频本地调用，默认不支持 LAN、公网、多人共享或生产化部署",
     "不能假装支持 streaming / tool calling / embeddings",
-    "需要能被 n8n OpenAI Chat Model 和 Langflow DeepSeek/OpenAI/LM Studio 组件调用"
+    "需要能被 n8n OpenAI Chat Model 和 Langflow DeepSeek/LM Studio 组件调用；Langflow OpenAI 组件作为补充路径单独冒烟"
   ],
   "claims": [
     {
@@ -779,7 +803,7 @@ Langflow：
       "dependsOn": ["E3", "E7", "E8"],
       "supportingEvidence": ["E3", "E7", "E8"],
       "hiddenAssumptions": [
-        "n8n 运行环境能访问 adapter 地址；Docker 场景不把 127.0.0.1 误认为宿主机",
+        "本机 n8n 进程能访问 127.0.0.1 adapter 地址",
         "使用者能在节点中关闭 Responses API",
         "OpenAI credential 的 Base URL 可以配置为本地 adapter 地址"
       ],
@@ -804,8 +828,8 @@ Langflow：
       "dependsOn": ["E4", "E5", "E9", "E10"],
       "supportingEvidence": ["E4", "E5", "E9", "E10"],
       "hiddenAssumptions": [
-        "LANGFLOW_SSRF_ALLOWED_HOSTS 或等效配置能在用户运行方式中生效",
-        "Langflow 运行环境能访问 adapter 地址；Docker 场景不把 127.0.0.1 误认为宿主机",
+        "LANGFLOW_SSRF_ALLOWED_HOSTS 或等效配置能在用户本机运行方式中生效",
+        "本机 Langflow 进程能访问 127.0.0.1 adapter 地址",
         "Langflow 组件 stream 可关闭，且目标 flow 不要求 tool calling"
       ],
       "falsifiers": [
@@ -826,7 +850,7 @@ Langflow：
       "id": "S4",
       "statement": "第一版应优先做 OpenAI-compatible adapter 作为公共协议层，而不是改 n8n/Langflow 源码或让它们直接调用 /search。",
       "type": "recommendation",
-      "dependsOn": ["S1", "S2", "S3", "E6"],
+      "dependsOn": ["S1", "S2", "S3", "E6", "E13"],
       "supportingEvidence": ["E1", "E2", "E3", "E4", "E5", "E6"],
       "hiddenAssumptions": [
         "n8n/Langflow 的第一版目标是 model slot 文本/JSON 调用，而不是完整 agent tool calling",
@@ -853,7 +877,7 @@ Langflow：
     },
     {
       "id": "S7",
-      "statement": "T1 同进程 adapter 与 T2 独立 Node facade 哪个更适合作为第一版，目前尚未被证明，编码前必须通过 Phase 0.5 mock spike 决策。",
+      "statement": "本地第一版默认倾向 T1 同进程 adapter；T2 独立 Node facade 只有在 Phase 0.5 出现明确触发证据时胜出。",
       "type": "recommendation",
       "dependsOn": ["S1", "S4", "E1", "E6", "E11", "E12"],
       "supportingEvidence": ["E1", "E6", "E11", "E12"],
@@ -864,6 +888,7 @@ Langflow：
       "falsifiers": [
         "已有未记录的运行约定强制要求独立 facade 进程",
         "已有未记录的运行约定强制要求所有 bridge endpoint 同进程",
+        "mock spike 证明 T1 会影响 /search 或 /health 现有行为",
         "mock spike 不能覆盖实际 n8n/Langflow 调用路径"
       ],
       "alternativesConsidered": [
@@ -912,15 +937,16 @@ Langflow：
       "id": "S6",
       "statement": "该方案第一版可作为本地低并发验证路径，但不能宣称达到生产级 n8n 自动化模型服务。",
       "type": "recommendation",
-      "dependsOn": ["S1", "S4", "S5", "E6"],
-      "supportingEvidence": ["E6"],
+      "dependsOn": ["S1", "S4", "S5", "E6", "E13"],
+      "supportingEvidence": ["E6", "E13"],
       "hiddenAssumptions": [
         "DeepSeek 网页端登录态、页面结构和账号风控仍然是不稳定外部依赖",
-        "n8n 企业自动化的吞吐和可靠性要求通常高于单 Chrome 网页自动化"
+        "n8n 企业自动化的吞吐和可靠性要求通常高于单 Chrome 网页自动化",
+        "用户当前只要求先做本地版本"
       ],
       "falsifiers": [
         "已有长期稳定压测证据证明网页 bridge 可承受 n8n 生产负载",
-        "用户目标仅限手动低频实验，不涉及自动化可靠性"
+        "用户目标升级为生产自动化或多人共享服务"
       ],
       "alternativesConsidered": [
         {
@@ -933,7 +959,7 @@ Langflow：
     }
   ],
   "conclusion": {
-    "statement": "当前证据支持先做 OpenAI-compatible adapter 作为 n8n/Langflow 接入 DeepSeek Web Bridge 的最低侵入主线；但 T1 同进程还是 T2 独立进程必须先做 Phase 0.5 mock spike 决策。第一版只应定位为本地低并发文本/JSON 模型接入，不应宣称支持 streaming、tool calling、Responses API 或生产级高并发。",
+    "statement": "当前证据支持先做 OpenAI-compatible adapter 作为 n8n/Langflow 接入 DeepSeek Web Bridge 的最低侵入主线；本地第一版默认倾向 T1 同进程 adapter，但必须先用 Phase 0.5 mock spike 证明 T1 不破坏 /search 与 /health，或出现明确触发证据时回退到 T2 独立进程。第一版只应定位为本地低并发文本/JSON 模型接入，不应宣称支持 streaming、tool calling、Responses API 或生产级高并发。",
     "dependsOn": ["S1", "S2", "S3", "S4", "S5", "S6", "S7"]
   }
 }
@@ -941,7 +967,7 @@ Langflow：
 
 ## 17. 代码/事实证据
 
-- E1 `scripts/deepseek-web-bridge.js:139`、`:170-176`、`:260-266`：当前 Node bridge 暴露 health、读取 `/search` 请求中的 `query`、`expectedJson`、`mode`、`sessionKey` 等字段，并绑定 `127.0.0.1:8789`。直接证据。
+- E1 `scripts/deepseek-web-bridge.js`、`scripts/deepseek-bridge-auth.js`：当前 Node bridge 暴露 health、读取 `/search` 请求中的 `query`、`expectedJson`、`mode`、`sessionKey` 等字段；默认绑定 `127.0.0.1`，并可通过 `DEEPSEEK_WEB_BRIDGE_HOST` 调整本地监听地址；非 loopback 绑定在未配置 `DEEPSEEK_OPENAI_FACADE_API_KEY` 时会 fail-fast，配置后 raw `/search` 也要求同一个 Bearer key。直接证据。
 - E2 `src/main/java/com/aimeeting/room/service/MeetingDeepSeekWebBridgeService.java:115-122`、`:180-181`：会议室后端将 system/user prompt 拼接为 `query`，设置 `expectedJson`，再读取 `result.answerText`。直接证据。
 - E3 `/tmp/codex-research-ai-meeting/n8n/packages/nodes-base/credentials/OpenAiApi.credentials.ts:35-40`、`:78-82`：n8n OpenAI credential 自带 Base URL，并用该 URL 测 `/models`。直接证据。
 - E4 `/tmp/codex-research-ai-meeting/langflow/src/lfx/src/lfx/components/deepseek/deepseek.py:49-55`、`:114-123`：Langflow DeepSeek 组件暴露 `api_base` 并传入 `ChatOpenAI(base_url=...)`，且使用 SSRF-protected client kwargs。直接证据。
@@ -953,14 +979,29 @@ Langflow：
 - E10 `/tmp/codex-research-ai-meeting/langflow/src/lfx/src/lfx/utils/ssrf_protection.py:44-50`、`:497-503`：Langflow SSRF blocked ranges 包含 `127.0.0.0/8`，阻断时提示加入 `LANGFLOW_SSRF_ALLOWED_HOSTS`。直接证据。
 - E11 `scripts/start-stock-watch-stack.sh:150-165`：现有 stack 启动脚本只管理 DeepSeek bridge，不管理独立 OpenAI facade。直接证据。
 - E12 `scripts/stop-stock-watch-stack.sh:68-70`：现有 stack 停止脚本只停止 frontend/backend/deepseek-web-bridge，不管理独立 OpenAI facade。直接证据。
+- E13 用户在 2026-07-12 明确“我的预期就是先做本地版本”。需求证据。
+- E14 `scripts/deepseek-openai-adapter.js`、`scripts/deepseek-openai-adapter.test.js`、`scripts/deepseek-web-bridge.js`：本地第一版已新增 T1 同进程 adapter route，并以 adapter 单元测试覆盖 `/v1/models`、`/v1/chat/completions`、`/v1/responses`、stream/tools 拒绝、JSON mode、bridge error mapping。直接证据。
+- E15 `docs/deepseek-openai-adapter-decision-record-2026-07-12.md`：Phase 0.5 decision record 记录 T1 选型、`http://127.0.0.1:8789/v1` Base URL、启动命令和 T2 回退条件。直接证据。
+- E16 `scripts/deepseek-openai-adapter-smoke.js`：本地 smoke 脚本验证 `/v1/models`、`/v1/responses` 拒绝、stream 拒绝、tools 拒绝，并诊断 Chrome debug port 上的 DeepSeek 登录态；`--chat` 才提交 chat completion 请求。直接证据。
+- E17 2026-07-12 实测：`node scripts/deepseek-openai-adapter-smoke.js` 通过并报告 `deepseekLogin.status=login_required`；真实 `/v1/chat/completions` 返回 `503 login_required`，Chrome target `1C6B6DCE846239FFAD99D59A7DDA1BA8` 位于 `https://chat.deepseek.com/sign_in`。运行证据。
+- E18 `scripts/start-deepseek-openai-adapter-mock.sh`、`scripts/deepseek-openai-adapter-mock-server.js`：可在独立本地端口启动显式纯 mock adapter，用于 DeepSeek 未登录时验证 n8n/Langflow OpenAI-compatible 接入路径；mock 响应标记 `deepseek_web_bridge.mock=true`，且不启动 Chrome。直接证据。
+- E19 `docker-compose.deepseek-openai-local.yml`：提供本地 n8n/Langflow UI 启动示例，默认固定到已验证的 `n8nio/n8n:2.29.10` 与 `langflowai/langflow:1.10.2`，UI 端口只发布到宿主机 `127.0.0.1`，容器内使用 `host.docker.internal` 访问宿主机 adapter，并为 Langflow 设置 SSRF allowlist 和本地 superuser password；`docker compose config` 已验证语法，两个固定 image tag 已用 `docker manifest inspect` 验证存在。直接证据。
+- E20 2026-07-13 实测：n8n Docker container 启动于 `http://127.0.0.1:5678`，容器内通过 `http://host.docker.internal:18789/v1` 访问 mock adapter 的 `/models`、文本 chat、JSON chat 均返回 200，且 chat 响应标记 `deepseek_web_bridge.mock=true`。运行证据。
+- E21 2026-07-13 实测：Langflow Docker container 在设置 `LANGFLOW_SUPERUSER_PASSWORD` 后启动于 `http://127.0.0.1:7860`，容器内通过 `http://host.docker.internal:18789/v1` 访问 mock adapter 的 `/models` 和文本 chat 均返回 200，且 chat 响应标记 `deepseek_web_bridge.mock=true`。运行证据。
+- E22 2026-07-13 实测：`scripts/n8n-openai-chat-model-node-smoke.js` 在 n8n 容器内加载已安装的 `LMChatOpenAi` 节点类，使用 fake minimal node context，设置 `responsesApiEnabled=false`、`model=deepseek-web-bridge`、`Base URL=http://host.docker.internal:18789/v1`，文本和 JSON mode 均通过 mock adapter 返回 200。运行证据。
+- E23 2026-07-13 实测：`scripts/langflow-openai-component-smoke.py` 在 Langflow 容器内加载已安装的 `DeepSeekModelComponent` 和 `LMStudioModelComponent`，通过 `http://host.docker.internal:18789/v1` 调用 mock adapter；DeepSeek 组件完成 model list、文本、JSON mode，LM Studio 组件完成文本调用。运行证据。
+- E24 2026-07-13 实测：临时以 `DEEPSEEK_WEB_BRIDGE_HOST=0.0.0.0`、`DEEPSEEK_OPENAI_FACADE_API_KEY=secret-key` 启动真实 bridge 后，未带 Authorization 的 raw `/search` 返回 401，带 `Bearer secret-key` 后进入原 `/search` handler 并因空 body 返回 `missing_query`。运行证据。
+- E25 2026-07-13 实测：`scripts/n8n-saved-workflow-runtime-smoke.js` 通过默认 REST-only 路径执行保存后的 workflow，mock adapter 下 `workflowId=DswbN8nSmoke001`、`executionStatus=success`、`executionFingerprint=3091f1127f77d07c`；同脚本验证 saved workflow config mismatch 会失败，已有 workflow refresh 走 n8n REST PATCH，只有 fixture 缺失时才要求 `N8N_SMOKE_IMPORT_WITH_CLI=1`。默认路径不读取宿主机 SQLite、不创建临时 JSON；旧版 importer 在 host `os.tmpdir()` 留下的历史 `n8n-dswb-smoke-*` 目录已清理。新增 `scripts/n8n-saved-workflow-runtime-smoke.test.js` 证明 prompt marker 在 `inputOverride` 中不会让 smoke 通过，当前 Node 测试数为 28 pass。该证据覆盖 saved workflow node config + runtime，不覆盖 n8n credential-store URL/key 内部内容。运行证据。
+- E26 2026-07-13 实测：`scripts/langflow-saved-flow-runtime-smoke.py` 通过 Langflow `/api/v1/run/{flow_id}` 执行保存后的 flow，mock adapter 下返回 `{"ok":true,"source":"deepseek-openai-adapter-mock"}`，`outputFingerprint=0d3a1ceb163e0dc7`，`outputSource=deepseek-web-bridge`；固定 flow update 路径复跑也成功。运行证据。
+- E27 2026-07-13 实测：`scripts/deepseek-openai-local-real-smoke.js` 作为真实链路总控诊断脚本通过语法检查；登录前运行返回 `rc=2`，证明真实 adapter `/v1/models` 在 `http://127.0.0.1:8789/v1` 可用，n8n/Langflow 容器均可访问 `http://host.docker.internal:8789/v1/models`，但未登录时不提交真实 chat、也不刷新 n8n fixture。登录后，因默认 `8789` 被会议室 Spring Boot 后端占用，本轮以隔离 `http://127.0.0.1:8790/v1` + Chrome debug `9344` 验证真实链路：direct adapter chat/json 均为 `mock=false` 且成功；n8n saved workflow 输出 `{"ok":true,"source":"n8n-saved-workflow-smoke"}`，`executionFingerprint=0df43f2d66bae81b`；Langflow saved flow 输出 `{"ok":true,"source":"langflow-saved-flow-smoke"}`，`runFingerprint=de56ee3eb70d4438`。运行证据。
 
 未验证：
 
-- 尚未启动 n8n / Langflow 做真实 UI 冒烟。
-- 尚未用 mock endpoint 实测 n8n 在 `Use Responses API=false` 后是否只访问 `/v1/models` 与 `/v1/chat/completions`。
-- 尚未用 mock endpoint 实测 n8n credential Base URL 与 node-level Base URL override 的 UI 配置差异。
-- 尚未用 mock endpoint 实测 Langflow 在默认 SSRF 与 allowlist 配置下的实际访问结果。
-- 尚未做 T1/T2 拓扑 spike，因此不能声称独立 Node facade 或同进程 adapter 已被证明为最优。
+- 尚未在 n8n UI 中手工配置 OpenAI credential / OpenAI Chat Model 并执行真实保存 workflow。
+- 尚未用 mock endpoint 实测 n8n credential Base URL 与 node-level Base URL override 的 UI 配置差异；但本地第一版优先走 credential Base URL。
+- 尚未在 Langflow UI 中手工配置 DeepSeek/LM Studio component 并执行真实保存 flow。
+- 尚未在默认 `8789` 且会议室后端同时运行的情况下跑通 one-command `--all-after-login`；当前真实完成证据来自隔离 `8790/9344`。
+- 旧 n8n SQLite `IOERR/NOTADB` 日志仍是历史风险背景；当前本地 SQLite 文件只读 `PRAGMA integrity_check;` 返回 `ok`，但生产级 DB 恢复/迁移不是本地 smoke 覆盖范围。
 
 ## 18. 设计边界
 
@@ -976,6 +1017,7 @@ Langflow：
 2. adapter 只看见 OpenAI-compatible request 和 bridge `/search` response。
 3. bridge 继续只负责 DeepSeek 网页端会话、模式切换、提交、轮询和完整性检测。
 4. 会议室 Spring Boot 继续负责业务编排、证据留痕、股票盯盘和落库。
+5. 第一版运行边界是同机本地开发，不承诺 LAN、公网、多人共享或生产化部署。
 
 第一版不跨越的边界：
 
@@ -989,10 +1031,10 @@ Langflow：
 1. E1/E2 支持 S1：现有 bridge 是 `/search` 协议，不是 `/v1/chat/completions`。
 2. E3/E7/E8 支持 S2：n8n 有 OpenAI Base URL 接入点，但默认 Responses API 和 URL restriction 是前置风险。
 3. E4/E5/E9/E10 支持 S3：Langflow 有 OpenAI-compatible base_url/api_base 接入点，但默认 SSRF 会阻断 loopback/private 地址。
-4. S1+S2+S3 推出 S4：与其改两个外部项目，不如提供它们共同能吃的 OpenAI-compatible adapter。
-5. E11/E12 支持 S7：独立进程会增加现有 stack 生命周期管理面；T1 同进程也有 `/search` 回归风险，所以必须先 spike。
+4. S1+S2+S3+E13 推出 S4：与其改两个外部项目，不如提供它们共同能吃的本地 OpenAI-compatible adapter。
+5. E11/E12 支持 S7：独立进程会增加现有 stack 生命周期管理面，因此本地第一版默认倾向 T1；但 T1 同进程也有 `/search` 回归风险，所以必须用 spike 证实 T1 安全，或触发 T2 回退。
 6. E6 支持 S5/S6：底层网页 bridge 串行、冷却、依赖 Chrome，不适合宣称完整模型 API。
-7. S4/S5/S6/S7 合并得出结论：adapter 主线当前证据支持，但进程拓扑和实际 n8n/Langflow 接入路径仍需补证。
+7. S4/S5/S6/S7 合并得出结论：本地 adapter 主线当前证据支持，但进程拓扑和实际 n8n/Langflow 接入路径仍需补证。
 
 会推翻结论的条件：
 
@@ -1000,3 +1042,4 @@ Langflow：
 2. Langflow SSRF protection 无法通过 allowlist 或网络拓扑允许 adapter endpoint。
 3. 用户第一版目标必须是支持 tool-calling agent，而不是文本/JSON 模型调用。
 4. Phase 0.5 证明 T1/T2 两种拓扑都无法在不破坏 `/search` 的前提下提供稳定 `/v1/chat/completions`。
+5. 用户目标从本地版本升级为生产化 n8n/Langflow 模型服务。

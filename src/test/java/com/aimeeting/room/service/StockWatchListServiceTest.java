@@ -10,6 +10,7 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -68,6 +69,29 @@ class StockWatchListServiceTest {
         assertEquals("candidate", captor.getValue().getGroupKey());
         assertEquals("candidate", payload.get("groupKey"));
         assertEquals("备选股", payload.get("groupName"));
+    }
+
+    @Test
+    void saveNormalizesHongKongCodeAndEnrichesName() {
+        StockWatchItem saved = item("09988", "hk", "阿里巴巴-W", "holding");
+        when(itemMapper.selectBySymbolMarket(eq("09988"), eq("hk")))
+                .thenReturn(null, saved);
+        Map<String, Object> quote = new LinkedHashMap<>();
+        quote.put("name", "阿里巴巴-W");
+        when(stockQuoteService.fetchQuotes("09988.hk")).thenReturn(List.of(quote));
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("symbol", "H09988");
+        body.put("groupKey", "holding");
+
+        Map<String, Object> payload = service.save(body);
+
+        ArgumentCaptor<StockWatchItem> captor = ArgumentCaptor.forClass(StockWatchItem.class);
+        verify(itemMapper).insert(captor.capture());
+        assertEquals("09988", captor.getValue().getSymbol());
+        assertEquals("hk", captor.getValue().getMarket());
+        assertEquals("阿里巴巴-W", captor.getValue().getStockName());
+        assertEquals("holding", payload.get("groupKey"));
     }
 
     private StockWatchItem item(String symbol, String market, String name, String groupKey) {

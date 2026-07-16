@@ -1094,7 +1094,7 @@
         <div class="stock-form">
           <label>
             <span>股票编码</span>
-            <input v-model.trim="addStockForm.code" type="text" placeholder="688017 或 688017.SH" />
+            <input v-model.trim="addStockForm.code" type="text" placeholder="688017.SH 或 H09988" />
           </label>
           <label>
             <span>股票名称 <em>可选，行情刷新后自动补全</em></span>
@@ -3361,7 +3361,7 @@ async function deleteAiRule(rule) {
 async function confirmAddStock() {
   const normalized = normalizeStockCode(addStockForm.code)
   if (!normalized) {
-    addStockError.value = '请输入 6 位股票编码，可带 SH/SZ/BJ 后缀'
+    addStockError.value = '请输入 A 股 6 位编码，或港股 H/HK 前缀、5 位编码、HK 后缀'
     return
   }
 
@@ -3481,19 +3481,37 @@ function normalizeStockCode(input) {
   const raw = input.trim().toLowerCase().replace(/\s+/g, '')
   if (!raw) return null
 
-  const prefixed = raw.match(/^(sh|sz|bj)[._-]?(\d{6})$/)
-  if (prefixed) {
-    return { market: prefixed[1], symbol: prefixed[2] }
+  const hkPrefixed = raw.match(/^(?:h|hk|hkg|hkex)[._:-]?(\d{1,5})$/)
+  if (hkPrefixed) {
+    return { market: 'hk', symbol: hkPrefixed[1].padStart(5, '0') }
   }
 
-  const suffixed = raw.match(/^(\d{6})(?:[._-]?(sh|sz|bj))?$/)
+  const hkSuffixed = raw.match(/^(\d{1,5})[._:-]?(?:h|hk|hkg|hkex)$/)
+  if (hkSuffixed) {
+    return { market: 'hk', symbol: hkSuffixed[1].padStart(5, '0') }
+  }
+
+  if (/^\d{1,5}$/.test(raw)) {
+    return { market: 'hk', symbol: raw.padStart(5, '0') }
+  }
+
+  const prefixed = raw.match(/^(sh|sz|bj|sse|szse)[._:-]?(\d{6})$/)
+  if (prefixed) {
+    const market = prefixed[1] === 'sse' ? 'sh' : (prefixed[1] === 'szse' ? 'sz' : prefixed[1])
+    return { market, symbol: prefixed[2] }
+  }
+
+  const suffixed = raw.match(/^(\d{6})(?:[._:-]?(sh|sz|bj|sse|szse))?$/)
   if (!suffixed) return null
   const symbol = suffixed[1]
-  return { symbol, market: suffixed[2] || inferMarket(symbol) }
+  const explicitMarket = suffixed[2] === 'sse' ? 'sh' : (suffixed[2] === 'szse' ? 'sz' : suffixed[2])
+  return { symbol, market: explicitMarket || inferMarket(symbol) }
 }
 
 function inferMarket(symbol) {
+  if (/^\d{5}$/.test(symbol)) return 'hk'
   if (/^(6|9)/.test(symbol)) return 'sh'
+  if (/^5/.test(symbol)) return 'sh'
   if (/^(0|2|3)/.test(symbol)) return 'sz'
   if (/^(4|8)/.test(symbol)) return 'bj'
   return 'sh'

@@ -1,9 +1,17 @@
 #!/usr/bin/env node
 
 const http = require('http');
-const { searchQuery, prepareSharedTarget, DEBUG_PORT, WAIT_TIMEOUT_MS } = require('./deepseek-web-client');
+const { searchQuery, prepareSharedTarget, getWorkerStates, DEBUG_PORT, WAIT_TIMEOUT_MS } = require('./deepseek-web-client');
+const { handleOpenAiAdapterRequest } = require('./deepseek-openai-adapter');
+const {
+  LOOPBACK_HOSTS,
+  isBearerAuthorized,
+  sharedBridgeAuthHeaders,
+  shouldRequireSharedBridgeAuth
+} = require('./deepseek-bridge-auth');
 
 const PORT = Number(process.env.DEEPSEEK_WEB_BRIDGE_PORT || 8789);
+const HOST = process.env.DEEPSEEK_WEB_BRIDGE_HOST || '127.0.0.1';
 let inFlight = false;
 let inFlightStartedAt = 0;
 const WAIT_FOR_FREE_MS = Number(process.env.DEEPSEEK_WEB_BRIDGE_QUEUE_TIMEOUT_MS || 180000);
@@ -23,6 +31,16 @@ let sharedTargetState = {
   status: 'initializing'
 };
 let activeRequestState = null;
+
+if (!LOOPBACK_HOSTS.has(String(HOST).toLowerCase()) && !process.env.DEEPSEEK_OPENAI_FACADE_API_KEY) {
+  console.error(JSON.stringify({
+    ok: false,
+    event: 'unsafe_non_loopback_bind_without_api_key',
+    host: HOST,
+    message: 'Set DEEPSEEK_OPENAI_FACADE_API_KEY before binding the DeepSeek OpenAI adapter bridge outside loopback.'
+  }));
+  process.exit(78);
+}
 
 const sharedTargetReady = prepareSharedTarget()
   .then((state) => {
@@ -76,7 +94,11 @@ function classifyBridgeError(error) {
   if (lower.includes('login may be required')) {
     return { statusCode: 503, error: 'login_required', message };
   }
-  if (lower.includes('remote debugging endpoint did not become ready') || lower.includes('crashpad permission')) {
+  if (lower.includes('remote debugging endpoint did not become ready')
+    || lower.includes('crashpad permission')
+    || lower.includes('debugger profile mismatch')
+    || lower.includes('debugger profile')
+  ) {
     return { statusCode: 503, error: 'debugger_unavailable', message };
   }
   if (lower.includes('failed to submit query')) {
@@ -92,6 +114,14 @@ function sendJson(res, statusCode, payload) {
     'Content-Length': Buffer.byteLength(body)
   });
   res.end(body);
+}
+
+function sendAuthError(res) {
+  return sendJson(res, 401, {
+    ok: false,
+    error: 'invalid_api_key',
+    message: 'Invalid API key'
+  });
 }
 
 function readBody(req) {
@@ -136,15 +166,82 @@ function updateActiveRequest(patch) {
   activeRequestState = { ...activeRequestState, ...patch, updatedAt: new Date().toISOString() };
 }
 
+async function invokeLocalSearch(payload) {
+  const response = await fetch(`http://127.0.0.1:${PORT}/search`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...sharedBridgeAuthHeaders(HOST)
+    },
+    body: JSON.stringify(payload)
+  });
+  const text = await response.text();
+  let parsed;
+  try {
+    parsed = text ? JSON.parse(text) : {};
+  } catch (_) {
+    parsed = {
+      ok: false,
+      error: 'invalid_bridge_response',
+      message: text || 'Bridge returned a non-JSON response'
+    };
+  }
+  return {
+    statusCode: response.status,
+    payload: parsed
+  };
+}
+
 const server = http.createServer(async (req, res) => {
-  if (req.method === 'GET' && req.url === '/health') {
+  const requestUrl = new URL(req.url || '/', `http://${HOST}`);
+  const pathname = requestUrl.pathname;
+
+  if (req.method === 'GET' && pathname === '/health') {
     if (isInFlightStale()) {
       forceResetInFlight('stale_inflight_on_health_check');
+    }
+    const healthAccountKey = String(requestUrl.searchParams.get('accountKey') || '').trim();
+    const prepare = ['1', 'true', 'yes'].includes(String(requestUrl.searchParams.get('prepare') || '').toLowerCase());
+    const accountHealth = healthAccountKey ? {
+      requestedAccountKey: healthAccountKey,
+      prepareRequested: prepare,
+      status: prepare ? 'preparing' : 'not_prepared_without_prepare',
+      note: prepare
+        ? 'Preparing and verifying the requested account worker.'
+        : 'Pass prepare=1 to verify and prepare this account worker; sharedTarget below is the default worker state.'
+    } : null;
+    let preparedTarget = null;
+    if (prepare) {
+      if (shouldRequireSharedBridgeAuth(HOST) && !isBearerAuthorized(req)) {
+        return sendAuthError(res);
+      }
+      try {
+        preparedTarget = await prepareSharedTarget({ accountKey: healthAccountKey });
+        if (accountHealth) {
+          accountHealth.status = 'prepared';
+          accountHealth.effectiveAccountKey = preparedTarget.accountKey || null;
+          accountHealth.preparedTarget = preparedTarget;
+        }
+      } catch (error) {
+        if (accountHealth) {
+          accountHealth.status = 'error';
+          accountHealth.message = error && error.message ? error.message : String(error);
+        }
+        return sendJson(res, 503, {
+          ok: false,
+          error: 'debugger_unavailable',
+          message: error && error.message ? error.message : String(error),
+          accountKey: healthAccountKey || null,
+          accountHealth,
+          workers: getWorkerStates()
+        });
+      }
     }
     return sendJson(res, 200, {
       ok: true,
       mode: 'deepseek_web_bridge',
       debugPort: DEBUG_PORT,
+      defaultDebugPort: DEBUG_PORT,
       waitTimeoutMs: WAIT_TIMEOUT_MS,
       maxInFlightMs: MAX_INFLIGHT_MS,
       requestHardTimeoutMs: REQUEST_HARD_TIMEOUT_MS,
@@ -152,11 +249,28 @@ const server = http.createServer(async (req, res) => {
       busyForMs: inFlight && inFlightStartedAt > 0 ? Date.now() - inFlightStartedAt : 0,
       cooldownRemainingMs: Math.max(0, nextAllowedAt - Date.now()),
       activeRequest: activeRequestState,
-      sharedTarget: sharedTargetState
+      sharedTarget: sharedTargetState,
+      defaultSharedTarget: sharedTargetState,
+      accountHealth,
+      preparedTarget,
+      workers: getWorkerStates()
     });
   }
 
-  if (req.method === 'POST' && req.url === '/search') {
+  const adapterHandled = await handleOpenAiAdapterRequest(req, res, {
+    readBody,
+    sendJson,
+    invokeSearch: invokeLocalSearch
+  });
+  if (adapterHandled) {
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/search') {
+    if (shouldRequireSharedBridgeAuth(HOST) && !isBearerAuthorized(req)) {
+      return sendAuthError(res);
+    }
+
     const requestId = ++requestSeq;
     const receivedAt = Date.now();
     let slotAcquired = false;
@@ -172,11 +286,13 @@ const server = http.createServer(async (req, res) => {
       const forceNewSession = parsed.forceNewSession === true || parsed.resetSession === true;
       const expectedJson = parsed.expectedJson === true;
       const mode = typeof parsed.mode === 'string' ? parsed.mode.trim() : '';
+      const accountKey = typeof parsed.accountKey === 'string' ? parsed.accountKey.trim() : '';
       const closeTargetAfter = !sessionKey && isolatedSession && parsed.closeTargetAfter !== false;
       console.log(JSON.stringify({
         ok: true,
         event: 'request_start',
         requestId,
+        accountKey: accountKey || null,
         queryLength: query.length,
         expectedJson,
         mode: mode || null,
@@ -191,6 +307,7 @@ const server = http.createServer(async (req, res) => {
         requestId,
         phase: 'cooldown',
         startedAt: new Date(inFlightStartedAt).toISOString(),
+        accountKey: accountKey || null,
         queryLength: query.length,
         expectedJson,
         mode: mode || null
@@ -203,12 +320,16 @@ const server = http.createServer(async (req, res) => {
       }));
       await waitForCooldown();
       updateActiveRequest({ phase: 'prepare_target' });
-      await sharedTargetReady;
+      if (accountKey) {
+        await prepareSharedTarget({ accountKey });
+      } else {
+        await sharedTargetReady;
+      }
       updateActiveRequest({ phase: 'search' });
       const searchStartedAt = Date.now();
       // 给 searchQuery 加一个硬上限：超时立即返回错误，let finally 释放锁。
       const result = await Promise.race([
-        searchQuery(query, { isolatedSession, closeTargetAfter, sessionKey, forceNewSession, expectedJson, mode }),
+        searchQuery(query, { isolatedSession, closeTargetAfter, sessionKey, forceNewSession, expectedJson, mode, accountKey }),
         new Promise((_, reject) => setTimeout(
           () => reject(new Error('searchQuery exceeded MAX_INFLIGHT_MS hard timeout')),
           MAX_INFLIGHT_MS
@@ -257,11 +378,14 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { ok: false, error: 'not_found' });
 });
 
-server.listen(PORT, '127.0.0.1', () => {
+server.listen(PORT, HOST, () => {
   console.log(JSON.stringify({
     ok: true,
     mode: 'deepseek_web_bridge',
+    host: HOST,
     port: PORT,
-    debugPort: DEBUG_PORT
+    debugPort: DEBUG_PORT,
+    defaultDebugPort: DEBUG_PORT,
+    workers: getWorkerStates()
   }));
 });

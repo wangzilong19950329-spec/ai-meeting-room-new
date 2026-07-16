@@ -5,14 +5,16 @@ const path = require('path');
 
 const CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const DEBUG_PORT = Number(process.env.DEEPSEEK_WEB_DEBUG_PORT || 9333);
-const PROFILE_ROOT = process.env.DEEPSEEK_WEB_PROFILE_ROOT
+const DEFAULT_PROFILE_ROOT = process.env.DEEPSEEK_WEB_PROFILE_ROOT
   || path.join(os.tmpdir(), 'deepseek-web-profile');
-const CHROME_LOG_PATH = process.env.DEEPSEEK_WEB_CHROME_LOG
+const DEFAULT_CHROME_LOG_PATH = process.env.DEEPSEEK_WEB_CHROME_LOG
   || path.join(os.tmpdir(), 'deepseek-web-chrome.log');
-const SESSION_STORE_PATH = process.env.DEEPSEEK_WEB_SESSION_STORE
+const DEFAULT_SESSION_STORE_PATH = process.env.DEEPSEEK_WEB_SESSION_STORE
   || path.join(os.homedir(), '.aimeeting-room', 'deepseek-web-sessions.json');
 const SESSION_STORE_META_KEY = '__meta';
 const SOURCE_CHROME_DIR = path.join(os.homedir(), 'Library/Application Support/Google/Chrome');
+const DEFAULT_ACCOUNT_KEY = normalizeAccountKey(process.env.DEEPSEEK_WEB_DEFAULT_ACCOUNT_KEY || 'default');
+const ACCOUNT_WORKERS = new Map();
 const WAIT_TIMEOUT_MS = Number(process.env.DEEPSEEK_WEB_WAIT_TIMEOUT_MS || 120000);
 const QUICK_RETURN_BUDGET_MS = Number(process.env.DEEPSEEK_WEB_QUICK_RETURN_BUDGET_MS || 12000);
 const LINK_ONLY_RETURN_BUDGET_MS = Number(process.env.DEEPSEEK_WEB_LINK_ONLY_RETURN_BUDGET_MS || 30000);
@@ -34,6 +36,146 @@ async function sleepWithJitter(baseMs, jitterMs = HUMAN_JITTER_MS) {
   await sleep(safeBase + extra);
 }
 
+function normalizeAccountKey(accountKey) {
+  const normalized = String(accountKey || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_.:-]/g, '_')
+    .slice(0, 80);
+  return normalized || DEFAULT_ACCOUNT_KEY || 'default';
+}
+
+function accountEnvSuffix(accountKey) {
+  return normalizeAccountKey(accountKey).replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
+}
+
+function accountEnvValue(accountKey, suffix) {
+  const scoped = process.env[`DEEPSEEK_WEB_ACCOUNT_${accountEnvSuffix(accountKey)}_${suffix}`];
+  if (scoped) return scoped;
+  if (normalizeAccountKey(accountKey) === 'stock') {
+    const stockScoped = process.env[`STOCK_WATCH_DEEPSEEK_WEB_${suffix}`];
+    if (stockScoped) return stockScoped;
+  }
+  return '';
+}
+
+function stableAccountOffset(accountKey) {
+  const key = normalizeAccountKey(accountKey);
+  let hash = 2166136261;
+  for (let index = 0; index < key.length; index += 1) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return 1 + ((hash >>> 0) % 400);
+}
+
+function allocateDebugPort(accountKey, explicitPort) {
+  const used = new Set(Array.from(ACCOUNT_WORKERS.values()).map(worker => worker.debugPort));
+  const configured = Number(explicitPort);
+  if (Number.isFinite(configured) && configured > 0) {
+    return configured;
+  }
+  let port = DEBUG_PORT + stableAccountOffset(accountKey);
+  while (used.has(port)) {
+    port += 1;
+  }
+  return port;
+}
+
+function accountScopedPath(prefix, accountKey, suffix) {
+  return path.join(os.homedir(), '.aimeeting-room', `${prefix}-${normalizeAccountKey(accountKey)}-${suffix}`);
+}
+
+function normalizeProfileBootstrap(raw, fallback) {
+  const value = String(raw || fallback || '').trim().toLowerCase();
+  return value === 'copy' ? 'copy' : 'empty';
+}
+
+function canonicalPath(value) {
+  const resolved = path.resolve(String(value || ''));
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch (_) {
+    return resolved;
+  }
+}
+
+function isSamePathOrNested(child, parent) {
+  const childPath = canonicalPath(child);
+  const parentPath = canonicalPath(parent);
+  return childPath === parentPath || childPath.startsWith(`${parentPath}${path.sep}`);
+}
+
+function assertNoWorkerConfigConflict(candidate) {
+  const candidateProfileRoot = canonicalPath(candidate.profileRoot);
+  const candidateSessionStore = canonicalPath(candidate.sessionStorePath);
+  for (const worker of ACCOUNT_WORKERS.values()) {
+    if (worker.accountKey === candidate.accountKey) continue;
+    if (worker.debugPort === candidate.debugPort) {
+      throw new Error(`DeepSeek account worker debug port conflict: ${candidate.accountKey} and ${worker.accountKey} both use ${candidate.debugPort}`);
+    }
+    if (canonicalPath(worker.profileRoot) === candidateProfileRoot) {
+      throw new Error(`DeepSeek account worker profile conflict: ${candidate.accountKey} and ${worker.accountKey} both use ${candidate.profileRoot}`);
+    }
+    if (canonicalPath(worker.sessionStorePath) === candidateSessionStore) {
+      throw new Error(`DeepSeek account worker session store conflict: ${candidate.accountKey} and ${worker.accountKey} both use ${candidate.sessionStorePath}`);
+    }
+  }
+}
+
+function resolveWorkerConfig(options = {}) {
+  const accountKey = normalizeAccountKey(options.accountKey || options.profileKey || DEFAULT_ACCOUNT_KEY);
+  if (ACCOUNT_WORKERS.has(accountKey)) {
+    return ACCOUNT_WORKERS.get(accountKey);
+  }
+
+  const isDefault = accountKey === DEFAULT_ACCOUNT_KEY || accountKey === 'default';
+  const profileRoot = accountEnvValue(accountKey, 'PROFILE_ROOT')
+    || (isDefault ? DEFAULT_PROFILE_ROOT : accountScopedPath('deepseek-web', accountKey, 'profile'));
+  const sessionStorePath = accountEnvValue(accountKey, 'SESSION_STORE')
+    || (isDefault ? DEFAULT_SESSION_STORE_PATH : accountScopedPath('deepseek-web', accountKey, 'sessions.json'));
+  const chromeLogPath = accountEnvValue(accountKey, 'CHROME_LOG')
+    || (isDefault ? DEFAULT_CHROME_LOG_PATH : accountScopedPath('deepseek-web', accountKey, 'chrome.log'));
+  const profileBootstrap = normalizeProfileBootstrap(
+    accountEnvValue(accountKey, 'PROFILE_BOOTSTRAP') || process.env.DEEPSEEK_WEB_PROFILE_BOOTSTRAP,
+    isDefault ? 'copy' : 'empty'
+  );
+  const debugPort = isDefault
+    ? Number(accountEnvValue(accountKey, 'DEBUG_PORT') || DEBUG_PORT)
+    : allocateDebugPort(accountKey, accountEnvValue(accountKey, 'DEBUG_PORT'));
+
+  const worker = {
+    accountKey,
+    debugPort,
+    profileRoot,
+    sessionStorePath,
+    chromeLogPath,
+    profileBootstrap
+  };
+  assertNoWorkerConfigConflict(worker);
+  ACCOUNT_WORKERS.set(accountKey, worker);
+  return worker;
+}
+
+function workerPublicState(worker) {
+  return {
+    accountKey: worker.accountKey,
+    debugPort: worker.debugPort,
+    profileRoot: worker.profileRoot,
+    sessionStorePath: worker.sessionStorePath,
+    chromeLogPath: worker.chromeLogPath,
+    profileBootstrap: worker.profileBootstrap,
+    debuggerProfileVerified: worker.debuggerProfileVerified === true,
+    debuggerProfileCheck: worker.debuggerProfileCheck || null
+  };
+}
+
+function getWorkerStates() {
+  if (ACCOUNT_WORKERS.size === 0) {
+    resolveWorkerConfig();
+  }
+  return Array.from(ACCOUNT_WORKERS.values()).map(workerPublicState);
+}
+
 function normalizeSessionKey(sessionKey) {
   return String(sessionKey || '')
     .trim()
@@ -41,21 +183,21 @@ function normalizeSessionKey(sessionKey) {
     .slice(0, 120);
 }
 
-function loadSessionStore() {
+function loadSessionStore(worker = resolveWorkerConfig()) {
   try {
-    if (!fs.existsSync(SESSION_STORE_PATH)) {
+    if (!fs.existsSync(worker.sessionStorePath)) {
       return {};
     }
-    return JSON.parse(fs.readFileSync(SESSION_STORE_PATH, 'utf8')) || {};
+    return JSON.parse(fs.readFileSync(worker.sessionStorePath, 'utf8')) || {};
   } catch (_) {
     return {};
   }
 }
 
-function saveSessionStore(store) {
+function saveSessionStore(store, worker = resolveWorkerConfig()) {
   try {
-    fs.mkdirSync(path.dirname(SESSION_STORE_PATH), { recursive: true });
-    fs.writeFileSync(SESSION_STORE_PATH, JSON.stringify(store || {}, null, 2));
+    fs.mkdirSync(path.dirname(worker.sessionStorePath), { recursive: true });
+    fs.writeFileSync(worker.sessionStorePath, JSON.stringify(store || {}, null, 2));
   } catch (_) {}
 }
 
@@ -113,10 +255,10 @@ function bindSessionStoreToSharedTarget(store, targetId) {
   return next;
 }
 
-function updateSessionStore(sessionKey, patch) {
+function updateSessionStore(sessionKey, patch, worker = resolveWorkerConfig()) {
   const normalized = normalizeSessionKey(sessionKey);
   if (!normalized) return;
-  const store = loadSessionStore();
+  const store = loadSessionStore(worker);
   const current = store[normalized] || {};
   store[normalized] = {
     ...current,
@@ -127,7 +269,7 @@ function updateSessionStore(sessionKey, patch) {
   if (!store[normalized].createdAt) {
     store[normalized].createdAt = store[normalized].updatedAt;
   }
-  saveSessionStore(store);
+  saveSessionStore(store, worker);
 }
 
 async function fetchJson(url, options) {
@@ -146,12 +288,17 @@ async function tryFetchJson(url, options) {
   }
 }
 
-function ensureAutomationProfile() {
-  if (!fs.existsSync(path.join(PROFILE_ROOT, 'Default'))) {
-    fs.mkdirSync(PROFILE_ROOT, { recursive: true });
+function ensureAutomationProfile(worker = resolveWorkerConfig()) {
+  if (!fs.existsSync(path.join(worker.profileRoot, 'Default'))) {
+    fs.mkdirSync(worker.profileRoot, { recursive: true });
+    if (worker.profileBootstrap === 'empty') {
+      fs.mkdirSync(path.join(worker.profileRoot, 'Default'), { recursive: true });
+      cleanupProfileLocks(worker);
+      return;
+    }
     for (const item of ['Local State', 'Default']) {
       const src = path.join(SOURCE_CHROME_DIR, item);
-      const dest = path.join(PROFILE_ROOT, item);
+      const dest = path.join(worker.profileRoot, item);
       if (!fs.existsSync(src)) continue;
       fs.cpSync(src, dest, {
         recursive: true,
@@ -163,10 +310,10 @@ function ensureAutomationProfile() {
       });
     }
   }
-  cleanupProfileLocks();
+  cleanupProfileLocks(worker);
 }
 
-function cleanupProfileLocks() {
+function cleanupProfileLocks(worker = resolveWorkerConfig()) {
   for (const entry of [
     'SingletonCookie',
     'SingletonLock',
@@ -174,7 +321,7 @@ function cleanupProfileLocks() {
     path.join('Default', 'LOCK'),
     path.join('Default', 'Cookies-journal')
   ]) {
-    const target = path.join(PROFILE_ROOT, entry);
+    const target = path.join(worker.profileRoot, entry);
     try {
       if (fs.existsSync(target)) {
         fs.rmSync(target, { force: true, recursive: true });
@@ -183,55 +330,57 @@ function cleanupProfileLocks() {
   }
 }
 
-function readChromeLogTail() {
+function readChromeLogTail(worker = resolveWorkerConfig()) {
   try {
-    const chromeLog = fs.readFileSync(CHROME_LOG_PATH, 'utf8');
+    const chromeLog = fs.readFileSync(worker.chromeLogPath, 'utf8');
     return chromeLog ? chromeLog.slice(-2000) : '(no chrome log captured)';
   } catch (_) {
     return '(no chrome log captured)';
   }
 }
 
-async function getExistingDebuggerVersion() {
-  return tryFetchJson(`http://127.0.0.1:${DEBUG_PORT}/json/version`);
+async function getExistingDebuggerVersion(worker = resolveWorkerConfig()) {
+  return tryFetchJson(`http://127.0.0.1:${worker.debugPort}/json/version`);
 }
 
-async function listTargets() {
-  return fetchJson(`http://127.0.0.1:${DEBUG_PORT}/json/list`);
+async function listTargets(worker = resolveWorkerConfig()) {
+  return fetchJson(`http://127.0.0.1:${worker.debugPort}/json/list`);
 }
 
-async function closeTarget(targetId) {
+async function closeTarget(targetId, worker = resolveWorkerConfig()) {
   if (!targetId) return;
   try {
-    await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/close/${targetId}`, { method: 'PUT' });
+    await fetch(`http://127.0.0.1:${worker.debugPort}/json/close/${targetId}`, { method: 'PUT' });
   } catch (_) {}
 }
 
-async function waitForDebugger() {
+async function waitForDebugger(worker = resolveWorkerConfig()) {
   const deadline = Date.now() + 30000;
   while (Date.now() < deadline) {
     try {
-      return await fetchJson(`http://127.0.0.1:${DEBUG_PORT}/json/version`);
+      return await fetchJson(`http://127.0.0.1:${worker.debugPort}/json/version`);
     } catch (_) {
-      const crashpadError = readChromeLogTail();
+      const crashpadError = readChromeLogTail(worker);
       if (crashpadError.includes('crashpad') && crashpadError.toLowerCase().includes('permission denied')) {
         throw new Error(`Chrome remote debugging blocked by crashpad permission\n${crashpadError}`);
       }
       await sleep(500);
     }
   }
-  throw new Error(`Chrome remote debugging endpoint did not become ready\n${readChromeLogTail()}`);
+  throw new Error(`Chrome remote debugging endpoint did not become ready for account ${worker.accountKey}\n${readChromeLogTail(worker)}`);
 }
 
-function launchChrome() {
-  const chromeLogFd = fs.openSync(CHROME_LOG_PATH, 'a');
+function launchChrome(worker = resolveWorkerConfig()) {
+  fs.mkdirSync(path.dirname(worker.chromeLogPath), { recursive: true });
+  const chromeLogFd = fs.openSync(worker.chromeLogPath, 'a');
   return spawn(CHROME_BIN, [
-    `--remote-debugging-port=${DEBUG_PORT}`,
+    `--remote-debugging-port=${worker.debugPort}`,
     '--remote-debugging-address=127.0.0.1',
-    `--user-data-dir=${PROFILE_ROOT}`,
+    `--user-data-dir=${worker.profileRoot}`,
     '--profile-directory=Default',
     '--no-first-run',
     '--no-default-browser-check',
+    '--enable-automation',
     '--disable-breakpad',
     '--disable-crash-reporter',
     '--disable-crashpad',
@@ -310,10 +459,145 @@ class CdpClient {
   }
 }
 
+function extractUserDataDirFromCommandLine(args) {
+  const commandLine = Array.isArray(args) ? args : [];
+  for (let index = 0; index < commandLine.length; index += 1) {
+    const arg = String(commandLine[index] || '');
+    if (arg.startsWith('--user-data-dir=')) {
+      return arg.slice('--user-data-dir='.length);
+    }
+    if (arg === '--user-data-dir' && commandLine[index + 1]) {
+      return String(commandLine[index + 1]);
+    }
+  }
+  return '';
+}
+
+async function readBrowserCommandLine(debuggerVersion) {
+  const browserWs = debuggerVersion && debuggerVersion.webSocketDebuggerUrl;
+  if (!browserWs) return null;
+  const client = new CdpClient(browserWs);
+  try {
+    await client.open();
+    return await client.send('Browser.getBrowserCommandLine');
+  } finally {
+    client.close();
+  }
+}
+
+function parseProfilePathFromChromeVersionText(text) {
+  const normalized = String(text || '');
+  for (const rawLine of normalized.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^(profile path|个人资料路径|設定檔路徑|プロフィール パス|프로필 경로)\b/i.test(line)) {
+      const cleaned = line
+        .replace(/^(profile path|个人资料路径|設定檔路徑|プロフィール パス|프로필 경로)\s*/i, '')
+        .replace(/^[:：]\s*/, '')
+        .trim();
+      if (cleaned) return cleaned;
+    }
+  }
+  return '';
+}
+
+async function readChromeVersionText(worker) {
+  let target = null;
+  let client = null;
+  try {
+    target = await fetchJson(`http://127.0.0.1:${worker.debugPort}/json/new?chrome://version/`, { method: 'PUT' });
+    if (!target || !target.webSocketDebuggerUrl) return '';
+    client = new CdpClient(target.webSocketDebuggerUrl);
+    await client.open();
+    await client.send('Runtime.enable');
+    await sleep(1000);
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const text = await client.eval('document.body ? document.body.innerText : ""').catch(() => '');
+      if (text && (text.includes(worker.profileRoot) || /profile path/i.test(text) || text.includes('个人资料路径'))) {
+        return text;
+      }
+      await sleep(500);
+    }
+    return '';
+  } finally {
+    if (client) client.close();
+    if (target && target.id) {
+      await closeTarget(target.id, worker);
+    }
+  }
+}
+
+async function verifyDebuggerProfile(worker, debuggerVersion) {
+  const expectedProfileRoot = worker.profileRoot;
+  const check = {
+    verified: false,
+    expectedProfileRoot,
+    method: '',
+    actualProfilePath: '',
+    error: ''
+  };
+
+  try {
+    const commandLine = await readBrowserCommandLine(debuggerVersion);
+    const userDataDir = extractUserDataDirFromCommandLine(commandLine && commandLine.arguments);
+    if (userDataDir) {
+      check.method = 'Browser.getBrowserCommandLine';
+      check.actualProfilePath = userDataDir;
+      if (isSamePathOrNested(userDataDir, expectedProfileRoot)) {
+        check.verified = true;
+        worker.debuggerProfileVerified = true;
+        worker.debuggerProfileCheck = check;
+        return check;
+      }
+    }
+  } catch (error) {
+    check.error = error && error.message ? error.message : String(error);
+  }
+
+  try {
+    const versionText = await readChromeVersionText(worker);
+    const profilePath = parseProfilePathFromChromeVersionText(versionText)
+      || (versionText.includes(expectedProfileRoot) ? expectedProfileRoot : '');
+    if (profilePath) {
+      check.method = check.method || 'chrome://version';
+      check.actualProfilePath = profilePath;
+      if (isSamePathOrNested(profilePath, expectedProfileRoot)) {
+        check.verified = true;
+        worker.debuggerProfileVerified = true;
+        worker.debuggerProfileCheck = check;
+        return check;
+      }
+    }
+  } catch (error) {
+    check.error = check.error || (error && error.message ? error.message : String(error));
+  }
+
+  worker.debuggerProfileVerified = false;
+  worker.debuggerProfileCheck = check;
+  if (['1', 'true', 'yes'].includes(String(process.env.DEEPSEEK_WEB_ALLOW_UNVERIFIED_DEBUGGER || '').toLowerCase())) {
+    console.error(JSON.stringify({
+      ok: false,
+      event: 'debugger_profile_unverified_allowed',
+      accountKey: worker.accountKey,
+      debugPort: worker.debugPort,
+      ...check
+    }));
+    return check;
+  }
+
+  throw new Error(
+    `DeepSeek Chrome debugger profile mismatch or unverified for account ${worker.accountKey}: `
+    + `debugPort=${worker.debugPort} expectedProfileRoot=${expectedProfileRoot} `
+    + `actualProfilePath=${check.actualProfilePath || 'unknown'} method=${check.method || 'none'} `
+    + `error=${check.error || 'none'}`
+  );
+}
+
 // Bridge requests are serialized, so logical sessions can safely share one Chrome page.
 // Conversation continuity comes from the saved DeepSeek URL instead of a permanent tab.
 async function openPageTarget(options = {}) {
-  const targets = await listTargets();
+  const worker = resolveWorkerConfig(options);
+  const targets = await listTargets(worker);
   const matches = targets.filter((item) =>
     item
     && item.type === 'page'
@@ -321,7 +605,7 @@ async function openPageTarget(options = {}) {
     && (item.url || '').includes('chat.deepseek.com')
   );
   const sessionKey = normalizeSessionKey(options.sessionKey);
-  const store = loadSessionStore();
+  const store = loadSessionStore(worker);
   const savedSession = sessionKey ? store[sessionKey] : null;
   const requestedMode = normalizeBridgeMode(options.mode || options.webMode || DEFAULT_BRIDGE_MODE);
   const savedBridgeMode = String(savedSession && savedSession.bridgeMode || '').toLowerCase();
@@ -335,23 +619,26 @@ async function openPageTarget(options = {}) {
   let target = selectSharedTarget(matches, store, sessionKey);
   const reused = !!target;
   if (!target) {
-    target = await fetchJson(`http://127.0.0.1:${DEBUG_PORT}/json/new?https://chat.deepseek.com/`, { method: 'PUT' });
+    target = await fetchJson(`http://127.0.0.1:${worker.debugPort}/json/new?https://chat.deepseek.com/`, { method: 'PUT' });
   }
 
   const duplicateTargets = matches.filter(item => item.id !== target.id);
-  await Promise.all(duplicateTargets.map(item => closeTarget(item.id)));
-  saveSessionStore(bindSessionStoreToSharedTarget(store, target.id));
+  await Promise.all(duplicateTargets.map(item => closeTarget(item.id, worker)));
+  saveSessionStore(bindSessionStoreToSharedTarget(store, target.id), worker);
   if (sessionKey) {
     updateSessionStore(sessionKey, {
       targetId: target.id,
       forceNewSession: !!options.forceNewSession
-    });
+    }, worker);
   }
   return {
     targetId: target.id,
     webSocketDebuggerUrl: target.webSocketDebuggerUrl,
     reused,
     isolatedSession: !!options.isolatedSession,
+    accountKey: worker.accountKey,
+    debugPort: worker.debugPort,
+    profileRoot: worker.profileRoot,
     sessionKey,
     resumeUrl,
     sharedTarget: true,
@@ -359,22 +646,28 @@ async function openPageTarget(options = {}) {
   };
 }
 
-async function ensureDebuggerAvailable() {
-  let debuggerVersion = await getExistingDebuggerVersion();
+async function ensureDebuggerAvailable(options = {}) {
+  const worker = resolveWorkerConfig(options);
+  let debuggerVersion = await getExistingDebuggerVersion(worker);
   if (!debuggerVersion) {
-    ensureAutomationProfile();
-    const chrome = launchChrome();
+    ensureAutomationProfile(worker);
+    const chrome = launchChrome(worker);
     chrome.unref();
-    debuggerVersion = await waitForDebugger();
+    debuggerVersion = await waitForDebugger(worker);
   }
+  await verifyDebuggerProfile(worker, debuggerVersion);
   return debuggerVersion;
 }
 
-async function prepareSharedTarget() {
-  await ensureDebuggerAvailable();
-  const target = await openPageTarget({ prepareOnly: true });
+async function prepareSharedTarget(options = {}) {
+  const worker = resolveWorkerConfig(options);
+  await ensureDebuggerAvailable(worker);
+  const target = await openPageTarget({ ...options, prepareOnly: true, accountKey: worker.accountKey });
   return {
     mode: 'single_worker',
+    accountKey: worker.accountKey,
+    debugPort: worker.debugPort,
+    profileRoot: worker.profileRoot,
     targetId: target.targetId,
     reused: target.reused,
     closedDuplicateTargets: target.closedDuplicateTargets
@@ -1242,6 +1535,9 @@ function normalizeResult(raw) {
     providerTimingMs: raw.providerTimingMs || null,
     modeState: raw.modeState || null,
     isolatedSession: !!raw.isolatedSession,
+    accountKey: raw.accountKey || null,
+    debugPort: raw.debugPort || null,
+    profileRoot: raw.profileRoot || null,
     targetId: raw.targetId || null,
     sessionKey: raw.sessionKey || null,
     finalUrl: raw.finalUrl || null,
@@ -1269,9 +1565,10 @@ async function searchQuery(query, options = {}) {
   if (!query || !query.trim()) {
     throw new Error('Query is required');
   }
+  const worker = resolveWorkerConfig(options);
   const bridgeMode = normalizeBridgeMode(options.mode || options.webMode || DEFAULT_BRIDGE_MODE);
-  await ensureDebuggerAvailable();
-  const target = await openPageTarget(options);
+  await ensureDebuggerAvailable(worker);
+  const target = await openPageTarget({ ...options, accountKey: worker.accountKey });
   const client = new CdpClient(target.webSocketDebuggerUrl);
   let conversationSurface = null;
   try {
@@ -1317,13 +1614,16 @@ async function searchQuery(query, options = {}) {
         expertMode: modeState.expertMode,
         quickMode: modeState.quickMode,
         lastAnswerAt: new Date().toISOString()
-      });
+      }, worker);
     }
     return normalizeResult({
       ...raw,
       providerTimingMs: Date.now() - searchStartedAt,
       modeState,
       isolatedSession: !!options.isolatedSession,
+      accountKey: worker.accountKey,
+      debugPort: worker.debugPort,
+      profileRoot: worker.profileRoot,
       targetId: target.targetId || null,
       sessionKey: options.sessionKey || target.sessionKey || null,
       finalUrl: finalUrl || null,
@@ -1334,7 +1634,7 @@ async function searchQuery(query, options = {}) {
   } finally {
     client.close();
     if (options.closeTargetAfter && target && target.targetId && !target.sharedTarget) {
-      await closeTarget(target.targetId);
+      await closeTarget(target.targetId, worker);
     }
   }
 }
@@ -1342,11 +1642,18 @@ async function searchQuery(query, options = {}) {
 module.exports = {
   searchQuery,
   prepareSharedTarget,
+  getWorkerStates,
   DEBUG_PORT,
   WAIT_TIMEOUT_MS,
-  CHROME_LOG_PATH,
+  CHROME_LOG_PATH: DEFAULT_CHROME_LOG_PATH,
   _internals: {
+    accountEnvSuffix,
+    extractUserDataDirFromCommandLine,
+    getWorkerStates,
     isReusableConversationUrl,
+    normalizeAccountKey,
+    parseProfilePathFromChromeVersionText,
+    resolveWorkerConfig,
     selectSharedTarget,
     bindSessionStoreToSharedTarget,
     buildTurnSignature,

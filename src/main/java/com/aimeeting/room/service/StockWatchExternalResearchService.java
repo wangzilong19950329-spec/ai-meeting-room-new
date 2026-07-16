@@ -187,7 +187,7 @@ public class StockWatchExternalResearchService {
     }
 
     private Map<String, Object> fetchEastmoneySnapshot(StockRef ref, List<String> warnings) {
-        String secid = ("sh".equals(ref.market) ? "1" : "0") + "." + ref.symbol;
+        String secid = StockSymbol.eastmoneySecid(ref.symbol, ref.market);
         Exception lastError = null;
         Integer lastCode = null;
         for (String quoteUrl : EASTMONEY_QUOTE_URLS) {
@@ -309,25 +309,8 @@ public class StockWatchExternalResearchService {
     }
 
     private StockRef normalizeStockRef(String rawSymbol, String rawMarket) {
-        String value = firstNonBlank(rawSymbol, "").trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        String market = normalizeMarket(firstNonBlank(rawMarket, ""));
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj|sse|szse)[._:-]?(\\d{6})$")
-                .matcher(value);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), normalizeMarket(prefixed.group(1)));
-        }
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._:-]?(sh|sz|bj|sse|szse))?$")
-                .matcher(value);
-        if (!suffixed.matches()) {
-            throw new IllegalArgumentException("股票编码格式不正确");
-        }
-        String symbol = suffixed.group(1);
-        String suffixMarket = normalizeMarket(suffixed.group(2));
-        return new StockRef(symbol, StringUtils.hasText(market)
-                ? market
-                : (StringUtils.hasText(suffixMarket) ? suffixMarket : inferMarket(symbol)));
+        StockSymbol normalized = StockSymbol.parse(rawSymbol, rawMarket);
+        return new StockRef(normalized.getSymbol(), normalized.getMarket());
     }
 
     private String normalizeMarket(String market) {
@@ -335,12 +318,6 @@ public class StockWatchExternalResearchService {
         if ("sse".equals(value)) return "sh";
         if ("szse".equals(value)) return "sz";
         return value;
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9") || symbol.startsWith("5")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
     }
 
     private String tradingViewPrefix(String market) {
@@ -390,13 +367,7 @@ public class StockWatchExternalResearchService {
     }
 
     private String marketFromEastmoney(Integer value, String symbol) {
-        if (value != null && value == 1) {
-            return "sh";
-        }
-        if (symbol != null && (symbol.startsWith("4") || symbol.startsWith("8"))) {
-            return "bj";
-        }
-        return "sz";
+        return StockSymbol.marketFromEastmoney(value, symbol);
     }
 
     private String formatTime(Long timestamp, DateTimeFormatter formatter) {

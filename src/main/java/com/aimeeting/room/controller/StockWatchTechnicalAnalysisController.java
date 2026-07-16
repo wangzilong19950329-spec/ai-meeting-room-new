@@ -3,6 +3,7 @@ package com.aimeeting.room.controller;
 import com.aimeeting.room.common.ApiResponse;
 import com.aimeeting.room.service.StockWatchTechnicalAnalysisService;
 import com.aimeeting.room.service.StockWatchPredictionService;
+import com.aimeeting.room.service.StockSymbol;
 import lombok.RequiredArgsConstructor;
 import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -44,13 +45,8 @@ public class StockWatchTechnicalAnalysisController {
     public ApiResponse<Map<String, Object>> predictions(@RequestParam("symbol") String symbol,
                                                         @RequestParam(value = "market", required = false) String market,
                                                         @RequestParam(value = "limit", defaultValue = "200") int limit) {
-        String normalizedSymbol = symbol == null ? "" : symbol.replaceAll("\\D", "");
-        String normalizedMarket = market == null ? "" : market.toLowerCase();
-        if (normalizedMarket.isEmpty()) {
-            normalizedMarket = normalizedSymbol.startsWith("6") || normalizedSymbol.startsWith("9") ? "sh"
-                    : (normalizedSymbol.startsWith("4") || normalizedSymbol.startsWith("8") ? "bj" : "sz");
-        }
-        return ApiResponse.ok(predictionService.history(normalizedSymbol, normalizedMarket, limit));
+        StockSymbol normalized = StockSymbol.parse(symbol, market);
+        return ApiResponse.ok(predictionService.history(normalized.getSymbol(), normalized.getMarket(), limit));
     }
 
     @PostMapping("/run")

@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -29,6 +31,24 @@ class StockWatchTechnicalAnalysisServiceTest {
             mock(StockWatchTechnicalSessionMapper.class),
             mock(StockWatchTechnicalAnalysisMapper.class)
     );
+
+    @Test
+    void normalizesHongKongSymbolForScheduledAnalysis() {
+        Object ref = ReflectionTestUtils.invokeMethod(service, "normalizeStockRef", "H03441", "");
+
+        assertNotNull(ref);
+        assertEquals("03441", ReflectionTestUtils.getField(ref, "symbol"));
+        assertEquals("hk", ReflectionTestUtils.getField(ref, "market"));
+    }
+
+    @Test
+    void hongKongTradingWindowContinuesAfterMainlandClose() {
+        ZonedDateTime at1530 = ZonedDateTime.of(2026, 7, 16, 15, 30, 0, 0, ZoneId.of("Asia/Shanghai"));
+
+        assertEquals(true, ReflectionTestUtils.invokeMethod(service, "isTradingSession", at1530, "hk"));
+        assertEquals(false, ReflectionTestUtils.invokeMethod(service, "isTradingSession", at1530, "sh"));
+        assertEquals("15:30", ReflectionTestUtils.invokeMethod(service, "currentRunSlot", at1530, false, "hk"));
+    }
 
     @Test
     void parseAnalysisPayloadCoercesObjectEvidenceAndMissingData() {

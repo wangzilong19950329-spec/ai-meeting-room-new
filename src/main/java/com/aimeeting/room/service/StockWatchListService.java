@@ -33,12 +33,12 @@ public class StockWatchListService {
     }
 
     public Map<String, Object> save(Map<String, Object> body) {
-        StockRef ref = normalizeStockRef(text(body, "symbol", text(body, "code", "")),
+        StockSymbol ref = StockSymbol.parse(text(body, "symbol", text(body, "code", "")),
                 text(body, "market", ""));
-        StockWatchItem existing = itemMapper.selectBySymbolMarket(ref.symbol, ref.market);
+        StockWatchItem existing = itemMapper.selectBySymbolMarket(ref.getSymbol(), ref.getMarket());
         StockWatchItem item = existing == null ? new StockWatchItem() : existing;
-        item.setSymbol(ref.symbol);
-        item.setMarket(ref.market);
+        item.setSymbol(ref.getSymbol());
+        item.setMarket(ref.getMarket());
         item.setStockName(resolveName(ref, text(body, "stockName", text(body, "name", ""))));
         item.setImageUrl(normalizeImageUrl(text(body, "imageUrl", text(body, "image", ""))));
         item.setEnabled(bool(body.get("enabled"), true));
@@ -49,16 +49,16 @@ public class StockWatchListService {
         } else {
             itemMapper.update(item);
         }
-        return toPayload(itemMapper.selectBySymbolMarket(ref.symbol, ref.market));
+        return toPayload(itemMapper.selectBySymbolMarket(ref.getSymbol(), ref.getMarket()));
     }
 
-    private String resolveName(StockRef ref, String requestedName) {
+    private String resolveName(StockSymbol ref, String requestedName) {
         String name = firstNonBlank(requestedName, "");
-        if (StringUtils.hasText(name) && !name.equalsIgnoreCase(ref.symbol + "." + ref.market)) {
+        if (StringUtils.hasText(name) && !name.equalsIgnoreCase(ref.label())) {
             return name;
         }
         try {
-            List<Map<String, Object>> quotes = stockQuoteService.fetchQuotes(ref.symbol + "." + ref.market);
+            List<Map<String, Object>> quotes = stockQuoteService.fetchQuotes(ref.label());
             if (!quotes.isEmpty()) {
                 String quoteName = text(quotes.get(0), "name", "");
                 if (StringUtils.hasText(quoteName)) {
@@ -68,7 +68,7 @@ public class StockWatchListService {
         } catch (Exception ignored) {
             // Name enrichment is best-effort; the symbol is still enough for scheduling.
         }
-        return ref.symbol + "." + ref.market.toUpperCase(Locale.ROOT);
+        return ref.getSymbol() + "." + ref.getMarket().toUpperCase(Locale.ROOT);
     }
 
     private Map<String, Object> toPayload(StockWatchItem item) {
@@ -138,34 +138,6 @@ public class StockWatchListService {
         }
     }
 
-    private StockRef normalizeStockRef(String rawSymbol, String rawMarket) {
-        String value = firstNonBlank(rawSymbol, "").trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        String market = firstNonBlank(rawMarket, "").trim().toLowerCase(Locale.ROOT);
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj)[._-]?(\\d{6})$")
-                .matcher(value);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), prefixed.group(1));
-        }
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$")
-                .matcher(value);
-        if (!suffixed.matches()) {
-            throw new IllegalArgumentException("股票编码格式不正确");
-        }
-        String symbol = suffixed.group(1);
-        String effectiveMarket = StringUtils.hasText(market)
-                ? market
-                : (StringUtils.hasText(suffixed.group(2)) ? suffixed.group(2) : inferMarket(symbol));
-        return new StockRef(symbol, effectiveMarket);
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
-    }
-
     private String normalizeImageUrl(String imageUrl) {
         String value = firstNonBlank(imageUrl, "");
         if (!StringUtils.hasText(value) || value.startsWith("data:")) {
@@ -205,13 +177,4 @@ public class StockWatchListService {
         return "";
     }
 
-    private static class StockRef {
-        private final String symbol;
-        private final String market;
-
-        private StockRef(String symbol, String market) {
-            this.symbol = symbol;
-            this.market = market;
-        }
-    }
 }

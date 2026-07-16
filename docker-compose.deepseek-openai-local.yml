@@ -1,0 +1,28 @@
+services:
+  n8n:
+    image: ${N8N_IMAGE:-n8nio/n8n:2.29.10}
+    container_name: ai-meeting-room-n8n-local
+    ports:
+      - "127.0.0.1:5678:5678"
+    environment:
+      N8N_SECURE_COOKIE: "false"
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: "false"
+      GENERIC_TIMEZONE: Asia/Shanghai
+    volumes:
+      - ${HOME}/.aimeeting-room/n8n:/home/node/.n8n
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  langflow:
+    image: ${LANGFLOW_IMAGE:-langflowai/langflow:1.10.2}
+    container_name: ai-meeting-room-langflow-local
+    ports:
+      - "127.0.0.1:7860:7860"
+    environment:
+      LANGFLOW_SSRF_ALLOWED_HOSTS: host.docker.internal,127.0.0.1,localhost
+      LANGFLOW_SUPERUSER: langflow
+      LANGFLOW_SUPERUSER_PASSWORD: langflow-local-dev
+    volumes:
+      - ${HOME}/.aimeeting-room/langflow:/app/langflow
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

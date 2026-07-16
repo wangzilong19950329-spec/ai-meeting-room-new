@@ -134,29 +134,11 @@ public class StockWatchAiRuleService {
         if (!StringUtils.hasText(rule.getSymbol())) {
             throw new IllegalArgumentException("股票编码不能为空");
         }
-        String symbol = rule.getSymbol().trim().toLowerCase(Locale.ROOT);
-        String market = StringUtils.hasText(rule.getMarket()) ? rule.getMarket().trim().toLowerCase(Locale.ROOT) : "";
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj)[._-]?(\\d{6})$")
-                .matcher(symbol);
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$")
-                .matcher(symbol);
-        if (prefixed.matches()) {
-            market = prefixed.group(1);
-            symbol = prefixed.group(2);
-        } else if (suffixed.matches()) {
-            symbol = suffixed.group(1);
-            if (!StringUtils.hasText(market)) {
-                market = StringUtils.hasText(suffixed.group(2)) ? suffixed.group(2) : inferMarket(symbol);
-            }
-        } else {
-            throw new IllegalArgumentException("股票编码格式不正确");
-        }
-        rule.setSymbol(symbol);
-        rule.setMarket(StringUtils.hasText(market) ? market : inferMarket(symbol));
+        StockSymbol normalized = StockSymbol.parse(rule.getSymbol(), rule.getMarket());
+        rule.setSymbol(normalized.getSymbol());
+        rule.setMarket(normalized.getMarket());
         if (!StringUtils.hasText(rule.getName())) {
-            rule.setName(symbol);
+            rule.setName(normalized.getSymbol());
         }
         if (!StringUtils.hasText(rule.getConditionText())) {
             throw new IllegalArgumentException("AI观察条件不能为空");
@@ -224,12 +206,6 @@ public class StockWatchAiRuleService {
 
     private String expandHome(String path) {
         return path.startsWith("~/") ? System.getProperty("user.home") + path.substring(1) : path;
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
     }
 
     private String text(Object raw, String fallback) {

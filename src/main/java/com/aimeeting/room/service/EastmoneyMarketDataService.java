@@ -284,6 +284,9 @@ public class EastmoneyMarketDataService {
     }
 
     private List<Map<String, Object>> fetchBenchmarkKlines(String symbol, String market, int limit) {
+        if ("hk".equals(market)) {
+            throw new IllegalStateException("unsupported_hk_benchmark");
+        }
         String code = benchmarkCode(symbol, market);
         return fetchKlines(code.substring(code.indexOf('.') + 1), "1".equals(code.substring(0, 1)) ? "sh" : "sz", 101, limit);
     }
@@ -714,7 +717,7 @@ public class EastmoneyMarketDataService {
     }
 
     private String secid(String symbol, String market) {
-        return ("sh".equals(market) ? "1" : "0") + "." + symbol;
+        return StockSymbol.eastmoneySecid(symbol, market);
     }
 
     private String benchmarkCode(String symbol, String market) {
@@ -724,20 +727,16 @@ public class EastmoneyMarketDataService {
     }
 
     private String benchmarkName(String symbol, String market) {
+        if ("hk".equals(market)) return "恒生指数";
         if ("sh".equals(market) && symbol != null && symbol.startsWith("688")) return "科创50";
         return "sh".equals(market) ? "上证指数" : "深证成指";
     }
 
     private String normalizeMarket(String market, String symbol) {
         if (StringUtils.hasText(market)) {
-            String value = market.toLowerCase(Locale.ROOT).replace(".", "");
-            if (value.startsWith("sh")) return "sh";
-            if (value.startsWith("bj")) return "bj";
-            if (value.startsWith("sz")) return "sz";
+            return StockSymbol.normalizeMarket(market);
         }
-        if (symbol != null && (symbol.startsWith("6") || symbol.startsWith("9"))) return "sh";
-        if (symbol != null && (symbol.startsWith("4") || symbol.startsWith("8"))) return "bj";
-        return "sz";
+        return StockSymbol.inferMarket(symbol);
     }
 
     private String normalizePeriod(String period) {

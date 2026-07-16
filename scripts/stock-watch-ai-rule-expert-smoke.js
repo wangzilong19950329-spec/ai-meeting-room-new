@@ -4,7 +4,10 @@
 const http = require('http');
 const https = require('https');
 
-const bridgeUrl = process.env.DEEPSEEK_WEB_BRIDGE_URL || 'http://127.0.0.1:8789/search';
+const bridgeUrl = process.env.STOCK_WATCH_AI_RULES_BRIDGE_URL
+  || process.env.STOCK_WATCH_TECH_BRIDGE_URL
+  || process.env.DEEPSEEK_WEB_BRIDGE_URL
+  || 'http://127.0.0.1:8789/search';
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 240000);
 const requireDeepThink = String(process.env.SMOKE_REQUIRE_DEEP_THINK || '').toLowerCase() === 'true';
 const token = `stock_watch_ai_rule_expert_smoke_${Date.now()}`;

@@ -68,6 +68,21 @@ public class StockWatchTechnicalAnalysisService {
             LocalTime.of(14, 30),
             LocalTime.of(15, 0)
     );
+    private static final List<LocalTime> HK_RUN_SLOTS = Arrays.asList(
+            LocalTime.of(9, 30),
+            LocalTime.of(10, 0),
+            LocalTime.of(10, 30),
+            LocalTime.of(11, 0),
+            LocalTime.of(11, 30),
+            LocalTime.of(12, 0),
+            LocalTime.of(13, 0),
+            LocalTime.of(13, 30),
+            LocalTime.of(14, 0),
+            LocalTime.of(14, 30),
+            LocalTime.of(15, 0),
+            LocalTime.of(15, 30),
+            LocalTime.of(16, 0)
+    );
     private static final List<String> MAIN_FORCE_INTENTS = Arrays.asList(
             "ACCUMULATE", "DISTRIBUTE", "WASH", "PULL_UP", "SUPPORT", "SUPPRESS", "ROTATE", "NEUTRAL", "UNKNOWN"
     );
@@ -227,11 +242,11 @@ public class StockWatchTechnicalAnalysisService {
         ZonedDateTime now = ZonedDateTime.now(CHINA_ZONE);
         String batchId = now.format(BATCH_ID_FORMATTER);
         lastRunAt = now;
-        boolean tradingSession = isTradingSession(now.toLocalTime());
+        List<StockRef> refs = scheduledRefs();
+        boolean tradingSession = refs.stream().anyMatch(ref -> isTradingSession(now, ref.market));
         boolean weeklyDue = isWeeklyDue(now);
         boolean monthlyDue = isMonthlyDue(now);
-        String daySlot = tradingSession ? currentRunSlot(now, false) : "";
-        List<StockRef> refs = scheduledRefs();
+        String daySlot = tradingSession ? now.toLocalTime().truncatedTo(java.time.temporal.ChronoUnit.MINUTES).format(SLOT_FORMATTER) : "";
         BatchStats stats = new BatchStats();
         log.info("stock-watch technical analysis batch start batchId={} now={} refs={} tradingSession={} daySlot={} weeklyDue={} monthlyDue={}",
                 batchId, now, refs.size(), tradingSession, daySlot, weeklyDue, monthlyDue);
@@ -243,7 +258,7 @@ public class StockWatchTechnicalAnalysisService {
         }
         for (StockRef ref : refs) {
             try {
-                if (tradingSession) {
+                if (isTradingSession(now, ref.market)) {
                     stats.record(runPeriodIfMissing(ref, now, "DAY", "scheduled", false, batchId));
                 }
                 if (weeklyDue) {
@@ -272,7 +287,7 @@ public class StockWatchTechnicalAnalysisService {
                                                String batchId) {
         long stockStartedAt = System.nanoTime();
         PeriodWindow window = currentPeriodWindow(periodType, now.toLocalDate());
-        String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours) : periodType;
+        String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours, ref.market) : periodType;
         String symbol = stockLabel(ref);
         log.info("stock-watch technical analysis stock start batchId={} symbol={} period={} slot={} periodKey={} reason={}",
                 batchId, symbol, periodType, runSlot, window.key, reason);
@@ -307,7 +322,7 @@ public class StockWatchTechnicalAnalysisService {
                                                     boolean skipExistingSuccess) {
         String periodType = normalizePeriodType(rawPeriodType);
         ZonedDateTime now = ZonedDateTime.now(CHINA_ZONE);
-        if ("DAY".equals(periodType) && tradingHoursOnly && !ignoreTradingHours && !isTradingSession(now.toLocalTime())) {
+        if ("DAY".equals(periodType) && tradingHoursOnly && !ignoreTradingHours && !isTradingSession(now, ref.market)) {
             throw new IllegalStateException("非交易时段，已跳过自动技术面分析");
         }
 
@@ -320,7 +335,7 @@ public class StockWatchTechnicalAnalysisService {
         String stockName = text(quote.get("name"), requestedName);
         LocalDate sourceTradeDate = sourceTradeDate(marketData.getPayload(), now.toLocalDate());
         PeriodWindow window = currentPeriodWindow(periodType, sourceTradeDate);
-        String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours) : periodType;
+        String runSlot = "DAY".equals(periodType) ? currentRunSlot(now, ignoreTradingHours, ref.market) : periodType;
         if (skipExistingSuccess) {
             StockWatchTechnicalAnalysis existing = analysisMapper.selectLatestBySymbolDateSlot(
                     ref.symbol,
@@ -1598,7 +1613,7 @@ public class StockWatchTechnicalAnalysisService {
             payload.put("traceable", false);
             payload.put("url", "");
             payload.put("lastRun", "--");
-            payload.put("nextRun", nextRunLabel(ZonedDateTime.now(CHINA_ZONE)));
+            payload.put("nextRun", nextRunLabel(ZonedDateTime.now(CHINA_ZONE), fallbackRef.market));
             return payload;
         }
         int limit = session.getContextLimitChars() == null || session.getContextLimitChars() <= 0
@@ -1617,7 +1632,7 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("url", url);
         payload.put("bridgeTargetId", session.getBridgeTargetId());
         payload.put("lastRun", session.getLastRunAt() == null ? "--" : SLOT_FORMATTER.format(session.getLastRunAt().toInstant().atZone(CHINA_ZONE)));
-        payload.put("nextRun", nextRunLabel(ZonedDateTime.now(CHINA_ZONE)));
+        payload.put("nextRun", nextRunLabel(ZonedDateTime.now(CHINA_ZONE), firstNonBlank(session.getMarket(), fallbackRef.market)));
         payload.put("lastRunStatus", session.getLastRunStatus());
         payload.put("lastError", session.getLastError());
         return payload;
@@ -1737,30 +1752,41 @@ public class StockWatchTechnicalAnalysisService {
                 && !"https://chat.deepseek.com".equals(url);
     }
 
-    private String currentRunSlot(ZonedDateTime now, boolean allowOutsideTrading) {
+    private String currentRunSlot(ZonedDateTime now, boolean allowOutsideTrading, String market) {
         LocalTime time = now.toLocalTime();
-        if (!isTradingSession(time) && allowOutsideTrading) {
+        if (!isTradingSession(now, market) && allowOutsideTrading) {
             return time.truncatedTo(java.time.temporal.ChronoUnit.MINUTES).format(SLOT_FORMATTER);
         }
-        return RUN_SLOTS.stream()
+        List<LocalTime> slots = runSlots(market);
+        return slots.stream()
                 .filter(slot -> !slot.isAfter(time))
                 .max(Comparator.naturalOrder())
-                .orElse(RUN_SLOTS.get(0))
+                .orElse(slots.get(0))
                 .format(SLOT_FORMATTER);
     }
 
-    private String nextRunLabel(ZonedDateTime now) {
+    private String nextRunLabel(ZonedDateTime now, String market) {
         LocalTime time = now.toLocalTime();
-        return RUN_SLOTS.stream()
+        return runSlots(market).stream()
                 .filter(slot -> slot.isAfter(time))
                 .findFirst()
                 .map(slot -> slot.format(SLOT_FORMATTER))
                 .orElse("下个交易日 09:30");
     }
 
-    private boolean isTradingSession(LocalTime time) {
-        return (!time.isBefore(LocalTime.of(9, 30)) && !time.isAfter(LocalTime.of(11, 30)))
-                || (!time.isBefore(LocalTime.of(13, 0)) && !time.isAfter(LocalTime.of(15, 0)));
+    private boolean isTradingSession(ZonedDateTime now, String market) {
+        if (now.getDayOfWeek() == DayOfWeek.SATURDAY || now.getDayOfWeek() == DayOfWeek.SUNDAY) {
+            return false;
+        }
+        LocalTime time = now.toLocalTime();
+        LocalTime morningClose = "hk".equalsIgnoreCase(market) ? LocalTime.of(12, 0) : LocalTime.of(11, 30);
+        LocalTime afternoonClose = "hk".equalsIgnoreCase(market) ? LocalTime.of(16, 0) : LocalTime.of(15, 0);
+        return (!time.isBefore(LocalTime.of(9, 30)) && !time.isAfter(morningClose))
+                || (!time.isBefore(LocalTime.of(13, 0)) && !time.isAfter(afternoonClose));
+    }
+
+    private List<LocalTime> runSlots(String market) {
+        return "hk".equalsIgnoreCase(market) ? HK_RUN_SLOTS : RUN_SLOTS;
     }
 
     private boolean isWeeklyDue(ZonedDateTime now) {
@@ -1974,31 +2000,8 @@ public class StockWatchTechnicalAnalysisService {
     }
 
     private StockRef normalizeStockRef(String rawSymbol, String rawMarket) {
-        String value = text(rawSymbol, "").trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        String market = text(rawMarket, "").trim().toLowerCase(Locale.ROOT);
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj)[._-]?(\\d{6})$")
-                .matcher(value);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), prefixed.group(1));
-        }
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$")
-                .matcher(value);
-        if (!suffixed.matches()) {
-            throw new IllegalArgumentException("股票编码格式不正确");
-        }
-        String symbol = suffixed.group(1);
-        String effectiveMarket = StringUtils.hasText(market)
-                ? market
-                : (StringUtils.hasText(suffixed.group(2)) ? suffixed.group(2) : inferMarket(symbol));
-        return new StockRef(symbol, effectiveMarket);
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
+        StockSymbol normalized = StockSymbol.parse(rawSymbol, rawMarket);
+        return new StockRef(normalized.getSymbol(), normalized.getMarket());
     }
 
     private LocalDate toLocalDate(java.util.Date date) {

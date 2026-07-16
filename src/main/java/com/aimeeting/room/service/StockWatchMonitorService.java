@@ -49,6 +49,7 @@ public class StockWatchMonitorService {
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final DateTimeFormatter EVENT_TIME_FORMATTER = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
     private static final Pattern EMAIL_PATTERN = Pattern.compile("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$");
+    private static final Pattern PRICE_LEVEL_PATTERN = Pattern.compile("(\\d+(?:\\.\\d+)?)\\s*元");
 
     private final StockQuoteService stockQuoteService;
     private final NotificationService notificationService;
@@ -60,6 +61,7 @@ public class StockWatchMonitorService {
     private final Map<String, RuleState> ruleStates = new LinkedHashMap<>();
     private final Set<String> sentSignalKeys = new LinkedHashSet<>();
     private final Map<String, String> lastAlertAtByStock = new LinkedHashMap<>();
+    private final Map<String, AiAlertState> lastAiAlerts = new LinkedHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     private boolean stateLoaded = false;
@@ -90,8 +92,17 @@ public class StockWatchMonitorService {
     @Value("${stock-watch.monitor.default-alert-interval-minutes:120}")
     private int defaultAlertIntervalMinutes;
 
-    @Value("${stock-watch.monitor.ai-context-max-age-minutes:360}")
-    private int aiContextMaxAgeMinutes;
+    @Value("${stock-watch.monitor.ai-alert-cooldown-minutes:30}")
+    private int aiAlertCooldownMinutes;
+
+    @Value("${stock-watch.monitor.ai-context-technical-lookback-days:14}")
+    private int aiContextTechnicalLookbackDays;
+
+    @Value("${stock-watch.monitor.ai-context-technical-limit:14}")
+    private int aiContextTechnicalLimit;
+
+    @Value("${stock-watch.monitor.ai-context-technical-max-chars:12000}")
+    private int aiContextTechnicalMaxChars;
 
     public StockWatchMonitorService(StockQuoteService stockQuoteService,
                                     NotificationService notificationService,
@@ -195,11 +206,13 @@ public class StockWatchMonitorService {
         status.put("rules", configuredRules);
         status.put("stateFile", stateFile().toString());
         status.put("defaultAlertIntervalMinutes", effectiveDefaultAlertIntervalMinutes());
+        status.put("aiAlertCooldownMinutes", effectiveAiAlertCooldownMinutes());
         status.put("lastRunAt", lastRunAt == null ? null : lastRunAt.format(EVENT_TIME_FORMATTER));
         status.put("lastRunStatus", lastRunStatus);
         status.put("ruleStates", stateSnapshot());
         status.put("sentSignalCount", sentSignalKeys.size());
         status.put("lastAlertAtByStock", new LinkedHashMap<>(lastAlertAtByStock));
+        status.put("aiAlertStateCount", lastAiAlerts.size());
         status.put("aiRuleCount", aiRuleService.listEnabled().size());
         return status;
     }
@@ -337,13 +350,16 @@ public class StockWatchMonitorService {
         boolean confidenceMet = decision.getConfidence() >= rule.getMinConfidence();
         boolean triggered = decision.isTriggered() && confidenceMet;
         LocalDate today = now.toLocalDate();
-        boolean duplicate = isAiDuplicate(today, rule);
-        boolean notificationAttempted = triggered && notify && rule.isNotify() && decision.isShouldNotify() && !duplicate;
+        AiSignalSnapshot signalSnapshot = buildAiSignalSnapshot(rule, quote, decision);
+        AiAlertGate alertGate = evaluateAiAlertGate(rule, quote, decision, signalSnapshot, now, notify, confidenceMet, triggered, today);
+        boolean notificationAttempted = alertGate.allowed;
         boolean emailSent = false;
-        AlertSendResult alertResult = AlertSendResult.notAttempted();
+        AlertSendResult alertResult = alertGate.allowed
+                ? AlertSendResult.notAttempted()
+                : AlertSendResult.skipped(alertGate.reason);
 
         Map<String, Object> event = new LinkedHashMap<>();
-        event.put("event_id", "ai_watch_" + rule.getSymbol() + "_" + rule.getId() + "_" + today);
+        event.put("event_id", "ai_watch_" + rule.getSymbol() + "_" + rule.getMarket() + "_" + rule.getId() + "_" + today);
         event.put("timestamp", now.format(EVENT_TIME_FORMATTER));
         event.put("symbol", rule.getSymbol());
         event.put("market", rule.getMarket());
@@ -358,16 +374,26 @@ public class StockWatchMonitorService {
         event.put("reason", decision.getReason());
         event.put("matched_signals", decision.getMatchedSignals());
         event.put("missing_data", decision.getMissingData());
+        event.put("belief_update", decision.getBeliefUpdate());
         event.put("quote", quote);
         event.put("ai_context_status", aiContextStatus(aiContext));
         event.put("ai_context_missing_data", aiContext == null ? Collections.emptyList() : aiContext.get("missingData"));
+        appendAiContextHistoryMetadata(event, aiContext);
+        event.put("ai_alert_state_key", aiAlertStateKey(rule));
+        event.put("ai_signal_shape_fingerprint", signalSnapshot.signalShapeFingerprint);
+        event.put("ai_risk_score", signalSnapshot.riskScore);
+        event.put("ai_risk_tier", signalSnapshot.riskTier);
+        event.put("ai_normalized_facts", signalSnapshot.normalizedFacts);
+        event.put("ai_alert_decision_reason", alertGate.reason);
+        event.put("ai_alert_signal_shape_changed", alertGate.signalShapeChanged);
+        event.put("ai_alert_severity_rank_up", alertGate.severityRankUp);
+        event.put("ai_alert_material_risk_delta", alertGate.materialRiskDelta);
 
         if (notificationAttempted) {
             alertResult = sendAiTriggeredEmail(rule, decision, event, now);
             emailSent = alertResult.sent;
             if (emailSent) {
-                sentSignalKeys.add(aiDedupeKey(today, rule));
-                trimSentSignalKeys();
+                markAiAlertSent(rule, signalSnapshot, decision, now);
             }
         }
 
@@ -377,38 +403,236 @@ public class StockWatchMonitorService {
         result.put("reason", decision.getReason());
         result.put("event", event);
         result.put("aiContextStatus", aiContextStatus(aiContext));
-        result.put("duplicate", duplicate);
+        result.put("duplicate", alertGate.duplicate);
+        result.put("aiAlertStateKey", aiAlertStateKey(rule));
+        result.put("aiAlertDecisionReason", alertGate.reason);
+        result.put("aiSignalShapeChanged", alertGate.signalShapeChanged);
+        result.put("aiSeverityRankUp", alertGate.severityRankUp);
+        result.put("aiMaterialRiskDelta", alertGate.materialRiskDelta);
+        result.put("aiSignalShapeFingerprint", signalSnapshot.signalShapeFingerprint);
+        result.put("aiRiskScore", signalSnapshot.riskScore);
+        result.put("aiRiskTier", signalSnapshot.riskTier);
         result.put("notificationAttempted", alertResult.attempted);
         result.put("notificationSkippedReason", alertResult.skippedReason);
         result.put("notificationError", alertResult.errorMessage);
         result.put("emailSent", emailSent);
+        log.info("stock-watch AI alert evaluated symbol={}.{} ruleId={} triggered={} confidenceMet={} shouldNotify={} skipReason={} attempted={} sent={} signalShapeChanged={} severityRankUp={} materialRiskDelta={}",
+                rule.getSymbol(), rule.getMarket(), rule.getId(), triggered, confidenceMet, decision.isShouldNotify(),
+                firstNonBlank(alertResult.skippedReason, alertGate.reason, "--"),
+                alertResult.attempted, emailSent, alertGate.signalShapeChanged, alertGate.severityRankUp, alertGate.materialRiskDelta);
         return result;
     }
 
+    private AiAlertGate evaluateAiAlertGate(AiWatchRule rule,
+                                            Map<String, Object> quote,
+                                            AiDecision decision,
+                                            AiSignalSnapshot snapshot,
+                                            ZonedDateTime now,
+                                            boolean notify,
+                                            boolean confidenceMet,
+                                            boolean triggered,
+                                            LocalDate today) {
+        if (!decision.isTriggered()) {
+            return AiAlertGate.blocked("notTriggered", false);
+        }
+        if (!confidenceMet) {
+            return AiAlertGate.blocked("confidenceBelowMin", false);
+        }
+        if (!notify) {
+            return AiAlertGate.blocked("notifyDisabled", false);
+        }
+        if (!rule.isNotify()) {
+            return AiAlertGate.blocked("ruleNotifyFalse", false);
+        }
+        if (!decision.isShouldNotify()) {
+            return AiAlertGate.blocked("decisionShouldNotifyFalse", false);
+        }
+
+        String stateKey = aiAlertStateKey(rule);
+        AiAlertState previous = lastAiAlerts.get(stateKey);
+        if (previous == null && sentSignalKeys.contains(aiDedupeKey(today, rule))) {
+            AiAlertState legacy = new AiAlertState();
+            legacy.lastSentAt = firstNonBlank(lastAlertAtByStock.get(stockKey(rule.getSymbol(), rule.getMarket())),
+                    now.format(EVENT_TIME_FORMATTER));
+            legacy.signalShapeFingerprint = snapshot.signalShapeFingerprint;
+            legacy.severityRank = snapshot.severityRank;
+            legacy.riskScore = snapshot.riskScore;
+            legacy.riskTier = snapshot.riskTier;
+            legacy.normalizedFacts = new LinkedHashMap<>(snapshot.normalizedFacts);
+            legacy.reason = firstNonBlank(decision.getReason(), "legacy_ai_sent_key_initialized");
+            legacy.source = "legacy_sent_signal_key";
+            lastAiAlerts.put(stateKey, legacy);
+            trimAiAlertState();
+            return AiAlertGate.blocked("legacyAiSentKeyInitialized", true);
+        }
+
+        if (previous == null) {
+            return AiAlertGate.allowed("firstAiAlert");
+        }
+
+        ZonedDateTime lastSentAt = parseEventTime(previous.lastSentAt);
+        if (lastSentAt != null) {
+            long elapsed = Duration.between(lastSentAt, now).toMinutes();
+            int cooldown = effectiveAiAlertCooldownMinutes();
+            if (elapsed < cooldown) {
+                return AiAlertGate.blocked("aiAlertCooldown:" + Math.max(0, elapsed) + "/" + cooldown + "m", true);
+            }
+        }
+
+        boolean signalShapeChanged = !Objects.equals(firstNonBlank(previous.signalShapeFingerprint, ""),
+                firstNonBlank(snapshot.signalShapeFingerprint, ""));
+        boolean severityRankUp = snapshot.severityRank > previous.severityRank;
+        boolean materialRiskDelta = materialRiskDelta(previous, snapshot);
+        if (signalShapeChanged || severityRankUp || materialRiskDelta) {
+            return AiAlertGate.allowed("aiAlertChanged", signalShapeChanged, severityRankUp, materialRiskDelta);
+        }
+        return AiAlertGate.blocked("fingerprintUnchanged", true, signalShapeChanged, severityRankUp, materialRiskDelta);
+    }
+
+    private AiSignalSnapshot buildAiSignalSnapshot(AiWatchRule rule, Map<String, Object> quote, AiDecision decision) {
+        Map<String, Object> facts = new LinkedHashMap<>();
+        List<String> shape = new ArrayList<>();
+
+        Double changePercent = number(quote.get("changePercent"), null);
+        String changeDirection = directionalBucket(changePercent, 0.3);
+        int changeAbsBucket = absBucket(changePercent, 0.5);
+        facts.put("changeDirection", changeDirection);
+        facts.put("changeAbsBucket", changeAbsBucket);
+        facts.put("changePercent", changePercent);
+        shape.add("changeDirection=" + changeDirection);
+
+        Double volumeRatio = number(quote.get("volumeRatio"), null);
+        int volumeRatioBucket = absBucket(volumeRatio, 0.5);
+        facts.put("volumeRatioBucket", volumeRatioBucket);
+        facts.put("volumeRatio", volumeRatio);
+
+        Double turnover = number(quote.get("turnover"), null);
+        int turnoverBucket = absBucket(turnover, 0.5);
+        facts.put("turnoverBucket", turnoverBucket);
+        facts.put("turnover", turnover);
+
+        Double mainInflow = number(quote.get("mainInflow"), null);
+        String flowDirection = directionalBucket(mainInflow, 10_000_000.0);
+        int mainInflowAbsBucket = absBucket(mainInflow, 10_000_000.0);
+        facts.put("mainFlowDirection", flowDirection);
+        facts.put("mainInflowAbsBucket", mainInflowAbsBucket);
+        facts.put("mainInflow", mainInflow);
+        shape.add("mainFlowDirection=" + flowDirection);
+
+        double absChange = changePercent == null ? 0.0 : Math.abs(changePercent);
+        double absMainInflow = mainInflow == null ? 0.0 : Math.abs(mainInflow);
+        boolean absChangeSignal = absChange >= 5.0;
+        boolean nearLimit = absChange >= 9.5;
+        boolean limitMove = absChange >= 9.8;
+        boolean volumeSpikeWithMove = volumeRatio != null && volumeRatio >= 2.0 && absChange >= 2.0;
+        boolean mainFlowExtreme = absMainInflow >= 100_000_000.0;
+        boolean turnoverWithMove = turnover != null && turnover >= 5.0 && absChange >= 3.0;
+        addSignalShape(shape, facts, "absChange>=5", absChangeSignal);
+        addSignalShape(shape, facts, "nearLimit", nearLimit);
+        addSignalShape(shape, facts, "limitMove", limitMove);
+        addSignalShape(shape, facts, "volumeSpikeWithMove", volumeSpikeWithMove);
+        addSignalShape(shape, facts, "mainFlowExtreme", mainFlowExtreme);
+        addSignalShape(shape, facts, "turnoverWithMove", turnoverWithMove);
+
+        int severityRank = severityRank(firstNonBlank(decision.getSeverity(), rule.getSeverity()));
+        int riskScore = severityRank
+                + (absChangeSignal ? 2 : 0)
+                + (nearLimit ? 2 : 0)
+                + (limitMove ? 1 : 0)
+                + (volumeSpikeWithMove ? 1 : 0)
+                + (volumeRatio != null && volumeRatio >= 4.0 ? 1 : 0)
+                + (mainFlowExtreme ? 2 : 0)
+                + (turnoverWithMove ? 1 : 0)
+                + Math.min(3, changeAbsBucket / 4)
+                + Math.min(3, mainInflowAbsBucket / 10);
+        facts.put("severityRank", severityRank);
+        facts.put("riskScore", riskScore);
+
+        Collections.sort(shape);
+        AiSignalSnapshot snapshot = new AiSignalSnapshot();
+        snapshot.signalShapeFingerprint = String.join("|", shape);
+        snapshot.normalizedFacts = facts;
+        snapshot.severityRank = severityRank;
+        snapshot.riskScore = riskScore;
+        snapshot.riskTier = riskTier(riskScore);
+        return snapshot;
+    }
+
+    private void addSignalShape(List<String> shape, Map<String, Object> facts, String key, boolean matched) {
+        facts.put(key, matched);
+        if (matched) {
+            shape.add(key);
+        }
+    }
+
+    private boolean materialRiskDelta(AiAlertState previous, AiSignalSnapshot snapshot) {
+        if (previous == null || snapshot == null) {
+            return false;
+        }
+        if (snapshot.riskScore - previous.riskScore >= 2) {
+            return true;
+        }
+        int previousFlowBucket = integerFromMap(previous.normalizedFacts, "mainInflowAbsBucket", 0);
+        int currentFlowBucket = integerFromMap(snapshot.normalizedFacts, "mainInflowAbsBucket", 0);
+        if (currentFlowBucket - previousFlowBucket >= 2) {
+            return true;
+        }
+        int previousChangeBucket = integerFromMap(previous.normalizedFacts, "changeAbsBucket", 0);
+        int currentChangeBucket = integerFromMap(snapshot.normalizedFacts, "changeAbsBucket", 0);
+        return currentChangeBucket - previousChangeBucket >= 2;
+    }
+
+    private void markAiAlertSent(AiWatchRule rule,
+                                 AiSignalSnapshot snapshot,
+                                 AiDecision decision,
+                                 ZonedDateTime now) {
+        AiAlertState state = new AiAlertState();
+        state.lastSentAt = now.format(EVENT_TIME_FORMATTER);
+        state.signalShapeFingerprint = snapshot.signalShapeFingerprint;
+        state.severityRank = snapshot.severityRank;
+        state.riskScore = snapshot.riskScore;
+        state.riskTier = snapshot.riskTier;
+        state.normalizedFacts = new LinkedHashMap<>(snapshot.normalizedFacts);
+        state.reason = firstNonBlank(decision.getReason(), "");
+        state.source = "ai_alert_sent";
+        lastAiAlerts.put(aiAlertStateKey(rule), state);
+        trimAiAlertState();
+    }
+
     private Map<String, Object> buildAiContext(AiWatchRule rule, Map<String, Object> quote, ZonedDateTime now) {
-        if (!requiresEnhancedAiContext(rule)) {
+        boolean enhanced = requiresEnhancedAiContext(rule);
+        Map<String, Object> recentTechnical = recentTechnicalAnalysisContext(rule, now, quote);
+        if (!enhanced && recentTechnical.isEmpty()) {
             return Collections.emptyMap();
         }
+
         Map<String, Object> context = new LinkedHashMap<>();
-        context.put("status", "requested");
-        context.put("reason", "condition_requires_enhanced_context");
+        context.put("status", recentTechnical.isEmpty() ? "requested" : "available");
+        context.put("reason", enhanced ? "condition_requires_enhanced_context" : "technical_history_for_ai_rule");
         context.put("requestedAt", now.format(EVENT_TIME_FORMATTER));
+        if (!recentTechnical.isEmpty()) {
+            context.put("recentTechnicalAnalysis", recentTechnical);
+        }
+
+        if (!enhanced) {
+            return context;
+        }
+
         try {
             EastmoneyMarketDataService.MarketDataBundle bundle = marketDataService.buildBundle(rule.getSymbol(), rule.getMarket(), "DAY");
             if (bundle == null) {
-                context.put("status", "unavailable");
-                context.put("error", "market_data_bundle_empty");
+                markMarketDataUnavailable(context, !recentTechnical.isEmpty(), "market_data_bundle_empty");
                 return context;
             }
             List<String> requiredMissing = bundle.getRequiredMissing();
             if (requiredMissing != null && !requiredMissing.isEmpty()) {
-                context.put("status", "unavailable");
+                markMarketDataUnavailable(context, !recentTechnical.isEmpty(), "required_market_data_missing");
                 context.put("missingData", requiredMissing);
-                context.put("error", "required_market_data_missing");
                 return context;
             }
             Map<String, Object> payload = bundle.getPayload();
             context.put("status", "available");
+            context.put("marketDataStatus", "available");
             context.put("source", "EastmoneyMarketDataService.buildBundle compact summary");
             context.put("asOf", payload.get("asOf"));
 
@@ -420,6 +644,8 @@ public class StockWatchMonitorService {
             copyIfPresent(payload, currentFacts, "dataQuality");
             if (!currentFacts.isEmpty()) {
                 context.put("currentFacts", currentFacts);
+                refreshPriorValidations(recentTechnical, quote, currentFacts, now);
+                trimTechnicalContextToMaxChars(recentTechnical);
             }
 
             Map<String, Object> recentSeries = new LinkedHashMap<>();
@@ -429,15 +655,10 @@ public class StockWatchMonitorService {
             if (!recentSeries.isEmpty()) {
                 context.put("recentSeries", recentSeries);
             }
-
-            StockWatchTechnicalAnalysis recentAnalysis = latestSuccessfulTechnicalAnalysis(rule, now);
-            if (recentAnalysis != null) {
-                context.put("recentTechnicalAnalysis", toTechnicalContext(recentAnalysis));
-            }
             return context;
         } catch (Exception e) {
-            context.put("status", "unavailable");
-            context.put("error", firstNonBlank(e.getMessage(), e.getClass().getSimpleName()));
+            markMarketDataUnavailable(context, !recentTechnical.isEmpty(),
+                    firstNonBlank(e.getMessage(), e.getClass().getSimpleName()));
             return context;
         }
     }
@@ -462,38 +683,759 @@ public class StockWatchMonitorService {
         return false;
     }
 
-    private StockWatchTechnicalAnalysis latestSuccessfulTechnicalAnalysis(AiWatchRule rule, ZonedDateTime now) {
+    private void markMarketDataUnavailable(Map<String, Object> context, boolean hasHistoricalContext, String error) {
+        context.put("marketDataStatus", "unavailable");
+        context.put("status", hasHistoricalContext ? "available" : "unavailable");
+        context.put("error", error);
+    }
+
+    private Map<String, Object> recentTechnicalAnalysisContext(AiWatchRule rule,
+                                                               ZonedDateTime now,
+                                                               Map<String, Object> quote) {
         if (technicalAnalysisMapper == null || rule == null) {
-            return null;
+            return Collections.emptyMap();
         }
-        int maxAge = Math.max(30, Math.min(24 * 60, aiContextMaxAgeMinutes));
-        Date since = Date.from(now.minusMinutes(maxAge).toInstant());
+        int lookbackDays = effectiveTechnicalLookbackDays();
+        int limit = effectiveTechnicalLimit();
+        LocalDate end = now.toLocalDate();
+        LocalDate start = end.minusDays(Math.max(0, lookbackDays - 1L));
         try {
-            return technicalAnalysisMapper.selectLatestSuccessfulBySymbolSince(
+            List<StockWatchTechnicalAnalysis> records = technicalAnalysisMapper.selectRecentSuccessfulSlotsByDateRange(
                     rule.getSymbol(),
                     rule.getMarket(),
+                    java.sql.Date.valueOf(start),
+                    java.sql.Date.valueOf(end),
                     "DAY",
-                    since
+                    limit
             );
+            if (records == null || records.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            records = new ArrayList<>(records);
+            Collections.reverse(records);
+            List<Map<String, Object>> compactRecords = records.stream()
+                    .filter(Objects::nonNull)
+                    .map(this::toTechnicalHistoryRecord)
+                    .collect(Collectors.toCollection(ArrayList::new));
+            if (compactRecords.isEmpty()) {
+                return Collections.emptyMap();
+            }
+            Map<String, Object> context = new LinkedHashMap<>();
+            context.put("status", "available");
+            context.put("lookbackDays", lookbackDays);
+            context.put("windowStart", start.toString());
+            context.put("windowEnd", end.toString());
+            context.put("recordCount", compactRecords.size());
+            context.put("maxRecords", limit);
+            context.put("selectionPolicy", "recent_successful_day_slots_limited_then_time_asc");
+            context.put("usage", "historical_analysis_only_for_analysis_continuity_not_trigger_fact");
+            context.put("records", compactRecords);
+            refreshPriorValidations(context, quote, Collections.emptyMap(), now);
+            trimTechnicalContextToMaxChars(context);
+            return context;
         } catch (Exception e) {
-            log.warn("stock-watch AI context recent technical analysis unavailable symbol={}.{} error={}",
+            log.warn("stock-watch AI context technical history unavailable symbol={}.{} error={}",
                     rule.getSymbol(), rule.getMarket(), e.getMessage());
+            return Collections.emptyMap();
+        }
+    }
+
+    private Map<String, Object> toTechnicalHistoryRecord(StockWatchTechnicalAnalysis analysis) {
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("id", analysis.getId());
+        item.put("date", analysisDateString(analysis.getAnalysisDate()));
+        item.put("time", analysis.getRunSlot());
+        item.put("periodType", analysis.getPeriodType());
+        item.put("status", analysis.getStatus());
+        item.put("stance", analysis.getStance());
+        item.put("tone", analysis.getTone());
+        item.put("confidence", analysis.getConfidence());
+        item.put("gmtCreate", dateTimeString(analysis.getGmtCreate()));
+        putTextIfPresent(item, "title", analysis.getTitle(), 90);
+        putTextIfPresent(item, "conclusion", analysis.getConclusion(), 280);
+        List<String> evidence = compactJsonStringArray(analysis.getEvidenceJson(), 3, 140);
+        if (!evidence.isEmpty()) {
+            item.put("evidence", evidence);
+        }
+        List<String> missingData = compactJsonStringArray(analysis.getMissingDataJson(), 3, 120);
+        if (!missingData.isEmpty()) {
+            item.put("missingData", missingData);
+        }
+        JSONObject mainForceIntent = parseJsonObject(analysis.getMainForceIntentJson());
+        Map<String, Object> inferredIntent = inferLegacyMainForceIntent(analysis);
+        if (mainForceIntent != null && !mainForceIntent.isEmpty() && !isUnknownMainForceIntent(mainForceIntent)) {
+            item.put("mainForceIntent", mainForceIntent);
+        } else if (!inferredIntent.isEmpty()) {
+            item.put("mainForceIntent", inferredIntent);
+            item.put("mainForceIntentSource", "legacy_text_fallback");
+        } else if (mainForceIntent != null && !mainForceIntent.isEmpty()) {
+            item.put("mainForceIntent", mainForceIntent);
+        }
+        putTextIfPresent(item, "mainForceIntentStatus", analysis.getMainForceIntentStatus(), 40);
+        return item;
+    }
+
+    private boolean isUnknownMainForceIntent(Map<?, ?> mainForceIntent) {
+        String intent = firstNonBlank(mapText(mainForceIntent, "intent"), "UNKNOWN");
+        return "UNKNOWN".equalsIgnoreCase(intent) || "NEUTRAL".equalsIgnoreCase(intent);
+    }
+
+    private Map<String, Object> inferLegacyMainForceIntent(StockWatchTechnicalAnalysis analysis) {
+        String title = firstNonBlank(analysis.getTitle(), "");
+        String conclusion = firstNonBlank(analysis.getConclusion(), "");
+        String text = (title + "。" + conclusion).trim();
+        if (!StringUtils.hasText(text)) {
+            return Collections.emptyMap();
+        }
+        String intent = inferLegacyIntent(text);
+        List<String> watchPoints = inferLegacyWatchPoints(title, conclusion);
+        if (!StringUtils.hasText(intent) && watchPoints.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Map<String, Object> inferred = new LinkedHashMap<>();
+        inferred.put("schemaVersion", "legacy-text-v1");
+        inferred.put("source", "legacy_text_fallback");
+        inferred.put("intent", StringUtils.hasText(intent) ? intent : "UNKNOWN");
+        inferred.put("timeWindow", "NEXT_SLOT_OR_SHORT_TERM");
+        inferred.put("confidence", StringUtils.hasText(intent) ? 0.45 : 0.3);
+        if (!watchPoints.isEmpty()) {
+            inferred.put("watchPoints", watchPoints);
+        }
+        inferred.put("evidenceText", truncateText(text, 260));
+        return inferred;
+    }
+
+    private String inferLegacyIntent(String text) {
+        if (!StringUtils.hasText(text)) {
+            return "";
+        }
+        if (containsAnyText(text,
+                "主力出逃", "主力流出", "资金流出", "净流出", "派发", "出货", "抛压", "获利回吐")) {
+            return "DISTRIBUTE";
+        }
+        if (containsAnyText(text, "洗盘", "震仓")) {
+            return "WASH";
+        }
+        if (containsAnyText(text, "主力净流入", "主力流入", "资金流入", "净流入", "吸筹", "承接")) {
+            return "ACCUMULATE";
+        }
+        if (containsAnyText(text, "拉升", "涨停", "封单稳固", "封死")) {
+            return "PULL_UP";
+        }
+        if (containsAnyText(text, "支撑", "守住")) {
+            return "SUPPORT";
+        }
+        return "";
+    }
+
+    private List<String> inferLegacyWatchPoints(String title, String conclusion) {
+        List<String> points = new ArrayList<>();
+        String text = firstNonBlank(conclusion, title, "");
+        for (String part : text.split("[。；;\\n]")) {
+            String clause = part == null ? "" : part.trim();
+            if (!StringUtils.hasText(clause)) {
+                continue;
+            }
+            if (containsAnyText(clause,
+                    "下一周期", "需验证", "验证", "若", "关注", "风险边界",
+                    "支撑", "跌破", "突破", "站稳", "回踩", "开板", "放量",
+                    "主力", "净流入", "净流出", "资金流入", "资金流出")) {
+                points.add(truncateText(clause, 180));
+            }
+            if (points.size() >= 6) {
+                break;
+            }
+        }
+        if (points.isEmpty() && StringUtils.hasText(title)
+                && containsAnyText(title, "主力", "支撑", "跌破", "突破", "开板", "放量", "流入", "流出")) {
+            points.add(truncateText(title, 180));
+        }
+        return points;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void refreshPriorValidations(Map<String, Object> recentTechnical,
+                                         Map<String, Object> quote,
+                                         Map<String, Object> currentFacts,
+                                         ZonedDateTime now) {
+        if (recentTechnical == null || recentTechnical.isEmpty()) {
+            return;
+        }
+        Object rawRecords = recentTechnical.get("records");
+        if (!(rawRecords instanceof List)) {
+            return;
+        }
+        for (Object rawRecord : (List<?>) rawRecords) {
+            if (!(rawRecord instanceof Map)) {
+                continue;
+            }
+            Map<String, Object> record = (Map<String, Object>) rawRecord;
+            Map<String, Object> validation = validatePriorIntentRecord(record, quote, currentFacts, now);
+            if (!validation.isEmpty()) {
+                record.put("priorValidation", validation);
+            }
+        }
+    }
+
+    private Map<String, Object> validatePriorIntentRecord(Map<String, Object> record,
+                                                          Map<String, Object> quote,
+                                                          Map<String, Object> currentFacts,
+                                                          ZonedDateTime now) {
+        Object rawIntent = record == null ? null : record.get("mainForceIntent");
+        if (!(rawIntent instanceof Map)) {
+            return Collections.emptyMap();
+        }
+        Map<?, ?> intentMap = (Map<?, ?>) rawIntent;
+        String intent = firstNonBlank(mapText(intentMap, "intent"), "UNKNOWN").toUpperCase(Locale.ROOT);
+        List<Map<String, Object>> checks = new ArrayList<>();
+
+        Map<String, Object> intentCheck = validateIntentDirection(intent, quote, currentFacts);
+        if (!intentCheck.isEmpty()) {
+            checks.add(intentCheck);
+        }
+        for (Object watchPoint : watchPointObjects(intentMap.get("watchPoints"))) {
+            Map<String, Object> check = validateWatchPoint(watchPoint, quote, currentFacts);
+            if (!check.isEmpty()) {
+                checks.add(check);
+            }
+        }
+        if (checks.isEmpty()) {
+            Map<String, Object> unresolved = new LinkedHashMap<>();
+            unresolved.put("type", "prior_intent");
+            unresolved.put("verdict", "UNRESOLVED");
+            unresolved.put("reason", "历史主力意图缺少可程序验证的方向或观察点");
+            checks.add(unresolved);
+        }
+
+        String verdict = aggregatePriorVerdict(checks);
+        Map<String, Object> validation = new LinkedHashMap<>();
+        validation.put("verdict", verdict);
+        validation.put("validatedAt", now.format(EVENT_TIME_FORMATTER));
+        validation.put("sourceAnalysisId", record.get("id"));
+        validation.put("basedOn", currentFacts == null || currentFacts.isEmpty()
+                ? List.of("quote")
+                : List.of("quote", "currentFacts"));
+        validation.put("summary", priorValidationSummary(verdict, checks));
+        validation.put("checks", checks);
+        return validation;
+    }
+
+    private Map<String, Object> validateIntentDirection(String intent,
+                                                        Map<String, Object> quote,
+                                                        Map<String, Object> currentFacts) {
+        if (!StringUtils.hasText(intent) || "UNKNOWN".equals(intent) || "NEUTRAL".equals(intent)) {
+            return Collections.emptyMap();
+        }
+        Double mainInflow = currentNumber(quote, currentFacts,
+                "quote.mainInflow",
+                "currentFacts.anchorFacts.mainInflowYuan",
+                "anchorFacts.mainInflowYuan");
+        Double changePct = currentNumber(quote, currentFacts,
+                "quote.changePercent",
+                "currentFacts.anchorFacts.changePercent",
+                "anchorFacts.changePercent",
+                "currentFacts.anchorFacts.changePct",
+                "anchorFacts.changePct");
+        Map<String, Object> check = new LinkedHashMap<>();
+        check.put("type", "intent_direction");
+        check.put("intent", intent);
+        if (mainInflow != null) {
+            check.put("mainInflow", mainInflow);
+        }
+        if (changePct != null) {
+            check.put("changePercent", changePct);
+        }
+
+        boolean positiveIntent = Arrays.asList("ACCUMULATE", "PULL_UP", "SUPPORT").contains(intent);
+        boolean negativeIntent = Arrays.asList("DISTRIBUTE", "SUPPRESS").contains(intent);
+        if (positiveIntent) {
+            if ((mainInflow != null && mainInflow >= 30_000_000.0) || (changePct != null && changePct >= 1.0)) {
+                check.put("verdict", "SUPPORTED");
+                check.put("reason", "本轮资金或价格方向支持此前偏多主力意图");
+            } else if (mainInflow != null && mainInflow <= -100_000_000.0 && changePct != null && changePct <= -1.0) {
+                check.put("verdict", "FALSIFIED");
+                check.put("reason", "本轮大额主力净流出且价格下跌，强烈反向于此前偏多主力意图");
+            } else if ((mainInflow != null && mainInflow < 0) || (changePct != null && changePct < 0)) {
+                check.put("verdict", "WEAKENED");
+                check.put("reason", "本轮资金或价格方向削弱此前偏多主力意图");
+            } else {
+                check.put("verdict", "UNRESOLVED");
+                check.put("reason", "本轮事实不足以验证此前偏多主力意图");
+            }
+            return check;
+        }
+        if (negativeIntent) {
+            if ((mainInflow != null && mainInflow <= -30_000_000.0) || (changePct != null && changePct <= -1.0)) {
+                check.put("verdict", "SUPPORTED");
+                check.put("reason", "本轮资金或价格方向支持此前偏空/派发主力意图");
+            } else if (mainInflow != null && mainInflow >= 100_000_000.0 && changePct != null && changePct >= 1.0) {
+                check.put("verdict", "FALSIFIED");
+                check.put("reason", "本轮大额主力净流入且价格上涨，强烈反向于此前偏空/派发主力意图");
+            } else if ((mainInflow != null && mainInflow > 0) || (changePct != null && changePct > 0)) {
+                check.put("verdict", "WEAKENED");
+                check.put("reason", "本轮资金或价格方向削弱此前偏空/派发主力意图");
+            } else {
+                check.put("verdict", "UNRESOLVED");
+                check.put("reason", "本轮事实不足以验证此前偏空/派发主力意图");
+            }
+            return check;
+        }
+        if ("WASH".equals(intent)) {
+            if (changePct != null && changePct < 0 && (mainInflow == null || mainInflow > -100_000_000.0)) {
+                check.put("verdict", "SUPPORTED");
+                check.put("reason", "本轮回落但未见强主力净流出，支持洗盘假设");
+            } else if (mainInflow != null && mainInflow <= -100_000_000.0) {
+                check.put("verdict", "WEAKENED");
+                check.put("reason", "本轮主力净流出过强，削弱洗盘假设");
+            } else {
+                check.put("verdict", "UNRESOLVED");
+                check.put("reason", "本轮事实不足以验证洗盘假设");
+            }
+            return check;
+        }
+        return Collections.emptyMap();
+    }
+
+    private List<Object> watchPointObjects(Object raw) {
+        if (raw instanceof JSONArray) {
+            JSONArray array = (JSONArray) raw;
+            List<Object> values = new ArrayList<>();
+            for (int i = 0; i < array.size(); i++) {
+                values.add(array.get(i));
+            }
+            return values;
+        }
+        if (raw instanceof Collection) {
+            return new ArrayList<>((Collection<?>) raw);
+        }
+        if (raw == null) {
+            return Collections.emptyList();
+        }
+        return Collections.singletonList(raw);
+    }
+
+    private Map<String, Object> validateWatchPoint(Object raw,
+                                                   Map<String, Object> quote,
+                                                   Map<String, Object> currentFacts) {
+        if (raw instanceof Map) {
+            return validateStructuredWatchPoint((Map<?, ?>) raw, quote, currentFacts);
+        }
+        return validateTextWatchPoint(raw == null ? "" : String.valueOf(raw), quote, currentFacts);
+    }
+
+    private Map<String, Object> validateStructuredWatchPoint(Map<?, ?> watchPoint,
+                                                             Map<String, Object> quote,
+                                                             Map<String, Object> currentFacts) {
+        String metricPath = firstNonBlank(
+                mapText(watchPoint, "metricPath"),
+                mapText(watchPoint, "path"),
+                mapText(watchPoint, "field"));
+        String operator = firstNonBlank(
+                mapText(watchPoint, "operator"),
+                mapText(watchPoint, "op"),
+                mapText(watchPoint, "compare"));
+        Double threshold = number(firstNonNull(
+                watchPoint.get("threshold"),
+                watchPoint.get("value"),
+                watchPoint.get("target")), null);
+        Map<String, Object> check = new LinkedHashMap<>();
+        check.put("type", "watch_point");
+        check.put("watchPoint", truncateText(String.valueOf(watchPoint), 220));
+        if (StringUtils.hasText(metricPath)) {
+            check.put("metricPath", metricPath);
+        }
+        if (StringUtils.hasText(operator)) {
+            check.put("operator", operator);
+        }
+        if (threshold != null) {
+            check.put("threshold", threshold);
+        }
+        if (!StringUtils.hasText(metricPath) || !StringUtils.hasText(operator) || threshold == null) {
+            check.put("verdict", "UNRESOLVED");
+            check.put("reason", "观察点缺少metricPath/operator/threshold，无法程序验证");
+            return check;
+        }
+        Double actual = resolveMetric(metricPath, quote, currentFacts);
+        if (actual == null) {
+            check.put("verdict", "UNRESOLVED");
+            check.put("reason", "本轮事实缺少观察点所需字段：" + metricPath);
+            return check;
+        }
+        check.put("actualValue", actual);
+        boolean matched = compare(actual, operator, threshold);
+        check.put("verdict", matched ? "SUPPORTED" : (bool(watchPoint.get("falsifyOnMiss"), false) ? "FALSIFIED" : "WEAKENED"));
+        check.put("reason", matched ? "本轮事实命中结构化观察点" : "本轮事实未命中结构化观察点");
+        return check;
+    }
+
+    private Map<String, Object> validateTextWatchPoint(String watchPoint,
+                                                       Map<String, Object> quote,
+                                                       Map<String, Object> currentFacts) {
+        Map<String, Object> check = new LinkedHashMap<>();
+        String text = firstNonBlank(watchPoint, "");
+        if (!StringUtils.hasText(text)) {
+            return Collections.emptyMap();
+        }
+        String normalized = text.toLowerCase(Locale.ROOT);
+        check.put("type", "watch_point");
+        check.put("watchPoint", truncateText(text, 220));
+
+        Double mainInflow = currentNumber(quote, currentFacts,
+                "quote.mainInflow",
+                "currentFacts.anchorFacts.mainInflowYuan",
+                "anchorFacts.mainInflowYuan");
+        if (text.contains("主力") && (text.contains("流入") || text.contains("净流入"))) {
+            return verdictFromSignedValue(check, mainInflow, true, "主力净流入观察点");
+        }
+        if (text.contains("主力") && (text.contains("流出") || text.contains("净流出"))) {
+            return verdictFromSignedValue(check, mainInflow, false, "主力净流出观察点");
+        }
+
+        Double volumeRatio = currentNumber(quote, currentFacts,
+                "quote.volumeRatio",
+                "currentFacts.anchorFacts.volumeRatio",
+                "anchorFacts.volumeRatio");
+        if (text.contains("放量") || text.contains("量能") || normalized.contains("volume")) {
+            check.put("metricPath", "quote.volumeRatio");
+            if (volumeRatio == null) {
+                check.put("verdict", "UNRESOLVED");
+                check.put("reason", "本轮缺少量比，无法验证量能观察点");
+            } else if (volumeRatio >= 1.2) {
+                check.put("actualValue", volumeRatio);
+                check.put("verdict", "SUPPORTED");
+                check.put("reason", "本轮量比支持量能观察点");
+            } else if (volumeRatio < 1.0) {
+                check.put("actualValue", volumeRatio);
+                check.put("verdict", "WEAKENED");
+                check.put("reason", "本轮量比不足，削弱量能观察点");
+            } else {
+                check.put("actualValue", volumeRatio);
+                check.put("verdict", "UNRESOLVED");
+                check.put("reason", "本轮量比中性，量能观察点未决");
+            }
+            return check;
+        }
+
+        Double threshold = priceThreshold(text);
+        Double price = currentNumber(quote, currentFacts,
+                "quote.price",
+                "currentFacts.anchorFacts.priceYuan",
+                "anchorFacts.priceYuan",
+                "currentFacts.technicalIndicators.close",
+                "technicalIndicators.close");
+        if (threshold != null) {
+            check.put("metricPath", "quote.price");
+            check.put("threshold", threshold);
+            if (price == null) {
+                check.put("verdict", "UNRESOLVED");
+                check.put("reason", "本轮缺少价格，无法验证价格观察点");
+                return check;
+            }
+            check.put("actualValue", price);
+            if (containsAnyText(text, "突破", "站稳", "收复", "上攻", "挑战", "守住", "支撑")) {
+                check.put("operator", ">=");
+                check.put("verdict", price >= threshold ? "SUPPORTED" : "WEAKENED");
+                check.put("reason", price >= threshold ? "本轮价格达到/守住观察价位" : "本轮价格未达到/未守住观察价位");
+                return check;
+            }
+            if (containsAnyText(text, "跌破", "失守", "破位", "回落至", "回踩")) {
+                check.put("operator", "<=");
+                check.put("verdict", price <= threshold ? "SUPPORTED" : "WEAKENED");
+                check.put("reason", price <= threshold ? "本轮价格触及/跌破观察价位" : "本轮价格尚未触及观察价位");
+                return check;
+            }
+        }
+
+        check.put("verdict", "UNRESOLVED");
+        check.put("reason", "文本观察点未能映射到稳定事实字段");
+        return check;
+    }
+
+    private Map<String, Object> verdictFromSignedValue(Map<String, Object> check,
+                                                       Double value,
+                                                       boolean expectPositive,
+                                                       String label) {
+        check.put("metricPath", "quote.mainInflow");
+        if (value == null) {
+            check.put("verdict", "UNRESOLVED");
+            check.put("reason", "本轮缺少主力净流入，无法验证" + label);
+            return check;
+        }
+        check.put("actualValue", value);
+        boolean supported = expectPositive ? value > 0 : value < 0;
+        check.put("verdict", supported ? "SUPPORTED" : "WEAKENED");
+        check.put("reason", supported ? "本轮资金方向支持" + label : "本轮资金方向削弱" + label);
+        return check;
+    }
+
+    private String aggregatePriorVerdict(List<Map<String, Object>> checks) {
+        int supported = 0;
+        int weakened = 0;
+        int falsified = 0;
+        int unresolved = 0;
+        for (Map<String, Object> check : checks) {
+            String verdict = firstNonBlank(mapText(check, "verdict"), "UNRESOLVED");
+            switch (verdict) {
+                case "SUPPORTED":
+                    supported++;
+                    break;
+                case "WEAKENED":
+                    weakened++;
+                    break;
+                case "FALSIFIED":
+                    falsified++;
+                    break;
+                default:
+                    unresolved++;
+                    break;
+            }
+        }
+        if (falsified > 0) {
+            return "FALSIFIED";
+        }
+        if (supported > 0 && weakened == 0) {
+            return "SUPPORTED";
+        }
+        if (weakened > 0 && supported == 0) {
+            return "WEAKENED";
+        }
+        if (supported > 0 && weakened > 0) {
+            return "MIXED";
+        }
+        return unresolved > 0 ? "UNRESOLVED" : "UNRESOLVED";
+    }
+
+    private String priorValidationSummary(String verdict, List<Map<String, Object>> checks) {
+        long supported = checks.stream().filter(item -> "SUPPORTED".equals(item.get("verdict"))).count();
+        long weakened = checks.stream().filter(item -> "WEAKENED".equals(item.get("verdict"))).count();
+        long falsified = checks.stream().filter(item -> "FALSIFIED".equals(item.get("verdict"))).count();
+        long unresolved = checks.stream().filter(item -> "UNRESOLVED".equals(item.get("verdict"))).count();
+        return "verdict=" + verdict
+                + ", supported=" + supported
+                + ", weakened=" + weakened
+                + ", falsified=" + falsified
+                + ", unresolved=" + unresolved;
+    }
+
+    private Double currentNumber(Map<String, Object> quote, Map<String, Object> currentFacts, String... paths) {
+        for (String path : paths) {
+            Double value = resolveMetric(path, quote, currentFacts);
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private Double resolveMetric(String metricPath, Map<String, Object> quote, Map<String, Object> currentFacts) {
+        if (!StringUtils.hasText(metricPath)) {
+            return null;
+        }
+        String path = metricPath.trim();
+        if (path.startsWith("aiContext.")) {
+            path = path.substring("aiContext.".length());
+        }
+        Object value = null;
+        if (path.startsWith("quote.")) {
+            value = nestedValue(quote, path.substring("quote.".length()));
+        } else if (path.startsWith("currentFacts.")) {
+            value = nestedValue(currentFacts, path.substring("currentFacts.".length()));
+        } else {
+            value = nestedValue(quote, path);
+            if (value == null) {
+                value = nestedValue(currentFacts, path);
+            }
+        }
+        return number(value, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object nestedValue(Map<String, Object> source, String path) {
+        if (source == null || !StringUtils.hasText(path)) {
+            return null;
+        }
+        Object cursor = source;
+        for (String part : path.split("\\.")) {
+            if (!(cursor instanceof Map)) {
+                return null;
+            }
+            cursor = ((Map<String, Object>) cursor).get(part);
+            if (cursor == null) {
+                return null;
+            }
+        }
+        return cursor;
+    }
+
+    private boolean compare(double actual, String operator, double threshold) {
+        String op = firstNonBlank(operator, "").trim();
+        switch (op) {
+            case ">":
+                return actual > threshold;
+            case ">=":
+            case "gte":
+            case "GE":
+                return actual >= threshold;
+            case "<":
+                return actual < threshold;
+            case "<=":
+            case "lte":
+            case "LE":
+                return actual <= threshold;
+            case "==":
+            case "=":
+                return Math.abs(actual - threshold) < 0.000001;
+            case "!=":
+                return Math.abs(actual - threshold) >= 0.000001;
+            default:
+                return false;
+        }
+    }
+
+    private Double priceThreshold(String text) {
+        java.util.regex.Matcher matcher = PRICE_LEVEL_PATTERN.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        return number(matcher.group(1), null);
+    }
+
+    private boolean containsAnyText(String value, String... tokens) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        for (String token : tokens) {
+            if (value.contains(token)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String mapText(Map<?, ?> map, String key) {
+        Object value = map == null ? null : map.get(key);
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private Object firstNonNull(Object... values) {
+        if (values == null) {
+            return null;
+        }
+        for (Object value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private int effectiveTechnicalLookbackDays() {
+        return Math.max(1, Math.min(30, aiContextTechnicalLookbackDays));
+    }
+
+    private int effectiveTechnicalLimit() {
+        return Math.max(1, Math.min(96, aiContextTechnicalLimit));
+    }
+
+    private int effectiveTechnicalMaxChars() {
+        return Math.max(2_000, Math.min(30_000, aiContextTechnicalMaxChars));
+    }
+
+    private void trimTechnicalContextToMaxChars(Map<String, Object> context) {
+        Object rawRecords = context.get("records");
+        if (!(rawRecords instanceof List)) {
+            return;
+        }
+        List<?> records = (List<?>) rawRecords;
+        int maxChars = effectiveTechnicalMaxChars();
+        while (records.size() > 1 && JSON.toJSONString(context).length() > maxChars) {
+            records.remove(0);
+        }
+        context.put("recordCount", records.size());
+        if (JSON.toJSONString(context).length() > maxChars) {
+            context.put("truncatedByMaxChars", true);
+        }
+    }
+
+    private String analysisDateString(Date date) {
+        if (date == null) {
+            return "";
+        }
+        if (date instanceof java.sql.Date) {
+            return ((java.sql.Date) date).toLocalDate().toString();
+        }
+        return date.toInstant().atZone(CHINA_ZONE).toLocalDate().toString();
+    }
+
+    private String dateTimeString(Date date) {
+        if (date == null) {
+            return "";
+        }
+        try {
+            return date.toInstant().atZone(CHINA_ZONE).format(EVENT_TIME_FORMATTER);
+        } catch (Exception ignored) {
+            return String.valueOf(date);
+        }
+    }
+
+    private void putTextIfPresent(Map<String, Object> target, String key, String value, int maxChars) {
+        if (StringUtils.hasText(value)) {
+            target.put(key, truncateText(value.trim(), maxChars));
+        }
+    }
+
+    private List<String> compactJsonStringArray(String raw, int maxItems, int maxChars) {
+        if (!StringUtils.hasText(raw) || maxItems <= 0) {
+            return Collections.emptyList();
+        }
+        List<String> values = new ArrayList<>();
+        try {
+            Object parsed = JSON.parse(raw);
+            if (parsed instanceof JSONArray) {
+                JSONArray array = (JSONArray) parsed;
+                for (int i = 0; i < array.size() && values.size() < maxItems; i++) {
+                    addCompactString(values, array.get(i), maxChars);
+                }
+            } else if (parsed instanceof Collection) {
+                for (Object item : (Collection<?>) parsed) {
+                    if (values.size() >= maxItems) break;
+                    addCompactString(values, item, maxChars);
+                }
+            } else {
+                addCompactString(values, parsed, maxChars);
+            }
+        } catch (Exception ignored) {
+            addCompactString(values, raw, maxChars);
+        }
+        return values;
+    }
+
+    private void addCompactString(List<String> values, Object raw, int maxChars) {
+        if (raw == null || values.size() >= 100) {
+            return;
+        }
+        String value = String.valueOf(raw).trim();
+        if (StringUtils.hasText(value)) {
+            values.add(truncateText(value, maxChars));
+        }
+    }
+
+    private JSONObject parseJsonObject(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return null;
+        }
+        try {
+            return JSON.parseObject(raw);
+        } catch (Exception ignored) {
             return null;
         }
     }
 
-    private Map<String, Object> toTechnicalContext(StockWatchTechnicalAnalysis analysis) {
-        Map<String, Object> item = new LinkedHashMap<>();
-        item.put("id", analysis.getId());
-        item.put("analysisDate", String.valueOf(analysis.getAnalysisDate()));
-        item.put("runSlot", analysis.getRunSlot());
-        item.put("periodType", analysis.getPeriodType());
-        item.put("status", analysis.getStatus());
-        item.put("confidence", analysis.getConfidence());
-        item.put("gmtCreate", String.valueOf(analysis.getGmtCreate()));
-        item.put("usage", "metadata_only_do_not_use_as_trigger_fact");
-        item.put("excludedFields", Arrays.asList("title", "conclusion", "evidence", "mainForceIntent"));
-        return item;
+    private String truncateText(String value, int maxChars) {
+        if (value == null || maxChars <= 0) {
+            return "";
+        }
+        return value.length() <= maxChars ? value : value.substring(0, maxChars) + "...";
     }
 
     private String aiContextStatus(Map<String, Object> aiContext) {
@@ -501,6 +1443,48 @@ public class StockWatchMonitorService {
             return "not_required";
         }
         return firstNonBlank(String.valueOf(aiContext.get("status")), "available");
+    }
+
+    private void appendAiContextHistoryMetadata(Map<String, Object> event, Map<String, Object> aiContext) {
+        if (event == null || aiContext == null) {
+            return;
+        }
+        Object raw = aiContext.get("recentTechnicalAnalysis");
+        if (!(raw instanceof Map)) {
+            return;
+        }
+        Map<?, ?> history = (Map<?, ?>) raw;
+        event.put("ai_context_history_record_count", history.get("recordCount"));
+        event.put("ai_context_history_window_start", history.get("windowStart"));
+        event.put("ai_context_history_window_end", history.get("windowEnd"));
+        event.put("ai_context_history_usage", history.get("usage"));
+        event.put("ai_context_history_selection_policy", history.get("selectionPolicy"));
+        Map<String, Integer> priorVerdicts = priorValidationVerdictCounts(history.get("records"));
+        if (!priorVerdicts.isEmpty()) {
+            event.put("ai_context_history_prior_verdicts", priorVerdicts);
+        }
+    }
+
+    private Map<String, Integer> priorValidationVerdictCounts(Object rawRecords) {
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        if (!(rawRecords instanceof List)) {
+            return counts;
+        }
+        for (Object rawRecord : (List<?>) rawRecords) {
+            if (!(rawRecord instanceof Map)) {
+                continue;
+            }
+            Object rawValidation = ((Map<?, ?>) rawRecord).get("priorValidation");
+            if (!(rawValidation instanceof Map)) {
+                continue;
+            }
+            Object rawVerdict = ((Map<?, ?>) rawValidation).get("verdict");
+            String verdict = rawVerdict == null ? "" : String.valueOf(rawVerdict).trim();
+            if (StringUtils.hasText(verdict)) {
+                counts.put(verdict, counts.getOrDefault(verdict, 0) + 1);
+            }
+        }
+        return counts;
     }
 
     private void copyIfPresent(Map<String, Object> source, Map<String, Object> target, String key) {
@@ -593,7 +1577,78 @@ public class StockWatchMonitorService {
 
         appendSection(content, "五、观察条件");
         appendParagraph(content, compactCondition(rule.getConditionText()), "  ");
-        return sendAlertWithFrequencyGate(rule.getSymbol(), rule.getMarket(), rule.getName(), subject, content.toString(), now);
+        return sendAiAlertWithFrequencyGate(rule, subject, content.toString(), now);
+    }
+
+    private AlertSendResult sendAiAlertWithFrequencyGate(AiWatchRule rule,
+                                                         String subject,
+                                                         String content,
+                                                         ZonedDateTime now) {
+        StockWatchDeliveryConfig config = deliveryConfigMapper.selectBySymbolMarket(rule.getSymbol(), rule.getMarket());
+        if (config == null) {
+            return AlertSendResult.skipped("deliveryConfigMissing: 未配置单股邮件推送，不允许回退到全局邮箱");
+        }
+        String stateKey = aiAlertStateKey(rule);
+        boolean configEnabled = Boolean.TRUE.equals(config.getEnabled());
+        if (!configEnabled) {
+            return AlertSendResult.skipped("deliveryConfigDisabled: 单股邮件推送未启用");
+        }
+        List<String> recipients = parseRecipients(config.getRecipientsJson());
+        if (recipients.isEmpty()) {
+            return AlertSendResult.skipped("deliveryRecipientsMissing: 单股邮件配置没有有效收件人");
+        }
+        CooldownGate gate = aiDeliveryCooldownGate(config, stateKey, now);
+        if (!gate.due) {
+            return AlertSendResult.skipped("deliveryFrequencyBlocked: " + gate.reason);
+        }
+
+        NotificationService.EmailSendResult sendResult = notificationService.sendStockWatchAlertToRecipients(
+                subject,
+                content,
+                recipients,
+                null
+        );
+        if (sendResult.isSuccess()) {
+            deliveryConfigMapper.updateDispatchStatus(config.getId(), "SENT", "Stock Watch 预警已发送：" + subject, new Date());
+            markStockAlertSent(stockKey(config.getSymbol(), config.getMarket()), now);
+            return AlertSendResult.sent(sendResult.getMessageId(), "使用单股邮件配置发送");
+        }
+        String error = firstNonBlank(sendResult.getErrorMessage(), "SMTP 发送失败");
+        deliveryConfigMapper.updateDispatchStatus(config.getId(), "FAILED", "Stock Watch 预警发送失败：" + error, null);
+        return AlertSendResult.failed(error);
+    }
+
+    private CooldownGate aiDeliveryCooldownGate(StockWatchDeliveryConfig config, String stateKey, ZonedDateTime now) {
+        String frequency = firstNonBlank(config.getFrequencyType(), "MANUAL").toUpperCase(Locale.ROOT);
+        AiAlertState state = lastAiAlerts.get(stateKey);
+        ZonedDateTime lastSentAt = state == null ? null : parseEventTime(state.lastSentAt);
+        if ("MANUAL".equals(frequency)) {
+            return CooldownGate.blocked("邮件频率为手动发送");
+        }
+        if ("IMMEDIATE".equals(frequency)) {
+            return CooldownGate.allowed();
+        }
+        if ("INTERVAL".equals(frequency)) {
+            if (lastSentAt == null) {
+                return CooldownGate.allowed();
+            }
+            int interval = Math.max(effectiveIntervalMinutes(config.getIntervalMinutes()), effectiveAiAlertCooldownMinutes());
+            long elapsed = Duration.between(lastSentAt, now).toMinutes();
+            return elapsed >= interval
+                    ? CooldownGate.allowed()
+                    : CooldownGate.blocked("AI发送频率未到：已过 " + Math.max(0, elapsed) + " 分钟 / 间隔 " + interval + " 分钟");
+        }
+        if ("DAILY_CLOSE".equals(frequency)) {
+            LocalTime closeDispatchTime = LocalTime.of(15, 10);
+            if (now.toLocalTime().isBefore(closeDispatchTime)) {
+                return CooldownGate.blocked("发送频率为收盘后发送，当前未到 15:10");
+            }
+            boolean notSentToday = lastSentAt == null || lastSentAt.toLocalDate().isBefore(now.toLocalDate());
+            return notSentToday
+                    ? CooldownGate.allowed()
+                    : CooldownGate.blocked("今日已发送过该股票AI邮件");
+        }
+        return CooldownGate.blocked("未知邮件频率：" + frequency);
     }
 
     private AlertSendResult sendAlertWithFrequencyGate(String symbol,
@@ -805,6 +1860,9 @@ public class StockWatchMonitorService {
         Set<String> activeAiRules = aiRules.stream()
                 .map(rule -> normalizeSymbol(rule.getSymbol()) + ":" + rule.getId())
                 .collect(Collectors.toSet());
+        Set<String> activeAiAlertKeys = aiRules.stream()
+                .map(this::aiAlertStateKey)
+                .collect(Collectors.toSet());
         Set<String> activeStocks = new LinkedHashSet<>();
         rules.forEach(rule -> activeStocks.add(stockKey(rule.symbol, rule.market)));
         aiRules.forEach(rule -> activeStocks.add(stockKey(rule.getSymbol(), rule.getMarket())));
@@ -812,6 +1870,7 @@ public class StockWatchMonitorService {
         ruleStates.keySet().removeIf(key -> !activeSupportRules.contains(key));
         sentSignalKeys.removeIf(key -> !isActiveSentSignal(key, activeSupportRules, activeAiRules));
         lastAlertAtByStock.keySet().removeIf(key -> !activeStocks.contains(key));
+        lastAiAlerts.keySet().removeIf(key -> !activeAiAlertKeys.contains(key));
     }
 
     private boolean isActiveSentSignal(String key,
@@ -930,8 +1989,10 @@ public class StockWatchMonitorService {
                 return false;
             default:
                 LocalTime time = now.toLocalTime();
-                return (!time.isBefore(LocalTime.of(9, 30)) && !time.isAfter(LocalTime.of(11, 30)))
-                        || (!time.isBefore(LocalTime.of(13, 0)) && !time.isAfter(LocalTime.of(15, 0)));
+                // The monitor serves both mainland and Hong Kong symbols. Use the union of
+                // their continuous trading sessions so HK quotes remain monitored until 16:00.
+                return (!time.isBefore(LocalTime.of(9, 30)) && !time.isAfter(LocalTime.of(12, 0)))
+                        || (!time.isBefore(LocalTime.of(13, 0)) && !time.isAfter(LocalTime.of(16, 0)));
         }
     }
 
@@ -1019,6 +2080,17 @@ public class StockWatchMonitorService {
                     }
                 }
             }
+            JSONObject aiAlerts = root.getJSONObject("lastAiAlerts");
+            if (aiAlerts != null) {
+                for (String key : aiAlerts.keySet()) {
+                    JSONObject value = aiAlerts.getJSONObject(key);
+                    AiAlertState state = parseAiAlertState(value);
+                    if (StringUtils.hasText(key) && state != null) {
+                        lastAiAlerts.put(key, state);
+                    }
+                }
+                trimAiAlertState();
+            }
             if (lastAlertAtByStock.isEmpty() && !sentSignalKeys.isEmpty()) {
                 String migratedAt = firstNonBlank(root.getString("savedAt"), ZonedDateTime.now(CHINA_ZONE).format(EVENT_TIME_FORMATTER));
                 for (String signalKey : sentSignalKeys) {
@@ -1044,6 +2116,7 @@ public class StockWatchMonitorService {
             root.put("ruleStates", stateSnapshot());
             root.put("sentSignalKeys", new ArrayList<>(sentSignalKeys));
             root.put("lastAlertAtByStock", new LinkedHashMap<>(lastAlertAtByStock));
+            root.put("lastAiAlerts", aiAlertStateSnapshot());
             root.put("savedAt", ZonedDateTime.now(CHINA_ZONE).format(EVENT_TIME_FORMATTER));
             Files.write(file, JSON.toJSONString(root, true).getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
@@ -1064,6 +2137,48 @@ public class StockWatchMonitorService {
             snapshot.put(entry.getKey(), item);
         }
         return snapshot;
+    }
+
+    private Map<String, Object> aiAlertStateSnapshot() {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        for (Map.Entry<String, AiAlertState> entry : lastAiAlerts.entrySet()) {
+            AiAlertState state = entry.getValue();
+            if (state == null) {
+                continue;
+            }
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("lastSentAt", state.lastSentAt);
+            item.put("signalShapeFingerprint", state.signalShapeFingerprint);
+            item.put("severityRank", state.severityRank);
+            item.put("riskScore", state.riskScore);
+            item.put("riskTier", state.riskTier);
+            item.put("normalizedFacts", new LinkedHashMap<>(state.normalizedFacts));
+            item.put("reason", state.reason);
+            item.put("source", state.source);
+            snapshot.put(entry.getKey(), item);
+        }
+        return snapshot;
+    }
+
+    private AiAlertState parseAiAlertState(JSONObject value) {
+        if (value == null) {
+            return null;
+        }
+        AiAlertState state = new AiAlertState();
+        state.lastSentAt = value.getString("lastSentAt");
+        state.signalShapeFingerprint = value.getString("signalShapeFingerprint");
+        state.severityRank = integer(value.get("severityRank"), 0);
+        state.riskScore = integer(value.get("riskScore"), 0);
+        state.riskTier = value.getString("riskTier");
+        state.reason = value.getString("reason");
+        state.source = value.getString("source");
+        JSONObject facts = value.getJSONObject("normalizedFacts");
+        if (facts != null) {
+            for (String key : facts.keySet()) {
+                state.normalizedFacts.put(key, facts.get(key));
+            }
+        }
+        return state;
     }
 
     private Path stateFile() {
@@ -1088,6 +2203,14 @@ public class StockWatchMonitorService {
         }
     }
 
+    private void trimAiAlertState() {
+        int max = 1000;
+        while (lastAiAlerts.size() > max) {
+            String first = lastAiAlerts.keySet().iterator().next();
+            lastAiAlerts.remove(first);
+        }
+    }
+
     private boolean isAiDuplicate(LocalDate today, AiWatchRule rule) {
         int cooldownDays = rule.getCooldownDays() == null ? 1 : Math.max(1, rule.getCooldownDays());
         for (int i = 0; i < cooldownDays; i++) {
@@ -1102,8 +2225,16 @@ public class StockWatchMonitorService {
         return date + ":AI:" + rule.getSymbol() + ":" + rule.getId();
     }
 
+    private String aiAlertStateKey(AiWatchRule rule) {
+        return stockKey(rule.getSymbol(), rule.getMarket()) + ":" + rule.getId();
+    }
+
     private int effectiveDefaultAlertIntervalMinutes() {
         return Math.max(5, Math.min(24 * 60, defaultAlertIntervalMinutes));
+    }
+
+    private int effectiveAiAlertCooldownMinutes() {
+        return Math.max(5, Math.min(240, aiAlertCooldownMinutes));
     }
 
     private int effectiveIntervalMinutes(Integer intervalMinutes) {
@@ -1124,7 +2255,7 @@ public class StockWatchMonitorService {
     private String stockKey(String symbol, String market) {
         return firstNonBlank(symbol, "").toLowerCase(Locale.ROOT)
                 + "."
-                + firstNonBlank(market, inferMarket(firstNonBlank(symbol, ""))).toLowerCase(Locale.ROOT);
+                + firstNonBlank(market, StockSymbol.inferMarket(firstNonBlank(symbol, ""))).toLowerCase(Locale.ROOT);
     }
 
     private String stockKeyFromSentSignal(String signalKey) {
@@ -1138,7 +2269,7 @@ public class StockWatchMonitorService {
         } else if (parts.length >= 2) {
             symbol = parts[1];
         }
-        return symbol.matches("\\d{6}") ? stockKey(symbol, inferMarket(symbol)) : "";
+        return symbol.matches("\\d{5,6}") ? stockKey(symbol, StockSymbol.inferMarket(symbol)) : "";
     }
 
     private List<String> parseRecipients(Object raw) {
@@ -1183,31 +2314,8 @@ public class StockWatchMonitorService {
     }
 
     private StockRef parseStockRef(String raw) {
-        if (!StringUtils.hasText(raw)) {
-            return null;
-        }
-        String value = raw.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj)[._-]?(\\d{6})$")
-                .matcher(value);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), prefixed.group(1));
-        }
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$")
-                .matcher(value);
-        if (!suffixed.matches()) {
-            return null;
-        }
-        String symbol = suffixed.group(1);
-        String market = StringUtils.hasText(suffixed.group(2)) ? suffixed.group(2) : inferMarket(symbol);
-        return new StockRef(symbol, market);
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol.startsWith("6") || symbol.startsWith("9")) return "sh";
-        if (symbol.startsWith("4") || symbol.startsWith("8")) return "bj";
-        return "sz";
+        StockSymbol normalized = StockSymbol.tryParse(raw, "");
+        return normalized == null ? null : new StockRef(normalized.getSymbol(), normalized.getMarket());
     }
 
     private String normalizeSymbol(String symbol) {
@@ -1265,6 +2373,60 @@ public class StockWatchMonitorService {
         return String.format(Locale.ROOT, "%.2f", value);
     }
 
+    private String directionalBucket(Double value, double deadZone) {
+        if (value == null) {
+            return "missing";
+        }
+        if (value > deadZone) {
+            return "up";
+        }
+        if (value < -deadZone) {
+            return "down";
+        }
+        return "flat";
+    }
+
+    private int absBucket(Double value, double bucketSize) {
+        if (value == null || bucketSize <= 0) {
+            return 0;
+        }
+        return (int) Math.floor(Math.abs(value) / bucketSize);
+    }
+
+    private int severityRank(String severity) {
+        String normalized = firstNonBlank(severity, "").toLowerCase(Locale.ROOT);
+        if (Arrays.asList("critical", "severe", "danger", "red", "high").contains(normalized)) {
+            return 4;
+        }
+        if (Arrays.asList("risk", "warning", "warn", "amber", "medium").contains(normalized)) {
+            return 3;
+        }
+        if (Arrays.asList("watch", "notice", "yellow", "low").contains(normalized)) {
+            return 2;
+        }
+        if (Arrays.asList("info", "neutral", "green").contains(normalized)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    private String riskTier(int riskScore) {
+        if (riskScore >= 8) {
+            return "high";
+        }
+        if (riskScore >= 5) {
+            return "medium";
+        }
+        return "low";
+    }
+
+    private int integerFromMap(Map<String, Object> values, String key, int fallback) {
+        if (values == null) {
+            return fallback;
+        }
+        return integer(values.get(key), fallback);
+    }
+
     private static class SupportBreakRule {
         private String symbol;
         private String market;
@@ -1285,6 +2447,71 @@ public class StockWatchMonitorService {
         private Double lastPrice;
         private String lastEvaluatedAt;
         private String lastSeedSource;
+    }
+
+    private static class AiAlertState {
+        private String lastSentAt;
+        private String signalShapeFingerprint;
+        private int severityRank;
+        private int riskScore;
+        private String riskTier;
+        private Map<String, Object> normalizedFacts = new LinkedHashMap<>();
+        private String reason;
+        private String source;
+    }
+
+    private static class AiSignalSnapshot {
+        private String signalShapeFingerprint;
+        private Map<String, Object> normalizedFacts = new LinkedHashMap<>();
+        private int severityRank;
+        private int riskScore;
+        private String riskTier;
+    }
+
+    private static class AiAlertGate {
+        private final boolean allowed;
+        private final boolean duplicate;
+        private final String reason;
+        private final boolean signalShapeChanged;
+        private final boolean severityRankUp;
+        private final boolean materialRiskDelta;
+
+        private AiAlertGate(boolean allowed,
+                            boolean duplicate,
+                            String reason,
+                            boolean signalShapeChanged,
+                            boolean severityRankUp,
+                            boolean materialRiskDelta) {
+            this.allowed = allowed;
+            this.duplicate = duplicate;
+            this.reason = reason;
+            this.signalShapeChanged = signalShapeChanged;
+            this.severityRankUp = severityRankUp;
+            this.materialRiskDelta = materialRiskDelta;
+        }
+
+        private static AiAlertGate allowed(String reason) {
+            return allowed(reason, false, false, false);
+        }
+
+        private static AiAlertGate allowed(String reason,
+                                           boolean signalShapeChanged,
+                                           boolean severityRankUp,
+                                           boolean materialRiskDelta) {
+            return new AiAlertGate(true, false, reason, signalShapeChanged, severityRankUp, materialRiskDelta);
+        }
+
+        private static AiAlertGate blocked(String reason, boolean duplicate) {
+            return blocked(reason, duplicate, false, false, false);
+        }
+
+        private static AiAlertGate blocked(String reason,
+                                           boolean duplicate,
+                                           boolean signalShapeChanged,
+                                           boolean severityRankUp,
+                                           boolean materialRiskDelta) {
+            return new AiAlertGate(false, duplicate, reason, signalShapeChanged, severityRankUp, materialRiskDelta);
+        }
     }
 
     private static class CooldownGate {

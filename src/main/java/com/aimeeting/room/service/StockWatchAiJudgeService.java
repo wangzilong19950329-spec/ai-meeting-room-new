@@ -35,7 +35,7 @@ public class StockWatchAiJudgeService {
             "你是A股盯盘规则判断器，只能基于用户提供的结构化数据判断，不能编造实时行情。",
             "你的任务是判断用户的自然语言观察条件是否已经命中。",
             "必须只输出一个JSON对象，不要输出Markdown、解释性前后缀或代码块。",
-            "JSON字段固定为：triggered(boolean), confidence(number 0-1), severity(string), shouldNotify(boolean), reason(string), analysis(string), matchedSignals(array), missingData(array)。",
+            "JSON字段固定为：triggered(boolean), confidence(number 0-1), severity(string), shouldNotify(boolean), reason(string), analysis(string), matchedSignals(array), missingData(array), beliefUpdate(object，可为空)。",
             "reason只写简洁的事实触发依据；analysis必须给出真正的分析，包括异动含义、持续性判断、主要风险和下一步观察点，不要重复阈值公式。",
             "如果数据不足，triggered=false，missingData列出缺失字段。",
             "如果条件语义模糊但有明显风险，可以提高severity，但confidence必须体现不确定性。"
@@ -51,6 +51,9 @@ public class StockWatchAiJudgeService {
 
     @Value("${stock-watch.ai-rules.bridge-read-timeout-seconds:210}")
     private int bridgeReadTimeoutSeconds;
+
+    @Value("${stock-watch.ai-rules.bridge-first:false}")
+    private boolean bridgeFirst;
 
     public StockWatchAiJudgeService(AiModelRouter aiModelRouter) {
         this.aiModelRouter = aiModelRouter;
@@ -70,10 +73,15 @@ public class StockWatchAiJudgeService {
         String userPrompt = buildPrompt(rule, quote, now, aiContext);
         String raw = null;
         try {
-            raw = aiModelRouter.chat(model, SYSTEM_PROMPT, userPrompt, 900);
-            if (!StringUtils.hasText(raw)) {
+            if (shouldUseBridgeFirst(model)) {
                 actualModel = "deepseek-web";
                 raw = callDeepSeekWebBridgeWithRetry(rule, userPrompt);
+            } else {
+                raw = aiModelRouter.chat(model, SYSTEM_PROMPT, userPrompt, 900);
+                if (!StringUtils.hasText(raw)) {
+                    actualModel = "deepseek-web";
+                    raw = callDeepSeekWebBridgeWithRetry(rule, userPrompt);
+                }
             }
             if (!StringUtils.hasText(raw)) {
                 if (structuredDecision != null) {
@@ -108,9 +116,11 @@ public class StockWatchAiJudgeService {
             decision.setAnalysis(text(parsed.get("analysis"), decision.getReason()));
             decision.setMatchedSignals(toStringList(parsed.getJSONArray("matchedSignals")));
             decision.setMissingData(toStringList(parsed.getJSONArray("missingData")));
+            decision.setBeliefUpdate(toObjectMap(parsed.get("beliefUpdate")));
             decision.setRawResponse(raw);
             decision.setModel(actualModel);
             decision.setOk(true);
+            guardHistoricalTriggerSource(decision);
             return mergeStructuredDecision(structuredDecision, decision);
         } catch (Exception e) {
             log.warn("DeepSeek stock-watch rule judgment failed ruleId={} model={} error={}",
@@ -123,6 +133,17 @@ public class StockWatchAiJudgeService {
             }
             return AiDecision.failed("模型判断异常：" + e.getMessage(), raw);
         }
+    }
+
+    private boolean shouldUseBridgeFirst(String model) {
+        if (bridgeFirst) {
+            return true;
+        }
+        String normalized = model == null ? "" : model.trim().toLowerCase(Locale.ROOT);
+        return "deepseek-web".equals(normalized)
+                || "deepseek_web".equals(normalized)
+                || "deepseek-web-bridge".equals(normalized)
+                || "deepseek_web_bridge".equals(normalized);
     }
 
     private AiDecision judgeStructuredQuoteRule(AiWatchRule rule, Map<String, Object> quote) {
@@ -224,6 +245,45 @@ public class StockWatchAiJudgeService {
         return modelDecision;
     }
 
+    private void guardHistoricalTriggerSource(AiDecision decision) {
+        if (decision == null || !decision.isTriggered()) {
+            return;
+        }
+        if (!mentionsHistoricalTriggerSource(decision.getReason())
+                && !mentionsHistoricalTriggerSource(decision.getMatchedSignals())) {
+            return;
+        }
+        decision.setTriggered(false);
+        decision.setShouldNotify(false);
+        decision.setConfidence(Math.min(decision.getConfidence(), 0.49));
+        decision.setReason("模型触发依据引用历史技术分析，已按本轮事实边界拦截；历史技术分析仅保留为analysis背景。");
+        decision.setMatchedSignals(new ArrayList<>());
+    }
+
+    private boolean mentionsHistoricalTriggerSource(List<String> values) {
+        if (values == null) {
+            return false;
+        }
+        for (String value : values) {
+            if (mentionsHistoricalTriggerSource(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean mentionsHistoricalTriggerSource(String value) {
+        if (!StringUtils.hasText(value)) {
+            return false;
+        }
+        String normalized = value.toLowerCase(Locale.ROOT);
+        return normalized.contains("recenttechnicalanalysis")
+                || normalized.contains("历史技术分析")
+                || normalized.contains("历史分析")
+                || normalized.contains("历史mainforceintent")
+                || normalized.contains("mainforceintent");
+    }
+
     private List<String> mergeLists(List<String> first, List<String> second) {
         List<String> merged = new ArrayList<>();
         if (first != null) {
@@ -251,8 +311,8 @@ public class StockWatchAiJudgeService {
         if (aiContext != null && !aiContext.isEmpty()) {
             payload.put("aiContext", sanitizeAiContext(aiContext));
         }
-        payload.put("factPriority", "事实优先级：本轮quote实时行情 > aiContext.currentFacts本轮增强摘要；aiContext.recentTechnicalAnalysis仅为历史记录元数据，不含可触发结论文本。");
-        payload.put("instruction", "判断 rule.conditionText 是否被本轮数据命中。优先使用quote；aiContext.status=available时可参考currentFacts；recentTechnicalAnalysis只能证明历史分析存在，不能作为触发事实或补充主力意图。不要猜测缺失数据。");
+        payload.put("factPriority", "事实优先级：本轮quote实时行情 > aiContext.currentFacts本轮增强摘要 > aiContext.recentTechnicalAnalysis.records[].priorValidation程序化历史验证；recentTechnicalAnalysis历史技术分析只能用于analysis/beliefUpdate里的主力意图连续性、反证、风险和观察点。");
+        payload.put("instruction", "判断 rule.conditionText 是否被本轮数据命中。triggered、reason、matchedSignals只能引用quote或aiContext.currentFacts里的本轮事实；不得用recentTechnicalAnalysis、历史技术分析、历史mainForceIntent或priorValidation作为本轮触发依据。analysis必须结合recentTechnicalAnalysis.records[].priorValidation说明过去两周每轮技术判断中哪些被支持、削弱、证伪或仍未决，并在beliefUpdate里输出当前主力意图连续判断、被证伪/缩小的旧假设、下一轮最关键观察点。若历史结论与本轮事实冲突，以本轮事实为准。不要猜测缺失数据。");
         return JSON.toJSONString(payload, true);
     }
 
@@ -281,17 +341,72 @@ public class StockWatchAiJudgeService {
             return sanitized;
         }
         Map<?, ?> source = (Map<?, ?>) raw;
-        copyContextField(source, sanitized, "id");
-        copyContextField(source, sanitized, "analysisDate");
-        copyContextField(source, sanitized, "runSlot");
-        copyContextField(source, sanitized, "periodType");
         copyContextField(source, sanitized, "status");
-        copyContextField(source, sanitized, "confidence");
-        copyContextField(source, sanitized, "gmtCreate");
+        copyContextField(source, sanitized, "lookbackDays");
+        copyContextField(source, sanitized, "windowStart");
+        copyContextField(source, sanitized, "windowEnd");
+        copyContextField(source, sanitized, "recordCount");
+        copyContextField(source, sanitized, "maxRecords");
+        copyContextField(source, sanitized, "selectionPolicy");
         copyContextField(source, sanitized, "usage");
-        copyContextField(source, sanitized, "excludedFields");
+        copyContextField(source, sanitized, "truncatedByMaxChars");
+        Object records = source.get("records");
+        if (records instanceof List) {
+            List<Object> sanitizedRecords = new ArrayList<>();
+            for (Object record : (List<?>) records) {
+                if (sanitizedRecords.size() >= 48) {
+                    break;
+                }
+                Map<String, Object> sanitizedRecord = sanitizeTechnicalRecord(record);
+                if (!sanitizedRecord.isEmpty()) {
+                    sanitizedRecords.add(sanitizedRecord);
+                }
+            }
+            if (!sanitizedRecords.isEmpty()) {
+                sanitized.put("records", sanitizedRecords);
+                sanitized.put("recordCount", sanitizedRecords.size());
+            }
+        } else {
+            Map<String, Object> singleRecord = sanitizeTechnicalRecord(source);
+            if (!singleRecord.isEmpty()) {
+                sanitized.put("records", List.of(singleRecord));
+                sanitized.put("recordCount", 1);
+            }
+        }
         if (!sanitized.containsKey("usage")) {
-            sanitized.put("usage", "metadata_only_do_not_use_as_trigger_fact");
+            sanitized.put("usage", "historical_analysis_only_for_analysis_continuity_not_trigger_fact");
+        }
+        return sanitized;
+    }
+
+    private Map<String, Object> sanitizeTechnicalRecord(Object raw) {
+        Map<String, Object> sanitized = new LinkedHashMap<>();
+        if (!(raw instanceof Map)) {
+            return sanitized;
+        }
+        Map<?, ?> source = (Map<?, ?>) raw;
+        copyContextField(source, sanitized, "id");
+        copyTextContextField(source, sanitized, "date", 20);
+        copyTextContextField(source, sanitized, "analysisDate", 20);
+        copyTextContextField(source, sanitized, "time", 16);
+        copyTextContextField(source, sanitized, "runSlot", 16);
+        copyTextContextField(source, sanitized, "periodType", 16);
+        copyTextContextField(source, sanitized, "status", 24);
+        copyTextContextField(source, sanitized, "stance", 24);
+        copyTextContextField(source, sanitized, "tone", 24);
+        copyContextField(source, sanitized, "confidence");
+        copyTextContextField(source, sanitized, "title", 90);
+        copyTextContextField(source, sanitized, "conclusion", 280);
+        copyStringListContextField(source, sanitized, "evidence", 3, 140);
+        copyStringListContextField(source, sanitized, "missingData", 3, 120);
+        Map<String, Object> intent = sanitizeMainForceIntent(source.get("mainForceIntent"));
+        if (!intent.isEmpty()) {
+            sanitized.put("mainForceIntent", intent);
+        }
+        copyTextContextField(source, sanitized, "mainForceIntentStatus", 40);
+        Map<String, Object> priorValidation = sanitizePriorValidation(source.get("priorValidation"));
+        if (!priorValidation.isEmpty()) {
+            sanitized.put("priorValidation", priorValidation);
         }
         return sanitized;
     }
@@ -299,6 +414,179 @@ public class StockWatchAiJudgeService {
     private void copyContextField(Map<?, ?> source, Map<String, Object> target, String key) {
         if (source.containsKey(key)) {
             target.put(key, source.get(key));
+        }
+    }
+
+    private void copyTextContextField(Map<?, ?> source, Map<String, Object> target, String key, int maxLength) {
+        if (!source.containsKey(key) || source.get(key) == null) {
+            return;
+        }
+        String value = String.valueOf(source.get(key)).trim();
+        if (StringUtils.hasText(value)) {
+            target.put(key, truncate(value, maxLength));
+        }
+    }
+
+    private void copyStringListContextField(Map<?, ?> source,
+                                            Map<String, Object> target,
+                                            String key,
+                                            int maxItems,
+                                            int maxLength) {
+        Object raw = source.get(key);
+        List<String> values = sanitizeStringList(raw, maxItems, maxLength);
+        if (!values.isEmpty()) {
+            target.put(key, values);
+        }
+    }
+
+    private Map<String, Object> sanitizeMainForceIntent(Object raw) {
+        Map<String, Object> sanitized = new LinkedHashMap<>();
+        if (!(raw instanceof Map)) {
+            return sanitized;
+        }
+        Map<?, ?> source = (Map<?, ?>) raw;
+        copyContextField(source, sanitized, "schemaVersion");
+        copyTextContextField(source, sanitized, "hypothesisId", 64);
+        copyTextContextField(source, sanitized, "intent", 32);
+        copyTextContextField(source, sanitized, "timeWindow", 32);
+        copyContextField(source, sanitized, "confidence");
+        copyStringListContextField(source, sanitized, "evidence", 3, 140);
+        copyStringListContextField(source, sanitized, "counterEvidence", 3, 140);
+        copyStringListContextField(source, sanitized, "assumptions", 3, 120);
+        copyTextContextField(source, sanitized, "risk", 180);
+        List<Object> watchPoints = sanitizeWatchPoints(source.get("watchPoints"), 6);
+        if (!watchPoints.isEmpty()) {
+            sanitized.put("watchPoints", watchPoints);
+        }
+        copyStringListContextField(source, sanitized, "validatedEvidencePaths", 5, 160);
+        copyContextField(source, sanitized, "previousAnalysisId");
+        copyContextField(source, sanitized, "sourceAnalysisIds");
+        Map<String, Object> lastValidation = sanitizePriorValidation(source.get("lastValidation"));
+        if (!lastValidation.isEmpty()) {
+            sanitized.put("lastValidation", lastValidation);
+        }
+        copyTextContextField(source, sanitized, "invalidatedAt", 40);
+        copyTextContextField(source, sanitized, "invalidatedBy", 180);
+        return sanitized;
+    }
+
+    private Map<String, Object> sanitizePriorValidation(Object raw) {
+        Map<String, Object> sanitized = new LinkedHashMap<>();
+        if (!(raw instanceof Map)) {
+            return sanitized;
+        }
+        Map<?, ?> source = (Map<?, ?>) raw;
+        copyTextContextField(source, sanitized, "verdict", 24);
+        copyTextContextField(source, sanitized, "validatedAt", 40);
+        copyContextField(source, sanitized, "sourceAnalysisId");
+        copyContextField(source, sanitized, "basedOn");
+        copyTextContextField(source, sanitized, "summary", 240);
+        Object checks = source.get("checks");
+        if (checks instanceof List) {
+            List<Object> sanitizedChecks = new ArrayList<>();
+            for (Object item : (List<?>) checks) {
+                if (sanitizedChecks.size() >= 8) {
+                    break;
+                }
+                Map<String, Object> check = sanitizePriorValidationCheck(item);
+                if (!check.isEmpty()) {
+                    sanitizedChecks.add(check);
+                }
+            }
+            if (!sanitizedChecks.isEmpty()) {
+                sanitized.put("checks", sanitizedChecks);
+            }
+        }
+        return sanitized;
+    }
+
+    private Map<String, Object> sanitizePriorValidationCheck(Object raw) {
+        Map<String, Object> sanitized = new LinkedHashMap<>();
+        if (!(raw instanceof Map)) {
+            return sanitized;
+        }
+        Map<?, ?> source = (Map<?, ?>) raw;
+        copyTextContextField(source, sanitized, "type", 32);
+        copyTextContextField(source, sanitized, "verdict", 24);
+        copyTextContextField(source, sanitized, "reason", 180);
+        copyTextContextField(source, sanitized, "intent", 32);
+        copyTextContextField(source, sanitized, "watchPoint", 180);
+        copyTextContextField(source, sanitized, "metricPath", 120);
+        copyTextContextField(source, sanitized, "operator", 12);
+        copyContextField(source, sanitized, "threshold");
+        copyContextField(source, sanitized, "actualValue");
+        copyContextField(source, sanitized, "mainInflow");
+        copyContextField(source, sanitized, "changePercent");
+        return sanitized;
+    }
+
+    private List<Object> sanitizeWatchPoints(Object raw, int maxItems) {
+        List<Object> values = new ArrayList<>();
+        if (raw instanceof JSONArray) {
+            JSONArray array = (JSONArray) raw;
+            for (int i = 0; i < array.size() && values.size() < maxItems; i++) {
+                addSanitizedWatchPoint(values, array.get(i));
+            }
+        } else if (raw instanceof List) {
+            for (Object item : (List<?>) raw) {
+                if (values.size() >= maxItems) break;
+                addSanitizedWatchPoint(values, item);
+            }
+        } else if (raw != null) {
+            addSanitizedWatchPoint(values, raw);
+        }
+        return values;
+    }
+
+    private void addSanitizedWatchPoint(List<Object> values, Object raw) {
+        if (raw instanceof Map) {
+            Map<?, ?> source = (Map<?, ?>) raw;
+            Map<String, Object> item = new LinkedHashMap<>();
+            copyTextContextField(source, item, "metricPath", 120);
+            copyTextContextField(source, item, "path", 120);
+            copyTextContextField(source, item, "operator", 12);
+            copyTextContextField(source, item, "op", 12);
+            copyContextField(source, item, "threshold");
+            copyContextField(source, item, "value");
+            copyTextContextField(source, item, "window", 32);
+            copyTextContextField(source, item, "expiry", 40);
+            copyTextContextField(source, item, "description", 180);
+            copyContextField(source, item, "falsifyOnMiss");
+            if (!item.isEmpty()) {
+                values.add(item);
+            }
+            return;
+        }
+        if (raw != null && StringUtils.hasText(String.valueOf(raw))) {
+            values.add(truncate(String.valueOf(raw).trim(), 160));
+        }
+    }
+
+    private List<String> sanitizeStringList(Object raw, int maxItems, int maxLength) {
+        List<String> values = new ArrayList<>();
+        if (raw instanceof JSONArray) {
+            JSONArray array = (JSONArray) raw;
+            for (int i = 0; i < array.size() && values.size() < maxItems; i++) {
+                addSanitizedString(values, array.get(i), maxLength);
+            }
+        } else if (raw instanceof List) {
+            for (Object item : (List<?>) raw) {
+                if (values.size() >= maxItems) break;
+                addSanitizedString(values, item, maxLength);
+            }
+        } else if (raw != null) {
+            addSanitizedString(values, raw, maxLength);
+        }
+        return values;
+    }
+
+    private void addSanitizedString(List<String> values, Object raw, int maxLength) {
+        if (raw == null) {
+            return;
+        }
+        String value = String.valueOf(raw).trim();
+        if (StringUtils.hasText(value)) {
+            values.add(truncate(value, maxLength));
         }
     }
 
@@ -484,6 +772,21 @@ public class StockWatchAiJudgeService {
         return values;
     }
 
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> toObjectMap(Object raw) {
+        Map<String, Object> values = new LinkedHashMap<>();
+        if (!(raw instanceof Map)) {
+            return values;
+        }
+        Map<?, ?> source = (Map<?, ?>) raw;
+        for (Map.Entry<?, ?> entry : source.entrySet()) {
+            if (entry.getKey() != null) {
+                values.put(String.valueOf(entry.getKey()), entry.getValue());
+            }
+        }
+        return values;
+    }
+
     @Data
     public static class AiDecision {
         private boolean ok;
@@ -495,6 +798,7 @@ public class StockWatchAiJudgeService {
         private String analysis;
         private List<String> matchedSignals = new ArrayList<>();
         private List<String> missingData = new ArrayList<>();
+        private Map<String, Object> beliefUpdate = new LinkedHashMap<>();
         private String rawResponse;
         private String model;
 

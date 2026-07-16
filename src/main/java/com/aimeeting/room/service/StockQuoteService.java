@@ -41,13 +41,13 @@ public class StockQuoteService {
             .build();
 
     public List<Map<String, Object>> fetchQuotes(String rawSymbols) {
-        List<StockRef> refs = parseStockRefs(rawSymbols);
+        List<StockSymbol> refs = parseStockRefs(rawSymbols);
         if (refs.isEmpty()) {
             return Collections.emptyList();
         }
 
         String secids = refs.stream()
-                .map(StockRef::secid)
+                .map(StockSymbol::eastmoneySecid)
                 .distinct()
                 .collect(Collectors.joining(","));
 
@@ -94,7 +94,15 @@ public class StockQuoteService {
                 }
 
                 return refs.stream()
-                        .map(ref -> byCode.getOrDefault(ref.symbol, failedQuote(ref, "eastmoney_missing")))
+                        .map(ref -> {
+                            Map<String, Object> quote = byCode.get(ref.getSymbol());
+                            if (quote == null) {
+                                return failedQuote(ref, "eastmoney_missing");
+                            }
+                            Map<String, Object> normalized = new LinkedHashMap<>(quote);
+                            normalized.put("market", ref.getMarket());
+                            return normalized;
+                        })
                         .collect(Collectors.toList());
             } catch (Exception e) {
                 lastError = e;
@@ -146,23 +154,23 @@ public class StockQuoteService {
         return quote;
     }
 
-    private Map<String, Object> failedQuote(StockRef ref, String reason) {
+    private Map<String, Object> failedQuote(StockSymbol ref, String reason) {
         Map<String, Object> quote = new LinkedHashMap<>();
         quote.put("ok", false);
         quote.put("source", "Eastmoney quote");
-        quote.put("symbol", ref.symbol);
-        quote.put("market", ref.market);
+        quote.put("symbol", ref.getSymbol());
+        quote.put("market", ref.getMarket());
         quote.put("reason", reason);
         return quote;
     }
 
-    private List<StockRef> parseStockRefs(String rawSymbols) {
+    private List<StockSymbol> parseStockRefs(String rawSymbols) {
         if (rawSymbols == null || rawSymbols.trim().isEmpty()) {
             return Collections.emptyList();
         }
-        List<StockRef> refs = new ArrayList<>();
+        List<StockSymbol> refs = new ArrayList<>();
         for (String token : rawSymbols.split("[,;\\s]+")) {
-            StockRef ref = parseStockRef(token);
+            StockSymbol ref = StockSymbol.tryParse(token, "");
             if (ref != null) {
                 refs.add(ref);
             }
@@ -170,54 +178,8 @@ public class StockQuoteService {
         return refs;
     }
 
-    private StockRef parseStockRef(String raw) {
-        if (raw == null) {
-            return null;
-        }
-        String value = raw.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
-        if (value.isEmpty()) {
-            return null;
-        }
-
-        java.util.regex.Matcher prefixed = java.util.regex.Pattern
-                .compile("^(sh|sz|bj)[._-]?(\\d{6})$")
-                .matcher(value);
-        if (prefixed.matches()) {
-            return new StockRef(prefixed.group(2), prefixed.group(1));
-        }
-
-        java.util.regex.Matcher suffixed = java.util.regex.Pattern
-                .compile("^(\\d{6})(?:[._-]?(sh|sz|bj))?$")
-                .matcher(value);
-        if (!suffixed.matches()) {
-            return null;
-        }
-        String symbol = suffixed.group(1);
-        String market = suffixed.group(2) != null ? suffixed.group(2) : inferMarket(symbol);
-        return new StockRef(symbol, market);
-    }
-
-    private String inferMarket(String symbol) {
-        if (symbol == null) {
-            return "sh";
-        }
-        if (symbol.startsWith("6") || symbol.startsWith("9")) {
-            return "sh";
-        }
-        if (symbol.startsWith("4") || symbol.startsWith("8")) {
-            return "bj";
-        }
-        return "sz";
-    }
-
     private String marketFromEastmoney(Integer value, String symbol) {
-        if (value != null && value == 1) {
-            return "sh";
-        }
-        if (symbol != null && (symbol.startsWith("4") || symbol.startsWith("8"))) {
-            return "bj";
-        }
-        return "sz";
+        return StockSymbol.marketFromEastmoney(value, symbol);
     }
 
     private Double readDouble(Object value) {
@@ -255,17 +217,4 @@ public class StockQuoteService {
         return Instant.ofEpochSecond(timestamp).atZone(CHINA_ZONE).format(formatter);
     }
 
-    private static class StockRef {
-        private final String symbol;
-        private final String market;
-
-        private StockRef(String symbol, String market) {
-            this.symbol = symbol;
-            this.market = market;
-        }
-
-        private String secid() {
-            return ("sh".equals(market) ? "1" : "0") + "." + symbol;
-        }
-    }
 }

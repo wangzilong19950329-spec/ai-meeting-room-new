@@ -128,6 +128,40 @@
         LIMIT #{limit}
     </select>
 
+    <select id="selectLatestSuccessfulDailyByDateRange" resultMap="BaseResultMap">
+        SELECT t.* FROM stock_watch_technical_analysis t
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.status = 'SUCCESS'
+          AND t.analysis_date &gt;= #{startDate}
+          AND t.analysis_date &lt;= #{endDate}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          AND t.id = (
+              SELECT t2.id FROM stock_watch_technical_analysis t2
+              WHERE t2.symbol = t.symbol
+                AND t2.market = t.market
+                AND t2.status = 'SUCCESS'
+                AND t2.analysis_date = t.analysis_date
+                AND COALESCE(t2.period_type, 'DAY') = COALESCE(t.period_type, 'DAY')
+              ORDER BY t2.gmt_create DESC, t2.id DESC
+              LIMIT 1
+          )
+        ORDER BY t.analysis_date DESC, t.gmt_create DESC, t.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectRecentSuccessfulSlotsByDateRange" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND status = 'SUCCESS'
+          AND analysis_date &gt;= #{startDate}
+          AND analysis_date &lt;= #{endDate}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+        ORDER BY analysis_date DESC, run_slot DESC, gmt_create DESC, id DESC
+        LIMIT #{limit}
+    </select>
+
     <select id="selectSuccessfulSince" resultMap="BaseResultMap">
         SELECT * FROM stock_watch_technical_analysis
         WHERE symbol = #{symbol}

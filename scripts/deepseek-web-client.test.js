@@ -11,7 +11,11 @@ const {
   normalizeResult,
   normalizeBridgeMode,
   buildModeState,
-  isFatalCompletionCaptureError
+  isFatalCompletionCaptureError,
+  extractUserDataDirFromCommandLine,
+  normalizeAccountKey,
+  parseProfilePathFromChromeVersionText,
+  resolveWorkerConfig
 } = require('./deepseek-web-client')._internals;
 
 test('buildTurnSignature is stable across whitespace-only rendering differences', () => {
@@ -27,6 +31,151 @@ test('normalizeBridgeMode accepts per-request professional mode aliases', () => 
   assert.equal(normalizeBridgeMode('professional'), 'expert');
   assert.equal(normalizeBridgeMode('fast'), 'fast');
   assert.equal(normalizeBridgeMode(''), 'fast');
+});
+
+test('non-default account worker uses isolated profile/session store by default', () => {
+  const previousBootstrap = process.env.DEEPSEEK_WEB_PROFILE_BOOTSTRAP;
+  delete process.env.DEEPSEEK_WEB_PROFILE_BOOTSTRAP;
+  try {
+    const accountKey = 'unit-account-isolation-test';
+    const worker = resolveWorkerConfig({ accountKey });
+
+    assert.equal(worker.accountKey, accountKey);
+    assert.equal(worker.profileBootstrap, 'empty');
+    assert.match(worker.profileRoot, /deepseek-web-unit-account-isolation-test-profile$/);
+    assert.match(worker.sessionStorePath, /deepseek-web-unit-account-isolation-test-sessions\.json$/);
+    assert.notEqual(worker.debugPort, resolveWorkerConfig().debugPort);
+  } finally {
+    if (previousBootstrap === undefined) {
+      delete process.env.DEEPSEEK_WEB_PROFILE_BOOTSTRAP;
+    } else {
+      process.env.DEEPSEEK_WEB_PROFILE_BOOTSTRAP = previousBootstrap;
+    }
+  }
+});
+
+test('two non-default account workers do not share debug port, profile, or session store', () => {
+  const left = resolveWorkerConfig({ accountKey: 'unit-two-account-left' });
+  const right = resolveWorkerConfig({ accountKey: 'unit-two-account-right' });
+
+  assert.notEqual(left.debugPort, right.debugPort);
+  assert.notEqual(left.profileRoot, right.profileRoot);
+  assert.notEqual(left.sessionStorePath, right.sessionStorePath);
+  assert.equal(left.profileBootstrap, 'empty');
+  assert.equal(right.profileBootstrap, 'empty');
+});
+
+test('account worker config accepts explicit per-account environment overrides', () => {
+  const accountKey = 'unit-env-account';
+  const suffix = 'UNIT_ENV_ACCOUNT';
+  const previous = {
+    debugPort: process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_DEBUG_PORT`],
+    profileRoot: process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_PROFILE_ROOT`],
+    sessionStore: process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_SESSION_STORE`],
+    chromeLog: process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_CHROME_LOG`],
+    bootstrap: process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_PROFILE_BOOTSTRAP`]
+  };
+  process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_DEBUG_PORT`] = '19444';
+  process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_PROFILE_ROOT`] = '/tmp/deepseek-web-unit-env-profile';
+  process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_SESSION_STORE`] = '/tmp/deepseek-web-unit-env-sessions.json';
+  process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_CHROME_LOG`] = '/tmp/deepseek-web-unit-env-chrome.log';
+  process.env[`DEEPSEEK_WEB_ACCOUNT_${suffix}_PROFILE_BOOTSTRAP`] = 'copy';
+  try {
+    const worker = resolveWorkerConfig({ accountKey });
+
+    assert.equal(normalizeAccountKey('unit env/account'), 'unit_env_account');
+    assert.equal(worker.debugPort, 19444);
+    assert.equal(worker.profileRoot, '/tmp/deepseek-web-unit-env-profile');
+    assert.equal(worker.sessionStorePath, '/tmp/deepseek-web-unit-env-sessions.json');
+    assert.equal(worker.chromeLogPath, '/tmp/deepseek-web-unit-env-chrome.log');
+    assert.equal(worker.profileBootstrap, 'copy');
+  } finally {
+    for (const [name, value] of Object.entries({
+      DEBUG_PORT: previous.debugPort,
+      PROFILE_ROOT: previous.profileRoot,
+      SESSION_STORE: previous.sessionStore,
+      CHROME_LOG: previous.chromeLog,
+      PROFILE_BOOTSTRAP: previous.bootstrap
+    })) {
+      const envKey = `DEEPSEEK_WEB_ACCOUNT_${suffix}_${name}`;
+      if (value === undefined) {
+        delete process.env[envKey];
+      } else {
+        process.env[envKey] = value;
+      }
+    }
+  }
+});
+
+test('account worker config rejects profile, session store, and debug port conflicts', () => {
+  const suffix = (accountKey) => accountKey.replace(/[^a-zA-Z0-9]/g, '_').toUpperCase();
+  const setEnv = (accountKey, values) => {
+    const envSuffix = suffix(accountKey);
+    for (const [name, value] of Object.entries(values)) {
+      process.env[`DEEPSEEK_WEB_ACCOUNT_${envSuffix}_${name}`] = String(value);
+    }
+  };
+  const clearEnv = (accountKey) => {
+    const envSuffix = suffix(accountKey);
+    for (const name of ['DEBUG_PORT', 'PROFILE_ROOT', 'SESSION_STORE', 'CHROME_LOG', 'PROFILE_BOOTSTRAP']) {
+      delete process.env[`DEEPSEEK_WEB_ACCOUNT_${envSuffix}_${name}`];
+    }
+  };
+
+  const base = 'unit-conflict-base';
+  const sameProfile = 'unit-conflict-same-profile';
+  const sameSession = 'unit-conflict-same-session';
+  const samePort = 'unit-conflict-same-port';
+  try {
+    setEnv(base, {
+      DEBUG_PORT: 19550,
+      PROFILE_ROOT: '/tmp/dswb-unit-conflict-profile-a',
+      SESSION_STORE: '/tmp/dswb-unit-conflict-sessions-a.json',
+      CHROME_LOG: '/tmp/dswb-unit-conflict-a.log'
+    });
+    setEnv(sameProfile, {
+      DEBUG_PORT: 19551,
+      PROFILE_ROOT: '/tmp/dswb-unit-conflict-profile-a',
+      SESSION_STORE: '/tmp/dswb-unit-conflict-sessions-b.json',
+      CHROME_LOG: '/tmp/dswb-unit-conflict-b.log'
+    });
+    setEnv(sameSession, {
+      DEBUG_PORT: 19552,
+      PROFILE_ROOT: '/tmp/dswb-unit-conflict-profile-c',
+      SESSION_STORE: '/tmp/dswb-unit-conflict-sessions-a.json',
+      CHROME_LOG: '/tmp/dswb-unit-conflict-c.log'
+    });
+    setEnv(samePort, {
+      DEBUG_PORT: 19550,
+      PROFILE_ROOT: '/tmp/dswb-unit-conflict-profile-d',
+      SESSION_STORE: '/tmp/dswb-unit-conflict-sessions-d.json',
+      CHROME_LOG: '/tmp/dswb-unit-conflict-d.log'
+    });
+
+    resolveWorkerConfig({ accountKey: base });
+    assert.throws(() => resolveWorkerConfig({ accountKey: sameProfile }), /profile conflict/);
+    assert.throws(() => resolveWorkerConfig({ accountKey: sameSession }), /session store conflict/);
+    assert.throws(() => resolveWorkerConfig({ accountKey: samePort }), /debug port conflict/);
+  } finally {
+    for (const accountKey of [base, sameProfile, sameSession, samePort]) {
+      clearEnv(accountKey);
+    }
+  }
+});
+
+test('debugger profile helpers read user-data-dir and chrome version profile path', () => {
+  assert.equal(
+    extractUserDataDirFromCommandLine(['chrome', '--flag', '--user-data-dir=/tmp/dswb-profile']),
+    '/tmp/dswb-profile'
+  );
+  assert.equal(
+    extractUserDataDirFromCommandLine(['chrome', '--user-data-dir', '/tmp/dswb-profile-2']),
+    '/tmp/dswb-profile-2'
+  );
+  assert.equal(
+    parseProfilePathFromChromeVersionText('Executable Path /Applications/Chrome\nProfile Path /tmp/dswb-profile/Default\nCommand Line ...'),
+    '/tmp/dswb-profile/Default'
+  );
 });
 
 test('expert mode state does not treat deep-think alone as professional mode', () => {
@@ -177,10 +326,16 @@ test('normalizeResult marks active timeout text as incomplete instead of success
     candidateTexts: [{ text: '这是一段仍在生成中的会议分析正文，已经超过四十个字符但没有完成。' }],
     links: [],
     completionReason: 'timeout_with_last_state',
+    accountKey: 'stock',
+    debugPort: 9344,
+    profileRoot: '/tmp/deepseek-stock-profile',
     generationActive: true
   });
 
   assert.equal(result.contentStatus, 'incomplete');
   assert.equal(result.completionReason, 'timeout_with_last_state');
+  assert.equal(result.accountKey, 'stock');
+  assert.equal(result.debugPort, 9344);
+  assert.equal(result.profileRoot, '/tmp/deepseek-stock-profile');
   assert.equal(result.generationActive, true);
 });

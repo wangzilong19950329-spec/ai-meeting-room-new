@@ -150,6 +150,10 @@ stock-watch:
     scan-interval-ms: ${STOCK_WATCH_SCAN_INTERVAL_MS:600000}
     initial-delay-ms: ${STOCK_WATCH_INITIAL_DELAY_MS:30000}
     symbols: ${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}
+    ai-alert-cooldown-minutes: ${STOCK_WATCH_AI_ALERT_COOLDOWN_MINUTES:30}
+    ai-context-technical-lookback-days: ${STOCK_WATCH_AI_CONTEXT_TECHNICAL_LOOKBACK_DAYS:14}
+    ai-context-technical-limit: ${STOCK_WATCH_AI_CONTEXT_TECHNICAL_LIMIT:48}
+    ai-context-technical-max-chars: ${STOCK_WATCH_AI_CONTEXT_TECHNICAL_MAX_CHARS:16000}
     # 旧版价格规则仅在显式配置 STOCK_WATCH_RULES 时启用，禁止注入不可见的演示规则。
     # 格式：symbol.market:ruleId:support:requiredBreakDays:severity
     rules: ${STOCK_WATCH_RULES:}
@@ -157,6 +161,10 @@ stock-watch:
   ai-rules:
     store-file: ${STOCK_WATCH_AI_RULES_FILE:}
     default-model: ${STOCK_WATCH_AI_MODEL:deepseek-chat}
+    bridge-url: ${STOCK_WATCH_AI_RULES_BRIDGE_URL:${STOCK_WATCH_TECH_BRIDGE_URL:${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}}}
+    bridge-first: ${STOCK_WATCH_AI_RULES_BRIDGE_FIRST:false}
+    bridge-connect-timeout-seconds: ${STOCK_WATCH_AI_RULES_BRIDGE_CONNECT_TIMEOUT_SECONDS:10}
+    bridge-read-timeout-seconds: ${STOCK_WATCH_AI_RULES_BRIDGE_READ_TIMEOUT_SECONDS:210}
   technical-analysis:
     enabled: ${STOCK_WATCH_TECH_ANALYSIS_ENABLED:true}
     trading-hours-only: ${STOCK_WATCH_TECH_TRADING_HOURS_ONLY:true}
