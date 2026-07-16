@@ -49,6 +49,8 @@ class StockWatchMonitorServiceTest {
     @Mock private StockWatchDeliveryConfigMapper deliveryConfigMapper;
     @Mock private EastmoneyMarketDataService marketDataService;
     @Mock private StockWatchTechnicalAnalysisMapper technicalAnalysisMapper;
+    @Mock private StockWatchRiskPatternService riskPatternService;
+    @Mock private StockWatchFactPersistenceService factPersistenceService;
 
     @TempDir private Path tempDir;
 
@@ -63,7 +65,9 @@ class StockWatchMonitorServiceTest {
                 aiJudgeService,
                 deliveryConfigMapper,
                 marketDataService,
-                technicalAnalysisMapper
+                technicalAnalysisMapper,
+                riskPatternService,
+                factPersistenceService
         );
         ReflectionTestUtils.setField(service, "enabled", true);
         ReflectionTestUtils.setField(service, "notifyEnabled", true);
@@ -127,7 +131,7 @@ class StockWatchMonitorServiceTest {
         Map<?, ?> evaluation = (Map<?, ?>) ((List<?>) result.get("evaluations")).get(0);
 
         assertEquals("not_required", evaluation.get("aiContextStatus"));
-        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString());
+        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString(), anyMap());
         verify(technicalAnalysisMapper, never()).selectLatestSuccessfulBySymbolSince(anyString(), anyString(), anyString(), any());
     }
 
@@ -157,7 +161,7 @@ class StockWatchMonitorServiceTest {
         verify(aiJudgeService).judge(eq(rule), eq(quote), any(ZonedDateTime.class), contextCaptor.capture());
 
         assertEquals("available", evaluation.get("aiContextStatus"));
-        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString());
+        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString(), anyMap());
         Map<String, Object> recent = (Map<String, Object>) contextCaptor.getValue().get("recentTechnicalAnalysis");
         assertEquals(1, recent.get("recordCount"));
         List<Map<String, Object>> records = (List<Map<String, Object>>) recent.get("records");
@@ -171,7 +175,8 @@ class StockWatchMonitorServiceTest {
         AiWatchRule rule = aiRule("enhanced-rule", "002979", "sz", "雷赛智能", "技术面跌破MA20且主力资金流恶化");
         Map<String, Object> quote = quote("002979", "sz", "雷赛智能");
         when(aiRuleService.listEnabled()).thenReturn(Collections.singletonList(rule));
-        when(marketDataService.buildBundle("002979", "sz", "DAY")).thenThrow(new IllegalStateException("eastmoney timeout"));
+        when(marketDataService.buildBundle(eq("002979"), eq("sz"), eq("DAY"), eq(quote)))
+                .thenThrow(new IllegalStateException("eastmoney timeout"));
         when(aiJudgeService.judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap()))
                 .thenReturn(decision(false));
 
@@ -202,7 +207,8 @@ class StockWatchMonitorServiceTest {
         when(technicalAnalysisMapper.selectRecentSuccessfulSlotsByDateRange(
                 eq("002979"), eq("sz"), any(), any(), eq("DAY"), eq(14)))
                 .thenReturn(Collections.singletonList(history));
-        when(marketDataService.buildBundle("002979", "sz", "DAY")).thenThrow(new IllegalStateException("eastmoney timeout"));
+        when(marketDataService.buildBundle(eq("002979"), eq("sz"), eq("DAY"), eq(quote)))
+                .thenThrow(new IllegalStateException("eastmoney timeout"));
         when(aiJudgeService.judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap()))
                 .thenReturn(decision(false));
 
@@ -239,7 +245,7 @@ class StockWatchMonitorServiceTest {
                 Collections.emptyList()
         );
         when(aiRuleService.listEnabled()).thenReturn(Collections.singletonList(rule));
-        when(marketDataService.buildBundle("002979", "sz", "DAY")).thenReturn(bundle);
+        when(marketDataService.buildBundle(eq("002979"), eq("sz"), eq("DAY"), eq(quote))).thenReturn(bundle);
         when(aiJudgeService.judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap()))
                 .thenReturn(decision(false));
 
@@ -282,7 +288,7 @@ class StockWatchMonitorServiceTest {
         analysis.setMainForceIntentJson("{\"intent\":\"DISTRIBUTE\",\"timeWindow\":\"FIVE_DAY\",\"confidence\":0.73}");
         analysis.setMainForceIntentStatus("VALID");
         when(aiRuleService.listEnabled()).thenReturn(Collections.singletonList(rule));
-        when(marketDataService.buildBundle("002979", "sz", "DAY")).thenReturn(bundle);
+        when(marketDataService.buildBundle(eq("002979"), eq("sz"), eq("DAY"), eq(quote))).thenReturn(bundle);
         when(technicalAnalysisMapper.selectRecentSuccessfulSlotsByDateRange(
                 eq("002979"), eq("sz"), any(), any(), eq("DAY"), eq(14)))
                 .thenReturn(Collections.singletonList(analysis));
@@ -407,7 +413,7 @@ class StockWatchMonitorServiceTest {
 
         assertFalse(Boolean.TRUE.equals(evaluation.get("triggered")));
         assertEquals("AI观察条件未启用", evaluation.get("reason"));
-        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString());
+        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString(), anyMap());
         verify(aiJudgeService, never()).judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap());
     }
 
@@ -430,7 +436,7 @@ class StockWatchMonitorServiceTest {
 
         assertFalse(Boolean.TRUE.equals(evaluation.get("triggered")));
         assertEquals("行情缺失或抓取失败，未调用DeepSeek判断", evaluation.get("reason"));
-        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString());
+        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString(), anyMap());
         verify(aiJudgeService, never()).judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap());
     }
 

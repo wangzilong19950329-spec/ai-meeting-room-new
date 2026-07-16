@@ -9,6 +9,7 @@ import com.aimeeting.room.entity.StockWatchDeliveryConfig;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
+import com.aimeeting.room.service.StockWatchRiskPatternService.RiskPatternResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -58,6 +59,8 @@ public class StockWatchMonitorService {
     private final StockWatchDeliveryConfigMapper deliveryConfigMapper;
     private final EastmoneyMarketDataService marketDataService;
     private final StockWatchTechnicalAnalysisMapper technicalAnalysisMapper;
+    private final StockWatchRiskPatternService riskPatternService;
+    private final StockWatchFactPersistenceService factPersistenceService;
     private final Map<String, RuleState> ruleStates = new LinkedHashMap<>();
     private final Set<String> sentSignalKeys = new LinkedHashSet<>();
     private final Map<String, String> lastAlertAtByStock = new LinkedHashMap<>();
@@ -110,7 +113,9 @@ public class StockWatchMonitorService {
                                     StockWatchAiJudgeService aiJudgeService,
                                     StockWatchDeliveryConfigMapper deliveryConfigMapper,
                                     EastmoneyMarketDataService marketDataService,
-                                    StockWatchTechnicalAnalysisMapper technicalAnalysisMapper) {
+                                    StockWatchTechnicalAnalysisMapper technicalAnalysisMapper,
+                                    StockWatchRiskPatternService riskPatternService,
+                                    StockWatchFactPersistenceService factPersistenceService) {
         this.stockQuoteService = stockQuoteService;
         this.notificationService = notificationService;
         this.aiRuleService = aiRuleService;
@@ -118,6 +123,8 @@ public class StockWatchMonitorService {
         this.deliveryConfigMapper = deliveryConfigMapper;
         this.marketDataService = marketDataService;
         this.technicalAnalysisMapper = technicalAnalysisMapper;
+        this.riskPatternService = riskPatternService;
+        this.factPersistenceService = factPersistenceService;
     }
 
     @Scheduled(
@@ -158,13 +165,13 @@ public class StockWatchMonitorService {
         boolean ignoreTradingHours = bool(request.get("ignoreTradingHours"), false);
         Boolean notifyOverride = nullableBool(request.get("notify"));
         boolean notify = notifyOverride != null ? notifyOverride : notifyEnabled;
+        List<SupportBreakRule> rules = resolveRules(request.get("rules"));
+        List<AiWatchRule> aiRules = resolveAiRules(request.get("aiRules"));
         if (tradingHoursOnly && !ignoreTradingHours && !isTradingSession(now)) {
             lastRunStatus = "skipped_non_trading_session";
             return buildRunResult(now, reason, true, "非交易时段，跳过盯盘扫描", Collections.emptyList());
         }
 
-        List<SupportBreakRule> rules = resolveRules(request.get("rules"));
-        List<AiWatchRule> aiRules = resolveAiRules(request.get("aiRules"));
         if (!request.containsKey("rules") && !request.containsKey("aiRules")) {
             pruneInactiveRuleState(rules, aiRules);
         }
@@ -179,6 +186,8 @@ public class StockWatchMonitorService {
                 ));
 
         List<Map<String, Object>> evaluations = new ArrayList<>();
+        Map<String, RiskPatternResult> riskPatternsByStock = buildRiskPatterns(aiRules, quoteBySymbol, now);
+        List<Map<String, Object>> factObservations = persistRiskFacts(riskPatternsByStock, quoteBySymbol, now);
         for (SupportBreakRule rule : rules) {
             Map<String, Object> quote = quoteBySymbol.get(rule.symbol);
             Map<String, Object> evaluation = evaluateRule(rule, quote, now, notify);
@@ -186,13 +195,22 @@ public class StockWatchMonitorService {
         }
         for (AiWatchRule rule : aiRules) {
             Map<String, Object> quote = quoteBySymbol.get(normalizeSymbol(rule.getSymbol()));
-            Map<String, Object> evaluation = evaluateAiRule(rule, quote, now, notify);
+            Map<String, Object> evaluation = evaluateAiRule(
+                    rule,
+                    quote,
+                    riskPatternsByStock.get(stockKey(rule.getSymbol(), rule.getMarket())),
+                    now,
+                    notify
+            );
             evaluations.add(evaluation);
         }
 
         saveStateQuietly();
         lastRunStatus = "success";
-        return buildRunResult(now, reason, false, "盯盘扫描完成", evaluations);
+        Map<String, Object> result = buildRunResult(now, reason, false, "盯盘扫描完成", evaluations);
+        result.put("factObservations", factObservations);
+        result.put("factObservationCount", factObservations.size());
+        return result;
     }
 
     public synchronized Map<String, Object> status() {
@@ -318,6 +336,7 @@ public class StockWatchMonitorService {
 
     private Map<String, Object> evaluateAiRule(AiWatchRule rule,
                                                Map<String, Object> quote,
+                                               RiskPatternResult riskPattern,
                                                ZonedDateTime now,
                                                boolean notify) {
         Map<String, Object> result = new LinkedHashMap<>();
@@ -329,6 +348,8 @@ public class StockWatchMonitorService {
         result.put("conditionText", rule.getConditionText());
         result.put("minConfidence", rule.getMinConfidence());
         result.put("severity", rule.getSeverity());
+        result.put("requiredCapabilities", rule.getRequiredCapabilities());
+        result.put("riskPatternTriggerMode", rule.getRiskPatternTriggerMode());
 
         if (!rule.isEnabled()) {
             result.put("triggered", false);
@@ -345,10 +366,24 @@ public class StockWatchMonitorService {
             return result;
         }
 
-        Map<String, Object> aiContext = buildAiContext(rule, quote, now);
-        AiDecision decision = aiJudgeService.judge(rule, quote, now, aiContext);
+        Map<String, Object> aiContext = buildAiContext(rule, quote, riskPattern, now);
+        AiDecision decision = rule.isGeneralLegacy()
+                ? aiJudgeService.judge(rule, quote, now, aiContext)
+                : aiJudgeService.judgeDeterministic(rule, quote);
+        if (rule.requiresRiskPattern() && riskPattern != null && riskPattern.hasTriggeredPattern()) {
+            decision.setTriggered(true);
+            decision.setShouldNotify(true);
+            decision.setConfidence(1.0);
+            decision.setSeverity(rule.getSeverity());
+            decision.setReason(triggeredRiskPatternReason(riskPattern));
+            decision.setAnalysis("本地L0风险结构已命中；连续主力意图解释由同一 observation 的技术分析任务统一生成。");
+            decision.setMatchedSignals(triggeredRiskPatternIds(riskPattern));
+            decision.setModel("deterministic-risk-pattern");
+        }
         boolean confidenceMet = decision.getConfidence() >= rule.getMinConfidence();
-        boolean triggered = decision.isTriggered() && confidenceMet;
+        boolean modelReportedTriggered = decision.isTriggered() && confidenceMet;
+        RuleCapabilityGate capabilityGate = evaluateRuleCapabilityGate(rule, decision, riskPattern, modelReportedTriggered);
+        boolean triggered = modelReportedTriggered && capabilityGate.allowed;
         LocalDate today = now.toLocalDate();
         AiSignalSnapshot signalSnapshot = buildAiSignalSnapshot(rule, quote, decision);
         AiAlertGate alertGate = evaluateAiAlertGate(rule, quote, decision, signalSnapshot, now, notify, confidenceMet, triggered, today);
@@ -369,6 +404,10 @@ public class StockWatchMonitorService {
         event.put("severity", decision.getSeverity());
         event.put("condition_text", rule.getConditionText());
         event.put("triggered", triggered);
+        event.put("model_reported_triggered", modelReportedTriggered);
+        event.put("trigger_evidence_policy", capabilityGate.policy);
+        event.put("trigger_evidence_allowed", capabilityGate.allowed);
+        event.put("trigger_evidence_gate_reason", capabilityGate.reason);
         event.put("confidence", decision.getConfidence());
         event.put("min_confidence", rule.getMinConfidence());
         event.put("reason", decision.getReason());
@@ -378,6 +417,9 @@ public class StockWatchMonitorService {
         event.put("quote", quote);
         event.put("ai_context_status", aiContextStatus(aiContext));
         event.put("ai_context_missing_data", aiContext == null ? Collections.emptyList() : aiContext.get("missingData"));
+        if (riskPattern != null) {
+            event.put("risk_pattern_observations", riskPattern.getObservations());
+        }
         appendAiContextHistoryMetadata(event, aiContext);
         event.put("ai_alert_state_key", aiAlertStateKey(rule));
         event.put("ai_signal_shape_fingerprint", signalSnapshot.signalShapeFingerprint);
@@ -398,6 +440,15 @@ public class StockWatchMonitorService {
         }
 
         result.put("triggered", triggered);
+        result.put("modelReportedTriggered", modelReportedTriggered);
+        result.put("triggerEvidencePolicy", capabilityGate.policy);
+        result.put("triggerEvidenceAllowed", capabilityGate.allowed);
+        result.put("triggerEvidenceGateReason", capabilityGate.reason);
+        result.put("alertTriggerConfidence", decision.getConfidence());
+        result.put("alertTriggerConfidenceSemantics", decision.getModel() != null && decision.getModel().startsWith("deterministic")
+                ? "deterministic_match_indicator_not_probability"
+                : "model_reported_rule_match_confidence_not_calibrated_price_probability");
+        result.put("riskPatternObservations", riskPattern == null ? null : riskPattern.getObservations());
         result.put("confidenceMet", confidenceMet);
         result.put("decision", decision);
         result.put("reason", decision.getReason());
@@ -599,10 +650,13 @@ public class StockWatchMonitorService {
         trimAiAlertState();
     }
 
-    private Map<String, Object> buildAiContext(AiWatchRule rule, Map<String, Object> quote, ZonedDateTime now) {
+    private Map<String, Object> buildAiContext(AiWatchRule rule,
+                                               Map<String, Object> quote,
+                                               RiskPatternResult riskPattern,
+                                               ZonedDateTime now) {
         boolean enhanced = requiresEnhancedAiContext(rule);
         Map<String, Object> recentTechnical = recentTechnicalAnalysisContext(rule, now, quote);
-        if (!enhanced && recentTechnical.isEmpty()) {
+        if (!enhanced && recentTechnical.isEmpty() && riskPattern == null) {
             return Collections.emptyMap();
         }
 
@@ -613,13 +667,20 @@ public class StockWatchMonitorService {
         if (!recentTechnical.isEmpty()) {
             context.put("recentTechnicalAnalysis", recentTechnical);
         }
+        if (riskPattern != null) {
+            Map<String, Object> currentFacts = new LinkedHashMap<>();
+            currentFacts.put("riskPatternObservations", riskPattern.getObservations());
+            context.put("currentFacts", currentFacts);
+            context.put("riskPatternGuidance", riskPattern.getGuidance());
+        }
 
         if (!enhanced) {
             return context;
         }
 
         try {
-            EastmoneyMarketDataService.MarketDataBundle bundle = marketDataService.buildBundle(rule.getSymbol(), rule.getMarket(), "DAY");
+            EastmoneyMarketDataService.MarketDataBundle bundle = marketDataService.buildBundle(
+                    rule.getSymbol(), rule.getMarket(), "DAY", quote);
             if (bundle == null) {
                 markMarketDataUnavailable(context, !recentTechnical.isEmpty(), "market_data_bundle_empty");
                 return context;
@@ -636,7 +697,9 @@ public class StockWatchMonitorService {
             context.put("source", "EastmoneyMarketDataService.buildBundle compact summary");
             context.put("asOf", payload.get("asOf"));
 
-            Map<String, Object> currentFacts = new LinkedHashMap<>();
+            Map<String, Object> currentFacts = context.get("currentFacts") instanceof Map
+                    ? new LinkedHashMap<>((Map<String, Object>) context.get("currentFacts"))
+                    : new LinkedHashMap<>();
             copyIfPresent(payload, currentFacts, "anchorFacts");
             copyIfPresent(payload, currentFacts, "technicalIndicators");
             copyIfPresent(payload, currentFacts, "valuation");
@@ -661,6 +724,113 @@ public class StockWatchMonitorService {
                     firstNonBlank(e.getMessage(), e.getClass().getSimpleName()));
             return context;
         }
+    }
+
+    private Map<String, RiskPatternResult> buildRiskPatterns(List<AiWatchRule> aiRules,
+                                                              Map<String, Map<String, Object>> quoteBySymbol,
+                                                              ZonedDateTime now) {
+        Map<String, RiskPatternResult> results = new LinkedHashMap<>();
+        Set<String> stocks = aiRules.stream()
+                .filter(AiWatchRule::usesRiskPattern)
+                .map(rule -> stockKey(rule.getSymbol(), rule.getMarket()))
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        for (String stock : stocks) {
+            String[] parts = stock.split(":", 2);
+            String symbol = parts[0];
+            String market = parts.length > 1 ? parts[1] : "";
+            Map<String, Object> quote = quoteBySymbol.get(normalizeSymbol(symbol));
+            List<Map<String, Object>> dailyBars;
+            try {
+                dailyBars = marketDataService.fetchDailyBars(symbol, market, 80);
+            } catch (Exception e) {
+                log.warn("stock-watch L0 daily bars unavailable symbol={}.{} error={}", symbol, market, e.getMessage());
+                dailyBars = Collections.emptyList();
+            }
+            RiskPatternResult result = riskPatternService.analyze(symbol, market, quote, dailyBars, now);
+            results.put(stock, result);
+            log.info("stock-watch L0 evaluated symbol={}.{} status={} active={} triggered={}",
+                    symbol, market, result.getObservations().get("evaluationStatus"),
+                    result.isActive(), result.hasTriggeredPattern());
+        }
+        return results;
+    }
+
+    private RuleCapabilityGate evaluateRuleCapabilityGate(AiWatchRule rule,
+                                                            AiDecision decision,
+                                                            RiskPatternResult riskPattern,
+                                                            boolean modelReportedTriggered) {
+        if (rule == null || rule.isGeneralLegacy()) {
+            return RuleCapabilityGate.allowed("LEGACY_MODEL_RULE", "general_legacy_compatibility");
+        }
+        if (!modelReportedTriggered) {
+            return RuleCapabilityGate.allowed(rule.getRiskPatternTriggerMode(), "model_or_structured_rule_not_triggered");
+        }
+        if (rule.requiresRiskPattern()) {
+            return riskPattern != null && riskPattern.hasTriggeredPattern()
+                    ? RuleCapabilityGate.allowed("RISK_PATTERN_REQUIRED", "local_risk_pattern_triggered")
+                    : RuleCapabilityGate.blocked("RISK_PATTERN_REQUIRED", "local_risk_pattern_not_triggered");
+        }
+        boolean structuredQuoteTriggered = decision != null
+                && StringUtils.hasText(decision.getReason())
+                && decision.getReason().startsWith("结构化行情规则命中");
+        return structuredQuoteTriggered
+                ? RuleCapabilityGate.allowed("L0_ADVISORY", "structured_quote_rule_triggered")
+                : RuleCapabilityGate.blocked("L0_ADVISORY", "model_finding_cannot_open_notification");
+    }
+
+    private String triggeredRiskPatternReason(RiskPatternResult riskPattern) {
+        List<String> ids = triggeredRiskPatternIds(riskPattern);
+        return ids.isEmpty() ? "本地L0风险结构未命中" : "本地L0风险结构命中：" + String.join("、", ids);
+    }
+
+    private List<String> triggeredRiskPatternIds(RiskPatternResult riskPattern) {
+        if (riskPattern == null || !(riskPattern.getObservations().get("patterns") instanceof List)) {
+            return Collections.emptyList();
+        }
+        List<String> ids = new ArrayList<>();
+        for (Object raw : (List<?>) riskPattern.getObservations().get("patterns")) {
+            if (!(raw instanceof Map)) continue;
+            Map<?, ?> item = (Map<?, ?>) raw;
+            if ("triggered".equals(item.get("status")) && item.get("patternId") != null) {
+                ids.add(String.valueOf(item.get("patternId")));
+            }
+        }
+        return ids;
+    }
+
+    private List<Map<String, Object>> persistRiskFacts(Map<String, RiskPatternResult> riskPatternsByStock,
+                                                       Map<String, Map<String, Object>> quoteBySymbol,
+                                                       ZonedDateTime now) {
+        if (riskPatternsByStock == null || riskPatternsByStock.isEmpty()) return Collections.emptyList();
+        List<Map<String, Object>> receipts = new ArrayList<>();
+        for (Map.Entry<String, RiskPatternResult> entry : riskPatternsByStock.entrySet()) {
+            String[] parts = entry.getKey().split(":", 2);
+            String symbol = parts[0];
+            String market = parts.length > 1 ? parts[1] : "";
+            Map<String, Object> quote = quoteBySymbol.get(normalizeSymbol(symbol));
+            try {
+                Map<String, Object> receipt = factPersistenceService.observe(
+                        symbol,
+                        market,
+                        quote == null ? symbol : text(quote, "name", symbol),
+                        quote,
+                        entry.getValue(),
+                        now
+                ).toMap();
+                receipt.put("symbol", symbol);
+                receipt.put("market", market);
+                receipts.add(receipt);
+            } catch (Exception e) {
+                Map<String, Object> failed = new LinkedHashMap<>();
+                failed.put("symbol", symbol);
+                failed.put("market", market);
+                failed.put("status", "ERROR");
+                failed.put("reason", firstNonBlank(e.getMessage(), e.getClass().getSimpleName()));
+                receipts.add(failed);
+                log.warn("stock-watch fact observation persist failed symbol={}.{} error={}", symbol, market, e.getMessage());
+            }
+        }
+        return receipts;
     }
 
     private boolean requiresEnhancedAiContext(AiWatchRule rule) {
@@ -1547,10 +1717,11 @@ public class StockWatchMonitorService {
         String subject = "Stock Watch AI预警 · " + rule.getName();
         Map<?, ?> quote = event.get("quote") instanceof Map ? (Map<?, ?>) event.get("quote") : Collections.emptyMap();
         StringBuilder content = new StringBuilder();
-        appendTitle(content, "Stock Watch AI 盯盘提醒");
+        boolean deterministic = decision.getModel() != null && decision.getModel().startsWith("deterministic");
+        appendTitle(content, deterministic ? "Stock Watch 确定性盯盘提醒" : "Stock Watch AI 盯盘提醒");
         appendSection(content, "一、触发摘要");
         appendLine(content, "标的", rule.getName() + "（" + rule.getSymbol() + "." + rule.getMarket() + "）");
-        appendLine(content, "结果", "DeepSeek 判断观察条件已触发");
+        appendLine(content, "结果", deterministic ? "本地确定性规则已触发" : "DeepSeek 判断观察条件已触发");
         appendLine(content, "级别", firstNonBlank(decision.getSeverity(), rule.getSeverity(), "--"));
         appendLine(content, "置信度", format(decision.getConfidence()) + " / 阈值 " + format(rule.getMinConfidence()));
         appendLine(content, "时间", text(event, "timestamp", "--"));
@@ -1562,9 +1733,11 @@ public class StockWatchMonitorService {
         appendQuoteLine(content, quote, "换手率", "turnover", "%");
         appendQuoteLine(content, quote, "主力净流入", "mainInflow");
 
-        appendSection(content, "三、DeepSeek 分析建议");
-        appendParagraph(content, firstNonBlank(decision.getAnalysis(), "本轮 DeepSeek 未返回明确分析建议。"), "  ");
-        appendLine(content, "分析模型", firstNonBlank(decision.getModel(), "--"));
+        appendSection(content, deterministic ? "三、本地复核说明" : "三、DeepSeek 分析建议");
+        appendParagraph(content, firstNonBlank(decision.getAnalysis(), deterministic
+                ? "本轮仅保留可复核的本地确定性事实。"
+                : "本轮 DeepSeek 未返回明确分析建议。"), "  ");
+        appendLine(content, deterministic ? "判断来源" : "分析模型", firstNonBlank(decision.getModel(), "--"));
 
         appendSection(content, "四、触发依据");
         appendParagraph(content, firstNonBlank(decision.getReason(), "未返回触发依据。"), "  ");
@@ -2565,6 +2738,26 @@ public class StockWatchMonitorService {
 
         private static AlertSendResult failed(String errorMessage) {
             return new AlertSendResult(true, false, null, null, errorMessage);
+        }
+    }
+
+    private static class RuleCapabilityGate {
+        private final boolean allowed;
+        private final String policy;
+        private final String reason;
+
+        private RuleCapabilityGate(boolean allowed, String policy, String reason) {
+            this.allowed = allowed;
+            this.policy = policy;
+            this.reason = reason;
+        }
+
+        private static RuleCapabilityGate allowed(String policy, String reason) {
+            return new RuleCapabilityGate(true, policy, reason);
+        }
+
+        private static RuleCapabilityGate blocked(String policy, String reason) {
+            return new RuleCapabilityGate(false, policy, reason);
         }
     }
 

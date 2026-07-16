@@ -2,9 +2,12 @@ package com.aimeeting.room.service;
 
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
+import com.aimeeting.room.entity.StockWatchAnalysisTask;
+import com.aimeeting.room.service.StockWatchAnalysisTaskService.Reservation;
 import com.aimeeting.room.service.ai.AiModelRouter;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InjectMocks;
@@ -27,16 +30,34 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.lenient;
 
 @ExtendWith(MockitoExtension.class)
 class StockWatchAiJudgeServiceTest {
 
     @Mock private AiModelRouter aiModelRouter;
+    @Mock private StockWatchAnalysisTaskService analysisTaskService;
+    @Mock private Reservation reservation;
     @InjectMocks private StockWatchAiJudgeService service;
+
+    @BeforeEach
+    void setUpTaskReservation() {
+        StockWatchAnalysisTask task = new StockWatchAnalysisTask();
+        task.setId(1L);
+        task.setSubmissionKey("test-submission");
+        task.setRequestDigest("test-digest");
+        task.setRowVersion(0L);
+        when(analysisTaskService.reserve(anyString(), anyString(), anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyInt(), anyString(), any())).thenReturn(reservation);
+        when(reservation.isNewSubmission()).thenReturn(true);
+        lenient().when(reservation.getTask()).thenReturn(task);
+    }
 
     @Test
     void structuredTriggerStillCallsDeepSeekAndKeepsModelAnalysis() {
@@ -176,7 +197,7 @@ class StockWatchAiJudgeServiceTest {
     }
 
     @Test
-    void blankApiFallsBackToBridgeWithExpectedJsonAndRetriesFreshSession() throws Exception {
+    void blankApiDoesNotFallbackOrResubmitAndKeepsStructuredResult() throws Exception {
         AiWatchRule rule = new AiWatchRule();
         rule.setId("rule-bridge");
         rule.setSymbol("600378");
@@ -225,17 +246,12 @@ class StockWatchAiJudgeServiceTest {
                     ZonedDateTime.now(ZoneId.of("Asia/Shanghai"))
             );
 
-            assertEquals(2, requestCount.get());
-            assertTrue(requestBodies.get(0).contains("\"expectedJson\":true"));
-            assertTrue(requestBodies.get(0).contains("\"mode\":\"expert\""));
-            assertTrue(requestBodies.get(0).contains("\"forceNewSession\":false"));
-            assertTrue(requestBodies.get(1).contains("\"expectedJson\":true"));
-            assertTrue(requestBodies.get(1).contains("\"mode\":\"expert\""));
-            assertTrue(requestBodies.get(1).contains("\"forceNewSession\":true"));
+            assertEquals(0, requestCount.get());
+            assertTrue(requestBodies.isEmpty());
             assertTrue(decision.isTriggered());
             assertTrue(decision.isShouldNotify());
-            assertEquals("deepseek-web", decision.getModel());
-            assertTrue(decision.getAnalysis().contains("短线抛压占优"));
+            assertEquals("deepseek-chat", decision.getModel());
+            assertTrue(decision.getAnalysis().contains("未返回分析正文"));
             assertTrue(decision.getReason().contains("结构化行情规则命中"));
         } finally {
             server.stop(0);

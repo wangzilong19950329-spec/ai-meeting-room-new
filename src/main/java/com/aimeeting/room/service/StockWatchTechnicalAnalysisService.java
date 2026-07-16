@@ -7,6 +7,7 @@ import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalSessionMapper;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.entity.StockWatchTechnicalSession;
+import com.aimeeting.room.service.StockWatchAnalysisTaskService.Reservation;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -99,6 +100,9 @@ public class StockWatchTechnicalAnalysisService {
     private final StockWatchListService watchListService;
     private final StockWatchTechnicalSessionMapper sessionMapper;
     private final StockWatchTechnicalAnalysisMapper analysisMapper;
+    private final StockWatchAnalysisTaskService analysisTaskService;
+    private final StockWatchRiskPatternService riskPatternService;
+    private final StockWatchFactPersistenceService factPersistenceService;
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     @Value("${stock-watch.technical-analysis.enabled:true}")
@@ -135,12 +139,18 @@ public class StockWatchTechnicalAnalysisService {
                                               StockWatchPredictionService predictionService,
                                               StockWatchListService watchListService,
                                               StockWatchTechnicalSessionMapper sessionMapper,
-                                              StockWatchTechnicalAnalysisMapper analysisMapper) {
+                                              StockWatchTechnicalAnalysisMapper analysisMapper,
+                                              StockWatchAnalysisTaskService analysisTaskService,
+                                              StockWatchRiskPatternService riskPatternService,
+                                              StockWatchFactPersistenceService factPersistenceService) {
         this.marketDataService = marketDataService;
         this.predictionService = predictionService;
         this.watchListService = watchListService;
         this.sessionMapper = sessionMapper;
         this.analysisMapper = analysisMapper;
+        this.analysisTaskService = analysisTaskService;
+        this.riskPatternService = riskPatternService;
+        this.factPersistenceService = factPersistenceService;
     }
 
     @Scheduled(
@@ -349,11 +359,35 @@ public class StockWatchTechnicalAnalysisService {
                 throw new ExistingAnalysisSkippedException(existing);
             }
         }
+        List<Map<String, Object>> dailyBars = toMapList(marketData.getPayload().get("dailyKline"));
+        StockWatchRiskPatternService.RiskPatternResult riskPattern = riskPatternService.analyze(
+                ref.symbol, ref.market, quote, dailyBars, now);
+        marketData.getPayload().put("riskPatternObservations", riskPattern.getObservations());
+        marketData.getPayload().put("riskPatternGuidance", riskPattern.getGuidance());
+        Map<String, Object> factReceipt = factPersistenceService.observe(
+                ref.symbol, ref.market, stockName, quote, riskPattern, now).toMap();
+        marketData.getPayload().put("factObservationReceipt", factReceipt);
         Map<String, Object> evidenceSignals = buildEvidenceSignals(marketData.getPayload(), periodType);
         StockWatchTechnicalSession session = getOrCreateSession(ref, stockName, forceNewSession, periodType);
         List<StockWatchTechnicalAnalysis> sourceRecords = sourceRecordsForPeriod(ref, periodType, window);
         String prompt = buildPrompt(ref, stockName, marketData, evidenceSignals, session, reason, periodType, window, sourceRecords);
-        String promptHash = sha256(prompt).substring(0, 24);
+        String promptHash = sha256(prompt);
+        String observationKey = periodType + ":" + sourceTradeDate + ":" + text(quote.get("timestamp"), runSlot);
+        int generation = session.getGeneration() == null ? 1 : session.getGeneration();
+        String submissionKey = "stock-analysis-v1:" + ref.market + ":" + ref.symbol + ":" + observationKey + ":g" + generation;
+        Map<String, Object> requestEnvelope = new LinkedHashMap<>();
+        requestEnvelope.put("schema", "stock-analysis-v1");
+        requestEnvelope.put("symbol", ref.symbol);
+        requestEnvelope.put("market", ref.market);
+        requestEnvelope.put("periodType", periodType);
+        requestEnvelope.put("observationKey", observationKey);
+        requestEnvelope.put("sourceTradeDate", sourceTradeDate.toString());
+        requestEnvelope.put("runSlot", runSlot);
+        requestEnvelope.put("generation", generation);
+        requestEnvelope.put("promptChars", prompt.length());
+        Reservation taskReservation = analysisTaskService.reserve(
+                submissionKey, promptHash, "stock-analysis-v1", ref.symbol, ref.market, periodType,
+                observationKey, generation, "deepseek_web_bridge", requestEnvelope);
 
         BridgeResult bridgeResult = null;
         AnalysisPayload parsed;
@@ -372,14 +406,18 @@ public class StockWatchTechnicalAnalysisService {
         record.setProvider("deepseek_web_bridge");
         record.setPromptHash(promptHash);
         try {
-            bridgeResult = callDeepSeekBridgeWithRetry(prompt, session, forceNewSession, periodType);
+            if (taskReservation.hasReusableSuccess()) {
+                bridgeResult = BridgeResult.cached(taskReservation.getTask().getRawResponse(),
+                        taskReservation.getTask().getContentStatus(), taskReservation.getTask().getCompletionReason());
+            } else {
+                if (!taskReservation.isNewSubmission()) {
+                    throw new IllegalStateException(taskReservation.refusalReason());
+                }
+                analysisTaskService.markSubmitted(taskReservation, "deepseek_web_bridge");
+                bridgeResult = callDeepSeekBridge(prompt, session, forceNewSession, taskReservation);
+            }
             parsed = parseAnalysisPayload(bridgeResult.answerText, stockName);
             intentValidation = validateMainForceIntent(parsed.mainForceIntent, evidenceSignals);
-            if (!hasRequiredForecasts(parsed.forecasts, periodType) || !intentValidation.valid) {
-                bridgeResult = callDeepSeekBridge(structuredRetryPrompt(periodType, intentValidation.problems), session, false);
-                parsed = parseAnalysisPayload(bridgeResult.answerText, stockName);
-                intentValidation = validateMainForceIntent(parsed.mainForceIntent, evidenceSignals);
-            }
             if (!hasRequiredForecasts(parsed.forecasts, periodType)) {
                 throw new ModelResponseSchemaException("DeepSeek 返回JSON缺少当前周期要求的完整 forecasts，未保存不完整预测"
                         + schemaWarningSuffix(parsed));
@@ -388,6 +426,13 @@ public class StockWatchTechnicalAnalysisService {
                 throw new ModelResponseSchemaException("DeepSeek 返回JSON缺少可校验的 mainForceIntent，未保存不完整主力意图："
                         + String.join("；", intentValidation.problems) + schemaWarningSuffix(parsed));
             }
+            Double originObservationIdValue = number(factReceipt.get("observationId"), null);
+            if (originObservationIdValue != null) {
+                factPersistenceService.registerModelIntentTests(
+                        originObservationIdValue.longValue(), ref.symbol, ref.market, intentValidation.intent);
+            }
+            analysisTaskService.markSuccess(taskReservation, bridgeResult.answerText,
+                    bridgeResult.contentStatus, bridgeResult.completionReason, "PARSED_VALID");
             parsed.missingData = new ArrayList<>();
             parsed.missingData.addAll(marketData.getRequiredMissing());
             parsed.missingData.addAll(marketData.getOptionalMissing());
@@ -414,6 +459,19 @@ public class StockWatchTechnicalAnalysisService {
             updateSessionAfterRun(session, stockName, bridgeResult, record, null);
             return record;
         } catch (Exception e) {
+            if (analysisTaskService.shouldMarkInvalid(e)) {
+                analysisTaskService.markInvalid(taskReservation,
+                        bridgeResult == null ? null : bridgeResult.answerText,
+                        bridgeResult == null ? null : bridgeResult.contentStatus,
+                        bridgeResult == null ? null : bridgeResult.completionReason,
+                        diagnosticMessage(e));
+            } else if (analysisTaskService.shouldMarkUnknown(e)) {
+                analysisTaskService.markUnknown(taskReservation,
+                        bridgeResult == null ? null : bridgeResult.answerText, diagnosticMessage(e));
+            } else {
+                analysisTaskService.markFailed(taskReservation,
+                        bridgeResult == null ? null : bridgeResult.answerText, diagnosticMessage(e));
+            }
             record.setStatus("ERROR");
             record.setStance("分析失败");
             record.setTone("red");
@@ -526,7 +584,8 @@ public class StockWatchTechnicalAnalysisService {
 
     private BridgeResult callDeepSeekBridge(String prompt,
                                             StockWatchTechnicalSession session,
-                                            boolean forceNewSession) throws Exception {
+                                            boolean forceNewSession,
+                                            Reservation reservation) throws Exception {
         JSONObject body = new JSONObject();
         body.put("query", prompt);
         body.put("sessionKey", session.getSessionKey());
@@ -534,6 +593,9 @@ public class StockWatchTechnicalAnalysisService {
         body.put("closeTargetAfter", false);
         body.put("expectedJson", true);
         body.put("mode", "expert");
+        body.put("purpose", "stock-analysis-v1");
+        body.put("requestDigest", reservation.getTask().getRequestDigest());
+        body.put("submissionKey", reservation.getTask().getSubmissionKey());
 
         OkHttpClient client = new OkHttpClient.Builder()
                 .connectTimeout(Math.max(5, connectTimeoutSeconds), TimeUnit.SECONDS)
@@ -577,35 +639,6 @@ public class StockWatchTechnicalAnalysisService {
             }
             return bridgeResult;
         }
-    }
-
-    private BridgeResult callDeepSeekBridgeWithRetry(String prompt,
-                                                     StockWatchTechnicalSession session,
-                                                     boolean forceNewSession,
-                                                     String periodType) throws Exception {
-        try {
-            return callDeepSeekBridge(prompt, session, forceNewSession);
-        } catch (Exception e) {
-            String message = text(e.getMessage(), "").toLowerCase(Locale.ROOT);
-            if (!message.contains("未完整生成") && !message.contains("incomplete_json")) {
-                throw e;
-            }
-            log.warn("DeepSeek structured response incomplete; retrying in same session key={}", session.getSessionKey());
-            return callDeepSeekBridge(structuredRetryPrompt(periodType, Collections.singletonList("response_incomplete_json")), session, false);
-        }
-    }
-
-    private String structuredRetryPrompt(String periodType, List<String> schemaProblems) {
-        String horizons = "WEEK".equals(periodType) ? "W1"
-                : ("MONTH".equals(periodType) ? "M1" : "T1和T5");
-        String problems = schemaProblems == null || schemaProblems.isEmpty()
-                ? "未通过结构化校验"
-                : String.join("；", schemaProblems);
-        return "上一条结构化回答不完整。不要重新搜索，不要解释，只根据上一条任务输入重新输出一个完整、可解析的JSON对象；"
-                + "必须包含stance、tone、confidence、title、conclusion、evidence、missingData、mainForceIntent、forecasts，forecasts必须包含" + horizons + "。"
-                + "mainForceIntent必须包含intent/timeWindow/confidence/evidence/counterEvidence/assumptions/risk/watchPoints；"
-                + "mainForceIntent.evidence和counterEvidence必须引用上一条输入中evidenceSignals.citationPaths里的完整路径。"
-                + "本轮未通过项：" + problems + "。";
     }
 
     private boolean hasRequiredForecasts(JSONArray forecasts, String periodType) {
@@ -667,6 +700,7 @@ public class StockWatchTechnicalAnalysisService {
                 .stream()
                 .map(this::toPromptRecordPayload)
                 .collect(Collectors.toList());
+        List<Map<String, Object>> recentTwoWeekLedger = recentTwoWeekLedger(ref, periodType, window.end);
 
         JSONObject payload = new JSONObject(true);
         payload.put("task", "stock_watch_multi_period_technical_analysis");
@@ -681,6 +715,12 @@ public class StockWatchTechnicalAnalysisService {
                 .map(this::toPromptSourceRecordPayload)
                 .collect(Collectors.toList()));
         payload.put("recentSamePeriodAnalysis", recent);
+        payload.put("recentTwoWeekAnalysisLedger", recentTwoWeekLedger);
+        payload.put("recentTwoWeekCoverage", Map.of(
+                "lookbackDays", 14,
+                "includedCount", recentTwoWeekLedger.size(),
+                "selectionPolicy", "latest_success_per_date_slot_then_chronological"
+        ));
         Map<String, Object> sessionPayload = new LinkedHashMap<>();
         sessionPayload.put("sessionKey", session.getSessionKey());
         sessionPayload.put("generation", session.getGeneration());
@@ -708,6 +748,9 @@ public class StockWatchTechnicalAnalysisService {
                 "marketData.latestNews是必须参考的最近新闻；marketData.shareholderCounts是股东户数变化线索。若相关字段为空，只能在missingData复制dataQuality.requiredMissing或optionalMissing里的对应项。",
                 "marketData.dataPacking说明本轮为节省上下文已截取最近序列；完整原始行情快照由系统另存，不要抱怨未提供更早原始明细。",
                 "evidenceSignals是程序从marketData派生的资金流、价量、位置和证据覆盖信号。你必须强制分析mainForceIntent，但只能解释这些信号，不能把模型猜测当成事实。",
+                "marketData.riskPatternObservations是程序计算的R01-R04事实；marketData.factObservationReceipt.testVerdicts是对历史观点的程序化验证。你只能解释它们如何支持、削弱或证伪旧假设，不能修改status或verdict。",
+                "R01-R04只证明可观察的价量风险结构，不能证明操纵、坐庄、对倒、账户组或任何主体的真实身份与违法意图。",
+                "recentTwoWeekAnalysisLedger包含最近两周逐slot技术分析。你必须逐条结合本轮testVerdicts说明旧判断被SUPPORTED、WEAKENED、FALSIFIED或仍UNRESOLVED，并据此收窄本轮主力意图假设；不能只总结两周行情。",
                 "mainForceIntent是“主力意图的模型推断”，不是事实标签；intent只能取ACCUMULATE/DISTRIBUTE/WASH/PULL_UP/SUPPORT/SUPPRESS/ROTATE/NEUTRAL/UNKNOWN。",
                 "mainForceIntent字段固定为：intent(string), timeWindow(string: INTRADAY/THREE_DAY/FIVE_DAY/TWENTY_DAY), confidence(number 0-1), evidence(array string), counterEvidence(array string), assumptions(array string), risk(string), watchPoints(array string)。",
                 "mainForceIntent.evidence和counterEvidence每条都必须引用evidenceSignals.citationPaths里的至少一个完整路径，例如evidenceSignals.fundFlowEvidence.anchorMainInflowYuan；证据不足时intent必须为NEUTRAL或UNKNOWN，confidence不得高于0.55。",
@@ -721,6 +764,23 @@ public class StockWatchTechnicalAnalysisService {
                 "输入数据：",
                 payload.toJSONString()
         );
+    }
+
+    private List<Map<String, Object>> recentTwoWeekLedger(StockRef ref,
+                                                           String periodType,
+                                                           LocalDate endDate) {
+        if (!"DAY".equals(periodType) || endDate == null) return Collections.emptyList();
+        List<StockWatchTechnicalAnalysis> rows = analysisMapper.selectRecentSuccessfulSlotsByDateRange(
+                ref.symbol, ref.market, Date.valueOf(endDate.minusDays(13)), Date.valueOf(endDate), "DAY", 100);
+        if (rows == null || rows.isEmpty()) return Collections.emptyList();
+        Map<String, StockWatchTechnicalAnalysis> unique = new LinkedHashMap<>();
+        for (StockWatchTechnicalAnalysis row : rows) {
+            String key = toLocalDate(row.getAnalysisDate()) + ":" + text(row.getRunSlot(), "") + ":" + text(row.getPeriodType(), "DAY");
+            unique.putIfAbsent(key, row);
+        }
+        List<StockWatchTechnicalAnalysis> chronological = new ArrayList<>(unique.values());
+        Collections.reverse(chronological);
+        return chronological.stream().map(this::toPromptRecordPayload).collect(Collectors.toList());
     }
 
     private Map<String, Object> toPromptMarketDataPayload(Map<String, Object> raw, String periodType) {
@@ -740,6 +800,9 @@ public class StockWatchTechnicalAnalysisService {
         copyIfPresent(raw, payload, "technicalIndicators");
         copyIfPresent(raw, payload, "valuation");
         copyIfPresent(raw, payload, "marketBenchmark");
+        copyIfPresent(raw, payload, "riskPatternObservations");
+        copyIfPresent(raw, payload, "riskPatternGuidance");
+        copyIfPresent(raw, payload, "factObservationReceipt");
 
         String normalizedPeriod = normalizePeriodType(periodType);
         int dailyCount = "DAY".equals(normalizedPeriod) ? 20 : 50;
@@ -768,6 +831,16 @@ public class StockWatchTechnicalAnalysisService {
         packing.put("shareholderCountsLatestCount", 3);
         payload.put("dataPacking", packing);
         return payload;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> toMapList(Object raw) {
+        if (!(raw instanceof List)) return Collections.emptyList();
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Object item : (List<?>) raw) {
+            if (item instanceof Map) result.add((Map<String, Object>) item);
+        }
+        return result;
     }
 
     private Map<String, Object> buildEvidenceSignals(Map<String, Object> raw, String periodType) {
@@ -2174,6 +2247,14 @@ public class StockWatchTechnicalAnalysisService {
         private String finalUrl;
         private String contentStatus;
         private String completionReason;
+
+        private static BridgeResult cached(String answerText, String contentStatus, String completionReason) {
+            BridgeResult result = new BridgeResult();
+            result.answerText = answerText;
+            result.contentStatus = contentStatus;
+            result.completionReason = completionReason;
+            return result;
+        }
     }
 
     private static class AnalysisPayload {

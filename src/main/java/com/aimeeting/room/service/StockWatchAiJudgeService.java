@@ -4,6 +4,7 @@ import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
+import com.aimeeting.room.service.StockWatchAnalysisTaskService.Reservation;
 import com.aimeeting.room.service.ai.AiModelRouter;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
@@ -42,6 +43,7 @@ public class StockWatchAiJudgeService {
     );
 
     private final AiModelRouter aiModelRouter;
+    private final StockWatchAnalysisTaskService analysisTaskService;
 
     @Value("${stock-watch.ai-rules.bridge-url:${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}}")
     private String bridgeUrl;
@@ -55,12 +57,35 @@ public class StockWatchAiJudgeService {
     @Value("${stock-watch.ai-rules.bridge-first:false}")
     private boolean bridgeFirst;
 
-    public StockWatchAiJudgeService(AiModelRouter aiModelRouter) {
+    public StockWatchAiJudgeService(AiModelRouter aiModelRouter,
+                                    StockWatchAnalysisTaskService analysisTaskService) {
         this.aiModelRouter = aiModelRouter;
+        this.analysisTaskService = analysisTaskService;
     }
 
     public AiDecision judge(AiWatchRule rule, Map<String, Object> quote, ZonedDateTime now) {
         return judge(rule, quote, now, null);
+    }
+
+    public AiDecision judgeDeterministic(AiWatchRule rule, Map<String, Object> quote) {
+        AiDecision structured = judgeStructuredQuoteRule(rule, quote);
+        if (structured != null) {
+            structured.setAnalysis("本轮仅执行本地结构化行情规则；模型解释由同一 observation 的技术分析任务统一生成。");
+            structured.setModel("deterministic-quote-rule");
+            return structured;
+        }
+        AiDecision decision = new AiDecision();
+        decision.setOk(true);
+        decision.setTriggered(false);
+        decision.setShouldNotify(false);
+        decision.setConfidence(1.0);
+        decision.setSeverity("info");
+        decision.setReason("本地结构化行情规则未命中或该自然语言条件没有可执行的结构化字段");
+        decision.setAnalysis("本轮没有调用模型；等待统一技术分析任务生成连续主力意图解释。");
+        decision.setMatchedSignals(new ArrayList<>());
+        decision.setMissingData(new ArrayList<>());
+        decision.setModel("deterministic-only");
+        return decision;
     }
 
     public AiDecision judge(AiWatchRule rule,
@@ -72,18 +97,23 @@ public class StockWatchAiJudgeService {
         String actualModel = model;
         String userPrompt = buildPrompt(rule, quote, now, aiContext);
         String raw = null;
+        Reservation taskReservation = reserveTask(rule, quote, model, userPrompt);
         try {
-            if (shouldUseBridgeFirst(model)) {
+            if (taskReservation.hasReusableSuccess()) {
+                raw = taskReservation.getTask().getRawResponse();
+                actualModel = taskReservation.getTask().getProvider();
+            } else if (!taskReservation.isNewSubmission()) {
+                throw new IllegalStateException(taskReservation.refusalReason());
+            } else if (shouldUseBridgeFirst(model)) {
                 actualModel = "deepseek-web";
-                raw = callDeepSeekWebBridgeWithRetry(rule, userPrompt);
+                analysisTaskService.markSubmitted(taskReservation, actualModel);
+                raw = callDeepSeekWebBridge(rule, userPrompt, false, taskReservation);
             } else {
+                analysisTaskService.markSubmitted(taskReservation, actualModel);
                 raw = aiModelRouter.chat(model, SYSTEM_PROMPT, userPrompt, 900);
-                if (!StringUtils.hasText(raw)) {
-                    actualModel = "deepseek-web";
-                    raw = callDeepSeekWebBridgeWithRetry(rule, userPrompt);
-                }
             }
             if (!StringUtils.hasText(raw)) {
+                analysisTaskService.markInvalid(taskReservation, raw, "empty", "empty_response", "model_response_empty");
                 if (structuredDecision != null) {
                     structuredDecision.setRawResponse(raw);
                     structuredDecision.setModel(actualModel);
@@ -93,12 +123,8 @@ public class StockWatchAiJudgeService {
                 return AiDecision.failed("模型调用未返回正文，请检查DeepSeek API Key、余额或模型配置", raw);
             }
             JSONObject parsed = extractJsonObject(raw);
-            if (parsed == null && !"deepseek-web".equals(actualModel)) {
-                actualModel = "deepseek-web";
-                raw = callDeepSeekWebBridgeWithRetry(rule, userPrompt);
-                parsed = extractJsonObject(raw);
-            }
             if (parsed == null) {
+                analysisTaskService.markInvalid(taskReservation, raw, "invalid", "json_parse_failed", "model_response_json_invalid");
                 if (structuredDecision != null) {
                     structuredDecision.setRawResponse(raw);
                     structuredDecision.setModel(actualModel);
@@ -121,10 +147,18 @@ public class StockWatchAiJudgeService {
             decision.setModel(actualModel);
             decision.setOk(true);
             guardHistoricalTriggerSource(decision);
+            analysisTaskService.markSuccess(taskReservation, raw, "complete", "parsed", "PARSED_VALID");
             return mergeStructuredDecision(structuredDecision, decision);
         } catch (Exception e) {
             log.warn("DeepSeek stock-watch rule judgment failed ruleId={} model={} error={}",
                     rule.getId(), model, e.getMessage());
+            if (analysisTaskService.shouldMarkInvalid(e)) {
+                analysisTaskService.markInvalid(taskReservation, raw, null, null, e.getMessage());
+            } else if (analysisTaskService.shouldMarkUnknown(e)) {
+                analysisTaskService.markUnknown(taskReservation, raw, e.getMessage());
+            } else {
+                analysisTaskService.markFailed(taskReservation, raw, e.getMessage());
+            }
             if (structuredDecision != null) {
                 structuredDecision.setRawResponse(raw);
                 structuredDecision.setModel(actualModel);
@@ -133,6 +167,27 @@ public class StockWatchAiJudgeService {
             }
             return AiDecision.failed("模型判断异常：" + e.getMessage(), raw);
         }
+    }
+
+    private Reservation reserveTask(AiWatchRule rule,
+                                    Map<String, Object> quote,
+                                    String model,
+                                    String userPrompt) {
+        String observationKey = text(quote == null ? null : quote.get("timestamp"), "unknown");
+        String provider = shouldUseBridgeFirst(model) ? "deepseek-web" : model;
+        String submissionKey = "stock-analysis-v1:rule:" + rule.getMarket() + ":" + rule.getSymbol()
+                + ":" + text(rule.getId(), "inline") + ":" + observationKey + ":" + provider;
+        Map<String, Object> envelope = new LinkedHashMap<>();
+        envelope.put("schema", "stock-analysis-v1");
+        envelope.put("scope", "rule");
+        envelope.put("symbol", rule.getSymbol());
+        envelope.put("market", rule.getMarket());
+        envelope.put("ruleId", rule.getId());
+        envelope.put("observationKey", observationKey);
+        envelope.put("provider", provider);
+        envelope.put("promptChars", userPrompt.length());
+        return analysisTaskService.reserve(submissionKey, sha256Hex(userPrompt), "stock-analysis-v1",
+                rule.getSymbol(), rule.getMarket(), "DAY", observationKey, 1, provider, envelope);
     }
 
     private boolean shouldUseBridgeFirst(String model) {
@@ -305,7 +360,7 @@ public class StockWatchAiJudgeService {
                                Map<String, Object> aiContext) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("timestamp", now.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
-        payload.put("rule", rule);
+        payload.put("rule", rule.isGeneralLegacy() ? legacyRuleProjection(rule) : rule);
         payload.put("quote", quote);
         payload.put("availableFields", quote == null ? List.of() : quote.keySet());
         if (aiContext != null && !aiContext.isEmpty()) {
@@ -314,6 +369,29 @@ public class StockWatchAiJudgeService {
         payload.put("factPriority", "事实优先级：本轮quote实时行情 > aiContext.currentFacts本轮增强摘要 > aiContext.recentTechnicalAnalysis.records[].priorValidation程序化历史验证；recentTechnicalAnalysis历史技术分析只能用于analysis/beliefUpdate里的主力意图连续性、反证、风险和观察点。");
         payload.put("instruction", "判断 rule.conditionText 是否被本轮数据命中。triggered、reason、matchedSignals只能引用quote或aiContext.currentFacts里的本轮事实；不得用recentTechnicalAnalysis、历史技术分析、历史mainForceIntent或priorValidation作为本轮触发依据。analysis必须结合recentTechnicalAnalysis.records[].priorValidation说明过去两周每轮技术判断中哪些被支持、削弱、证伪或仍未决，并在beliefUpdate里输出当前主力意图连续判断、被证伪/缩小的旧假设、下一轮最关键观察点。若历史结论与本轮事实冲突，以本轮事实为准。不要猜测缺失数据。");
         return JSON.toJSONString(payload, true);
+    }
+
+    private Map<String, Object> legacyRuleProjection(AiWatchRule rule) {
+        Map<String, Object> legacy = new LinkedHashMap<>();
+        putIfNotNull(legacy, "id", rule.getId());
+        putIfNotNull(legacy, "symbol", rule.getSymbol());
+        putIfNotNull(legacy, "market", rule.getMarket());
+        putIfNotNull(legacy, "name", rule.getName());
+        putIfNotNull(legacy, "conditionText", rule.getConditionText());
+        legacy.put("enabled", rule.isEnabled());
+        legacy.put("notify", rule.isNotify());
+        putIfNotNull(legacy, "severity", rule.getSeverity());
+        putIfNotNull(legacy, "model", rule.getModel());
+        putIfNotNull(legacy, "minConfidence", rule.getMinConfidence());
+        putIfNotNull(legacy, "cooldownDays", rule.getCooldownDays());
+        putIfNotNull(legacy, "note", rule.getNote());
+        putIfNotNull(legacy, "createdAt", rule.getCreatedAt());
+        putIfNotNull(legacy, "updatedAt", rule.getUpdatedAt());
+        return legacy;
+    }
+
+    private void putIfNotNull(Map<String, Object> target, String key, Object value) {
+        if (value != null) target.put(key, value);
     }
 
     private Map<String, Object> sanitizeAiContext(Map<String, Object> aiContext) {
@@ -590,32 +668,10 @@ public class StockWatchAiJudgeService {
         }
     }
 
-    private String callDeepSeekWebBridgeWithRetry(AiWatchRule rule, String userPrompt) throws Exception {
-        try {
-            return callDeepSeekWebBridge(rule, userPrompt, false);
-        } catch (Exception first) {
-            String message = text(first.getMessage(), "").toLowerCase(Locale.ROOT);
-            if (!isRetryableBridgeFailure(message)) {
-                throw first;
-            }
-            log.warn("DeepSeek stock-watch rule bridge returned retryable failure ruleId={} error={}, retrying with fresh session",
-                    rule.getId(), first.getMessage());
-            return callDeepSeekWebBridge(rule, userPrompt, true);
-        }
-    }
-
-    private boolean isRetryableBridgeFailure(String message) {
-        return message.contains("未返回分析正文")
-                || message.contains("未完整生成")
-                || message.contains("incomplete_json")
-                || message.contains("timeout")
-                || message.contains("max_inflight")
-                || message.contains("bridge http 500")
-                || message.contains("provider_timeout")
-                || message.contains("search_failed");
-    }
-
-    private String callDeepSeekWebBridge(AiWatchRule rule, String userPrompt, boolean forceNewSession) throws Exception {
+    private String callDeepSeekWebBridge(AiWatchRule rule,
+                                         String userPrompt,
+                                         boolean forceNewSession,
+                                         Reservation reservation) throws Exception {
         if (!StringUtils.hasText(bridgeUrl)) {
             throw new IllegalStateException("DeepSeek 网页 Bridge 未配置");
         }
@@ -626,6 +682,9 @@ public class StockWatchAiJudgeService {
         body.put("closeTargetAfter", false);
         body.put("expectedJson", true);
         body.put("mode", "expert");
+        body.put("purpose", "stock-analysis-v1");
+        body.put("requestDigest", reservation.getTask().getRequestDigest());
+        body.put("submissionKey", reservation.getTask().getSubmissionKey());
 
         OkHttpClient client = new OkHttpClient.Builder()
                 .connectTimeout(Math.max(5, bridgeConnectTimeoutSeconds), TimeUnit.SECONDS)
@@ -658,6 +717,18 @@ public class StockWatchAiJudgeService {
                         + "，completionReason=" + completionReason);
             }
             return answer;
+        }
+    }
+
+    private String sha256Hex(String value) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] bytes = digest.digest(text(value, "").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (byte b : bytes) hex.append(String.format("%02x", b));
+            return hex.toString();
+        } catch (Exception e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
         }
     }
 

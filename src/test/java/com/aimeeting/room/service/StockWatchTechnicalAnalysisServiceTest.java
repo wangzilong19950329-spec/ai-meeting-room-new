@@ -29,7 +29,10 @@ class StockWatchTechnicalAnalysisServiceTest {
             mock(StockWatchPredictionService.class),
             mock(StockWatchListService.class),
             mock(StockWatchTechnicalSessionMapper.class),
-            mock(StockWatchTechnicalAnalysisMapper.class)
+            mock(StockWatchTechnicalAnalysisMapper.class),
+            mock(StockWatchAnalysisTaskService.class),
+            mock(StockWatchRiskPatternService.class),
+            mock(StockWatchFactPersistenceService.class)
     );
 
     @Test

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchFactObservationMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchFactObservation">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="observation_key" property="observationKey"/>
+        <result column="arrival_version" property="arrivalVersion"/>
+        <result column="source_time_epoch_ms" property="sourceTimeEpochMs"/>
+        <result column="source_date" property="sourceDate"/>
+        <result column="source_time_quality" property="sourceTimeQuality"/>
+        <result column="fact_hash" property="factHash"/>
+        <result column="fact_snapshot_json" property="factSnapshotJson"/>
+        <result column="data_quality_json" property="dataQualityJson"/>
+        <result column="sampled_at" property="sampledAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_fact_observation
+        (symbol, market, stock_name, observation_key, arrival_version, source_time_epoch_ms,
+         source_date, source_time_quality, fact_hash, fact_snapshot_json, data_quality_json, sampled_at)
+        VALUES
+        (#{symbol}, #{market}, #{stockName}, #{observationKey}, #{arrivalVersion}, #{sourceTimeEpochMs},
+         #{sourceDate}, #{sourceTimeQuality}, #{factHash}, #{factSnapshotJson}, #{dataQualityJson}, #{sampledAt})
+    </insert>
+
+    <select id="selectByObservationKey" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_fact_observation WHERE observation_key = #{observationKey}
+    </select>
+</mapper>

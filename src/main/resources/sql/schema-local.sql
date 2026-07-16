@@ -407,6 +407,112 @@ CREATE TABLE IF NOT EXISTS stock_watch_prediction (
 CREATE INDEX IF NOT EXISTS idx_sw_prediction_symbol_date ON stock_watch_prediction(symbol, market, forecast_date);
 CREATE INDEX IF NOT EXISTS idx_sw_prediction_status ON stock_watch_prediction(status, forecast_date);
 
+CREATE TABLE IF NOT EXISTS stock_watch_fact_head (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    arrival_version BIGINT DEFAULT 0 NOT NULL,
+    latest_observation_id BIGINT,
+    last_source_time_epoch_ms BIGINT,
+    last_source_date VARCHAR(16),
+    last_source_quality VARCHAR(32),
+    last_fact_hash VARCHAR(64),
+    row_version BIGINT DEFAULT 0 NOT NULL,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_fact_head_symbol UNIQUE (symbol, market)
+);
+
+CREATE TABLE IF NOT EXISTS stock_watch_fact_observation (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    stock_name VARCHAR(128),
+    observation_key VARCHAR(64) NOT NULL,
+    arrival_version BIGINT NOT NULL,
+    source_time_epoch_ms BIGINT NOT NULL,
+    source_date VARCHAR(16) NOT NULL,
+    source_time_quality VARCHAR(32) NOT NULL,
+    fact_hash VARCHAR(64) NOT NULL,
+    fact_snapshot_json CLOB NOT NULL,
+    data_quality_json CLOB,
+    sampled_at TIMESTAMP NOT NULL,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_fact_observation_key UNIQUE (observation_key),
+    CONSTRAINT uk_sw_fact_observation_version UNIQUE (symbol, market, arrival_version)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_fact_observation_source ON stock_watch_fact_observation(symbol, market, source_time_epoch_ms);
+
+CREATE TABLE IF NOT EXISTS stock_watch_intent_test (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    origin_observation_id BIGINT NOT NULL,
+    activation_after_observation_id BIGINT NOT NULL,
+    test_key VARCHAR(160) NOT NULL,
+    claim_ref VARCHAR(64) NOT NULL,
+    metric_path VARCHAR(128) NOT NULL,
+    comparison_operator VARCHAR(32) NOT NULL,
+    target_value_json CLOB NOT NULL,
+    max_observation_age INT NOT NULL,
+    required_observed_count INT NOT NULL,
+    age_count INT DEFAULT 0 NOT NULL,
+    observed_count INT DEFAULT 0 NOT NULL,
+    test_verdict VARCHAR(32) DEFAULT 'UNRESOLVED' NOT NULL,
+    row_version BIGINT DEFAULT 0 NOT NULL,
+    last_evaluated_observation_id BIGINT,
+    resolved_observation_id BIGINT,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_intent_test_origin_key UNIQUE (origin_observation_id, test_key)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_intent_test_active ON stock_watch_intent_test(symbol, market, resolved_observation_id);
+
+CREATE TABLE IF NOT EXISTS stock_watch_intent_test_result (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    observation_id BIGINT NOT NULL,
+    observation_version BIGINT NOT NULL,
+    test_id BIGINT NOT NULL,
+    actual_value_json CLOB,
+    match_status VARCHAR(32) NOT NULL,
+    verdict_after VARCHAR(32) NOT NULL,
+    age_after INT NOT NULL,
+    observed_after INT NOT NULL,
+    evaluated_at TIMESTAMP NOT NULL,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_intent_test_result UNIQUE (observation_id, test_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_intent_test_result_test ON stock_watch_intent_test_result(test_id, observation_version);
+
+CREATE TABLE IF NOT EXISTS stock_watch_analysis_task (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    submission_key VARCHAR(255) NOT NULL,
+    request_digest VARCHAR(64) NOT NULL,
+    purpose VARCHAR(64) NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    period_type VARCHAR(16),
+    observation_key VARCHAR(128),
+    generation INT DEFAULT 1 NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    provider VARCHAR(64),
+    request_envelope_json CLOB NOT NULL,
+    response_hash VARCHAR(64),
+    raw_response CLOB,
+    content_status VARCHAR(32),
+    completion_reason VARCHAR(128),
+    provider_status VARCHAR(64),
+    submitted_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    error_message CLOB,
+    row_version BIGINT DEFAULT 0 NOT NULL,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_analysis_task_submission UNIQUE (submission_key)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_analysis_task_observation ON stock_watch_analysis_task(symbol, market, observation_key);
+CREATE INDEX IF NOT EXISTS idx_sw_analysis_task_status ON stock_watch_analysis_task(status, gmt_create);
+
 CREATE TABLE IF NOT EXISTS stock_watch_delivery_config (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     symbol VARCHAR(16) NOT NULL,

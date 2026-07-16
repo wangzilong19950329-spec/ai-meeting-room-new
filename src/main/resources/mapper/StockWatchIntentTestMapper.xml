@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchIntentTestMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchIntentTest">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="origin_observation_id" property="originObservationId"/>
+        <result column="activation_after_observation_id" property="activationAfterObservationId"/>
+        <result column="test_key" property="testKey"/>
+        <result column="claim_ref" property="claimRef"/>
+        <result column="metric_path" property="metricPath"/>
+        <result column="comparison_operator" property="comparisonOperator"/>
+        <result column="target_value_json" property="targetValueJson"/>
+        <result column="max_observation_age" property="maxObservationAge"/>
+        <result column="required_observed_count" property="requiredObservedCount"/>
+        <result column="age_count" property="ageCount"/>
+        <result column="observed_count" property="observedCount"/>
+        <result column="test_verdict" property="testVerdict"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="last_evaluated_observation_id" property="lastEvaluatedObservationId"/>
+        <result column="resolved_observation_id" property="resolvedObservationId"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_intent_test
+        (symbol, market, origin_observation_id, activation_after_observation_id, test_key, claim_ref,
+         metric_path, comparison_operator, target_value_json, max_observation_age, required_observed_count,
+         age_count, observed_count, test_verdict, row_version)
+        VALUES
+        (#{symbol}, #{market}, #{originObservationId}, #{activationAfterObservationId}, #{testKey}, #{claimRef},
+         #{metricPath}, #{comparisonOperator}, #{targetValueJson}, #{maxObservationAge}, #{requiredObservedCount},
+         #{ageCount}, #{observedCount}, #{testVerdict}, #{rowVersion})
+    </insert>
+
+    <select id="selectActiveForUpdate" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_intent_test
+        WHERE symbol = #{symbol} AND market = #{market}
+          AND resolved_observation_id IS NULL
+          AND activation_after_observation_id &lt; #{beforeObservationId}
+        ORDER BY id ASC
+        FOR UPDATE
+    </select>
+
+    <update id="updateProgress">
+        UPDATE stock_watch_intent_test
+        SET age_count = #{ageCount}, observed_count = #{observedCount}, test_verdict = #{testVerdict},
+            last_evaluated_observation_id = #{lastEvaluatedObservationId},
+            resolved_observation_id = #{resolvedObservationId}, row_version = row_version + 1
+        WHERE id = #{id} AND row_version = #{expectedRowVersion}
+    </update>
+</mapper>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchIntentTestResultMapper">
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_intent_test_result
+        (observation_id, observation_version, test_id, actual_value_json, match_status,
+         verdict_after, age_after, observed_after, evaluated_at)
+        VALUES
+        (#{observationId}, #{observationVersion}, #{testId}, #{actualValueJson}, #{matchStatus},
+         #{verdictAfter}, #{ageAfter}, #{observedAfter}, #{evaluatedAt})
+    </insert>
+</mapper>

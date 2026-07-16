@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchFactHeadMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchFactHead">
+        <id column="id" property="id"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="arrival_version" property="arrivalVersion"/>
+        <result column="latest_observation_id" property="latestObservationId"/>
+        <result column="last_source_time_epoch_ms" property="lastSourceTimeEpochMs"/>
+        <result column="last_source_date" property="lastSourceDate"/>
+        <result column="last_source_quality" property="lastSourceQuality"/>
+        <result column="last_fact_hash" property="lastFactHash"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <select id="selectBySymbolMarket" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_fact_head WHERE symbol = #{symbol} AND market = #{market}
+    </select>
+
+    <select id="selectForUpdate" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_fact_head WHERE symbol = #{symbol} AND market = #{market} FOR UPDATE
+    </select>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_fact_head
+        (symbol, market, arrival_version, latest_observation_id, last_source_time_epoch_ms,
+         last_source_date, last_source_quality, last_fact_hash, row_version)
+        VALUES
+        (#{symbol}, #{market}, #{arrivalVersion}, #{latestObservationId}, #{lastSourceTimeEpochMs},
+         #{lastSourceDate}, #{lastSourceQuality}, #{lastFactHash}, #{rowVersion})
+    </insert>
+
+    <update id="updateLatest">
+        UPDATE stock_watch_fact_head
+        SET arrival_version = #{arrivalVersion}, latest_observation_id = #{latestObservationId},
+            last_source_time_epoch_ms = #{lastSourceTimeEpochMs}, last_source_date = #{lastSourceDate},
+            last_source_quality = #{lastSourceQuality}, last_fact_hash = #{lastFactHash},
+            row_version = row_version + 1
+        WHERE id = #{id} AND row_version = #{expectedRowVersion}
+    </update>
+
+    <update id="updateArrivalVersion">
+        UPDATE stock_watch_fact_head
+        SET arrival_version = #{arrivalVersion}, row_version = row_version + 1
+        WHERE id = #{id} AND row_version = #{expectedRowVersion}
+    </update>
+</mapper>

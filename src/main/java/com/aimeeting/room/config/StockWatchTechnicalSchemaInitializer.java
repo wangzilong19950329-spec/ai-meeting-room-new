@@ -227,6 +227,63 @@ public class StockWatchTechnicalSchemaInitializer {
         } catch (Exception e) {
             log.warn("failed to ensure stock-watch technical analysis schema: {}", e.getMessage());
         }
+        ensureV17FactSchema();
+    }
+
+    private void ensureV17FactSchema() {
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_fact_head ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,"
+                + "symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,arrival_version BIGINT NOT NULL DEFAULT 0,"
+                + "latest_observation_id BIGINT,last_source_time_epoch_ms BIGINT,last_source_date VARCHAR(16),"
+                + "last_source_quality VARCHAR(32),last_fact_hash VARCHAR(64),row_version BIGINT NOT NULL DEFAULT 0,"
+                + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                + "PRIMARY KEY (id),UNIQUE KEY uk_sw_fact_head_symbol (symbol, market)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_fact_observation ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,"
+                + "stock_name VARCHAR(128),observation_key VARCHAR(64) NOT NULL,arrival_version BIGINT NOT NULL,"
+                + "source_time_epoch_ms BIGINT NOT NULL,source_date VARCHAR(16) NOT NULL,source_time_quality VARCHAR(32) NOT NULL,"
+                + "fact_hash VARCHAR(64) NOT NULL,fact_snapshot_json MEDIUMTEXT NOT NULL,data_quality_json TEXT,"
+                + "sampled_at DATETIME NOT NULL,gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY (id),"
+                + "UNIQUE KEY uk_sw_fact_observation_key (observation_key),"
+                + "UNIQUE KEY uk_sw_fact_observation_version (symbol, market, arrival_version),"
+                + "KEY idx_sw_fact_observation_source (symbol, market, source_time_epoch_ms)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_intent_test ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,"
+                + "origin_observation_id BIGINT NOT NULL,activation_after_observation_id BIGINT NOT NULL,"
+                + "test_key VARCHAR(160) NOT NULL,claim_ref VARCHAR(64) NOT NULL,metric_path VARCHAR(128) NOT NULL,"
+                + "comparison_operator VARCHAR(32) NOT NULL,target_value_json TEXT NOT NULL,max_observation_age INT NOT NULL,"
+                + "required_observed_count INT NOT NULL,age_count INT NOT NULL DEFAULT 0,observed_count INT NOT NULL DEFAULT 0,"
+                + "test_verdict VARCHAR(32) NOT NULL DEFAULT 'UNRESOLVED',row_version BIGINT NOT NULL DEFAULT 0,"
+                + "last_evaluated_observation_id BIGINT,resolved_observation_id BIGINT,"
+                + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,PRIMARY KEY (id),"
+                + "UNIQUE KEY uk_sw_intent_test_origin_key (origin_observation_id, test_key),"
+                + "KEY idx_sw_intent_test_active (symbol, market, resolved_observation_id)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_intent_test_result ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,observation_id BIGINT NOT NULL,observation_version BIGINT NOT NULL,"
+                + "test_id BIGINT NOT NULL,actual_value_json TEXT,match_status VARCHAR(32) NOT NULL,"
+                + "verdict_after VARCHAR(32) NOT NULL,age_after INT NOT NULL,observed_after INT NOT NULL,"
+                + "evaluated_at DATETIME NOT NULL,gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY (id),"
+                + "UNIQUE KEY uk_sw_intent_test_result (observation_id, test_id),"
+                + "KEY idx_sw_intent_test_result_test (test_id, observation_version)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_analysis_task ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,submission_key VARCHAR(255) NOT NULL,request_digest VARCHAR(64) NOT NULL,"
+                + "purpose VARCHAR(64) NOT NULL,symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,period_type VARCHAR(16),"
+                + "observation_key VARCHAR(128),generation INT NOT NULL DEFAULT 1,status VARCHAR(32) NOT NULL,provider VARCHAR(64),"
+                + "request_envelope_json MEDIUMTEXT NOT NULL,response_hash VARCHAR(64),raw_response MEDIUMTEXT,"
+                + "content_status VARCHAR(32),completion_reason VARCHAR(128),provider_status VARCHAR(64),submitted_at DATETIME,"
+                + "completed_at DATETIME,error_message TEXT,row_version BIGINT NOT NULL DEFAULT 0,"
+                + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,PRIMARY KEY (id),"
+                + "UNIQUE KEY uk_sw_analysis_task_submission (submission_key),"
+                + "KEY idx_sw_analysis_task_observation (symbol, market, observation_key),"
+                + "KEY idx_sw_analysis_task_status (status, gmt_create)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     }
 
     private void safeAddColumn(String table, String column, String definition) {

@@ -59,6 +59,13 @@ public class EastmoneyMarketDataService {
     }
 
     public MarketDataBundle buildBundle(String symbol, String market, String periodType) {
+        return buildBundle(symbol, market, periodType, null);
+    }
+
+    public MarketDataBundle buildBundle(String symbol,
+                                        String market,
+                                        String periodType,
+                                        Map<String, Object> canonicalQuote) {
         String normalizedMarket = normalizeMarket(market, symbol);
         String normalizedPeriod = normalizePeriod(periodType);
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -72,7 +79,7 @@ public class EastmoneyMarketDataService {
         payload.put("periodType", normalizedPeriod);
 
         Map<String, Object> quote = capture("quote", true, sources, requiredMissing, optionalMissing,
-                () -> fetchQuote(symbol, normalizedMarket));
+                () -> canonicalQuote == null ? fetchQuote(symbol, normalizedMarket) : validateCanonicalQuote(symbol, normalizedMarket, canonicalQuote));
         if (quote != null) payload.put("quote", quote);
 
         Map<String, Object> detail = capture("stockDetail", false, sources, requiredMissing, optionalMissing,
@@ -147,6 +154,23 @@ public class EastmoneyMarketDataService {
         quality.put("sourceStatus", sources);
         payload.put("dataQuality", quality);
         return new MarketDataBundle(payload, requiredMissing, optionalMissing);
+    }
+
+    private Map<String, Object> validateCanonicalQuote(String symbol,
+                                                       String market,
+                                                       Map<String, Object> canonicalQuote) {
+        if (canonicalQuote == null || !bool(canonicalQuote.get("ok"))) {
+            throw new IllegalStateException("canonical_quote_unavailable");
+        }
+        String quoteSymbol = text(canonicalQuote.get("symbol"));
+        String quoteMarket = text(canonicalQuote.get("market"));
+        if (StringUtils.hasText(quoteSymbol) && !symbol.equalsIgnoreCase(quoteSymbol)) {
+            throw new IllegalStateException("canonical_quote_symbol_mismatch");
+        }
+        if (StringUtils.hasText(quoteMarket) && !market.equalsIgnoreCase(StockSymbol.normalizeMarket(quoteMarket))) {
+            throw new IllegalStateException("canonical_quote_market_mismatch");
+        }
+        return new LinkedHashMap<>(canonicalQuote);
     }
 
     public List<Map<String, Object>> fetchDailyBars(String symbol, String market, int limit) {
@@ -658,7 +682,7 @@ public class EastmoneyMarketDataService {
         quality.put("dailyKlineTradeDate", dailyDate == null ? null : dailyDate.toString());
         quality.put("selectedSource", quoteDate != null ? "quote.timestamp"
                 : (dailyDate != null ? "dailyKline.latest" : "system_date_fallback"));
-        boolean consistent = quoteDate == null || dailyDate == null || quoteDate.equals(dailyDate);
+        boolean consistent = quoteDate == null || dailyDate == null || !dailyDate.isAfter(quoteDate);
         quality.put("consistent", consistent);
         if (!consistent) {
             quality.put("warning", "quote_trade_date_and_daily_kline_latest_date_mismatch");

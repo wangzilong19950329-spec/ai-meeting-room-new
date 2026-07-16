@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchAnalysisTaskMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchAnalysisTask">
+        <id column="id" property="id"/>
+        <result column="submission_key" property="submissionKey"/>
+        <result column="request_digest" property="requestDigest"/>
+        <result column="purpose" property="purpose"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="period_type" property="periodType"/>
+        <result column="observation_key" property="observationKey"/>
+        <result column="generation" property="generation"/>
+        <result column="status" property="status"/>
+        <result column="provider" property="provider"/>
+        <result column="request_envelope_json" property="requestEnvelopeJson"/>
+        <result column="response_hash" property="responseHash"/>
+        <result column="raw_response" property="rawResponse"/>
+        <result column="content_status" property="contentStatus"/>
+        <result column="completion_reason" property="completionReason"/>
+        <result column="provider_status" property="providerStatus"/>
+        <result column="submitted_at" property="submittedAt"/>
+        <result column="completed_at" property="completedAt"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <select id="selectBySubmissionKey" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_task WHERE submission_key = #{submissionKey}
+    </select>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_analysis_task
+        (submission_key, request_digest, purpose, symbol, market, period_type, observation_key,
+         generation, status, provider, request_envelope_json, row_version)
+        VALUES
+        (#{submissionKey}, #{requestDigest}, #{purpose}, #{symbol}, #{market}, #{periodType}, #{observationKey},
+         #{generation}, #{status}, #{provider}, #{requestEnvelopeJson}, #{rowVersion})
+    </insert>
+
+    <update id="markSubmitted">
+        UPDATE stock_watch_analysis_task
+        SET status = 'SUBMITTED', provider = #{provider}, submitted_at = #{submittedAt}, row_version = row_version + 1
+        WHERE id = #{id} AND row_version = #{expectedRowVersion} AND status = 'RESERVED'
+    </update>
+
+    <update id="complete">
+        UPDATE stock_watch_analysis_task
+        SET status = #{status}, response_hash = #{responseHash}, raw_response = #{rawResponse},
+            content_status = #{contentStatus}, completion_reason = #{completionReason},
+            provider_status = #{providerStatus}, completed_at = #{completedAt}, error_message = #{errorMessage},
+            row_version = row_version + 1
+        WHERE id = #{id}
+    </update>
+</mapper>
