@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -96,6 +97,45 @@ class StockWatchMonitorServiceTest {
         assertEquals(0L, result.get("emailSentCount"));
         assertTrue(((List<?>) result.get("evaluations")).isEmpty());
         verify(notificationService, never()).sendStockWatchAlert(anyString(), anyString());
+    }
+
+    @Test
+    void l0RulePreservesDotStockKeyAndDoesNotBuildEnhancedBundle() {
+        AiWatchRule rule = aiRule("l0-rule", "002979", "sz", "雷赛智能", "涨跌幅 changePercent 绝对值 >= 5");
+        rule.setRequiredCapabilities(Collections.singletonList(StockWatchAiRuleService.CAPABILITY_L0_ADVISORY));
+        rule.setRiskPatternTriggerMode(StockWatchAiRuleService.TRIGGER_MODE_ADVISORY);
+        Map<String, Object> quote = quote("002979", "sz", "雷赛智能");
+        Map<String, Object> observations = new LinkedHashMap<>();
+        observations.put("evaluationStatus", "EVALUATED");
+        observations.put("patterns", Collections.emptyList());
+        StockWatchRiskPatternService.RiskPatternResult riskPattern =
+                new StockWatchRiskPatternService.RiskPatternResult(observations, Collections.emptyMap(),
+                        ZonedDateTime.now(CHINA_ZONE), false);
+        when(aiRuleService.listEnabled()).thenReturn(Collections.singletonList(rule));
+        when(marketDataService.fetchDailyBars("002979", "sz", 80)).thenReturn(Collections.emptyList());
+        when(riskPatternService.analyze(eq("002979"), eq("sz"), eq(quote), anyList(), any(ZonedDateTime.class)))
+                .thenReturn(riskPattern);
+        when(factPersistenceService.observe(eq("002979"), eq("sz"), eq("雷赛智能"), eq(quote),
+                eq(riskPattern), any(ZonedDateTime.class)))
+                .thenReturn(StockWatchFactPersistenceService.ObservationReceipt.skipped("test"));
+        when(aiJudgeService.judgeDeterministic(rule, quote)).thenReturn(decision(false));
+
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("rules", Collections.emptyList());
+        request.put("quotes", Collections.singletonList(quote));
+        request.put("ignoreTradingHours", true);
+        request.put("notify", false);
+
+        Map<String, Object> result = service.runOnce(request, "test");
+        Map<?, ?> evaluation = (Map<?, ?>) ((List<?>) result.get("evaluations")).get(0);
+
+        assertEquals("002979", evaluation.get("symbol"));
+        assertEquals("sz", evaluation.get("market"));
+        verify(riskPatternService).analyze(eq("002979"), eq("sz"), eq(quote), anyList(), any(ZonedDateTime.class));
+        verify(factPersistenceService).observe(eq("002979"), eq("sz"), eq("雷赛智能"), eq(quote),
+                eq(riskPattern), any(ZonedDateTime.class));
+        verify(marketDataService, never()).buildBundle(anyString(), anyString(), anyString(), anyMap());
+        verify(aiJudgeService, never()).judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap());
     }
 
     @Test

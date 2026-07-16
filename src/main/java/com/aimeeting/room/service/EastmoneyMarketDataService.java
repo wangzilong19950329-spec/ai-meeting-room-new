@@ -37,6 +37,7 @@ public class EastmoneyMarketDataService {
 
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final String KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get";
+    private static final String TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
     private static final String STOCK_DETAIL_URL = "https://push2.eastmoney.com/api/qt/stock/get";
     private static final String TRENDS_URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get";
     private static final String INTRADAY_FLOW_URL = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get";
@@ -88,7 +89,7 @@ public class EastmoneyMarketDataService {
 
         int dailyLimit = "MONTH".equals(normalizedPeriod) ? 500 : ("WEEK".equals(normalizedPeriod) ? 300 : 160);
         List<Map<String, Object>> dailyBars = capture("dailyKline", true, sources, requiredMissing, optionalMissing,
-                () -> fetchKlines(symbol, normalizedMarket, 101, dailyLimit));
+                () -> fetchCanonicalDailyKlines(symbol, normalizedMarket, dailyLimit, quote));
         if (dailyBars == null) dailyBars = Collections.emptyList();
         if (dailyBars.size() < 30 && !requiredMissing.contains("dailyKline")) {
             requiredMissing.add("dailyKline:need_at_least_30_bars");
@@ -137,7 +138,7 @@ public class EastmoneyMarketDataService {
         if (shareholderCounts != null) payload.put("shareholderCounts", shareholderCounts);
 
         List<Map<String, Object>> benchmarkBars = capture("marketBenchmark", false, sources, requiredMissing, optionalMissing,
-                () -> fetchBenchmarkKlines(symbol, normalizedMarket, 120));
+                () -> fetchBenchmarkKlines(symbol, normalizedMarket, 120, sourceTradeDate));
         if (benchmarkBars != null) {
             Map<String, Object> benchmark = new LinkedHashMap<>();
             benchmark.put("name", benchmarkName(symbol, normalizedMarket));
@@ -174,7 +175,7 @@ public class EastmoneyMarketDataService {
     }
 
     public List<Map<String, Object>> fetchDailyBars(String symbol, String market, int limit) {
-        return fetchKlines(symbol, normalizeMarket(market, symbol), 101, Math.max(30, limit));
+        return fetchCanonicalDailyKlines(symbol, normalizeMarket(market, symbol), Math.max(30, limit), null);
     }
 
     private Map<String, Object> fetchQuote(String symbol, String market) {
@@ -253,6 +254,128 @@ public class EastmoneyMarketDataService {
         return bars;
     }
 
+    private List<Map<String, Object>> fetchCanonicalDailyKlines(String symbol,
+                                                                 String market,
+                                                                 int limit,
+                                                                 Map<String, Object> canonicalQuote) {
+        Exception primaryFailure;
+        try {
+            List<Map<String, Object>> bars = fetchKlines(symbol, market, 101, limit);
+            validateCanonicalDailyKlines(bars, canonicalQuote, "eastmoney");
+            annotateLatestTrace("series", "klines");
+            annotateLatestTrace("adjustment", "qfq");
+            return bars;
+        } catch (Exception failure) {
+            primaryFailure = failure;
+        }
+        if (!("sh".equals(market) || "sz".equals(market))) {
+            throw new IllegalStateException("daily_kline_primary_failed_and_fallback_unsupported:"
+                    + primaryFailure.getMessage(), primaryFailure);
+        }
+        return fetchTencentKlines(symbol, market, limit, true, canonicalQuote,
+                "eastmoney:" + primaryFailure.getMessage());
+    }
+
+    private List<Map<String, Object>> fetchTencentKlines(String symbol,
+                                                          String market,
+                                                          int limit,
+                                                          boolean adjusted,
+                                                          Map<String, Object> canonicalQuote,
+                                                          String fallbackReason) {
+        String instrument = market + symbol;
+        String series = adjusted ? "qfqday" : "day";
+        Map<String, String> params = new LinkedHashMap<>();
+        params.put("param", instrument + ",day,,," + Math.max(30, limit) + "," + (adjusted ? "qfq" : ""));
+        JSONObject root = getJson("tencent", TENCENT_KLINE_URL, params);
+        JSONObject data = root.getJSONObject("data");
+        JSONObject instrumentData = data == null ? null : data.getJSONObject(instrument);
+        JSONArray rows = instrumentData == null ? null : instrumentData.getJSONArray(series);
+        if (rows == null || rows.isEmpty()) {
+            throw new IllegalStateException("empty_tencent_kline:" + instrument + ":" + series);
+        }
+        List<Map<String, Object>> bars = new ArrayList<>();
+        for (int i = 0; i < rows.size(); i++) {
+            JSONArray row = rows.getJSONArray(i);
+            if (row == null || row.size() < 6) {
+                throw new IllegalStateException("invalid_tencent_kline_row:" + i);
+            }
+            Map<String, Object> bar = new LinkedHashMap<>();
+            bar.put("date", row.getString(0));
+            bar.put("open", decimal(row.get(1)));
+            bar.put("close", decimal(row.get(2)));
+            bar.put("high", decimal(row.get(3)));
+            bar.put("low", decimal(row.get(4)));
+            bar.put("volume", decimal(row.get(5)));
+            bars.add(bar);
+        }
+        validateCanonicalDailyKlines(bars, canonicalQuote, "tencent");
+        annotateLatestTrace("series", series);
+        annotateLatestTrace("adjustment", adjusted ? "qfq" : "none");
+        annotateLatestTrace("fallbackReason", fallbackReason);
+        annotateLatestTrace("missingFields", List.of("amount", "amplitudePct", "changePct", "change", "turnoverPct"));
+        return bars;
+    }
+
+    private void validateCanonicalDailyKlines(List<Map<String, Object>> bars,
+                                              Map<String, Object> canonicalQuote,
+                                              String provider) {
+        if (bars == null || bars.isEmpty()) {
+            throw new IllegalStateException("canonical_daily_kline_empty:" + provider);
+        }
+        LocalDate previous = null;
+        for (int i = 0; i < bars.size(); i++) {
+            Map<String, Object> bar = bars.get(i);
+            LocalDate current;
+            try {
+                current = LocalDate.parse(text(bar.get("date")));
+            } catch (Exception invalidDate) {
+                throw new IllegalStateException("canonical_daily_kline_date_invalid:" + provider + ":" + i,
+                        invalidDate);
+            }
+            if (previous != null && !current.isAfter(previous)) {
+                throw new IllegalStateException("canonical_daily_kline_not_strictly_increasing:" + provider + ":" + i);
+            }
+            if (current.isAfter(LocalDate.now(CHINA_ZONE))) {
+                throw new IllegalStateException("canonical_daily_kline_future_date:" + provider + ":" + current);
+            }
+            previous = current;
+        }
+        LocalDate quoteDate = tradeDateFromQuote(canonicalQuote);
+        if (quoteDate == null) return;
+        if (!quoteDate.equals(previous)) {
+            throw new IllegalStateException("canonical_daily_kline_stale:" + provider + ":latest="
+                    + previous + ":quote=" + quoteDate);
+        }
+        Map<String, Object> latest = bars.get(bars.size() - 1);
+        requireApproximatelyEqual(latest.get("close"), canonicalQuote.get("price"), 0.02, 0.001,
+                "close", provider);
+        requireApproximatelyEqual(latest.get("open"), canonicalQuote.get("open"), 0.02, 0.001,
+                "open", provider);
+        requireApproximatelyEqual(latest.get("high"), canonicalQuote.get("high"), 0.02, 0.001,
+                "high", provider);
+        requireApproximatelyEqual(latest.get("low"), canonicalQuote.get("low"), 0.02, 0.001,
+                "low", provider);
+        requireApproximatelyEqual(latest.get("volume"), canonicalQuote.get("volume"), 1.0, 0.01,
+                "volume", provider);
+    }
+
+    private void requireApproximatelyEqual(Object barValue,
+                                           Object quoteValue,
+                                           double absoluteTolerance,
+                                           double relativeTolerance,
+                                           String field,
+                                           String provider) {
+        Double left = decimal(barValue);
+        Double right = decimal(quoteValue);
+        if (left == null || right == null) {
+            throw new IllegalStateException("canonical_daily_kline_field_missing:" + provider + ":" + field);
+        }
+        double tolerance = Math.max(absoluteTolerance, Math.abs(right) * relativeTolerance);
+        if (Math.abs(left - right) > tolerance) {
+            throw new IllegalStateException("canonical_daily_kline_quote_mismatch:" + provider + ":" + field);
+        }
+    }
+
     private List<Map<String, Object>> fetchMinuteTrends(String symbol, String market) {
         Map<String, String> params = new LinkedHashMap<>();
         params.put("secid", secid(symbol, market));
@@ -307,12 +430,31 @@ public class EastmoneyMarketDataService {
         return result;
     }
 
-    private List<Map<String, Object>> fetchBenchmarkKlines(String symbol, String market, int limit) {
+    private List<Map<String, Object>> fetchBenchmarkKlines(String symbol,
+                                                           String market,
+                                                           int limit,
+                                                           LocalDate canonicalSourceDate) {
         if ("hk".equals(market)) {
             throw new IllegalStateException("unsupported_hk_benchmark");
         }
         String code = benchmarkCode(symbol, market);
-        return fetchKlines(code.substring(code.indexOf('.') + 1), "1".equals(code.substring(0, 1)) ? "sh" : "sz", 101, limit);
+        String benchmarkMarket = "1".equals(code.substring(0, 1)) ? "sh" : "sz";
+        String benchmarkSymbol = code.substring(code.indexOf('.') + 1);
+        List<Map<String, Object>> bars;
+        try {
+            bars = fetchKlines(benchmarkSymbol, benchmarkMarket, 101, limit);
+        } catch (Exception primaryFailure) {
+            bars = fetchTencentKlines(benchmarkSymbol, benchmarkMarket, limit, false, null,
+                    "eastmoney:" + primaryFailure.getMessage());
+        }
+        LocalDate benchmarkDate = latestDailyTradeDate(bars);
+        if (canonicalSourceDate == null || benchmarkDate == null || !canonicalSourceDate.equals(benchmarkDate)) {
+            throw new IllegalStateException("market_benchmark_stale:latest=" + benchmarkDate
+                    + ":source=" + canonicalSourceDate);
+        }
+        annotateLatestTrace("sourceTradeDate", benchmarkDate.toString());
+        annotateLatestTrace("fresh", true);
+        return bars;
     }
 
     private Map<String, Object> fetchValuation(String symbol) {
@@ -527,9 +669,14 @@ public class EastmoneyMarketDataService {
     }
 
     private JSONObject getJson(String baseUrl, Map<String, String> params) {
+        return getJson("eastmoney", baseUrl, params);
+    }
+
+    private JSONObject getJson(String provider, String baseUrl, Map<String, String> params) {
         Exception lastError = null;
         for (int attempt = 0; attempt < 3; attempt++) {
-            String effectiveUrl = attempt > 0 && baseUrl.startsWith("https://datacenter-web.eastmoney.com")
+            String effectiveUrl = "eastmoney".equals(provider) && attempt > 0
+                    && baseUrl.startsWith("https://datacenter-web.eastmoney.com")
                     ? baseUrl.replaceFirst("^https://", "http://")
                     : baseUrl;
             HttpUrl.Builder builder = Objects.requireNonNull(HttpUrl.parse(effectiveUrl)).newBuilder();
@@ -543,7 +690,7 @@ public class EastmoneyMarketDataService {
                     .get()
                     .build();
             long requestStart = System.currentTimeMillis();
-            Map<String, Object> trace = buildRequestTrace(baseUrl, effectiveUrl, url, params, attempt + 1);
+            Map<String, Object> trace = buildRequestTrace(provider, baseUrl, effectiveUrl, url, params, attempt + 1);
             boolean recorded = false;
             try (Response response = http.newCall(request).execute()) {
                 String body = response.body() == null ? "" : response.body().string();
@@ -580,13 +727,14 @@ public class EastmoneyMarketDataService {
         throw new IllegalStateException(lastError == null ? "request_failed" : lastError.getMessage(), lastError);
     }
 
-    private Map<String, Object> buildRequestTrace(String originalBaseUrl,
+    private Map<String, Object> buildRequestTrace(String provider,
+                                                  String originalBaseUrl,
                                                   String effectiveBaseUrl,
                                                   HttpUrl url,
                                                   Map<String, String> params,
                                                   int attempt) {
         Map<String, Object> trace = new LinkedHashMap<>();
-        trace.put("provider", "eastmoney");
+        trace.put("provider", provider);
         trace.put("sourceType", "HTTP_JSON");
         trace.put("method", "GET");
         trace.put("attempt", attempt);
@@ -608,6 +756,12 @@ public class EastmoneyMarketDataService {
         }
     }
 
+    private void annotateLatestTrace(String key, Object value) {
+        List<Map<String, Object>> traces = currentRequestTrace.get();
+        if (traces == null || traces.isEmpty() || !StringUtils.hasText(key)) return;
+        traces.get(traces.size() - 1).put(key, value);
+    }
+
     private void appendRequestTrace(Map<String, Object> status, List<Map<String, Object>> requestTrace) {
         if (requestTrace == null || requestTrace.isEmpty()) {
             status.put("sourceType", "INTERNAL_SERVICE");
@@ -616,6 +770,15 @@ public class EastmoneyMarketDataService {
         status.put("sourceType", "HTTP_JSON");
         status.put("requestCount", requestTrace.size());
         Map<String, Object> last = requestTrace.get(requestTrace.size() - 1);
+        status.put("selectedProvider", last.get("provider"));
+        status.put("series", last.get("series"));
+        status.put("adjustment", last.get("adjustment"));
+        status.put("missingFields", last.get("missingFields"));
+        long providerCount = requestTrace.stream().map(trace -> trace.get("provider")).distinct().count();
+        status.put("fallbackUsed", providerCount > 1);
+        if (providerCount > 1) {
+            status.put("fallbackReason", last.get("fallbackReason"));
+        }
         status.put("lastUrl", last.get("url"));
         status.put("lastParamsHash", last.get("paramsHash"));
         status.put("lastResponseHash", last.get("responseHash"));
@@ -682,10 +845,11 @@ public class EastmoneyMarketDataService {
         quality.put("dailyKlineTradeDate", dailyDate == null ? null : dailyDate.toString());
         quality.put("selectedSource", quoteDate != null ? "quote.timestamp"
                 : (dailyDate != null ? "dailyKline.latest" : "system_date_fallback"));
-        boolean consistent = quoteDate == null || dailyDate == null || !dailyDate.isAfter(quoteDate);
+        boolean consistent = quoteDate == null || dailyDate == null || dailyDate.equals(quoteDate);
         quality.put("consistent", consistent);
+        quality.put("fresh", consistent && (quoteDate == null || dailyDate != null));
         if (!consistent) {
-            quality.put("warning", "quote_trade_date_and_daily_kline_latest_date_mismatch");
+            quality.put("warning", "quote_trade_date_and_daily_kline_latest_date_must_match");
         }
         return quality;
     }
@@ -861,9 +1025,38 @@ public class EastmoneyMarketDataService {
     }
 
     private Double relativeStrength(List<Map<String, Object>> stock, List<Map<String, Object>> benchmark, int periods) {
-        Double stockReturn = periodReturn(stock, periods);
-        Double benchmarkReturn = periodReturn(benchmark, periods);
-        return stockReturn == null || benchmarkReturn == null ? null : round(stockReturn - benchmarkReturn);
+        Map<LocalDate, Double> stockByDate = closeByDate(stock);
+        Map<LocalDate, Double> benchmarkByDate = closeByDate(benchmark);
+        List<LocalDate> commonDates = stockByDate.keySet().stream()
+                .filter(benchmarkByDate::containsKey)
+                .sorted()
+                .collect(java.util.stream.Collectors.toList());
+        if (commonDates.size() <= periods) return null;
+        LocalDate end = commonDates.get(commonDates.size() - 1);
+        LocalDate start = commonDates.get(commonDates.size() - 1 - periods);
+        Double stockStart = stockByDate.get(start);
+        Double stockEnd = stockByDate.get(end);
+        Double benchmarkStart = benchmarkByDate.get(start);
+        Double benchmarkEnd = benchmarkByDate.get(end);
+        if (stockStart == null || stockEnd == null || benchmarkStart == null || benchmarkEnd == null
+                || stockStart == 0 || benchmarkStart == 0) return null;
+        double stockReturn = (stockEnd / stockStart - 1) * 100;
+        double benchmarkReturn = (benchmarkEnd / benchmarkStart - 1) * 100;
+        return round(stockReturn - benchmarkReturn);
+    }
+
+    private Map<LocalDate, Double> closeByDate(List<Map<String, Object>> bars) {
+        Map<LocalDate, Double> result = new LinkedHashMap<>();
+        if (bars == null) return result;
+        for (Map<String, Object> bar : bars) {
+            try {
+                LocalDate date = LocalDate.parse(text(bar.get("date")));
+                Double close = decimal(bar.get("close"));
+                if (close != null && close > 0) result.put(date, close);
+            } catch (Exception ignored) {
+            }
+        }
+        return result;
     }
 
     private double minTail(List<Double> values, int count) {

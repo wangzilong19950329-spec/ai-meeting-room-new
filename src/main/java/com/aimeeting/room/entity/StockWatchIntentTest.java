@@ -23,6 +23,7 @@ public class StockWatchIntentTest {
     private String testVerdict;
     private Long rowVersion;
     private Long lastEvaluatedObservationId;
+    private String lastEvaluatedSourceDate;
     private Long resolvedObservationId;
     private Date gmtCreate;
     private Date gmtModify;

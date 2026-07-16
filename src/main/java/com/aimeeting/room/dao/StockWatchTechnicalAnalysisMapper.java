@@ -13,6 +13,8 @@ public interface StockWatchTechnicalAnalysisMapper {
 
     StockWatchTechnicalAnalysis selectById(@Param("id") Long id);
 
+    StockWatchTechnicalAnalysis selectByAnalysisTaskId(@Param("analysisTaskId") Long analysisTaskId);
+
     StockWatchTechnicalAnalysis selectLatestBySymbolDateSlot(@Param("symbol") String symbol,
                                                              @Param("market") String market,
                                                              @Param("analysisDate") Date analysisDate,

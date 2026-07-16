@@ -315,6 +315,7 @@ CREATE TABLE IF NOT EXISTS `stock_watch_technical_session` (
 -- 股票盯盘：DeepSeek 网页技术面分析结论
 CREATE TABLE IF NOT EXISTS `stock_watch_technical_analysis` (
     `id`                  BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',
+    `analysis_task_id`    BIGINT                                COMMENT '模型提交任务ID',
     `session_id`          BIGINT                                COMMENT '会话ID',
     `symbol`              VARCHAR(16)  NOT NULL                COMMENT '股票代码',
     `market`              VARCHAR(8)   NOT NULL                COMMENT '市场 sh/sz/bj',
@@ -346,6 +347,7 @@ CREATE TABLE IF NOT EXISTS `stock_watch_technical_analysis` (
     `error_message`       TEXT                                  COMMENT '错误信息',
     `gmt_create`          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_tech_analysis_task` (`analysis_task_id`),
     KEY `idx_sw_tech_analysis_symbol_date` (`symbol`, `market`, `period_type`, `analysis_date`),
     KEY `idx_sw_tech_analysis_session` (`session_id`),
     KEY `idx_sw_tech_analysis_slot` (`symbol`, `market`, `period_type`, `period_key`, `analysis_date`, `run_slot`),
@@ -450,6 +452,7 @@ CREATE TABLE IF NOT EXISTS `stock_watch_intent_test` (
     `test_verdict` VARCHAR(32) NOT NULL DEFAULT 'UNRESOLVED',
     `row_version` BIGINT NOT NULL DEFAULT 0,
     `last_evaluated_observation_id` BIGINT,
+    `last_evaluated_source_date` VARCHAR(16),
     `resolved_observation_id` BIGINT,
     `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `gmt_modify` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -489,6 +492,8 @@ CREATE TABLE IF NOT EXISTS `stock_watch_analysis_task` (
     `provider` VARCHAR(64),
     `request_envelope_json` MEDIUMTEXT NOT NULL,
     `response_hash` VARCHAR(64),
+    `response_envelope_hash` VARCHAR(64),
+    `response_envelope_json` MEDIUMTEXT,
     `raw_response` MEDIUMTEXT,
     `content_status` VARCHAR(32),
     `completion_reason` VARCHAR(128),

@@ -17,6 +17,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
@@ -56,6 +57,28 @@ class StockWatchPredictionServiceTest {
         assertEquals("T1", captor.getValue().getHorizonCode());
         assertEquals(1.0, captor.getValue().getExpectedReturnLow(), 0.0001);
         assertEquals(5.0, captor.getValue().getExpectedReturnHigh(), 0.0001);
+    }
+
+    @Test
+    void strictValidationRejectsMissingDirectionAndDuplicateHorizonsBeforeProjection() {
+        StockWatchPredictionService service = new StockWatchPredictionService(
+                mock(StockWatchPredictionMapper.class), mock(EastmoneyMarketDataService.class));
+        JSONObject missingDirection = new JSONObject();
+        missingDirection.put("horizon", "T1");
+        missingDirection.put("targetLow", 99);
+        missingDirection.put("targetHigh", 103);
+        JSONArray invalid = new JSONArray();
+        invalid.add(missingDirection);
+        assertThrows(IllegalArgumentException.class,
+                () -> service.validatePredictionsStrict(100.0, invalid));
+
+        JSONObject first = forecast("T1", "UP", 99, 103);
+        JSONObject second = forecast("T+1", "DOWN", 95, 99);
+        JSONArray duplicate = new JSONArray();
+        duplicate.add(first);
+        duplicate.add(second);
+        assertThrows(IllegalArgumentException.class,
+                () -> service.validatePredictionsStrict(100.0, duplicate));
     }
 
     @Test
@@ -132,5 +155,14 @@ class StockWatchPredictionServiceTest {
         bar.put("high", high);
         bar.put("low", low);
         return bar;
+    }
+
+    private JSONObject forecast(String horizon, String direction, double targetLow, double targetHigh) {
+        JSONObject forecast = new JSONObject();
+        forecast.put("horizon", horizon);
+        forecast.put("direction", direction);
+        forecast.put("targetLow", targetLow);
+        forecast.put("targetHigh", targetHigh);
+        return forecast;
     }
 }

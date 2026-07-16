@@ -4,6 +4,7 @@
 
     <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchTechnicalAnalysis">
         <id column="id" property="id"/>
+        <result column="analysis_task_id" property="analysisTaskId"/>
         <result column="session_id" property="sessionId"/>
         <result column="symbol" property="symbol"/>
         <result column="market" property="market"/>
@@ -38,13 +39,13 @@
 
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO stock_watch_technical_analysis
-        (session_id, symbol, market, stock_name, analysis_date, run_slot, period_type, period_key, source_record_ids,
+        (analysis_task_id, session_id, symbol, market, stock_name, analysis_date, run_slot, period_type, period_key, source_record_ids,
          evidence_signal_json, main_force_intent_json, main_force_intent_status, main_force_intent_warnings_json,
          status, stance, tone, confidence,
          title, conclusion, evidence_json, missing_data_json, data_snapshot_json, raw_response, prompt_hash, provider, bridge_target_id,
          conversation_url, context_chars_delta, error_message)
         VALUES
-        (#{sessionId}, #{symbol}, #{market}, #{stockName}, #{analysisDate}, #{runSlot}, #{periodType}, #{periodKey},
+        (#{analysisTaskId}, #{sessionId}, #{symbol}, #{market}, #{stockName}, #{analysisDate}, #{runSlot}, #{periodType}, #{periodKey},
          #{sourceRecordIds}, #{evidenceSignalJson}, #{mainForceIntentJson}, #{mainForceIntentStatus}, #{mainForceIntentWarningsJson},
          #{status}, #{stance},
          #{tone}, #{confidence}, #{title}, #{conclusion}, #{evidenceJson}, #{missingDataJson}, #{dataSnapshotJson}, #{rawResponse}, #{promptHash},
@@ -53,6 +54,10 @@
 
     <select id="selectById" resultMap="BaseResultMap">
         SELECT * FROM stock_watch_technical_analysis WHERE id = #{id}
+    </select>
+
+    <select id="selectByAnalysisTaskId" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_technical_analysis WHERE analysis_task_id = #{analysisTaskId}
     </select>
 
     <select id="selectLatestBySymbolDateSlot" resultMap="BaseResultMap">

@@ -11,15 +11,69 @@ import org.springframework.util.StringUtils;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.List;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
 public class StockWatchAnalysisTaskService {
 
     private final StockWatchAnalysisTaskMapper mapper;
+
+    public Reservation find(String submissionKey) {
+        if (!StringUtils.hasText(submissionKey)) return null;
+        StockWatchAnalysisTask task = mapper.selectBySubmissionKey(submissionKey);
+        return task == null ? null : Reservation.existing(task, task.getRequestDigest());
+    }
+
+    public List<Reservation> findRecoverableBefore(Date before, int limit) {
+        List<StockWatchAnalysisTask> tasks = mapper.selectRecoverableBefore(before, Math.max(1, Math.min(limit, 100)));
+        if (tasks == null) return Collections.emptyList();
+        return tasks.stream().map(task -> Reservation.existing(task, task.getRequestDigest()))
+                .collect(Collectors.toList());
+    }
+
+    @Transactional
+    public Reservation claim(String submissionKey,
+                             String purpose,
+                             String symbol,
+                             String market,
+                             String periodType,
+                             String observationKey,
+                             String provider) {
+        Map<String, Object> envelope = new LinkedHashMap<>();
+        envelope.put("schema", "stock-analysis-claim-v1");
+        envelope.put("submissionKey", submissionKey);
+        return reserve(submissionKey, sha256(submissionKey), purpose, symbol, market, periodType,
+                observationKey, 0, provider, envelope);
+    }
+
+    @Transactional
+    public void prepare(Reservation reservation,
+                        String requestDigest,
+                        int generation,
+                        Map<String, Object> requestEnvelope) {
+        if (reservation == null || !reservation.isNewSubmission() || !StringUtils.hasText(requestDigest)
+                || requestEnvelope == null || requestEnvelope.isEmpty()) {
+            throw new IllegalArgumentException("analysis_task_prepare_input_required");
+        }
+        StockWatchAnalysisTask task = reservation.getTask();
+        String requestEnvelopeJson = JSON.toJSONString(requestEnvelope);
+        int updated = mapper.prepare(task.getId(), value(task.getRowVersion()), requestDigest, generation,
+                requestEnvelopeJson);
+        if (updated != 1) {
+            throw new IllegalStateException("analysis_task_prepare_conflict:" + task.getId());
+        }
+        task.setRequestDigest(requestDigest);
+        task.setGeneration(generation);
+        task.setRequestEnvelopeJson(requestEnvelopeJson);
+        task.setRowVersion(value(task.getRowVersion()) + 1);
+    }
 
     @Transactional
     public Reservation reserve(String submissionKey,
@@ -36,7 +90,7 @@ public class StockWatchAnalysisTaskService {
             throw new IllegalArgumentException("submission_key_and_request_digest_required");
         }
         StockWatchAnalysisTask existing = mapper.selectBySubmissionKey(submissionKey);
-        if (existing != null) return Reservation.existing(existing);
+        if (existing != null) return Reservation.existing(existing, requestDigest);
         StockWatchAnalysisTask task = new StockWatchAnalysisTask();
         task.setSubmissionKey(submissionKey);
         task.setRequestDigest(requestDigest);
@@ -55,7 +109,7 @@ public class StockWatchAnalysisTaskService {
             return Reservation.created(task);
         } catch (DuplicateKeyException duplicate) {
             existing = mapper.selectBySubmissionKey(submissionKey);
-            if (existing != null) return Reservation.existing(existing);
+            if (existing != null) return Reservation.existing(existing, requestDigest);
             throw duplicate;
         }
     }
@@ -71,31 +125,102 @@ public class StockWatchAnalysisTaskService {
         task.setRowVersion(value(task.getRowVersion()) + 1);
     }
 
+    @Transactional
     public void markSuccess(Reservation reservation,
                             String rawResponse,
                             String contentStatus,
                             String completionReason,
                             String providerStatus) {
-        complete(reservation, "SUCCESS", rawResponse, contentStatus, completionReason, providerStatus, null);
+        completeNewSubmission(reservation, Collections.singletonList("SUBMITTED"), "SUCCESS",
+                rawResponse, contentStatus, completionReason, providerStatus, null);
     }
 
+    @Transactional
+    public void markResponseReceived(Reservation reservation,
+                                     String rawResponse,
+                                     String contentStatus,
+                                     String completionReason,
+                                     String providerStatus,
+                                     String bridgeTargetId,
+                                     String conversationUrl) {
+        Map<String, Object> responseEnvelope = new LinkedHashMap<>();
+        responseEnvelope.put("schema", "stock-analysis-response-v1");
+        responseEnvelope.put("submissionKey", reservation == null ? null : reservation.getTask().getSubmissionKey());
+        responseEnvelope.put("requestDigest", reservation == null ? null : reservation.getTask().getRequestDigest());
+        responseEnvelope.put("responseHash", StringUtils.hasText(rawResponse) ? sha256(rawResponse) : null);
+        responseEnvelope.put("bridgeTargetId", bridgeTargetId);
+        responseEnvelope.put("conversationUrl", conversationUrl);
+        String responseEnvelopeJson = JSON.toJSONString(responseEnvelope);
+        transition(reservation, Collections.singletonList("SUBMITTED"), "RESPONSE_RECEIVED",
+                rawResponse, responseEnvelopeJson, contentStatus, completionReason, providerStatus, null);
+    }
+
+    @Transactional
+    public void markProjectedSuccess(Reservation reservation) {
+        transition(reservation, Arrays.asList("RESPONSE_RECEIVED", "PROJECTION_FAILED", "SUCCESS"),
+                "PROJECTED_SUCCESS", reservation == null ? null : reservation.getTask().getRawResponse(),
+                reservation == null ? null : reservation.getTask().getResponseEnvelopeJson(),
+                reservation == null ? null : reservation.getTask().getContentStatus(),
+                reservation == null ? null : reservation.getTask().getCompletionReason(),
+                "PROJECTED", null);
+    }
+
+    @Transactional
+    public void markProjectionFailed(Reservation reservation, String error) {
+        transition(reservation, Arrays.asList("RESPONSE_RECEIVED", "PROJECTION_FAILED", "SUCCESS"),
+                "PROJECTION_FAILED", reservation == null ? null : reservation.getTask().getRawResponse(),
+                reservation == null ? null : reservation.getTask().getResponseEnvelopeJson(),
+                reservation == null ? null : reservation.getTask().getContentStatus(),
+                reservation == null ? null : reservation.getTask().getCompletionReason(),
+                "PROJECTION_FAILED", error);
+    }
+
+    @Transactional
+    public void markProjectionInvalid(Reservation reservation, String error) {
+        transition(reservation, Arrays.asList("RESPONSE_RECEIVED", "PROJECTION_FAILED", "SUCCESS"),
+                "PROJECTION_INVALID", reservation == null ? null : reservation.getTask().getRawResponse(),
+                reservation == null ? null : reservation.getTask().getResponseEnvelopeJson(),
+                reservation == null ? null : reservation.getTask().getContentStatus(),
+                reservation == null ? null : reservation.getTask().getCompletionReason(),
+                "PROJECTION_INVALID", error);
+    }
+
+    @Transactional
     public void markInvalid(Reservation reservation,
                             String rawResponse,
                             String contentStatus,
                             String completionReason,
                             String error) {
-        complete(reservation, "INVALID_RESPONSE", rawResponse, contentStatus, completionReason, "INVALID", error);
+        completeNewSubmission(reservation, Collections.singletonList("SUBMITTED"), "INVALID_RESPONSE",
+                rawResponse, contentStatus, completionReason, "INVALID", error);
     }
 
+    @Transactional
     public void markUnknown(Reservation reservation, String rawResponse, String error) {
-        complete(reservation, "UNKNOWN", rawResponse, null, null, "UNKNOWN", error);
+        completeNewSubmission(reservation, Collections.singletonList("SUBMITTED"), "UNKNOWN",
+                rawResponse, null, null, "UNKNOWN", error);
     }
 
+    @Transactional
     public void markFailed(Reservation reservation, String rawResponse, String error) {
-        complete(reservation, "FAILED", rawResponse, null, null, "FAILED", error);
+        completeNewSubmission(reservation, Arrays.asList("RESERVED", "SUBMITTED"), "FAILED",
+                rawResponse, null, null, "FAILED", error);
     }
 
-    private void complete(Reservation reservation,
+    @Transactional
+    public void markAbandoned(Reservation reservation, String terminalStatus, String error) {
+        if (reservation == null || reservation.isNewSubmission()) {
+            throw new IllegalArgumentException("analysis_task_existing_reservation_required");
+        }
+        String target = "UNKNOWN".equalsIgnoreCase(terminalStatus) ? "UNKNOWN" : "FAILED";
+        transition(reservation, Arrays.asList("RESERVED", "SUBMITTED"), target,
+                reservation.getTask().getRawResponse(), reservation.getTask().getResponseEnvelopeJson(),
+                reservation.getTask().getContentStatus(), reservation.getTask().getCompletionReason(),
+                "ABANDONED_" + target, error);
+    }
+
+    private void completeNewSubmission(Reservation reservation,
+                          java.util.List<String> fromStatuses,
                           String status,
                           String rawResponse,
                           String contentStatus,
@@ -103,15 +228,39 @@ public class StockWatchAnalysisTaskService {
                           String providerStatus,
                           String error) {
         if (reservation == null || !reservation.isNewSubmission()) return;
+        transition(reservation, fromStatuses, status, rawResponse, null, contentStatus,
+                completionReason, providerStatus, error);
+    }
+
+    private void transition(Reservation reservation,
+                          java.util.List<String> fromStatuses,
+                          String status,
+                          String rawResponse,
+                          String responseEnvelopeJson,
+                          String contentStatus,
+                          String completionReason,
+                          String providerStatus,
+                          String error) {
+        if (reservation == null) return;
         String responseHash = StringUtils.hasText(rawResponse) ? sha256(rawResponse) : null;
-        mapper.complete(reservation.getTask().getId(), status, responseHash, rawResponse, contentStatus,
+        String responseEnvelopeHash = StringUtils.hasText(responseEnvelopeJson) ? sha256(responseEnvelopeJson) : null;
+        StockWatchAnalysisTask task = reservation.getTask();
+        int updated = mapper.transition(task.getId(), value(task.getRowVersion()), fromStatuses, status,
+                responseHash, responseEnvelopeHash, responseEnvelopeJson, rawResponse, contentStatus,
                 completionReason, providerStatus, new Date(), error);
+        if (updated != 1) {
+            throw new IllegalStateException("analysis_task_transition_conflict:" + task.getStatus() + "->" + status);
+        }
         reservation.getTask().setStatus(status);
+        reservation.getTask().setResponseHash(responseHash);
+        reservation.getTask().setResponseEnvelopeHash(responseEnvelopeHash);
+        reservation.getTask().setResponseEnvelopeJson(responseEnvelopeJson);
         reservation.getTask().setRawResponse(rawResponse);
         reservation.getTask().setContentStatus(contentStatus);
         reservation.getTask().setCompletionReason(completionReason);
         reservation.getTask().setProviderStatus(providerStatus);
         reservation.getTask().setErrorMessage(error);
+        reservation.getTask().setRowVersion(value(reservation.getTask().getRowVersion()) + 1);
     }
 
     public boolean shouldMarkUnknown(Throwable error) {
@@ -139,6 +288,37 @@ public class StockWatchAnalysisTaskService {
         }
     }
 
+    public void verifyResponseIntegrity(Reservation reservation) {
+        if (reservation == null || reservation.getTask() == null
+                || !StringUtils.hasText(reservation.getTask().getRawResponse())
+                || !StringUtils.hasText(reservation.getTask().getResponseHash())
+                || !sha256(reservation.getTask().getRawResponse()).equals(reservation.getTask().getResponseHash())
+                || !StringUtils.hasText(reservation.getTask().getResponseEnvelopeJson())
+                || !StringUtils.hasText(reservation.getTask().getResponseEnvelopeHash())
+                || !sha256(reservation.getTask().getResponseEnvelopeJson())
+                .equals(reservation.getTask().getResponseEnvelopeHash())) {
+            throw new IllegalStateException("analysis_response_hash_mismatch");
+        }
+    }
+
+    public Map<String, Object> responseReceipt(Reservation reservation) {
+        verifyResponseIntegrity(reservation);
+        Map<String, Object> receipt;
+        try {
+            receipt = JSON.parseObject(reservation.getTask().getResponseEnvelopeJson(), LinkedHashMap.class);
+        } catch (Exception invalid) {
+            throw new IllegalStateException("analysis_response_envelope_invalid", invalid);
+        }
+        if (receipt == null
+                || !"stock-analysis-response-v1".equals(String.valueOf(receipt.get("schema")))
+                || !reservation.getTask().getSubmissionKey().equals(String.valueOf(receipt.get("submissionKey")))
+                || !reservation.getTask().getRequestDigest().equals(String.valueOf(receipt.get("requestDigest")))
+                || !reservation.getTask().getResponseHash().equals(String.valueOf(receipt.get("responseHash")))) {
+            throw new IllegalStateException("analysis_response_envelope_fields_invalid");
+        }
+        return receipt;
+    }
+
     private long value(Long raw) {
         return raw == null ? 0L : raw;
     }
@@ -146,18 +326,21 @@ public class StockWatchAnalysisTaskService {
     public static class Reservation {
         private final StockWatchAnalysisTask task;
         private final boolean newSubmission;
+        private final boolean requestDigestMatch;
 
-        private Reservation(StockWatchAnalysisTask task, boolean newSubmission) {
+        private Reservation(StockWatchAnalysisTask task, boolean newSubmission, boolean requestDigestMatch) {
             this.task = task;
             this.newSubmission = newSubmission;
+            this.requestDigestMatch = requestDigestMatch;
         }
 
         static Reservation created(StockWatchAnalysisTask task) {
-            return new Reservation(task, true);
+            return new Reservation(task, true, true);
         }
 
-        static Reservation existing(StockWatchAnalysisTask task) {
-            return new Reservation(task, false);
+        static Reservation existing(StockWatchAnalysisTask task, String requestedDigest) {
+            return new Reservation(task, false, StringUtils.hasText(requestedDigest)
+                    && requestedDigest.equals(task.getRequestDigest()));
         }
 
         public StockWatchAnalysisTask getTask() {
@@ -168,8 +351,34 @@ public class StockWatchAnalysisTaskService {
             return newSubmission;
         }
 
+        public boolean isRequestDigestMatch() {
+            return requestDigestMatch;
+        }
+
         public boolean hasReusableSuccess() {
-            return !newSubmission && "SUCCESS".equals(task.getStatus()) && StringUtils.hasText(task.getRawResponse());
+            return !newSubmission && ("SUCCESS".equals(task.getStatus()) || "PROJECTED_SUCCESS".equals(task.getStatus()))
+                    && StringUtils.hasText(task.getRawResponse());
+        }
+
+        public boolean hasReusableResponse() {
+            return !newSubmission
+                    && ("RESPONSE_RECEIVED".equals(task.getStatus()) || "PROJECTION_FAILED".equals(task.getStatus()))
+                    && StringUtils.hasText(task.getRawResponse());
+        }
+
+        public boolean isProjectedSuccess() {
+            return !newSubmission && "PROJECTED_SUCCESS".equals(task.getStatus());
+        }
+
+        public boolean isTerminalFailure() {
+            return !newSubmission && ("UNKNOWN".equals(task.getStatus())
+                    || "INVALID_RESPONSE".equals(task.getStatus())
+                    || "FAILED".equals(task.getStatus())
+                    || "PROJECTION_INVALID".equals(task.getStatus()));
+        }
+
+        public boolean isInProgress() {
+            return !newSubmission && ("RESERVED".equals(task.getStatus()) || "SUBMITTED".equals(task.getStatus()));
         }
 
         public String refusalReason() {

@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
 const http = require('http');
+const os = require('os');
+const path = require('path');
 const { searchQuery, prepareSharedTarget, getWorkerStates, DEBUG_PORT, WAIT_TIMEOUT_MS } = require('./deepseek-web-client');
 const { handleOpenAiAdapterRequest } = require('./deepseek-openai-adapter');
+const { RequestLedger } = require('./deepseek-request-ledger');
 const {
   LOOPBACK_HOSTS,
   isBearerAuthorized,
@@ -12,6 +15,9 @@ const {
 
 const PORT = Number(process.env.DEEPSEEK_WEB_BRIDGE_PORT || 8789);
 const HOST = process.env.DEEPSEEK_WEB_BRIDGE_HOST || '127.0.0.1';
+const REQUEST_LEDGER_PATH = process.env.DEEPSEEK_WEB_REQUEST_LEDGER
+  || path.join(os.homedir(), '.aimeeting-room', `deepseek-web-${PORT}-requests.json`);
+const requestLedger = new RequestLedger(REQUEST_LEDGER_PATH, process.env.DEEPSEEK_WEB_REQUEST_LEDGER_MAX_ENTRIES);
 let inFlight = false;
 let inFlightStartedAt = 0;
 const WAIT_FOR_FREE_MS = Number(process.env.DEEPSEEK_WEB_BRIDGE_QUEUE_TIMEOUT_MS || 180000);
@@ -122,6 +128,28 @@ function sendAuthError(res) {
     error: 'invalid_api_key',
     message: 'Invalid API key'
   });
+}
+
+function sendLedgerResult(res, lookup) {
+  if (!lookup || lookup.status === 'NOT_FOUND') return false;
+  if (lookup.status === 'SUCCESS') {
+    sendJson(res, 200, {
+      ok: true,
+      result: { ...(lookup.entry.result || {}), idempotentReplay: true },
+      ledgerStatus: 'SUCCESS'
+    });
+    return true;
+  }
+  const statusCode = lookup.status === 'DIGEST_MISMATCH' ? 409 : 425;
+  sendJson(res, statusCode, {
+    ok: false,
+    error: lookup.status === 'DIGEST_MISMATCH'
+      ? 'submission_digest_mismatch'
+      : 'provider_outcome_not_retriable',
+    ledgerStatus: lookup.status,
+    message: lookup.entry && lookup.entry.error || null
+  });
+  return true;
 }
 
 function readBody(req) {
@@ -253,8 +281,25 @@ const server = http.createServer(async (req, res) => {
       defaultSharedTarget: sharedTargetState,
       accountHealth,
       preparedTarget,
+      requestLedger: requestLedger.summary(),
       workers: getWorkerStates()
     });
+  }
+
+  if (req.method === 'GET' && pathname === '/request-status') {
+    if (shouldRequireSharedBridgeAuth(HOST) && !isBearerAuthorized(req)) {
+      return sendAuthError(res);
+    }
+    const submissionKey = (requestUrl.searchParams.get('submissionKey') || '').trim();
+    const requestDigest = (requestUrl.searchParams.get('requestDigest') || '').trim();
+    if (!submissionKey || !requestDigest) {
+      return sendJson(res, 400, { ok: false, error: 'submission_identity_required' });
+    }
+    const lookup = requestLedger.lookup(submissionKey, requestDigest);
+    if (lookup.status === 'NOT_FOUND') {
+      return sendJson(res, 404, { ok: false, ledgerStatus: 'NOT_FOUND' });
+    }
+    return sendLedgerResult(res, lookup);
   }
 
   const adapterHandled = await handleOpenAiAdapterRequest(req, res, {
@@ -274,6 +319,9 @@ const server = http.createServer(async (req, res) => {
     const requestId = ++requestSeq;
     const receivedAt = Date.now();
     let slotAcquired = false;
+    let ledgerClaimed = false;
+    let submissionKey = '';
+    let requestDigest = '';
     try {
       const raw = await readBody(req);
       const parsed = raw ? JSON.parse(raw) : {};
@@ -287,6 +335,15 @@ const server = http.createServer(async (req, res) => {
       const expectedJson = parsed.expectedJson === true;
       const mode = typeof parsed.mode === 'string' ? parsed.mode.trim() : '';
       const accountKey = typeof parsed.accountKey === 'string' ? parsed.accountKey.trim() : '';
+      submissionKey = typeof parsed.submissionKey === 'string' ? parsed.submissionKey.trim() : '';
+      requestDigest = typeof parsed.requestDigest === 'string' ? parsed.requestDigest.trim() : '';
+      if ((submissionKey && !requestDigest) || (!submissionKey && requestDigest)) {
+        return sendJson(res, 400, { ok: false, error: 'submission_identity_incomplete' });
+      }
+      if (submissionKey) {
+        const existing = requestLedger.lookup(submissionKey, requestDigest);
+        if (sendLedgerResult(res, existing)) return;
+      }
       const closeTargetAfter = !sessionKey && isolatedSession && parsed.closeTargetAfter !== false;
       console.log(JSON.stringify({
         ok: true,
@@ -319,6 +376,18 @@ const server = http.createServer(async (req, res) => {
         waitedMs: Date.now() - receivedAt
       }));
       await waitForCooldown();
+      if (submissionKey) {
+        const claim = requestLedger.begin(submissionKey, requestDigest, {
+          purpose: typeof parsed.purpose === 'string' ? parsed.purpose : null,
+          sessionKey: sessionKey || null,
+          accountKey: accountKey || null
+        });
+        if (!claim.created) {
+          sendLedgerResult(res, claim);
+          return;
+        }
+        ledgerClaimed = true;
+      }
       updateActiveRequest({ phase: 'prepare_target' });
       if (accountKey) {
         await prepareSharedTarget({ accountKey });
@@ -335,6 +404,9 @@ const server = http.createServer(async (req, res) => {
           MAX_INFLIGHT_MS
         ))
       ]);
+      if (ledgerClaimed) {
+        requestLedger.complete(submissionKey, requestDigest, result);
+      }
       console.log(JSON.stringify({
         ok: true,
         event: 'request_end',
@@ -348,6 +420,15 @@ const server = http.createServer(async (req, res) => {
       }));
       return sendJson(res, 200, { ok: true, result });
     } catch (error) {
+      if (ledgerClaimed) {
+        try {
+          requestLedger.markUnknown(submissionKey, requestDigest,
+            error && error.message ? error.message : String(error));
+        } catch (ledgerError) {
+          console.error(JSON.stringify({ ok: false, event: 'request_ledger_update_failed',
+            submissionKey, message: ledgerError.message }));
+        }
+      }
       const classified = classifyBridgeError(error);
       console.error(JSON.stringify({
         ok: false,

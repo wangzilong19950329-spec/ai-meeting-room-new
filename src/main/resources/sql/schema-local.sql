@@ -330,6 +330,7 @@ CREATE INDEX IF NOT EXISTS idx_sw_tech_session_key ON stock_watch_technical_sess
 
 CREATE TABLE IF NOT EXISTS stock_watch_technical_analysis (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    analysis_task_id BIGINT,
     session_id BIGINT,
     symbol VARCHAR(16) NOT NULL,
     market VARCHAR(8) NOT NULL,
@@ -362,6 +363,7 @@ CREATE TABLE IF NOT EXISTS stock_watch_technical_analysis (
     gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS uk_sw_tech_analysis_task ON stock_watch_technical_analysis(analysis_task_id);
 CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_symbol_date ON stock_watch_technical_analysis(symbol, market, period_type, analysis_date);
 CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_session ON stock_watch_technical_analysis(session_id);
 CREATE INDEX IF NOT EXISTS idx_sw_tech_analysis_slot ON stock_watch_technical_analysis(symbol, market, period_type, period_key, analysis_date, run_slot);
@@ -461,6 +463,7 @@ CREATE TABLE IF NOT EXISTS stock_watch_intent_test (
     test_verdict VARCHAR(32) DEFAULT 'UNRESOLVED' NOT NULL,
     row_version BIGINT DEFAULT 0 NOT NULL,
     last_evaluated_observation_id BIGINT,
+    last_evaluated_source_date VARCHAR(16),
     resolved_observation_id BIGINT,
     gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
@@ -498,6 +501,8 @@ CREATE TABLE IF NOT EXISTS stock_watch_analysis_task (
     provider VARCHAR(64),
     request_envelope_json CLOB NOT NULL,
     response_hash VARCHAR(64),
+    response_envelope_hash VARCHAR(64),
+    response_envelope_json CLOB,
     raw_response CLOB,
     content_status VARCHAR(32),
     completion_reason VARCHAR(128),

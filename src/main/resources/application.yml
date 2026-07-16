@@ -161,7 +161,7 @@ stock-watch:
   ai-rules:
     store-file: ${STOCK_WATCH_AI_RULES_FILE:}
     default-model: ${STOCK_WATCH_AI_MODEL:deepseek-chat}
-    bridge-url: ${STOCK_WATCH_AI_RULES_BRIDGE_URL:${STOCK_WATCH_TECH_BRIDGE_URL:${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}}}
+    bridge-url: ${STOCK_WATCH_AI_RULES_BRIDGE_URL:${STOCK_WATCH_TECH_BRIDGE_URL:http://127.0.0.1:8791/search}}
     bridge-first: ${STOCK_WATCH_AI_RULES_BRIDGE_FIRST:false}
     bridge-connect-timeout-seconds: ${STOCK_WATCH_AI_RULES_BRIDGE_CONNECT_TIMEOUT_SECONDS:10}
     bridge-read-timeout-seconds: ${STOCK_WATCH_AI_RULES_BRIDGE_READ_TIMEOUT_SECONDS:210}
@@ -173,10 +173,14 @@ stock-watch:
     symbols: ${STOCK_WATCH_TECH_SYMBOLS:${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}}
     context-limit-chars: ${STOCK_WATCH_TECH_CONTEXT_LIMIT_CHARS:80000}
     context-rotate-ratio: ${STOCK_WATCH_TECH_CONTEXT_ROTATE_RATIO:0.85}
-    bridge-url: ${STOCK_WATCH_TECH_BRIDGE_URL:${DEEPSEEK_WEB_BRIDGE_URL:http://127.0.0.1:8789/search}}
-    debug-port: ${STOCK_WATCH_TECH_DEBUG_PORT:${DEEPSEEK_WEB_DEBUG_PORT:9333}}
+    bridge-url: ${STOCK_WATCH_TECH_BRIDGE_URL:http://127.0.0.1:8791/search}
+    debug-port: ${STOCK_WATCH_TECH_DEBUG_PORT:9344}
     connect-timeout-seconds: ${STOCK_WATCH_TECH_CONNECT_TIMEOUT_SECONDS:10}
     read-timeout-seconds: ${STOCK_WATCH_TECH_READ_TIMEOUT_SECONDS:320}
+    task-stale-after-seconds: ${STOCK_WATCH_TECH_TASK_STALE_AFTER_SECONDS:420}
+    reconcile-interval-ms: ${STOCK_WATCH_TECH_RECONCILE_INTERVAL_MS:60000}
+    reconcile-initial-delay-ms: ${STOCK_WATCH_TECH_RECONCILE_INITIAL_DELAY_MS:120000}
+    reconcile-batch-size: ${STOCK_WATCH_TECH_RECONCILE_BATCH_SIZE:20}
   delivery:
     enabled: ${STOCK_WATCH_DELIVERY_ENABLED:true}
     scan-interval-ms: ${STOCK_WATCH_DELIVERY_SCAN_INTERVAL_MS:300000}

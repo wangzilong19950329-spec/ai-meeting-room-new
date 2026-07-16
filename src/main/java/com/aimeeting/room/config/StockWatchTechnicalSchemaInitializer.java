@@ -61,6 +61,7 @@ public class StockWatchTechnicalSchemaInitializer {
 
             jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_technical_analysis ("
                     + "id BIGINT NOT NULL AUTO_INCREMENT,"
+                    + "analysis_task_id BIGINT,"
                     + "session_id BIGINT,"
                     + "symbol VARCHAR(16) NOT NULL,"
                     + "market VARCHAR(8) NOT NULL,"
@@ -92,6 +93,7 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "error_message TEXT,"
                     + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
                     + "PRIMARY KEY (id),"
+                    + "UNIQUE KEY uk_sw_tech_analysis_task (analysis_task_id),"
                     + "KEY idx_sw_tech_analysis_symbol_date (symbol, market, period_type, analysis_date),"
                     + "KEY idx_sw_tech_analysis_session (session_id),"
                     + "KEY idx_sw_tech_analysis_slot (symbol, market, period_type, period_key, analysis_date, run_slot)"
@@ -106,6 +108,8 @@ public class StockWatchTechnicalSchemaInitializer {
             safeAddColumn("stock_watch_technical_analysis", "main_force_intent_warnings_json", "TEXT");
             safeAddColumn("stock_watch_technical_analysis", "missing_data_json", "TEXT");
             safeAddColumn("stock_watch_technical_analysis", "data_snapshot_json", "MEDIUMTEXT");
+            safeAddColumn("stock_watch_technical_analysis", "analysis_task_id", "BIGINT");
+            safeExecute("CREATE UNIQUE INDEX uk_sw_tech_analysis_task ON stock_watch_technical_analysis(analysis_task_id)");
             safeExecute("CREATE INDEX idx_sw_tech_analysis_period ON stock_watch_technical_analysis(symbol, market, period_type, period_key)");
 
             jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_prediction ("
@@ -257,12 +261,13 @@ public class StockWatchTechnicalSchemaInitializer {
                 + "comparison_operator VARCHAR(32) NOT NULL,target_value_json TEXT NOT NULL,max_observation_age INT NOT NULL,"
                 + "required_observed_count INT NOT NULL,age_count INT NOT NULL DEFAULT 0,observed_count INT NOT NULL DEFAULT 0,"
                 + "test_verdict VARCHAR(32) NOT NULL DEFAULT 'UNRESOLVED',row_version BIGINT NOT NULL DEFAULT 0,"
-                + "last_evaluated_observation_id BIGINT,resolved_observation_id BIGINT,"
+                + "last_evaluated_observation_id BIGINT,last_evaluated_source_date VARCHAR(16),resolved_observation_id BIGINT,"
                 + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
                 + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,PRIMARY KEY (id),"
                 + "UNIQUE KEY uk_sw_intent_test_origin_key (origin_observation_id, test_key),"
                 + "KEY idx_sw_intent_test_active (symbol, market, resolved_observation_id)"
                 + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeAddColumn("stock_watch_intent_test", "last_evaluated_source_date", "VARCHAR(16)");
         safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_intent_test_result ("
                 + "id BIGINT NOT NULL AUTO_INCREMENT,observation_id BIGINT NOT NULL,observation_version BIGINT NOT NULL,"
                 + "test_id BIGINT NOT NULL,actual_value_json TEXT,match_status VARCHAR(32) NOT NULL,"
@@ -275,7 +280,8 @@ public class StockWatchTechnicalSchemaInitializer {
                 + "id BIGINT NOT NULL AUTO_INCREMENT,submission_key VARCHAR(255) NOT NULL,request_digest VARCHAR(64) NOT NULL,"
                 + "purpose VARCHAR(64) NOT NULL,symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,period_type VARCHAR(16),"
                 + "observation_key VARCHAR(128),generation INT NOT NULL DEFAULT 1,status VARCHAR(32) NOT NULL,provider VARCHAR(64),"
-                + "request_envelope_json MEDIUMTEXT NOT NULL,response_hash VARCHAR(64),raw_response MEDIUMTEXT,"
+                + "request_envelope_json MEDIUMTEXT NOT NULL,response_hash VARCHAR(64),"
+                + "response_envelope_hash VARCHAR(64),response_envelope_json MEDIUMTEXT,raw_response MEDIUMTEXT,"
                 + "content_status VARCHAR(32),completion_reason VARCHAR(128),provider_status VARCHAR(64),submitted_at DATETIME,"
                 + "completed_at DATETIME,error_message TEXT,row_version BIGINT NOT NULL DEFAULT 0,"
                 + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
@@ -284,6 +290,8 @@ public class StockWatchTechnicalSchemaInitializer {
                 + "KEY idx_sw_analysis_task_observation (symbol, market, observation_key),"
                 + "KEY idx_sw_analysis_task_status (status, gmt_create)"
                 + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeAddColumn("stock_watch_analysis_task", "response_envelope_hash", "VARCHAR(64)");
+        safeAddColumn("stock_watch_analysis_task", "response_envelope_json", "MEDIUMTEXT");
     }
 
     private void safeAddColumn(String table, String column, String definition) {

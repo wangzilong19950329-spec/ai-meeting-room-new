@@ -366,7 +366,7 @@ public class StockWatchMonitorService {
             return result;
         }
 
-        Map<String, Object> aiContext = buildAiContext(rule, quote, riskPattern, now);
+        Map<String, Object> aiContext = buildAiContext(rule, quote, riskPattern, now, rule.isGeneralLegacy());
         AiDecision decision = rule.isGeneralLegacy()
                 ? aiJudgeService.judge(rule, quote, now, aiContext)
                 : aiJudgeService.judgeDeterministic(rule, quote);
@@ -653,7 +653,8 @@ public class StockWatchMonitorService {
     private Map<String, Object> buildAiContext(AiWatchRule rule,
                                                Map<String, Object> quote,
                                                RiskPatternResult riskPattern,
-                                               ZonedDateTime now) {
+                                               ZonedDateTime now,
+                                               boolean allowExternalMarketData) {
         boolean enhanced = requiresEnhancedAiContext(rule);
         Map<String, Object> recentTechnical = recentTechnicalAnalysisContext(rule, now, quote);
         if (!enhanced && recentTechnical.isEmpty() && riskPattern == null) {
@@ -674,7 +675,7 @@ public class StockWatchMonitorService {
             context.put("riskPatternGuidance", riskPattern.getGuidance());
         }
 
-        if (!enhanced) {
+        if (!enhanced || !allowExternalMarketData) {
             return context;
         }
 
@@ -735,9 +736,13 @@ public class StockWatchMonitorService {
                 .map(rule -> stockKey(rule.getSymbol(), rule.getMarket()))
                 .collect(Collectors.toCollection(LinkedHashSet::new));
         for (String stock : stocks) {
-            String[] parts = stock.split(":", 2);
-            String symbol = parts[0];
-            String market = parts.length > 1 ? parts[1] : "";
+            StockRef ref = parseStockRef(stock);
+            if (ref == null) {
+                log.warn("stock-watch L0 stock key invalid stockKey={}", stock);
+                continue;
+            }
+            String symbol = ref.symbol;
+            String market = ref.market;
             Map<String, Object> quote = quoteBySymbol.get(normalizeSymbol(symbol));
             List<Map<String, Object>> dailyBars;
             try {
@@ -804,9 +809,18 @@ public class StockWatchMonitorService {
         if (riskPatternsByStock == null || riskPatternsByStock.isEmpty()) return Collections.emptyList();
         List<Map<String, Object>> receipts = new ArrayList<>();
         for (Map.Entry<String, RiskPatternResult> entry : riskPatternsByStock.entrySet()) {
-            String[] parts = entry.getKey().split(":", 2);
-            String symbol = parts[0];
-            String market = parts.length > 1 ? parts[1] : "";
+            StockRef ref = parseStockRef(entry.getKey());
+            if (ref == null) {
+                Map<String, Object> failed = new LinkedHashMap<>();
+                failed.put("symbol", entry.getKey());
+                failed.put("market", "");
+                failed.put("status", "ERROR");
+                failed.put("reason", "invalid_stock_key");
+                receipts.add(failed);
+                continue;
+            }
+            String symbol = ref.symbol;
+            String market = ref.market;
             Map<String, Object> quote = quoteBySymbol.get(normalizeSymbol(symbol));
             try {
                 Map<String, Object> receipt = factPersistenceService.observe(

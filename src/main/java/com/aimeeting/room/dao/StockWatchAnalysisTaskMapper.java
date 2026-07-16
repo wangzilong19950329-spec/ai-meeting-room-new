@@ -5,21 +5,35 @@ import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
 import java.util.Date;
+import java.util.List;
 
 @Mapper
 public interface StockWatchAnalysisTaskMapper {
     StockWatchAnalysisTask selectBySubmissionKey(@Param("submissionKey") String submissionKey);
 
+    List<StockWatchAnalysisTask> selectRecoverableBefore(@Param("before") Date before,
+                                                         @Param("limit") int limit);
+
     int insert(StockWatchAnalysisTask task);
+
+    int prepare(@Param("id") Long id,
+                @Param("expectedRowVersion") Long expectedRowVersion,
+                @Param("requestDigest") String requestDigest,
+                @Param("generation") Integer generation,
+                @Param("requestEnvelopeJson") String requestEnvelopeJson);
 
     int markSubmitted(@Param("id") Long id,
                       @Param("expectedRowVersion") Long expectedRowVersion,
                       @Param("provider") String provider,
                       @Param("submittedAt") Date submittedAt);
 
-    int complete(@Param("id") Long id,
+    int transition(@Param("id") Long id,
+                 @Param("expectedRowVersion") Long expectedRowVersion,
+                 @Param("fromStatuses") List<String> fromStatuses,
                  @Param("status") String status,
                  @Param("responseHash") String responseHash,
+                 @Param("responseEnvelopeHash") String responseEnvelopeHash,
+                 @Param("responseEnvelopeJson") String responseEnvelopeJson,
                  @Param("rawResponse") String rawResponse,
                  @Param("contentStatus") String contentStatus,
                  @Param("completionReason") String completionReason,

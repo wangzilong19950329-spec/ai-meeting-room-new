@@ -15,6 +15,8 @@
         <result column="provider" property="provider"/>
         <result column="request_envelope_json" property="requestEnvelopeJson"/>
         <result column="response_hash" property="responseHash"/>
+        <result column="response_envelope_hash" property="responseEnvelopeHash"/>
+        <result column="response_envelope_json" property="responseEnvelopeJson"/>
         <result column="raw_response" property="rawResponse"/>
         <result column="content_status" property="contentStatus"/>
         <result column="completion_reason" property="completionReason"/>
@@ -31,6 +33,14 @@
         SELECT * FROM stock_watch_analysis_task WHERE submission_key = #{submissionKey}
     </select>
 
+    <select id="selectRecoverableBefore" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_task
+        WHERE status IN ('RESERVED', 'SUBMITTED', 'RESPONSE_RECEIVED', 'PROJECTION_FAILED')
+          AND gmt_modify &lt;= #{before}
+        ORDER BY gmt_modify ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO stock_watch_analysis_task
         (submission_key, request_digest, purpose, symbol, market, period_type, observation_key,
@@ -40,18 +50,31 @@
          #{generation}, #{status}, #{provider}, #{requestEnvelopeJson}, #{rowVersion})
     </insert>
 
+    <update id="prepare">
+        UPDATE stock_watch_analysis_task
+        SET request_digest = #{requestDigest}, generation = #{generation},
+            request_envelope_json = #{requestEnvelopeJson}, row_version = row_version + 1
+        WHERE id = #{id} AND row_version = #{expectedRowVersion} AND status = 'RESERVED'
+    </update>
+
     <update id="markSubmitted">
         UPDATE stock_watch_analysis_task
         SET status = 'SUBMITTED', provider = #{provider}, submitted_at = #{submittedAt}, row_version = row_version + 1
         WHERE id = #{id} AND row_version = #{expectedRowVersion} AND status = 'RESERVED'
     </update>
 
-    <update id="complete">
+    <update id="transition">
         UPDATE stock_watch_analysis_task
-        SET status = #{status}, response_hash = #{responseHash}, raw_response = #{rawResponse},
+        SET status = #{status}, response_hash = #{responseHash},
+            response_envelope_hash = #{responseEnvelopeHash}, response_envelope_json = #{responseEnvelopeJson},
+            raw_response = #{rawResponse},
             content_status = #{contentStatus}, completion_reason = #{completionReason},
             provider_status = #{providerStatus}, completed_at = #{completedAt}, error_message = #{errorMessage},
             row_version = row_version + 1
-        WHERE id = #{id}
+        WHERE id = #{id} AND row_version = #{expectedRowVersion}
+          AND status IN
+          <foreach collection="fromStatuses" item="fromStatus" open="(" separator="," close=")">
+              #{fromStatus}
+          </foreach>
     </update>
 </mapper>

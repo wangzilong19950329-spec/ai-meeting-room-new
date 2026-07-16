@@ -7,6 +7,7 @@ import java.util.Date;
 @Data
 public class StockWatchTechnicalAnalysis {
     private Long id;
+    private Long analysisTaskId;
     private Long sessionId;
     private String symbol;
     private String market;

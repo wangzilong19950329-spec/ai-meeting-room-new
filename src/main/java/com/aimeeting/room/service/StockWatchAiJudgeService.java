@@ -45,7 +45,7 @@ public class StockWatchAiJudgeService {
     private final AiModelRouter aiModelRouter;
     private final StockWatchAnalysisTaskService analysisTaskService;
 
-    @Value("${stock-watch.ai-rules.bridge-url:${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}}")
+    @Value("${stock-watch.ai-rules.bridge-url:http://127.0.0.1:8791/search}")
     private String bridgeUrl;
 
     @Value("${stock-watch.ai-rules.bridge-connect-timeout-seconds:10}")

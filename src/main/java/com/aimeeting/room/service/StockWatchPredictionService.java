@@ -48,7 +48,60 @@ public class StockWatchPredictionService {
                                                        Double sourcePrice,
                                                        JSONArray forecasts,
                                                        String inputSnapshotJson) {
+        return persistPredictions(analysisId, symbol, market, stockName, forecastDate, sourcePrice,
+                forecasts, inputSnapshotJson, false);
+    }
+
+    public List<StockWatchPrediction> savePredictionsStrict(Long analysisId,
+                                                             String symbol,
+                                                             String market,
+                                                             String stockName,
+                                                             LocalDate forecastDate,
+                                                             Double sourcePrice,
+                                                             JSONArray forecasts,
+                                                             String inputSnapshotJson) {
+        return persistPredictions(analysisId, symbol, market, stockName, forecastDate, sourcePrice,
+                forecasts, inputSnapshotJson, true);
+    }
+
+    public void validatePredictionsStrict(Double sourcePrice, JSONArray forecasts) {
+        if (sourcePrice == null || sourcePrice <= 0 || forecasts == null || forecasts.isEmpty()) {
+            throw new IllegalArgumentException("prediction_projection_input_invalid");
+        }
+        Set<String> horizons = new HashSet<>();
+        for (int i = 0; i < forecasts.size(); i++) {
+            JSONObject item = forecasts.getJSONObject(i);
+            if (item == null) {
+                throw new IllegalArgumentException("prediction_projection_item_invalid:" + i);
+            }
+            String horizon = normalizeHorizon(item.getString("horizon"));
+            String direction = normalizeDirection(item.getString("direction"));
+            Double targetLow = decimal(item.get("targetLow"));
+            Double targetHigh = decimal(item.get("targetHigh"));
+            if (!StringUtils.hasText(horizon) || !StringUtils.hasText(direction)
+                    || targetLow == null || targetHigh == null || targetLow <= 0 || targetLow > targetHigh) {
+                throw new IllegalArgumentException("prediction_projection_item_invalid:" + i);
+            }
+            if (!horizons.add(horizon)) {
+                throw new IllegalArgumentException("prediction_projection_horizon_duplicate:" + horizon);
+            }
+        }
+    }
+
+    private List<StockWatchPrediction> persistPredictions(Long analysisId,
+                                                           String symbol,
+                                                           String market,
+                                                           String stockName,
+                                                           LocalDate forecastDate,
+                                                           Double sourcePrice,
+                                                           JSONArray forecasts,
+                                                           String inputSnapshotJson,
+                                                           boolean strict) {
+        if (strict) {
+            validatePredictionsStrict(sourcePrice, forecasts);
+        }
         if (analysisId == null || sourcePrice == null || sourcePrice <= 0 || forecasts == null) {
+            if (strict) throw new IllegalArgumentException("prediction_projection_input_invalid");
             return Collections.emptyList();
         }
         List<StockWatchPrediction> saved = new ArrayList<>();
@@ -61,6 +114,7 @@ public class StockWatchPredictionService {
             Double targetHigh = decimal(item.get("targetHigh"));
             if (!StringUtils.hasText(horizon) || !StringUtils.hasText(direction)
                     || targetLow == null || targetHigh == null || targetLow <= 0 || targetLow > targetHigh) {
+                if (strict) throw new IllegalArgumentException("prediction_projection_item_invalid:" + i);
                 log.warn("skip invalid prediction analysisId={} index={}", analysisId, i);
                 continue;
             }
@@ -87,6 +141,7 @@ public class StockWatchPredictionService {
                 predictionMapper.insert(prediction);
                 saved.add(prediction);
             } catch (Exception e) {
+                if (strict) throw new IllegalStateException("prediction_projection_persist_failed:" + horizon, e);
                 log.warn("failed to persist prediction analysisId={} horizon={} error={}", analysisId, horizon, e.getMessage());
             }
         }

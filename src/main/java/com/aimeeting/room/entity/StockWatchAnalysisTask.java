@@ -19,6 +19,8 @@ public class StockWatchAnalysisTask {
     private String provider;
     private String requestEnvelopeJson;
     private String responseHash;
+    private String responseEnvelopeHash;
+    private String responseEnvelopeJson;
     private String rawResponse;
     private String contentStatus;
     private String completionReason;

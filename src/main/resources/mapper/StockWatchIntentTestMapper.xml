@@ -19,6 +19,7 @@
         <result column="test_verdict" property="testVerdict"/>
         <result column="row_version" property="rowVersion"/>
         <result column="last_evaluated_observation_id" property="lastEvaluatedObservationId"/>
+        <result column="last_evaluated_source_date" property="lastEvaluatedSourceDate"/>
         <result column="resolved_observation_id" property="resolvedObservationId"/>
         <result column="gmt_create" property="gmtCreate"/>
         <result column="gmt_modify" property="gmtModify"/>
@@ -44,10 +45,17 @@
         FOR UPDATE
     </select>
 
+    <select id="selectBySymbolMarket" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_intent_test
+        WHERE symbol = #{symbol} AND market = #{market}
+        ORDER BY id ASC
+    </select>
+
     <update id="updateProgress">
         UPDATE stock_watch_intent_test
         SET age_count = #{ageCount}, observed_count = #{observedCount}, test_verdict = #{testVerdict},
             last_evaluated_observation_id = #{lastEvaluatedObservationId},
+            last_evaluated_source_date = #{lastEvaluatedSourceDate},
             resolved_observation_id = #{resolvedObservationId}, row_version = row_version + 1
         WHERE id = #{id} AND row_version = #{expectedRowVersion}
     </update>

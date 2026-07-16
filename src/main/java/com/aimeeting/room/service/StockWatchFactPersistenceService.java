@@ -104,22 +104,26 @@ public class StockWatchFactPersistenceService {
 
     @Transactional
     public int registerModelIntentTests(Long originObservationId,
+                                        Long analysisTaskId,
                                         String symbol,
                                         String market,
                                         Map<String, Object> validatedIntent) {
-        if (originObservationId == null || validatedIntent == null || validatedIntent.isEmpty()) return 0;
+        if (originObservationId == null || analysisTaskId == null
+                || validatedIntent == null || validatedIntent.isEmpty()) return 0;
         String intent = String.valueOf(validatedIntent.getOrDefault("intent", "UNKNOWN")).toUpperCase(Locale.ROOT);
         int maxAge = maxAgeForWindow(String.valueOf(validatedIntent.getOrDefault("timeWindow", "INTRADAY")));
         List<TestDefinition> definitions = modelIntentDefinitions(intent, maxAge);
         int created = 0;
+        String claimRef = "analysisTask:" + analysisTaskId + ":mainForceIntent";
         for (TestDefinition definition : definitions) {
             StockWatchIntentTest test = new StockWatchIntentTest();
             test.setSymbol(symbol);
             test.setMarket(market == null ? "" : market.toLowerCase(Locale.ROOT));
             test.setOriginObservationId(originObservationId);
             test.setActivationAfterObservationId(originObservationId);
-            test.setTestKey("mainForceIntent:" + intent + ":" + definition.metricPath + ":invalidation");
-            test.setClaimRef("mainForceIntent:" + intent);
+            test.setTestKey("analysisTask:" + analysisTaskId + ":" + intent + ":"
+                    + definition.metricPath + ":invalidation");
+            test.setClaimRef(claimRef);
             test.setMetricPath(definition.metricPath);
             test.setComparisonOperator(definition.operator);
             test.setTargetValueJson(JSON.toJSONString(definition.target));
@@ -139,16 +143,21 @@ public class StockWatchFactPersistenceService {
         return created;
     }
 
+    public List<StockWatchIntentTest> historyTests(String symbol, String market) {
+        List<StockWatchIntentTest> rows = intentTestMapper.selectBySymbolMarket(symbol, market);
+        return rows == null ? Collections.emptyList() : rows;
+    }
+
     private List<TestDefinition> modelIntentDefinitions(String intent, int maxAge) {
         List<TestDefinition> definitions = new ArrayList<>();
         if (Arrays.asList("ACCUMULATE", "PULL_UP", "SUPPORT").contains(intent)) {
-            definitions.add(new TestDefinition("dailyReturnPct", "LE", -1.0, maxAge, 1));
-            definitions.add(new TestDefinition("mainInflow", "LT", -100_000_000.0, maxAge, 1));
+            definitions.add(new TestDefinition("dailyReturnPct", "LE", -1.0, maxAge, maxAge));
+            definitions.add(new TestDefinition("mainInflow", "LT", -100_000_000.0, maxAge, maxAge));
         } else if (Arrays.asList("DISTRIBUTE", "SUPPRESS").contains(intent)) {
-            definitions.add(new TestDefinition("dailyReturnPct", "GE", 1.0, maxAge, 1));
-            definitions.add(new TestDefinition("mainInflow", "GT", 100_000_000.0, maxAge, 1));
+            definitions.add(new TestDefinition("dailyReturnPct", "GE", 1.0, maxAge, maxAge));
+            definitions.add(new TestDefinition("mainInflow", "GT", 100_000_000.0, maxAge, maxAge));
         } else if ("WASH".equals(intent)) {
-            definitions.add(new TestDefinition("mainInflow", "LE", -100_000_000.0, maxAge, 1));
+            definitions.add(new TestDefinition("mainInflow", "LE", -100_000_000.0, maxAge, maxAge));
         }
         return definitions;
     }
@@ -187,16 +196,17 @@ public class StockWatchFactPersistenceService {
         Map<String, Object> derived = map(riskPattern.getObservations().get("derived"));
         List<Map<String, Object>> verdicts = new ArrayList<>();
         for (StockWatchIntentTest test : tests) {
-            int age = value(test.getAgeCount(), 0) + 1;
+            boolean newTradingDay = !observation.getSourceDate().equals(test.getLastEvaluatedSourceDate());
+            int age = value(test.getAgeCount(), 0) + (newTradingDay ? 1 : 0);
             Double actual = number(derived.get(test.getMetricPath()));
-            int observed = value(test.getObservedCount(), 0) + (actual == null ? 0 : 1);
+            int observed = value(test.getObservedCount(), 0) + (newTradingDay && actual != null ? 1 : 0);
             Double target = number(JSON.parse(test.getTargetValueJson()));
             boolean matched = actual != null && target != null && compare(actual, target, test.getComparisonOperator());
-            boolean resolved = matched
-                    || observed >= value(test.getRequiredObservedCount(), 1)
-                    || age >= value(test.getMaxObservationAge(), 1);
+            boolean mature = age >= value(test.getMaxObservationAge(), 1);
+            boolean adequateCoverage = observed >= value(test.getRequiredObservedCount(), 1);
+            boolean resolved = matched || mature;
             String verdict = matched ? "FALSIFIED"
-                    : (observed >= value(test.getRequiredObservedCount(), 1) ? "SUPPORTED" : "UNRESOLVED");
+                    : (mature ? (adequateCoverage ? "SUPPORTED" : "INSUFFICIENT_DATA") : "UNRESOLVED");
 
             StockWatchIntentTestResult result = new StockWatchIntentTestResult();
             result.setObservationId(observation.getId());
@@ -210,7 +220,7 @@ public class StockWatchFactPersistenceService {
             result.setEvaluatedAt(new Date());
             testResultMapper.insert(result);
             int updated = intentTestMapper.updateProgress(test.getId(), value(test.getRowVersion(), 0L), age, observed,
-                    verdict, observation.getId(), resolved ? observation.getId() : null);
+                    verdict, observation.getId(), observation.getSourceDate(), resolved ? observation.getId() : null);
             if (updated != 1) throw new IllegalStateException("intent_test_concurrent_update:" + test.getId());
 
             Map<String, Object> item = new LinkedHashMap<>();
