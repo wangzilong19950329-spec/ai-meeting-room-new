@@ -6,9 +6,9 @@ ENV_FILE="${AI_MEETING_ENV_FILE:-$HOME/.aimeeting-room/local.env}"
 ACTION="${1:-preview}"
 
 case "$ACTION" in
-  schema|preview|migrate) ;;
+  schema|preview|migrate|bootstrap) ;;
   *)
-    echo "usage: $0 [schema|preview|migrate]" >&2
+    echo "usage: $0 [schema|preview|migrate|bootstrap]" >&2
     exit 2
     ;;
 esac
@@ -23,7 +23,7 @@ fi
 BACKEND_PORT="${AI_MEETING_BACKEND_PORT:-${BACKEND_PORT:-8127}}"
 BRIDGE_PORT="${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT:-8791}"
 
-if [[ "$ACTION" == "migrate" ]]; then
+if [[ "$ACTION" == "migrate" || "$ACTION" == "bootstrap" ]]; then
   if lsof -nP -iTCP:"$BACKEND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "refusing migration: backend port $BACKEND_PORT is still listening" >&2
     exit 1

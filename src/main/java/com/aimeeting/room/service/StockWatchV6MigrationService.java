@@ -116,6 +116,31 @@ public class StockWatchV6MigrationService {
         });
     }
 
+    public MigrationPlan bootstrapNewEpoch() {
+        return withMigrationLock(() -> {
+            assertSchemaReady();
+            MigrationPlan plan = bootstrapPlan();
+            MigrationState state = readState();
+            if (state != null && state.ready()) {
+                validateReadyState(plan, state);
+                log.info("stock-watch v6 bootstrap no-op status=READY planHash={}", plan.planHash);
+                return plan;
+            }
+            assertCanonicalTablesEmpty();
+            transactionTemplate.executeWithoutResult(status -> applyPlan(plan));
+            validateReadyState(plan, readState());
+            log.info("stock-watch v6 bootstrap committed legacyArchiveCount={} legacyCutoff={} planHash={}",
+                    plan.legacyAnalysisCount, plan.legacyAnalysisCutoffId, plan.planHash);
+            return plan;
+        });
+    }
+
+    private MigrationPlan bootstrapPlan() {
+        long legacyCutoff = maxTasklessAnalysisId();
+        long legacyCount = countTasklessAtOrBefore(legacyCutoff);
+        return new MigrationPlan(0L, legacyCutoff, legacyCount, Collections.emptyList());
+    }
+
     private MigrationPlan preflight() {
         assertSchemaReady();
         MigrationState state = readState();
@@ -262,6 +287,16 @@ public class StockWatchV6MigrationService {
                             + identity.identityKey + ":" + candidate.taskId);
                 }
             }
+        }
+    }
+
+    private void assertCanonicalTablesEmpty() {
+        Long identities = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM stock_watch_analysis_observation_identity", Long.class);
+        Long candidates = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM stock_watch_analysis_identity_candidate", Long.class);
+        if ((identities != null && identities > 0) || (candidates != null && candidates > 0)) {
+            throw new IllegalStateException("stock_watch_v6_bootstrap_requires_empty_canonical_tables");
         }
     }
 

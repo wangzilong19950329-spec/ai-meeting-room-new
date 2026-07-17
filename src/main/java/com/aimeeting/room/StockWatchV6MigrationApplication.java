@@ -30,6 +30,8 @@ public final class StockWatchV6MigrationApplication {
                 System.out.println(JSON.toJSONString(service.preview().toPayload()));
             } else if ("migrate".equals(action)) {
                 System.out.println(JSON.toJSONString(service.migrate().toPayload()));
+            } else if ("bootstrap".equals(action)) {
+                System.out.println(JSON.toJSONString(service.bootstrapNewEpoch().toPayload()));
             } else {
                 throw new IllegalArgumentException("stock_watch_v6_migration_action_invalid:" + action);
             }

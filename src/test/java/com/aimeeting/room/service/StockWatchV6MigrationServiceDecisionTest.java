@@ -82,6 +82,20 @@ class StockWatchV6MigrationServiceDecisionTest {
         assertFalse(Boolean.TRUE.equals(technical));
     }
 
+    @Test
+    void bootstrapPlanStartsNewEpochWithoutInspectingLegacyTechnicalTasks() {
+        JdbcTemplate jdbc = (JdbcTemplate) ReflectionTestUtils.getField(service, "jdbcTemplate");
+        jdbc.update("INSERT INTO stock_watch_technical_analysis VALUES(771,NULL,'SUCCESS','legacy',NULL,"
+                + "'002979','sz','DAY',?,'15:00')", Date.valueOf("2026-07-16"));
+
+        Object plan = ReflectionTestUtils.invokeMethod(service, "bootstrapPlan");
+
+        assertEquals(0L, ReflectionTestUtils.getField(plan, "technicalTaskCutoffId"));
+        assertEquals(771L, ReflectionTestUtils.getField(plan, "legacyAnalysisCutoffId"));
+        assertEquals(1L, ReflectionTestUtils.getField(plan, "legacyAnalysisCount"));
+        assertTrue(((java.util.List<?>) ReflectionTestUtils.getField(plan, "groups")).isEmpty());
+    }
+
     private Map<String, Object> invalidTask(long id) {
         Map<String, Object> task = baseTask(id, "stock-analysis-v4:sz:002979:DAY:2026-07-16:15:00");
         String raw = "{\"invalid\":true}";
