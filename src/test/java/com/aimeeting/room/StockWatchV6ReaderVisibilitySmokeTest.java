@@ -52,8 +52,10 @@ class StockWatchV6ReaderVisibilitySmokeTest {
 
         assertNull(analysisMapper.selectLatestBySymbolDateSlot("009996", "sz",
                 Date.valueOf("2026-07-16"), "09:30", "DAY", "2026-07-16"));
-        assertEquals(990003L, analysisMapper.selectLatestBySymbolDateSlot("009996", "sz",
-                Date.valueOf("2026-07-16"), "10:00", "DAY", "2026-07-16").getId());
+        StockWatchTechnicalAnalysis canonical = analysisMapper.selectLatestBySymbolDateSlot("009996", "sz",
+                Date.valueOf("2026-07-16"), "10:00", "DAY", "2026-07-16");
+        assertEquals(990003L, canonical.getId());
+        assertEquals(6, canonical.getResponseContractVersion());
         List<Long> visibleAnalysis = analysisMapper.selectBySymbolDateRange("009996", "sz",
                         Date.valueOf("2026-07-16"), Date.valueOf("2026-07-16"), "DAY")
                 .stream().map(StockWatchTechnicalAnalysis::getId).collect(Collectors.toList());

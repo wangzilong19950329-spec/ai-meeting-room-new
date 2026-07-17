@@ -4,8 +4,22 @@
 
     <sql id="VisibleHistoryJoins">
         LEFT JOIN stock_watch_analysis_observation_identity i ON i.canonical_task_id = t.analysis_task_id
+        LEFT JOIN stock_watch_analysis_task atask ON atask.id = t.analysis_task_id
         JOIN stock_watch_analysis_migration_state ms
           ON ms.migration_key = 'stock-watch-v6' AND ms.generation = 6 AND ms.status = 'READY'
+    </sql>
+
+    <sql id="AnalysisTaskJoin">
+        LEFT JOIN stock_watch_analysis_task atask ON atask.id = t.analysis_task_id
+    </sql>
+
+    <sql id="AnalysisSelectColumns">
+        t.*,
+        CASE
+            WHEN atask.purpose = 'stock-analysis-response-v6' THEN 6
+            WHEN atask.purpose = 'stock-analysis-response-v5' THEN 5
+            ELSE NULL
+        END AS response_contract_version
     </sql>
 
     <sql id="VisibleHistoryPredicate">
@@ -18,6 +32,7 @@
     <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchTechnicalAnalysis">
         <id column="id" property="id"/>
         <result column="analysis_task_id" property="analysisTaskId"/>
+        <result column="response_contract_version" property="responseContractVersion"/>
         <result column="session_id" property="sessionId"/>
         <result column="symbol" property="symbol"/>
         <result column="market" property="market"/>
@@ -66,17 +81,24 @@
     </insert>
 
     <select id="selectById" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis WHERE id = #{id}
+        SELECT <include refid="AnalysisSelectColumns"/>
+        FROM stock_watch_technical_analysis t
+        <include refid="AnalysisTaskJoin"/>
+        WHERE t.id = #{id}
     </select>
 
     <select id="selectByAnalysisTaskId" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis WHERE analysis_task_id = #{analysisTaskId}
+        SELECT <include refid="AnalysisSelectColumns"/>
+        FROM stock_watch_technical_analysis t
+        <include refid="AnalysisTaskJoin"/>
+        WHERE t.analysis_task_id = #{analysisTaskId}
     </select>
 
     <select id="selectLatestBySymbolDateSlot" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         JOIN stock_watch_analysis_observation_identity i
           ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        <include refid="AnalysisTaskJoin"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
           AND t.analysis_date = #{analysisDate}
@@ -88,7 +110,7 @@
     </select>
 
     <select id="selectBySymbolDateRange" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
@@ -100,7 +122,7 @@
     </select>
 
     <select id="selectBySymbolPeriodKeys" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
@@ -121,7 +143,7 @@
     </select>
 
     <select id="selectRecentBySymbol" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
@@ -132,9 +154,10 @@
     </select>
 
     <select id="selectLatestSuccessfulBySymbolSince" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         JOIN stock_watch_analysis_observation_identity i
           ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        <include refid="AnalysisTaskJoin"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
           AND t.status = 'SUCCESS'
@@ -145,7 +168,7 @@
     </select>
 
     <select id="selectSuccessfulByDateRange" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
@@ -159,7 +182,7 @@
     </select>
 
     <select id="selectLatestSuccessfulDailyByDateRange" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
@@ -188,7 +211,7 @@
     </select>
 
     <select id="selectRecentSuccessfulSlotsByDateRange" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
@@ -202,9 +225,10 @@
     </select>
 
     <select id="selectSuccessfulSince" resultMap="BaseResultMap">
-        SELECT t.* FROM stock_watch_technical_analysis t
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
         JOIN stock_watch_analysis_observation_identity i
           ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        <include refid="AnalysisTaskJoin"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
           AND t.status = 'SUCCESS'

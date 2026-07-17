@@ -149,6 +149,7 @@ class StockWatchTechnicalAnalysisServiceTest {
         StockWatchTechnicalAnalysis record = new StockWatchTechnicalAnalysis();
         record.setId(901L);
         record.setAnalysisTaskId(902L);
+        record.setResponseContractVersion(6);
         record.setAnalysisDate(java.sql.Date.valueOf("2026-07-16"));
         record.setRunSlot("15:00");
         record.setPeriodType("DAY");
@@ -163,13 +164,19 @@ class StockWatchTechnicalAnalysisServiceTest {
         record.setMissingDataJson("[]");
         record.setSourceRecordIds("[]");
         record.setRawResponse("压低股价以利于建仓");
-        record.setMainForceIntentJson("{\"contractVersion\":6,\"evidenceQuality\":\"SERVER_PROFILE_V1\",\"intent\":\"UNKNOWN\"}");
+        record.setMainForceIntentJson("{damaged-main-force-json");
+        record.setEvidenceSignalJson(JSON.toJSONString(evidenceSignals()));
 
         Map<?, ?> payload = ReflectionTestUtils.invokeMethod(service, "toRecordPayload", record);
 
         assertEquals(true, payload.get("rawResponseAuditOnly"));
         assertFalse(payload.containsKey("rawResponse"));
         assertFalse(payload.toString().contains("压低股价"));
+        assertEquals("当日技术信号偏多", payload.get("title"));
+        assertEquals("看涨", payload.get("stance"));
+        assertEquals("SERVER_TECHNICAL_V1", payload.get("technicalEvidenceQuality"));
+        assertEquals(1, payload.get("technicalRenderVersion"));
+        assertTrue(((List<?>) payload.get("evidence")).stream().anyMatch(item -> item.toString().contains("MA20")));
     }
 
     @Test
@@ -246,7 +253,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertTrue(String.valueOf(record.get("conclusion")).contains("本轮未调用模型"));
         assertEquals("待创建", ((Map<?, ?>) result.get("session")).get("status"));
         org.mockito.Mockito.verify(taskService).findCanonical(
-                "002979", "sz", "DAY", "DAY:2026-07-17:15:00");
+                org.mockito.ArgumentMatchers.eq("002979"), org.mockito.ArgumentMatchers.eq("sz"),
+                org.mockito.ArgumentMatchers.eq("DAY"), org.mockito.ArgumentMatchers.startsWith("DAY:2026-07-17:"));
         verifyNoInteractions(projectionService, sessionMapper);
         org.mockito.Mockito.verify(analysisMapper, org.mockito.Mockito.never())
                 .insert(org.mockito.ArgumentMatchers.any());
@@ -284,7 +292,7 @@ class StockWatchTechnicalAnalysisServiceTest {
         request.put("ignoreTradingHours", true);
         request.put("reuseOnly", true);
 
-        IllegalStateException error = assertThrows(IllegalStateException.class,
+        AnalysisReuseOnlyMissException error = assertThrows(AnalysisReuseOnlyMissException.class,
                 () -> localService.runManual(request));
 
         assertTrue(error.getMessage().startsWith("analysis_reuse_only_miss:DAY:"));

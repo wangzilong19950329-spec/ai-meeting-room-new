@@ -1,6 +1,7 @@
 package com.aimeeting.room.controller;
 
 import com.aimeeting.room.common.ApiResponse;
+import com.aimeeting.room.service.AnalysisReuseOnlyMissException;
 import com.aimeeting.room.service.StockWatchTechnicalAnalysisService;
 import com.aimeeting.room.service.StockWatchPredictionService;
 import com.aimeeting.room.service.StockSymbol;
@@ -15,6 +16,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.time.LocalDate;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 @RestController
@@ -51,8 +53,18 @@ public class StockWatchTechnicalAnalysisController {
 
     @PostMapping("/run")
     public ApiResponse<Map<String, Object>> run(@RequestBody(required = false) Map<String, Object> body) {
-        return ApiResponse.ok(technicalAnalysisService.runManual(
-                body == null ? Collections.emptyMap() : body
-        ));
+        try {
+            return ApiResponse.ok(technicalAnalysisService.runManual(
+                    body == null ? Collections.emptyMap() : body
+            ));
+        } catch (AnalysisReuseOnlyMissException miss) {
+            Map<String, Object> data = new LinkedHashMap<>();
+            data.put("errorCode", "ANALYSIS_REUSE_ONLY_MISS");
+            data.put("observationKey", miss.getObservationKey());
+            data.put("retryable", false);
+            ApiResponse<Map<String, Object>> response = ApiResponse.fail(409, "当前观察窗口没有可复用分析");
+            response.setData(data);
+            return response;
+        }
     }
 }

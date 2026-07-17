@@ -451,7 +451,7 @@ public class StockWatchTechnicalAnalysisService {
         Reservation taskReservation = analysisTaskService.findCanonical(
                 ref.symbol, ref.market, periodType, observationKey);
         if (taskReservation == null && reuseOnly) {
-            throw new IllegalStateException("analysis_reuse_only_miss:" + observationKey);
+            throw new AnalysisReuseOnlyMissException(observationKey);
         }
         if (taskReservation != null
                 && (taskReservation.isProjectedSuccess() || taskReservation.isTerminalFailure())) {
@@ -649,6 +649,7 @@ public class StockWatchTechnicalAnalysisService {
         Double projectionSourcePrice = frozen == null ? sourcePrice : frozen.sourcePrice;
         String projectionPromptHash = frozen == null ? taskReservation.getTask().getRequestDigest() : frozen.promptHash;
         int projectionPromptChars = frozen == null ? prompt.length() : frozen.promptChars;
+        int responseContractVersion = frozen == null ? RESPONSE_CONTRACT_VERSION : frozen.responseContractVersion;
 
         BridgeResult bridgeResult = null;
         AnalysisPayload parsed;
@@ -665,6 +666,7 @@ public class StockWatchTechnicalAnalysisService {
         record.setSourceRecordIds(projectionSourceRecordIds);
         record.setEvidenceSignalJson(projectionEvidenceSignalJson);
         record.setAnalysisTaskId(taskReservation.getTask().getId());
+        record.setResponseContractVersion(responseContractVersion);
         record.setProvider("deepseek_web_bridge");
         record.setPromptHash(projectionPromptHash);
         boolean projectionPhase = false;
@@ -683,13 +685,13 @@ public class StockWatchTechnicalAnalysisService {
             }
             runtimeGate.assertReady();
             parsed = parseAnalysisPayload(bridgeResult.answerText, projectionStockName);
-            int responseContractVersion = frozen == null ? RESPONSE_CONTRACT_VERSION : frozen.responseContractVersion;
             intentValidation = validateResponseContract(responseContractVersion, parsed.mainForceIntent,
                     projectionEvidenceSignals, projectionExternalEvidenceCatalog, projectionHistoryCatalog);
             if (responseContractVersion == 5) {
                 validateHistoricalNarrative(parsed, projectionHistoryCatalog);
             } else {
-                applyTrustedV6Payload(parsed, intentValidation, projectionEvidenceSignals);
+                applyTrustedV6Payload(parsed, projectionEvidenceSignals,
+                        projectionPeriodType, projectionSourceDate, projectionRunSlot);
             }
             if (!hasRequiredForecasts(parsed.forecasts, projectionPeriodType)) {
                 throw new ModelResponseSchemaException("DeepSeek 返回JSON缺少当前周期要求的完整 forecasts，未保存不完整预测"
@@ -1772,6 +1774,10 @@ public class StockWatchTechnicalAnalysisService {
         signals.put("atomCatalogVersion", 2);
         signals.put("roleProfileVersion", 1);
         signals.put("periodType", normalizePeriodType(periodType));
+        JSONObject quote = asJsonObject(raw == null ? null : raw.get("quote"));
+        if (quote != null && quote.get("timestamp") != null) {
+            signals.put("sourceTimestamp", quote.get("timestamp"));
+        }
         signals.put("fundFlowEvidence", fundFlow);
         signals.put("priceVolumeSignal", priceVolume);
         signals.put("positionSignal", position);
@@ -2512,31 +2518,18 @@ public class StockWatchTechnicalAnalysisService {
     }
 
     private void applyTrustedV6Payload(AnalysisPayload payload,
-                                       IntentValidationResult validation,
-                                       Map<String, Object> evidenceSignals) {
-        String intent = text(validation == null ? null : validation.intent.get("intent"), "UNKNOWN");
-        double confidence = number(validation == null ? null : validation.intent.get("confidence"), 0d);
-        List<String> evidence = stringValues(validation == null ? null : validation.intent.get("evidence"));
-        List<String> counters = stringValues(validation == null ? null : validation.intent.get("counterEvidence"));
-        if ("ACCUMULATE".equals(intent) || "DISTRIBUTE".equals(intent)) {
-            payload.title = "资金与价格同向的弱证据假设（非行动信号）";
-            payload.stance = intent;
-            payload.tone = "amber";
-            payload.conclusion = "服务器画像仅确认资金与价格同向，证据等级为 WEAK；不用于告警、历史缩窄或意图测试。";
-        } else if ("NEUTRAL".equals(intent)) {
-            payload.title = "资金与价格未呈现显著方向（弱证据，非行动信号）";
-            payload.stance = "NEUTRAL";
-            payload.tone = "blue";
-            payload.conclusion = "服务器画像未发现显著方向，证据等级为 WEAK；不构成主力意图事实。";
-        } else {
-            payload.title = "主力意图证据不足（未满足可验证画像）";
-            payload.stance = "UNKNOWN";
-            payload.tone = "blue";
-            payload.conclusion = "完整证据原子未匹配唯一画像；模型自由文本仅保留审计，普通产品界面不展示。";
-        }
-        payload.confidence = confidence;
-        payload.evidence = new ArrayList<>(evidence);
-        payload.evidence.addAll(counters.stream().map(value -> "反向证据: " + value).collect(Collectors.toList()));
+                                       Map<String, Object> evidenceSignals,
+                                       String periodType,
+                                       LocalDate analysisDate,
+                                       String observationSlot) {
+        TrustedTechnicalRendererV1.RenderedTechnical rendered = TrustedTechnicalRendererV1.render(
+                evidenceSignals, periodType, analysisDate, observationSlot);
+        payload.title = rendered.getTitle();
+        payload.stance = rendered.getStance();
+        payload.tone = rendered.getTone();
+        payload.conclusion = rendered.getConclusion();
+        payload.confidence = rendered.getConfidence();
+        payload.evidence = new ArrayList<>(rendered.getEvidence());
         for (Object value : payload.forecasts) {
             JSONObject forecast = asJsonObject(value);
             if (forecast != null) forecast.put("rationale", "模型方向预测；自由文本理由未通过语义验证，普通界面不展示。");
@@ -3124,8 +3117,7 @@ public class StockWatchTechnicalAnalysisService {
 
     private Map<String, Object> toRecordPayload(StockWatchTechnicalAnalysis record) {
         Map<String, Object> payload = toCompactRecordPayload(record);
-        JSONObject trustedIntent = parseObject(record.getMainForceIntentJson());
-        boolean v6Trusted = trustedIntent != null && trustedIntent.getIntValue("contractVersion") == 6;
+        boolean v6Trusted = TrustedTechnicalRendererV1.isTrustedV6(record);
         if (!v6Trusted) payload.put("rawResponse", record.getRawResponse());
         payload.put("rawResponseAuditOnly", v6Trusted);
         payload.put("errorMessage", record.getErrorMessage());
@@ -3149,6 +3141,8 @@ public class StockWatchTechnicalAnalysisService {
     }
 
     private Map<String, Object> toCompactRecordPayload(StockWatchTechnicalAnalysis record) {
+        TrustedTechnicalRendererV1.RenderedTechnical trustedTechnical = TrustedTechnicalRendererV1.isTrustedV6(record)
+                ? TrustedTechnicalRendererV1.render(record) : null;
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("id", record.getId());
         payload.put("analysisTaskId", record.getAnalysisTaskId());
@@ -3162,12 +3156,14 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("providerCode", record.getProvider());
         payload.put("modelCalled", modelCalled);
         payload.put("status", record.getStatus());
-        payload.put("stance", record.getStance());
-        payload.put("tone", record.getTone());
-        payload.put("confidence", formatConfidence(record.getConfidence()));
-        payload.put("title", record.getTitle());
-        payload.put("conclusion", record.getConclusion());
-        payload.put("evidence", parseEvidence(record.getEvidenceJson()));
+        payload.put("stance", trustedTechnical == null ? record.getStance() : trustedTechnical.getStance());
+        payload.put("tone", trustedTechnical == null ? record.getTone() : trustedTechnical.getTone());
+        payload.put("confidence", formatConfidence(trustedTechnical == null
+                ? record.getConfidence() : trustedTechnical.getConfidence()));
+        payload.put("title", trustedTechnical == null ? record.getTitle() : trustedTechnical.getTitle());
+        payload.put("conclusion", trustedTechnical == null ? record.getConclusion() : trustedTechnical.getConclusion());
+        payload.put("evidence", trustedTechnical == null
+                ? parseEvidence(record.getEvidenceJson()) : trustedTechnical.getEvidence());
         payload.put("missingData", parseEvidence(record.getMissingDataJson()));
         payload.put("mainForceIntent", parseObject(record.getMainForceIntentJson()));
         JSONObject mainForce = parseObject(record.getMainForceIntentJson());
@@ -3176,6 +3172,7 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("mainForceIntentStatus", record.getMainForceIntentStatus());
         payload.put("mainForceIntentWarnings", parseEvidence(record.getMainForceIntentWarningsJson()));
         payload.put("promptHash", record.getPromptHash());
+        if (trustedTechnical != null) payload.putAll(trustedTechnical.metadata());
         return payload;
     }
 

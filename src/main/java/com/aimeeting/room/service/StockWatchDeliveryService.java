@@ -252,6 +252,7 @@ public class StockWatchDeliveryService {
                 config.getSymbol(), config.getMarket(), config.getActiveFrom(), Math.max(1, batchLimit));
 
         for (StockWatchTechnicalAnalysis analysis : candidates) {
+            TrustedTechnicalRendererV1.applyTrustedView(analysis);
             if (!matchesPolicy(analysis, config.getTriggerPolicyJson())) {
                 plan.skippedPolicyCount += 1;
                 continue;
@@ -441,6 +442,7 @@ public class StockWatchDeliveryService {
     }
 
     private Map<String, Object> toAnalysisPreview(StockWatchTechnicalAnalysis analysis, int pendingRecipients) {
+        TrustedTechnicalRendererV1.RenderedTechnical trustedTechnical = TrustedTechnicalRendererV1.applyTrustedView(analysis);
         Map<String, Object> item = new LinkedHashMap<>();
         item.put("id", analysis.getId());
         item.put("date", analysis.getAnalysisDate() == null ? "" : DATE_FORMATTER.format(
@@ -450,10 +452,16 @@ public class StockWatchDeliveryService {
         item.put("stance", analysis.getStance());
         item.put("tone", analysis.getTone());
         item.put("confidence", analysis.getConfidence());
-        item.put("conclusion", firstNonBlank(analysis.getConclusion(), analysis.getRawResponse()));
-        item.put("mainForceIntent", validMainForceIntent(analysis));
+        item.put("conclusion", TrustedTechnicalRendererV1.isTrustedV6(analysis)
+                ? firstNonBlank(analysis.getConclusion(), "冻结技术证据不足，无法形成可信方向结论。")
+                : firstNonBlank(analysis.getConclusion(), analysis.getRawResponse()));
+        JSONObject mainForceIntent = validMainForceIntent(analysis);
+        item.put("mainForceIntent", mainForceIntent);
+        item.put("evidenceQuality", mainForceIntent == null
+                ? "LEGACY_UNVERIFIED" : firstNonBlank(mainForceIntent.getString("evidenceQuality"), "LEGACY_UNVERIFIED"));
         item.put("mainForceIntentStatus", analysis.getMainForceIntentStatus());
         item.put("pendingRecipients", pendingRecipients);
+        if (trustedTechnical != null) item.putAll(trustedTechnical.metadata());
         return item;
     }
 
@@ -480,15 +488,20 @@ public class StockWatchDeliveryService {
     }
 
     private void appendAnalysisBlock(StringBuilder builder, int index, StockWatchTechnicalAnalysis analysis) {
+        boolean v6Trusted = TrustedTechnicalRendererV1.isTrustedV6(analysis);
+        TrustedTechnicalRendererV1.applyTrustedView(analysis);
         appendSection(builder, "二、结论 " + index + "：" + firstNonBlank(analysis.getTitle(), "技术面分析结论"));
         appendLine(builder, "分析时间", firstNonBlank(formatAnalysisDate(analysis), "--"));
         appendLine(builder, "立场", firstNonBlank(analysis.getStance(), "--"));
         appendLine(builder, "情绪", firstNonBlank(analysis.getTone(), "--"));
         appendLine(builder, "置信度", analysis.getConfidence() == null ? "--" : String.format(Locale.ROOT, "%.2f", analysis.getConfidence()));
 
-        appendSection(builder, "三、DeepSeek 分析建议");
-        appendParagraph(builder, firstNonBlank(cleanAnalysisText(analysis.getConclusion()),
-                cleanAnalysisText(analysis.getRawResponse()), "本轮无可展示结论。"), "  ");
+        appendSection(builder, v6Trusted ? "三、服务器技术信号" : "三、DeepSeek 分析建议");
+        String conclusion = v6Trusted
+                ? firstNonBlank(cleanAnalysisText(analysis.getConclusion()), "冻结技术证据不足，无法形成可信方向结论。")
+                : firstNonBlank(cleanAnalysisText(analysis.getConclusion()),
+                        cleanAnalysisText(analysis.getRawResponse()), "本轮无可展示结论。");
+        appendParagraph(builder, conclusion, "  ");
         int sectionIndex = 4;
         if (appendMainForceIntentBlock(builder, analysis, sectionIndex)) {
             sectionIndex++;
@@ -513,7 +526,7 @@ public class StockWatchDeliveryService {
         if (intent == null || intent.isEmpty()) {
             return false;
         }
-        appendSection(builder, chineseSection(sectionIndex) + "、主力意图识别（模型推断，非事实标签）");
+        appendSection(builder, chineseSection(sectionIndex) + "、" + mainForceSectionLabel(intent));
         appendLine(builder, "意图", firstNonBlank(intent.getString("intent"), "UNKNOWN"));
         appendLine(builder, "窗口", firstNonBlank(intent.getString("timeWindow"), "--"));
         appendLine(builder, "置信度", intent.get("confidence") == null ? "--" : String.valueOf(intent.get("confidence")));
@@ -528,6 +541,18 @@ public class StockWatchDeliveryService {
             }
         }
         return true;
+    }
+
+    private String mainForceSectionLabel(JSONObject intent) {
+        String quality = firstNonBlank(intent == null ? null : intent.getString("evidenceQuality"), "LEGACY_UNVERIFIED");
+        if ("SERVER_PROFILE_V1".equalsIgnoreCase(quality)) {
+            return "主力证据画像（服务器确定性分类，非行动信号）";
+        }
+        if ("LEGACY_PATH_MEMBERSHIP_ONLY".equalsIgnoreCase(quality)
+                || "LEGACY_UNVERIFIED".equalsIgnoreCase(quality)) {
+            return "主力意图（模型推断，非事实标签）";
+        }
+        return "主力意图（来源未验证）";
     }
 
     private void appendTitle(StringBuilder builder, String title) {

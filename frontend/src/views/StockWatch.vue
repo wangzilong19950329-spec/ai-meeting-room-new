@@ -417,7 +417,7 @@
               <p>{{ record.conclusion }}</p>
               <div v-if="record.mainForceIntent" class="analysis-main-force">
                 <div>
-                  <strong>主力意图（模型推断）</strong>
+                  <strong>{{ record.mainForceIntent.provenanceLabel }}</strong>
                   <span>{{ record.mainForceIntent.intentLabel }} · {{ record.mainForceIntent.timeWindowLabel }} · 置信度 {{ record.mainForceIntent.confidence }}</span>
                 </div>
                 <p v-if="record.mainForceIntent.risk">{{ record.mainForceIntent.risk }}</p>
@@ -909,7 +909,7 @@
                 <small>#{{ record.id }} · {{ record.date }} {{ record.time }} · 待发送收件人 {{ record.pendingRecipients }}</small>
               </div>
               <small v-if="record.mainForceIntent" class="delivery-preview-intent">
-                主力意图（模型推断）：{{ record.mainForceIntent.intentLabel }} · {{ record.mainForceIntent.timeWindowLabel }}
+                {{ record.mainForceIntent.provenanceLabel }}：{{ record.mainForceIntent.intentLabel }} · {{ record.mainForceIntent.timeWindowLabel }}
               </small>
               <p>{{ record.conclusion }}</p>
             </article>
@@ -2869,7 +2869,7 @@ function normalizeDeliveryPreviewRecord(record) {
     time: record?.time || '--',
     title: record?.title || '技术面分析结论',
     conclusion: truncateText(record?.conclusion || '', 180),
-    mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus),
+    mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus, record?.evidenceQuality),
     pendingRecipients: Number(record?.pendingRecipients || 0)
   }
 }
@@ -2938,7 +2938,7 @@ function normalizeAnalysisRecord(record) {
     conclusion: record?.conclusion || record?.rawResponse || '本轮未返回可展示结论。',
     evidence: normalizeEvidence(record?.evidence),
     missingData: normalizeEvidence(record?.missingData),
-    mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus),
+    mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus, record?.evidenceQuality),
     mainForceIntentStatus: record?.mainForceIntentStatus || '',
     mainForceIntentWarnings: normalizeEvidence(record?.mainForceIntentWarnings),
     sourceRecordIds: normalizeEvidence(record?.sourceRecordIds),
@@ -2965,7 +2965,7 @@ function normalizeAnalysisSession(session, stock = selectedStock.value) {
   }
 }
 
-function normalizeMainForceIntent(raw, status = 'VALID') {
+function normalizeMainForceIntent(raw, status = 'VALID', fallbackEvidenceQuality = '') {
   const normalizedStatus = String(status || '').toUpperCase()
   if (normalizedStatus && !['VALID', 'VALID_WITH_WARNINGS'].includes(normalizedStatus)) return null
   let value = raw
@@ -2980,17 +2980,30 @@ function normalizeMainForceIntent(raw, status = 'VALID') {
   const confidence = Number(value.confidence)
   const intent = String(value.intent || 'UNKNOWN').toUpperCase()
   const timeWindow = String(value.timeWindow || 'INTRADAY').toUpperCase()
+  const evidenceQuality = String(value.evidenceQuality || fallbackEvidenceQuality || '').toUpperCase()
   return {
     intent,
     intentLabel: mainForceIntentLabel(intent),
     timeWindow,
     timeWindowLabel: mainForceWindowLabel(timeWindow),
+    evidenceQuality,
+    provenanceLabel: mainForceProvenanceLabel(evidenceQuality),
     confidence: Number.isFinite(confidence) ? `${Math.round(Math.max(0, Math.min(1, confidence)) * 100)}%` : '--',
     risk: String(value.risk || '').trim(),
     watchPoints: normalizeEvidence(value.watchPoints).slice(0, 4),
     evidence: normalizeEvidence(value.evidence).slice(0, 4),
     counterEvidence: normalizeEvidence(value.counterEvidence).slice(0, 4)
   }
+}
+
+function mainForceProvenanceLabel(evidenceQuality) {
+  if (evidenceQuality === 'SERVER_PROFILE_V1') {
+    return '主力证据画像（服务器确定性分类，非行动信号）'
+  }
+  if (['LEGACY_PATH_MEMBERSHIP_ONLY', 'LEGACY_UNVERIFIED'].includes(evidenceQuality)) {
+    return '主力意图（模型推断）'
+  }
+  return '主力意图（来源未验证）'
 }
 
 function mainForceIntentLabel(intent) {

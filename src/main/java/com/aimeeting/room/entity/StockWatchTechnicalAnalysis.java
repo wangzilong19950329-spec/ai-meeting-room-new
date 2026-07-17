@@ -8,6 +8,7 @@ import java.util.Date;
 public class StockWatchTechnicalAnalysis {
     private Long id;
     private Long analysisTaskId;
+    private Integer responseContractVersion;
     private Long sessionId;
     private String symbol;
     private String market;
