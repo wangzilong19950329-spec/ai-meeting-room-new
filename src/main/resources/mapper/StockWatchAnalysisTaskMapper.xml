@@ -33,6 +33,18 @@
         SELECT * FROM stock_watch_analysis_task WHERE submission_key = #{submissionKey}
     </select>
 
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_task WHERE id = #{id}
+    </select>
+
+    <select id="selectByObservation" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_task
+        WHERE symbol = #{symbol} AND market = #{market}
+          AND COALESCE(period_type, 'DAY') = #{periodType}
+          AND observation_key = #{observationKey}
+        ORDER BY id ASC
+    </select>
+
     <select id="selectRecoverableBefore" resultMap="BaseResultMap">
         SELECT * FROM stock_watch_analysis_task
         WHERE status IN ('RESERVED', 'SUBMITTED', 'RESPONSE_RECEIVED', 'PROJECTION_FAILED')

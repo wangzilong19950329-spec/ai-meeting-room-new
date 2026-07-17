@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -127,7 +128,7 @@ class StockWatchFactPersistenceServiceTest {
         when(intentTestMapper.insert(any())).thenReturn(1);
         Map<String, Object> intent = new LinkedHashMap<>();
         intent.put("intent", "ACCUMULATE");
-        intent.put("timeWindow", "THREE_DAY");
+        intent.put("timeWindow", "FIVE_DAY");
 
         assertEquals(2, service.registerModelIntentTests(21L, 101L, "002979", "sz", intent));
         assertEquals(2, service.registerModelIntentTests(21L, 102L, "002979", "sz", intent));
@@ -139,6 +140,8 @@ class StockWatchFactPersistenceServiceTest {
         assertEquals(Set.of("analysisTask:101:mainForceIntent", "analysisTask:102:mainForceIntent"), claimRefs);
         assertEquals(4, captor.getAllValues().stream().map(StockWatchIntentTest::getTestKey)
                 .collect(Collectors.toSet()).size());
+        assertTrue(captor.getAllValues().stream().allMatch(test -> test.getMaxObservationAge() == 5));
+        assertTrue(captor.getAllValues().stream().allMatch(test -> test.getRequiredObservedCount() == 5));
     }
 
     private StockWatchFactHead head() {

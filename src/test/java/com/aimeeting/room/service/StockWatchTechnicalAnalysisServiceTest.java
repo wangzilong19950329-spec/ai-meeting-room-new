@@ -44,7 +44,8 @@ class StockWatchTechnicalAnalysisServiceTest {
             mock(StockWatchAnalysisTaskService.class),
             mock(StockWatchAnalysisProjectionService.class),
             mock(StockWatchRiskPatternService.class),
-            mock(StockWatchFactPersistenceService.class)
+            mock(StockWatchFactPersistenceService.class),
+            mock(StockWatchV6RuntimeGate.class)
     );
 
     @Test
@@ -74,8 +75,101 @@ class StockWatchTechnicalAnalysisServiceTest {
         String submissionKey = ReflectionTestUtils.invokeMethod(service, "analysisSubmissionKey", ref, observationKey);
 
         assertEquals("DAY:2026-07-16:10:30", observationKey);
-        assertEquals("stock-analysis-v4:sz:002979:DAY:2026-07-16:10:30", submissionKey);
+        assertEquals("stock-analysis-slot-v1:sz:002979:DAY:2026-07-16:10:30", submissionKey);
         assertFalse(submissionKey.contains(":g"));
+    }
+
+    @Test
+    void exactMainlandCloseDeltaUsesCumulativeBoundaryDifference() {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        rows.add(flowRow("2026-07-16 14:45", -535_216_172d, -937_805_528d, 402_589_356d));
+        rows.add(flowRow("2026-07-16 14:59", -543_000_000d, -945_000_000d, 402_000_000d));
+        rows.add(flowRow("2026-07-16 15:00", -544_942_222d, -946_444_180d, 401_501_958d));
+
+        Map<?, ?> delta = ReflectionTestUtils.invokeMethod(service, "exactCloseFlowDelta",
+                new ArrayList<Object>(rows), "sz");
+
+        assertEquals(-9_726_050d, (Double) delta.get("mainDeltaYuan"), 0.001d);
+        assertEquals(-8_638_652d, (Double) delta.get("superLargeDeltaYuan"), 0.001d);
+        assertEquals(-1_087_398d, (Double) delta.get("largeDeltaYuan"), 0.001d);
+        assertEquals("2026-07-16 14:45", delta.get("startTime"));
+        assertEquals("2026-07-16 15:00", delta.get("endTime"));
+    }
+
+    @Test
+    void closeDeltaFailsClosedForMissingBoundaryAndDuplicateTimestamp() {
+        List<Object> missing = new ArrayList<>();
+        missing.add(flowRow("2026-07-16 14:46", 1d, 1d, 1d));
+        missing.add(flowRow("2026-07-16 15:00", 2d, 2d, 2d));
+        Map<?, ?> missingDelta = ReflectionTestUtils.invokeMethod(service, "exactCloseFlowDelta", missing, "sh");
+        assertTrue(String.valueOf(missingDelta.get("limitation")).contains("exact_endpoint_missing"));
+        assertFalse(missingDelta.containsKey("mainDeltaYuan"));
+
+        List<Object> duplicate = new ArrayList<>();
+        duplicate.add(flowRow("2026-07-16 14:45", 1d, 1d, 1d));
+        duplicate.add(flowRow("2026-07-16 14:45", 2d, 2d, 2d));
+        duplicate.add(flowRow("2026-07-16 15:00", 3d, 3d, 3d));
+        Map<?, ?> duplicateDelta = ReflectionTestUtils.invokeMethod(service, "exactCloseFlowDelta", duplicate, "sh");
+        assertEquals("tail15_close_duplicate_timestamp", duplicateDelta.get("limitation"));
+    }
+
+    @Test
+    void v6ServerProfileAppliesCounterCapAndIgnoresModelTactic() {
+        Map<String, Object> raw = evidenceRawWithNews(0);
+        Map<String, Object> indicators = (Map<String, Object>) raw.get("technicalIndicators");
+        indicators.put("macdDif", -2d);
+        indicators.put("macdDea", -1d);
+        indicators.put("macdHistogram", -2d);
+        JSONObject catalog = ReflectionTestUtils.invokeMethod(service, "buildExternalEvidenceCatalog", raw);
+        Map<String, Object> signals = ReflectionTestUtils.invokeMethod(service,
+                "buildEvidenceSignals", raw, "DAY", "sz", catalog);
+        JSONObject modelIntent = new JSONObject(true);
+        modelIntent.put("positioningIntent", "ACCUMULATE");
+        modelIntent.put("executionTactic", "SUPPRESS");
+        modelIntent.put("confidence", 0.99d);
+
+        Object validation = ReflectionTestUtils.invokeMethod(service, "validateResponseContract",
+                6, modelIntent, signals, catalog, emptyHistoryCatalog());
+        JSONObject trusted = (JSONObject) ReflectionTestUtils.getField(validation, "intent");
+        JSONObject positioning = trusted.getJSONObject("positioningEvaluation");
+        JSONObject tactic = trusted.getJSONObject("executionTacticEvaluation");
+
+        assertEquals("ACCUMULATE", trusted.getString("intent"));
+        assertEquals("WEAK", positioning.getString("tier"));
+        assertEquals(0.45d, positioning.getDoubleValue("confidence"), 0.001d);
+        assertTrue(positioning.getJSONArray("counterAtomIds").contains("TECH_MACD_BEAR"));
+        assertEquals("UNKNOWN", tactic.getString("normalizedValue"));
+        assertEquals("UNSUPPORTED", tactic.getString("tier"));
+        assertFalse(trusted.toJSONString().contains("SUPPRESS"));
+        assertFalse(positioning.getJSONObject("permissions").getBooleanValue("intentTestEligible"));
+    }
+
+    @Test
+    void v6NormalRecordPayloadDoesNotExposeRawModelText() {
+        StockWatchTechnicalAnalysis record = new StockWatchTechnicalAnalysis();
+        record.setId(901L);
+        record.setAnalysisTaskId(902L);
+        record.setAnalysisDate(java.sql.Date.valueOf("2026-07-16"));
+        record.setRunSlot("15:00");
+        record.setPeriodType("DAY");
+        record.setPeriodKey("2026-07-16");
+        record.setStatus("SUCCESS");
+        record.setStance("UNKNOWN");
+        record.setTone("blue");
+        record.setConfidence(0d);
+        record.setTitle("主力意图证据不足（未满足可验证画像）");
+        record.setConclusion("服务器可信摘要");
+        record.setEvidenceJson("[]");
+        record.setMissingDataJson("[]");
+        record.setSourceRecordIds("[]");
+        record.setRawResponse("压低股价以利于建仓");
+        record.setMainForceIntentJson("{\"contractVersion\":6,\"evidenceQuality\":\"SERVER_PROFILE_V1\",\"intent\":\"UNKNOWN\"}");
+
+        Map<?, ?> payload = ReflectionTestUtils.invokeMethod(service, "toRecordPayload", record);
+
+        assertEquals(true, payload.get("rawResponseAuditOnly"));
+        assertFalse(payload.containsKey("rawResponse"));
+        assertFalse(payload.toString().contains("压低股价"));
     }
 
     @Test
@@ -90,7 +184,7 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
-    void missingRequiredMarketDataPersistsDataUnavailableWithoutModelTask() {
+    void missingRequiredMarketDataReturnsTransientDataUnavailableWithoutModelTask() {
         EastmoneyMarketDataService marketDataService = mock(EastmoneyMarketDataService.class);
         StockWatchTechnicalSessionMapper sessionMapper = mock(StockWatchTechnicalSessionMapper.class);
         StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
@@ -100,7 +194,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         StockWatchFactPersistenceService factService = mock(StockWatchFactPersistenceService.class);
         StockWatchTechnicalAnalysisService localService = new StockWatchTechnicalAnalysisService(
                 marketDataService, mock(StockWatchPredictionService.class), mock(StockWatchListService.class),
-                sessionMapper, analysisMapper, taskService, projectionService, riskPatternService, factService);
+                sessionMapper, analysisMapper, taskService, projectionService, riskPatternService, factService,
+                mock(StockWatchV6RuntimeGate.class));
         ReflectionTestUtils.setField(localService, "tradingHoursOnly", false);
         ReflectionTestUtils.setField(localService, "contextLimitChars", 80_000);
 
@@ -150,8 +245,53 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertEquals(false, record.get("modelCalled"));
         assertTrue(String.valueOf(record.get("conclusion")).contains("本轮未调用模型"));
         assertEquals("待创建", ((Map<?, ?>) result.get("session")).get("status"));
-        org.mockito.Mockito.verify(taskService).find("stock-analysis-v4:sz:002979:DAY:2026-07-17:15:00");
+        org.mockito.Mockito.verify(taskService).findCanonical(
+                "002979", "sz", "DAY", "DAY:2026-07-17:15:00");
         verifyNoInteractions(projectionService, sessionMapper);
+        org.mockito.Mockito.verify(analysisMapper, org.mockito.Mockito.never())
+                .insert(org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void reuseOnlyMissStopsBeforeFactsSessionOrProviderWork() {
+        EastmoneyMarketDataService marketDataService = mock(EastmoneyMarketDataService.class);
+        StockWatchTechnicalSessionMapper sessionMapper = mock(StockWatchTechnicalSessionMapper.class);
+        StockWatchAnalysisTaskService taskService = mock(StockWatchAnalysisTaskService.class);
+        StockWatchAnalysisProjectionService projectionService = mock(StockWatchAnalysisProjectionService.class);
+        StockWatchRiskPatternService riskPatternService = mock(StockWatchRiskPatternService.class);
+        StockWatchFactPersistenceService factService = mock(StockWatchFactPersistenceService.class);
+        StockWatchTechnicalAnalysisService localService = new StockWatchTechnicalAnalysisService(
+                marketDataService, mock(StockWatchPredictionService.class), mock(StockWatchListService.class),
+                sessionMapper, mock(StockWatchTechnicalAnalysisMapper.class), taskService, projectionService,
+                riskPatternService, factService, mock(StockWatchV6RuntimeGate.class));
+        ReflectionTestUtils.setField(localService, "tradingHoursOnly", false);
+
+        Map<String, Object> quote = new LinkedHashMap<>();
+        quote.put("name", "雷赛智能");
+        quote.put("price", 58.51d);
+        quote.put("timestamp", ZonedDateTime.of(2026, 7, 16, 15, 0, 0, 0,
+                ZoneId.of("Asia/Shanghai")).toEpochSecond());
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("quote", quote);
+        when(marketDataService.buildBundle("002979", "sz", "DAY"))
+                .thenReturn(new EastmoneyMarketDataService.MarketDataBundle(
+                        payload, Collections.emptyList(), Collections.emptyList()));
+
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("symbol", "002979.sz");
+        request.put("name", "雷赛智能");
+        request.put("periodType", "DAY");
+        request.put("ignoreTradingHours", true);
+        request.put("reuseOnly", true);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> localService.runManual(request));
+
+        assertTrue(error.getMessage().startsWith("analysis_reuse_only_miss:DAY:"));
+        org.mockito.Mockito.verify(taskService).findCanonical(
+                org.mockito.ArgumentMatchers.eq("002979"), org.mockito.ArgumentMatchers.eq("sz"),
+                org.mockito.ArgumentMatchers.eq("DAY"), org.mockito.ArgumentMatchers.startsWith("DAY:"));
+        verifyNoInteractions(riskPatternService, factService, projectionService, sessionMapper);
     }
 
     @Test
@@ -161,7 +301,8 @@ class StockWatchTechnicalAnalysisServiceTest {
                 mock(EastmoneyMarketDataService.class), mock(StockWatchPredictionService.class),
                 mock(StockWatchListService.class), mock(StockWatchTechnicalSessionMapper.class), analysisMapper,
                 mock(StockWatchAnalysisTaskService.class), mock(StockWatchAnalysisProjectionService.class),
-                mock(StockWatchRiskPatternService.class), mock(StockWatchFactPersistenceService.class));
+                mock(StockWatchRiskPatternService.class), mock(StockWatchFactPersistenceService.class),
+                mock(StockWatchV6RuntimeGate.class));
         StockWatchAnalysisTask terminalTask = task(71L, "INVALID_RESPONSE", "digest-71");
         StockWatchTechnicalAnalysis existing = new StockWatchTechnicalAnalysis();
         existing.setId(701L);
@@ -187,13 +328,14 @@ class StockWatchTechnicalAnalysisServiceTest {
                 mock(StockWatchListService.class), mock(StockWatchTechnicalSessionMapper.class),
                 mock(StockWatchTechnicalAnalysisMapper.class), mock(StockWatchAnalysisTaskService.class),
                 mock(StockWatchAnalysisProjectionService.class), mock(StockWatchRiskPatternService.class),
-                mock(StockWatchFactPersistenceService.class));
+                mock(StockWatchFactPersistenceService.class), mock(StockWatchV6RuntimeGate.class));
         StockWatchTechnicalSession session = new StockWatchTechnicalSession();
         session.setId(81L);
         String promptHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");
         String projectionJson = ReflectionTestUtils.invokeMethod(localService, "frozenProjectionJson",
                 session, "雷赛智能", LocalDate.of(2026, 7, 16), "10:30", "DAY", "2026-07-16",
                 "[701]", "{\"fundFlowEvidence\":{\"anchorMainInflowYuan\":1}}",
+                emptyExternalEvidenceCatalog().toJSONString(),
                 "{\"quote\":{\"price\":58.51}}", 91L, 58.51, promptHash, 1234, "[]",
                 emptyHistoryCatalog().toJSONString());
         JSONObject envelope = new JSONObject(true);
@@ -211,6 +353,7 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertEquals("雷赛智能", ReflectionTestUtils.getField(frozen, "stockName"));
         assertEquals("[701]", ReflectionTestUtils.getField(frozen, "sourceRecordIds"));
         assertEquals(promptHash, ReflectionTestUtils.getField(frozen, "promptHash"));
+        assertEquals(6, ReflectionTestUtils.getField(frozen, "responseContractVersion"));
 
         envelope.put("projectionDigest", "tampered");
         responseTask.setRequestEnvelopeJson(JSON.toJSONString(envelope));
@@ -383,6 +526,95 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
+    void validateMainForceIntentRejectsMixedAllowedAndFabricatedPathsInOneItem() {
+        Map<String, Object> evidenceSignals = evidenceSignals();
+        JSONObject catalog = legacyHistoryCatalog();
+        JSONObject intent = validStrongIntent(catalog);
+        intent.put("evidence", jsonArray(
+                "合法路径 evidenceSignals.fundFlowEvidence.anchorMainInflowYuan，伪造路径 externalEvidenceCatalog.entriesByRef.news_fake.title",
+                "价量引用 evidenceSignals.priceVolumeSignal.volumeRatio",
+                "位置引用 evidenceSignals.positionSignal.closePosition20dPct"));
+
+        Object result = ReflectionTestUtils.invokeMethod(service, "validateMainForceIntent", intent,
+                evidenceSignals, catalog);
+
+        assertEquals(false, ReflectionTestUtils.getField(result, "valid"));
+        List<?> problems = (List<?>) ReflectionTestUtils.getField(result, "problems");
+        assertTrue(problems.contains("mainForceIntent.evidence[0]_invalid_evidence_path"));
+    }
+
+    @Test
+    void responseContractV5NormalizesDeclaredOneWeekAliasAndKeepsRawValue() {
+        Map<String, Object> raw = evidenceRawWithNews(2);
+        JSONObject externalCatalog = ReflectionTestUtils.invokeMethod(service,
+                "buildExternalEvidenceCatalog", raw);
+        Map<String, Object> evidenceSignals = ReflectionTestUtils.invokeMethod(service,
+                "buildEvidenceSignals", raw, "DAY", externalCatalog);
+        JSONObject historyCatalog = legacyHistoryCatalog();
+        JSONObject intent = validStrongIntent(historyCatalog);
+        intent.put("timeWindow", "ONE_WEEK");
+
+        Object result = ReflectionTestUtils.invokeMethod(service, "validateResponseContract", 5, intent,
+                evidenceSignals, externalCatalog, historyCatalog);
+
+        assertEquals(true, ReflectionTestUtils.getField(result, "valid"));
+        JSONObject normalized = (JSONObject) ReflectionTestUtils.getField(result, "intent");
+        assertEquals("ONE_WEEK", normalized.getString("rawTimeWindow"));
+        assertEquals("FIVE_DAY", normalized.getString("timeWindow"));
+        List<?> warnings = (List<?>) ReflectionTestUtils.getField(result, "warnings");
+        assertTrue(warnings.contains("mainForceIntent.timeWindow_alias:ONE_WEEK->FIVE_DAY"));
+    }
+
+    @Test
+    void responseContractV5RejectsUnknownWindowAndTamperedExternalCatalog() {
+        Map<String, Object> raw = evidenceRawWithNews(1);
+        JSONObject externalCatalog = ReflectionTestUtils.invokeMethod(service,
+                "buildExternalEvidenceCatalog", raw);
+        Map<String, Object> evidenceSignals = ReflectionTestUtils.invokeMethod(service,
+                "buildEvidenceSignals", raw, "DAY", externalCatalog);
+        JSONObject historyCatalog = legacyHistoryCatalog();
+        JSONObject intent = validStrongIntent(historyCatalog);
+        intent.put("timeWindow", "CALENDAR_WEEK");
+
+        Object result = ReflectionTestUtils.invokeMethod(service, "validateResponseContract", 5, intent,
+                evidenceSignals, externalCatalog, historyCatalog);
+        assertEquals(false, ReflectionTestUtils.getField(result, "valid"));
+        assertTrue(((List<?>) ReflectionTestUtils.getField(result, "problems"))
+                .contains("mainForceIntent.timeWindow_invalid:CALENDAR_WEEK"));
+
+        externalCatalog.getJSONObject("entriesByRef").values().stream().findFirst()
+                .map(JSONObject.class::cast).ifPresent(entry -> entry.put("title", "tampered"));
+        assertThrows(IllegalStateException.class, () -> ReflectionTestUtils.invokeMethod(service,
+                "validateResponseContract", 5, validStrongIntent(historyCatalog), evidenceSignals,
+                externalCatalog, historyCatalog));
+        assertThrows(IllegalStateException.class, () -> ReflectionTestUtils.invokeMethod(service,
+                "validateResponseContract", 4, validStrongIntent(historyCatalog), evidenceSignals,
+                ReflectionTestUtils.invokeMethod(service, "buildExternalEvidenceCatalog", raw),
+                historyCatalog));
+    }
+
+    @Test
+    void externalEvidenceCatalogUsesOnlySixCompactNewsItemsAndExactResolvablePaths() {
+        Map<String, Object> raw = evidenceRawWithNews(10);
+        JSONObject catalog = ReflectionTestUtils.invokeMethod(service, "buildExternalEvidenceCatalog", raw);
+        Map<String, Object> signals = ReflectionTestUtils.invokeMethod(service,
+                "buildEvidenceSignals", raw, "DAY", catalog);
+
+        assertEquals(6, catalog.getJSONObject("entriesByRef").size());
+        assertEquals(true, ReflectionTestUtils.invokeMethod(service,
+                "verifyExternalEvidenceCatalogDigest", JSON.parseObject(catalog.toJSONString())));
+        assertEquals(true, ReflectionTestUtils.invokeMethod(service,
+                "externalCatalogMatchesCitationPaths", catalog, signals));
+        List<?> paths = (List<?>) signals.get("citationPaths");
+        assertTrue(paths.stream().anyMatch(path -> String.valueOf(path)
+                .matches("externalEvidenceCatalog\\.entriesByRef\\.news_[0-9a-f]{16}\\.title")));
+        assertFalse(paths.contains("externalEvidenceCatalog.entriesByRef"));
+        assertFalse(catalog.getJSONObject("entriesByRef").values().stream()
+                .map(JSONObject.class::cast)
+                .anyMatch(entry -> "news-6".equals(entry.getString("title"))));
+    }
+
+    @Test
     void validateMainForceIntentRejectsHighConfidenceWhenPositionCoverageMissing() {
         Map<String, Object> evidenceSignals = evidenceSignals();
         @SuppressWarnings("unchecked")
@@ -455,6 +687,23 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
+    void historyCatalogDigestSurvivesNestedTestTargetsAndNullOmission() {
+        JSONObject catalog = legacyHistoryCatalog();
+        JSONObject entry = catalog.getJSONArray("entries").getJSONObject(0);
+        JSONObject test = new JSONObject(true);
+        test.put("testRef", "intentTest:91");
+        test.put("target", Map.of("upper", 62.25, "lower", 54.56));
+        test.put("optional", null);
+        entry.put("tests", jsonArray(test));
+        catalog.put("catalogDigest", ReflectionTestUtils.invokeMethod(service,
+                "historyCatalogDigest", catalog));
+
+        JSONObject reparsed = JSON.parseObject(catalog.toJSONString());
+        assertEquals(true, ReflectionTestUtils.invokeMethod(service,
+                "verifyHistoryCatalogDigest", reparsed));
+    }
+
+    @Test
     void historyAttributionRejectsMissingAssessmentAndNonArrayNarrowingField() {
         Map<String, Object> evidenceSignals = evidenceSignals();
         JSONObject catalog = legacyHistoryCatalog();
@@ -500,6 +749,11 @@ class StockWatchTechnicalAnalysisServiceTest {
         catalog.put("entries", new JSONArray());
         catalog.put("catalogDigest", ReflectionTestUtils.invokeMethod(service, "historyCatalogDigest", catalog));
         return catalog;
+    }
+
+    private JSONObject emptyExternalEvidenceCatalog() {
+        return ReflectionTestUtils.invokeMethod(service, "buildExternalEvidenceCatalog",
+                Collections.emptyMap());
     }
 
     private JSONObject emptyHistoryAttribution() {
@@ -576,6 +830,11 @@ class StockWatchTechnicalAnalysisServiceTest {
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> evidenceSignals() {
+        Map<String, Object> raw = evidenceRawWithNews(0);
+        return ReflectionTestUtils.invokeMethod(service, "buildEvidenceSignals", raw, "DAY");
+    }
+
+    private Map<String, Object> evidenceRawWithNews(int newsCount) {
         Map<String, Object> raw = new LinkedHashMap<>();
         Map<String, Object> quote = new LinkedHashMap<>();
         quote.put("price", 110.0);
@@ -626,7 +885,27 @@ class StockWatchTechnicalAnalysisServiceTest {
         flow.add(latest);
         raw.put("intradayFundFlow", flow);
 
-        return ReflectionTestUtils.invokeMethod(service, "buildEvidenceSignals", raw, "DAY");
+        List<Map<String, Object>> news = new ArrayList<>();
+        for (int i = 0; i < newsCount; i++) {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("title", "news-" + i);
+            item.put("showTime", "2026-07-" + String.format("%02d", 16 - i) + " 10:00:00");
+            item.put("source", i % 2 == 0 ? "source-a" : "source-b");
+            item.put("summary", "summary-" + i);
+            item.put("url", "https://example.test/news/" + i);
+            news.add(item);
+        }
+        raw.put("latestNews", news);
+        return raw;
+    }
+
+    private Map<String, Object> flowRow(String time, double main, double superLarge, double large) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("time", time);
+        row.put("main", main);
+        row.put("superLarge", superLarge);
+        row.put("large", large);
+        return row;
     }
 
     private JSONArray jsonArray(Object... values) {

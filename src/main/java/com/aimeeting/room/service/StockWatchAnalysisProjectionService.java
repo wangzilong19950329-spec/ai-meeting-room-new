@@ -25,6 +25,7 @@ public class StockWatchAnalysisProjectionService {
     private final StockWatchFactPersistenceService factPersistenceService;
     private final StockWatchTechnicalSessionMapper sessionMapper;
     private final StockWatchAnalysisTaskService analysisTaskService;
+    private final StockWatchV6RuntimeGate runtimeGate;
 
     @Transactional(rollbackFor = Exception.class)
     public StockWatchTechnicalAnalysis project(Reservation reservation,
@@ -38,10 +39,11 @@ public class StockWatchAnalysisProjectionService {
                                                 StockWatchTechnicalSession session,
                                                 String bridgeTargetId,
                                                 String conversationUrl) {
+        runtimeGate.assertReady();
         if (record == null || session == null || reservation == null) {
             throw new IllegalArgumentException("analysis_projection_input_required");
         }
-        if (originObservationId != null) {
+        if (originObservationId != null && intentTestEligible(validatedIntent)) {
             factPersistenceService.registerModelIntentTests(originObservationId,
                     reservation.getTask().getId(), record.getSymbol(),
                     record.getMarket(), validatedIntent);
@@ -63,6 +65,16 @@ public class StockWatchAnalysisProjectionService {
         return record;
     }
 
+    private boolean intentTestEligible(Map<String, Object> validatedIntent) {
+        if (validatedIntent == null) return false;
+        Object positioning = validatedIntent.get("positioningEvaluation");
+        if (!(positioning instanceof Map)) return true;
+        Object permissions = ((Map<?, ?>) positioning).get("permissions");
+        if (!(permissions instanceof Map)) return false;
+        Object eligible = ((Map<?, ?>) permissions).get("intentTestEligible");
+        return Boolean.TRUE.equals(eligible) || "true".equalsIgnoreCase(String.valueOf(eligible));
+    }
+
     @Transactional(rollbackFor = Exception.class)
     public StockWatchTechnicalAnalysis projectFailure(Reservation reservation,
                                                        StockWatchTechnicalAnalysis record,
@@ -74,6 +86,7 @@ public class StockWatchAnalysisProjectionService {
                                                        String error,
                                                        String bridgeTargetId,
                                                        String conversationUrl) {
+        runtimeGate.assertReady();
         if (reservation == null || !reservation.isNewSubmission() || record == null || session == null) {
             throw new IllegalStateException("analysis_failure_projection_requires_new_submission");
         }
@@ -94,6 +107,7 @@ public class StockWatchAnalysisProjectionService {
     public StockWatchTechnicalAnalysis projectReplayFailure(Reservation reservation,
                                                              StockWatchTechnicalAnalysis record,
                                                              String error) {
+        runtimeGate.assertReady();
         if (reservation == null || reservation.isNewSubmission() || record == null) {
             throw new IllegalStateException("analysis_replay_failure_projection_requires_existing_submission");
         }
@@ -109,6 +123,7 @@ public class StockWatchAnalysisProjectionService {
                                                          StockWatchTechnicalAnalysis record,
                                                          String terminalStatus,
                                                          String error) {
+        runtimeGate.assertReady();
         if (reservation == null || reservation.isNewSubmission() || record == null) {
             throw new IllegalStateException("analysis_abandoned_projection_requires_existing_submission");
         }
@@ -124,6 +139,7 @@ public class StockWatchAnalysisProjectionService {
                                                  String bridgeTargetId,
                                                  String conversationUrl,
                                                  String error) {
+        runtimeGate.assertReady();
         if (session == null || session.getId() == null || record == null) return;
         int used = session.getContextChars() == null ? 0 : session.getContextChars();
         int delta = record.getContextCharsDelta() == null ? 0 : record.getContextCharsDelta();

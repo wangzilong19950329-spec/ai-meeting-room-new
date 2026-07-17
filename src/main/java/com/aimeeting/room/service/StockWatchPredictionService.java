@@ -36,6 +36,7 @@ public class StockWatchPredictionService {
 
     private final StockWatchPredictionMapper predictionMapper;
     private final EastmoneyMarketDataService marketDataService;
+    private final StockWatchV6RuntimeGate runtimeGate;
 
     @Value("${stock-watch.prediction.evaluation-batch-limit:200}")
     private int evaluationBatchLimit = 200;
@@ -97,6 +98,7 @@ public class StockWatchPredictionService {
                                                            JSONArray forecasts,
                                                            String inputSnapshotJson,
                                                            boolean strict) {
+        runtimeGate.assertReady();
         if (strict) {
             validatePredictionsStrict(sourcePrice, forecasts);
         }
@@ -163,6 +165,7 @@ public class StockWatchPredictionService {
     @Scheduled(fixedDelayString = "${stock-watch.prediction.evaluation-interval-ms:1800000}",
             initialDelayString = "${stock-watch.prediction.evaluation-initial-delay-ms:180000}")
     public void evaluatePending() {
+        runtimeGate.assertReady();
         int limit = effectiveEvaluationBatchLimit();
         List<StockWatchPrediction> pending = predictionMapper.selectPending(limit);
         if (pending.isEmpty()) return;

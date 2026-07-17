@@ -518,6 +518,47 @@ CREATE TABLE IF NOT EXISTS stock_watch_analysis_task (
 CREATE INDEX IF NOT EXISTS idx_sw_analysis_task_observation ON stock_watch_analysis_task(symbol, market, observation_key);
 CREATE INDEX IF NOT EXISTS idx_sw_analysis_task_status ON stock_watch_analysis_task(status, gmt_create);
 
+CREATE TABLE IF NOT EXISTS stock_watch_analysis_observation_identity (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    identity_key VARCHAR(64) NOT NULL UNIQUE,
+    analysis_scope VARCHAR(40) NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    period_type VARCHAR(16) NOT NULL,
+    observation_key VARCHAR(160) NOT NULL,
+    canonical_task_id BIGINT UNIQUE,
+    migration_state VARCHAR(40) NOT NULL DEFAULT 'PENDING',
+    row_version BIGINT NOT NULL DEFAULT 0,
+    gmt_create TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    gmt_modify TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(analysis_scope, market, symbol, period_type, observation_key)
+);
+
+CREATE TABLE IF NOT EXISTS stock_watch_analysis_identity_candidate (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    identity_id BIGINT NOT NULL,
+    task_id BIGINT NOT NULL,
+    disposition VARCHAR(48) NOT NULL,
+    reason VARCHAR(255) NOT NULL,
+    source_fingerprint VARCHAR(64) NOT NULL,
+    verified_at TIMESTAMP NOT NULL,
+    gmt_create TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(identity_id, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_candidate_task ON stock_watch_analysis_identity_candidate(task_id);
+CREATE INDEX IF NOT EXISTS idx_sw_candidate_disposition ON stock_watch_analysis_identity_candidate(disposition);
+
+CREATE TABLE IF NOT EXISTS stock_watch_analysis_migration_state (
+    migration_key VARCHAR(64) PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    technical_task_cutoff_id BIGINT DEFAULT 0 NOT NULL,
+    legacy_analysis_cutoff_id BIGINT DEFAULT 0 NOT NULL,
+    legacy_analysis_count BIGINT DEFAULT 0 NOT NULL,
+    plan_hash VARCHAR(64) DEFAULT '' NOT NULL,
+    gmt_modify TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS stock_watch_delivery_config (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     symbol VARCHAR(16) NOT NULL,

@@ -11,6 +11,13 @@ import java.util.List;
 public interface StockWatchAnalysisTaskMapper {
     StockWatchAnalysisTask selectBySubmissionKey(@Param("submissionKey") String submissionKey);
 
+    StockWatchAnalysisTask selectById(@Param("id") Long id);
+
+    List<StockWatchAnalysisTask> selectByObservation(@Param("symbol") String symbol,
+                                                     @Param("market") String market,
+                                                     @Param("periodType") String periodType,
+                                                     @Param("observationKey") String observationKey);
+
     List<StockWatchAnalysisTask> selectRecoverableBefore(@Param("before") Date before,
                                                          @Param("limit") int limit);
 

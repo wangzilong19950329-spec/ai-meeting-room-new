@@ -54,16 +54,28 @@
     </select>
 
     <select id="selectRecent" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_prediction
-        WHERE symbol = #{symbol} AND market = #{market}
-        ORDER BY forecast_date DESC, id DESC
+        SELECT p.* FROM stock_watch_prediction p
+        JOIN stock_watch_technical_analysis a ON a.id = p.analysis_id
+        LEFT JOIN stock_watch_analysis_observation_identity i ON i.canonical_task_id = a.analysis_task_id
+        JOIN stock_watch_analysis_migration_state ms
+          ON ms.migration_key = 'stock-watch-v6' AND ms.generation = 6 AND ms.status = 'READY'
+        WHERE p.symbol = #{symbol} AND p.market = #{market}
+          AND (i.analysis_scope = 'TECHNICAL_RUNTIME'
+               OR (a.analysis_task_id IS NULL AND a.id &lt;= ms.legacy_analysis_cutoff_id))
+        ORDER BY p.forecast_date DESC, p.id DESC
         LIMIT #{limit}
     </select>
 
     <select id="selectPending" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_prediction
-        WHERE status = 'PENDING'
-        ORDER BY forecast_date ASC, id ASC
+        SELECT p.* FROM stock_watch_prediction p
+        JOIN stock_watch_technical_analysis a ON a.id = p.analysis_id
+        LEFT JOIN stock_watch_analysis_observation_identity i ON i.canonical_task_id = a.analysis_task_id
+        JOIN stock_watch_analysis_migration_state ms
+          ON ms.migration_key = 'stock-watch-v6' AND ms.generation = 6 AND ms.status = 'READY'
+        WHERE p.status = 'PENDING'
+          AND (i.analysis_scope = 'TECHNICAL_RUNTIME'
+               OR (a.analysis_task_id IS NULL AND a.id &lt;= ms.legacy_analysis_cutoff_id))
+        ORDER BY p.forecast_date ASC, p.id ASC
         LIMIT #{limit}
     </select>
 

@@ -17,6 +17,10 @@ mybatis:
   configuration:
     map-underscore-to-camel-case: true
 
+stock-watch:
+  technical-analysis:
+    v6-mode: disabled
+
 # 关闭后台追踪刷新调度，避免干扰冒烟测试
 ai:
   tracking:

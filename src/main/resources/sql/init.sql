@@ -510,6 +510,52 @@ CREATE TABLE IF NOT EXISTS `stock_watch_analysis_task` (
     KEY `idx_sw_analysis_task_status` (`status`, `gmt_create`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票模型单次提交与结果回执';
 
+CREATE TABLE IF NOT EXISTS `stock_watch_analysis_observation_identity` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `identity_key` VARCHAR(64) NOT NULL,
+    `analysis_scope` VARCHAR(40) NOT NULL,
+    `symbol` VARCHAR(16) NOT NULL,
+    `market` VARCHAR(8) NOT NULL,
+    `period_type` VARCHAR(16) NOT NULL,
+    `observation_key` VARCHAR(160) NOT NULL,
+    `canonical_task_id` BIGINT,
+    `migration_state` VARCHAR(40) NOT NULL DEFAULT 'PENDING',
+    `row_version` BIGINT NOT NULL DEFAULT 0,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_analysis_identity_key` (`identity_key`),
+    UNIQUE KEY `uk_sw_analysis_identity_observation` (`analysis_scope`,`market`,`symbol`,`period_type`,`observation_key`),
+    UNIQUE KEY `uk_sw_analysis_identity_task` (`canonical_task_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票分析 observation 的 canonical task 所有权';
+
+CREATE TABLE IF NOT EXISTS `stock_watch_analysis_identity_candidate` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `identity_id` BIGINT NOT NULL,
+    `task_id` BIGINT NOT NULL,
+    `disposition` VARCHAR(48) NOT NULL,
+    `reason` VARCHAR(255) NOT NULL,
+    `source_fingerprint` VARCHAR(64) NOT NULL,
+    `verified_at` DATETIME NOT NULL,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_identity_candidate` (`identity_id`,`task_id`),
+    KEY `idx_sw_candidate_task` (`task_id`),
+    KEY `idx_sw_candidate_disposition` (`disposition`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='canonical identity 的历史候选与裁决审计';
+
+CREATE TABLE IF NOT EXISTS `stock_watch_analysis_migration_state` (
+    `migration_key` VARCHAR(64) NOT NULL,
+    `generation` INT NOT NULL,
+    `status` VARCHAR(24) NOT NULL,
+    `technical_task_cutoff_id` BIGINT NOT NULL DEFAULT 0,
+    `legacy_analysis_cutoff_id` BIGINT NOT NULL DEFAULT 0,
+    `legacy_analysis_count` BIGINT NOT NULL DEFAULT 0,
+    `plan_hash` VARCHAR(64) NOT NULL DEFAULT '',
+    `gmt_modify` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`migration_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票分析迁移就绪状态';
+
 -- 股票盯盘：单股邮件推送配置
 CREATE TABLE IF NOT EXISTS `stock_watch_delivery_config` (
     `id`                    BIGINT       NOT NULL AUTO_INCREMENT COMMENT '主键',

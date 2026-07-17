@@ -2,6 +2,8 @@ package com.aimeeting.room.service;
 
 import com.alibaba.fastjson.JSON;
 import com.aimeeting.room.dao.StockWatchAnalysisTaskMapper;
+import com.aimeeting.room.dao.StockWatchAnalysisObservationIdentityMapper;
+import com.aimeeting.room.entity.StockWatchAnalysisObservationIdentity;
 import com.aimeeting.room.entity.StockWatchAnalysisTask;
 import lombok.RequiredArgsConstructor;
 import org.springframework.dao.DuplicateKeyException;
@@ -23,7 +25,78 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class StockWatchAnalysisTaskService {
 
+    public static final String TECHNICAL_RUNTIME_SCOPE = "TECHNICAL_RUNTIME";
+
     private final StockWatchAnalysisTaskMapper mapper;
+    private final StockWatchAnalysisObservationIdentityMapper identityMapper;
+    private final StockWatchV6RuntimeGate runtimeGate;
+
+    public Reservation findCanonical(String symbol, String market, String periodType, String observationKey) {
+        String identityKey = observationIdentityKey(TECHNICAL_RUNTIME_SCOPE,
+                symbol, market, periodType, observationKey);
+        StockWatchAnalysisObservationIdentity identity = identityMapper.selectByIdentityKey(identityKey);
+        if (identity == null || identity.getCanonicalTaskId() == null) return null;
+        StockWatchAnalysisTask task = mapper.selectById(identity.getCanonicalTaskId());
+        if (task == null) {
+            throw new IllegalStateException("analysis_identity_canonical_task_missing:" + identityKey);
+        }
+        return Reservation.existing(task, task.getRequestDigest());
+    }
+
+    @Transactional
+    public Reservation claimCanonical(String submissionKey,
+                                      String purpose,
+                                      String symbol,
+                                      String market,
+                                      String periodType,
+                                      String observationKey,
+                                      String provider) {
+        runtimeGate.assertReady();
+        String normalizedSymbol = normalize(symbol, false, "symbol");
+        String normalizedMarket = normalize(market, true, "market");
+        String normalizedPeriod = normalize(periodType, true, "periodType");
+        String normalizedObservation = requiredText(observationKey, "observationKey");
+        String identityKey = observationIdentityKey(TECHNICAL_RUNTIME_SCOPE, normalizedSymbol, normalizedMarket,
+                normalizedPeriod, normalizedObservation);
+        StockWatchAnalysisObservationIdentity candidate = new StockWatchAnalysisObservationIdentity();
+        candidate.setIdentityKey(identityKey);
+        candidate.setAnalysisScope(TECHNICAL_RUNTIME_SCOPE);
+        candidate.setSymbol(normalizedSymbol);
+        candidate.setMarket(normalizedMarket);
+        candidate.setPeriodType(normalizedPeriod);
+        candidate.setObservationKey(normalizedObservation);
+        candidate.setMigrationState("RUNTIME_CLAIMED");
+        candidate.setRowVersion(0L);
+        identityMapper.insertIfAbsent(candidate);
+        StockWatchAnalysisObservationIdentity identity = identityMapper.selectByIdentityKeyForUpdate(identityKey);
+        if (identity == null) {
+            throw new IllegalStateException("analysis_identity_insert_or_lock_failed:" + identityKey);
+        }
+        if (identity.getCanonicalTaskId() != null) {
+            StockWatchAnalysisTask existing = mapper.selectById(identity.getCanonicalTaskId());
+            if (existing == null) throw new IllegalStateException("analysis_identity_canonical_task_missing:" + identityKey);
+            return Reservation.existing(existing, existing.getRequestDigest());
+        }
+        List<StockWatchAnalysisTask> legacy = mapper.selectByObservation(
+                normalizedSymbol, normalizedMarket, normalizedPeriod, normalizedObservation);
+        if (legacy != null && legacy.size() > 1) {
+            throw new IllegalStateException("analysis_identity_ambiguous_unmigrated_tasks:" + identityKey + ":" + legacy.size());
+        }
+        Reservation reservation;
+        if (legacy != null && legacy.size() == 1) {
+            reservation = Reservation.existing(legacy.get(0), legacy.get(0).getRequestDigest());
+        } else {
+            Map<String, Object> envelope = new LinkedHashMap<>();
+            envelope.put("schema", "stock-analysis-claim-v1");
+            envelope.put("submissionKey", submissionKey);
+            reservation = reserve(submissionKey, sha256(submissionKey), purpose, normalizedSymbol,
+                    normalizedMarket, normalizedPeriod, normalizedObservation, 0, provider, envelope);
+        }
+        int bound = identityMapper.bindCanonical(identity.getId(), value(identity.getRowVersion()),
+                reservation.getTask().getId(), "CANONICAL");
+        if (bound != 1) throw new IllegalStateException("analysis_identity_bind_conflict:" + identityKey);
+        return reservation;
+    }
 
     public Reservation find(String submissionKey) {
         if (!StringUtils.hasText(submissionKey)) return null;
@@ -46,6 +119,7 @@ public class StockWatchAnalysisTaskService {
                              String periodType,
                              String observationKey,
                              String provider) {
+        runtimeGate.assertReady();
         Map<String, Object> envelope = new LinkedHashMap<>();
         envelope.put("schema", "stock-analysis-claim-v1");
         envelope.put("submissionKey", submissionKey);
@@ -58,6 +132,7 @@ public class StockWatchAnalysisTaskService {
                         String requestDigest,
                         int generation,
                         Map<String, Object> requestEnvelope) {
+        runtimeGate.assertReady();
         if (reservation == null || !reservation.isNewSubmission() || !StringUtils.hasText(requestDigest)
                 || requestEnvelope == null || requestEnvelope.isEmpty()) {
             throw new IllegalArgumentException("analysis_task_prepare_input_required");
@@ -86,6 +161,7 @@ public class StockWatchAnalysisTaskService {
                                int generation,
                                String provider,
                                Map<String, Object> requestEnvelope) {
+        runtimeGate.assertReady();
         if (!StringUtils.hasText(submissionKey) || !StringUtils.hasText(requestDigest)) {
             throw new IllegalArgumentException("submission_key_and_request_digest_required");
         }
@@ -116,6 +192,7 @@ public class StockWatchAnalysisTaskService {
 
     @Transactional
     public void markSubmitted(Reservation reservation, String provider) {
+        runtimeGate.assertReady();
         if (reservation == null || !reservation.isNewSubmission()) return;
         StockWatchAnalysisTask task = reservation.getTask();
         int updated = mapper.markSubmitted(task.getId(), value(task.getRowVersion()), provider, new Date());
@@ -227,6 +304,7 @@ public class StockWatchAnalysisTaskService {
                           String completionReason,
                           String providerStatus,
                           String error) {
+        runtimeGate.assertReady();
         if (reservation == null || !reservation.isNewSubmission()) return;
         transition(reservation, fromStatuses, status, rawResponse, null, contentStatus,
                 completionReason, providerStatus, error);
@@ -241,6 +319,7 @@ public class StockWatchAnalysisTaskService {
                           String completionReason,
                           String providerStatus,
                           String error) {
+        runtimeGate.assertReady();
         if (reservation == null) return;
         String responseHash = StringUtils.hasText(rawResponse) ? sha256(rawResponse) : null;
         String responseEnvelopeHash = StringUtils.hasText(responseEnvelopeJson) ? sha256(responseEnvelopeJson) : null;
@@ -286,6 +365,28 @@ public class StockWatchAnalysisTaskService {
         } catch (Exception e) {
             throw new IllegalStateException("sha256_unavailable", e);
         }
+    }
+
+    private String observationIdentityKey(String scope,
+                                          String symbol,
+                                          String market,
+                                          String periodType,
+                                          String observationKey) {
+        return sha256(normalize(scope, true, "scope") + "\u0000"
+                + normalize(market, true, "market") + "\u0000"
+                + normalize(symbol, false, "symbol") + "\u0000"
+                + normalize(periodType, true, "periodType") + "\u0000"
+                + requiredText(observationKey, "observationKey"));
+    }
+
+    private String normalize(String value, boolean upper, String field) {
+        String normalized = requiredText(value, field);
+        return upper ? normalized.toUpperCase(java.util.Locale.ROOT) : normalized.toLowerCase(java.util.Locale.ROOT);
+    }
+
+    private String requiredText(String value, String field) {
+        if (!StringUtils.hasText(value)) throw new IllegalArgumentException("analysis_identity_" + field + "_required");
+        return value.trim();
     }
 
     public void verifyResponseIntegrity(Reservation reservation) {

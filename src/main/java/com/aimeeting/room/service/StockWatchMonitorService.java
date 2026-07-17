@@ -946,7 +946,10 @@ public class StockWatchMonitorService {
             item.put("missingData", missingData);
         }
         JSONObject mainForceIntent = parseJsonObject(analysis.getMainForceIntentJson());
-        Map<String, Object> inferredIntent = inferLegacyMainForceIntent(analysis);
+        boolean explicitEvidenceQuality = mainForceIntent != null
+                && (mainForceIntent.containsKey("evidenceQuality") || mainForceIntent.containsKey("contractVersion"));
+        Map<String, Object> inferredIntent = explicitEvidenceQuality
+                ? Collections.emptyMap() : inferLegacyMainForceIntent(analysis);
         if (mainForceIntent != null && !mainForceIntent.isEmpty() && !isUnknownMainForceIntent(mainForceIntent)) {
             item.put("mainForceIntent", mainForceIntent);
         } else if (!inferredIntent.isEmpty()) {

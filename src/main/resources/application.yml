@@ -181,6 +181,7 @@ stock-watch:
     reconcile-interval-ms: ${STOCK_WATCH_TECH_RECONCILE_INTERVAL_MS:60000}
     reconcile-initial-delay-ms: ${STOCK_WATCH_TECH_RECONCILE_INITIAL_DELAY_MS:120000}
     reconcile-batch-size: ${STOCK_WATCH_TECH_RECONCILE_BATCH_SIZE:20}
+    v6-mode: ${STOCK_WATCH_V6_MODE:runtime}
   delivery:
     enabled: ${STOCK_WATCH_DELIVERY_ENABLED:true}
     scan-interval-ms: ${STOCK_WATCH_DELIVERY_SCAN_INTERVAL_MS:300000}

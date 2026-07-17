@@ -22,7 +22,7 @@ class StockWatchAnalysisProjectionServiceTest {
         StockWatchAnalysisProjectionService service = new StockWatchAnalysisProjectionService(
                 mock(StockWatchTechnicalAnalysisMapper.class), mock(StockWatchPredictionService.class),
                 mock(StockWatchFactPersistenceService.class), sessionMapper,
-                mock(StockWatchAnalysisTaskService.class));
+                mock(StockWatchAnalysisTaskService.class), mock(StockWatchV6RuntimeGate.class));
         StockWatchTechnicalSession session = new StockWatchTechnicalSession();
         session.setId(17L);
         session.setContextChars(10);

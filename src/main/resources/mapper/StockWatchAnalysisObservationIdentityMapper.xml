@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchAnalysisObservationIdentityMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchAnalysisObservationIdentity">
+        <id column="id" property="id"/>
+        <result column="identity_key" property="identityKey"/>
+        <result column="analysis_scope" property="analysisScope"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="period_type" property="periodType"/>
+        <result column="observation_key" property="observationKey"/>
+        <result column="canonical_task_id" property="canonicalTaskId"/>
+        <result column="migration_state" property="migrationState"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insertIfAbsent">
+        INSERT IGNORE INTO stock_watch_analysis_observation_identity
+        (identity_key, analysis_scope, symbol, market, period_type, observation_key, migration_state, row_version)
+        VALUES (#{identityKey}, #{analysisScope}, #{symbol}, #{market}, #{periodType}, #{observationKey},
+                #{migrationState}, #{rowVersion})
+    </insert>
+
+    <select id="selectByIdentityKey" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_observation_identity WHERE identity_key = #{identityKey}
+    </select>
+
+    <select id="selectByIdentityKeyForUpdate" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_observation_identity WHERE identity_key = #{identityKey} FOR UPDATE
+    </select>
+
+    <update id="bindCanonical">
+        UPDATE stock_watch_analysis_observation_identity
+        SET canonical_task_id = #{canonicalTaskId}, migration_state = #{migrationState},
+            row_version = row_version + 1
+        WHERE id = #{id} AND row_version = #{expectedRowVersion} AND canonical_task_id IS NULL
+    </update>
+</mapper>

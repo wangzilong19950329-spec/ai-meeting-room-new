@@ -36,7 +36,8 @@ class StockWatchPredictionServiceTest {
     @Test
     void persistsOnlyValidStructuredForecasts() {
         StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
-        StockWatchPredictionService service = new StockWatchPredictionService(mapper, mock(EastmoneyMarketDataService.class));
+        StockWatchPredictionService service = new StockWatchPredictionService(mapper,
+                mock(EastmoneyMarketDataService.class), mock(StockWatchV6RuntimeGate.class));
         JSONObject item = new JSONObject();
         item.put("horizon", "T+1");
         item.put("direction", "UP");
@@ -62,7 +63,8 @@ class StockWatchPredictionServiceTest {
     @Test
     void strictValidationRejectsMissingDirectionAndDuplicateHorizonsBeforeProjection() {
         StockWatchPredictionService service = new StockWatchPredictionService(
-                mock(StockWatchPredictionMapper.class), mock(EastmoneyMarketDataService.class));
+                mock(StockWatchPredictionMapper.class), mock(EastmoneyMarketDataService.class),
+                mock(StockWatchV6RuntimeGate.class));
         JSONObject missingDirection = new JSONObject();
         missingDirection.put("horizon", "T1");
         missingDirection.put("targetLow", 99);
@@ -85,7 +87,8 @@ class StockWatchPredictionServiceTest {
     void evaluatesOnNthFollowingTradingBar() {
         StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
         EastmoneyMarketDataService marketData = mock(EastmoneyMarketDataService.class);
-        StockWatchPredictionService service = new StockWatchPredictionService(mapper, marketData);
+        StockWatchPredictionService service = new StockWatchPredictionService(
+                mapper, marketData, mock(StockWatchV6RuntimeGate.class));
         StockWatchPrediction prediction = new StockWatchPrediction();
         prediction.setId(1L);
         prediction.setSymbol("688146");
@@ -117,7 +120,8 @@ class StockWatchPredictionServiceTest {
     void cachesSourceFailuresWithinCurrentBatch() {
         StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
         EastmoneyMarketDataService marketData = mock(EastmoneyMarketDataService.class);
-        StockWatchPredictionService service = new StockWatchPredictionService(mapper, marketData);
+        StockWatchPredictionService service = new StockWatchPredictionService(
+                mapper, marketData, mock(StockWatchV6RuntimeGate.class));
         StockWatchPrediction first = pendingPrediction(1L);
         StockWatchPrediction second = pendingPrediction(2L);
         when(mapper.selectPending(200)).thenReturn(Arrays.asList(first, second));

@@ -2,6 +2,19 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper">
 
+    <sql id="VisibleHistoryJoins">
+        LEFT JOIN stock_watch_analysis_observation_identity i ON i.canonical_task_id = t.analysis_task_id
+        JOIN stock_watch_analysis_migration_state ms
+          ON ms.migration_key = 'stock-watch-v6' AND ms.generation = 6 AND ms.status = 'READY'
+    </sql>
+
+    <sql id="VisibleHistoryPredicate">
+        AND (
+            i.analysis_scope = 'TECHNICAL_RUNTIME'
+            OR (t.analysis_task_id IS NULL AND t.id &lt;= ms.legacy_analysis_cutoff_id)
+        )
+    </sql>
+
     <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchTechnicalAnalysis">
         <id column="id" property="id"/>
         <result column="analysis_task_id" property="analysisTaskId"/>
@@ -61,35 +74,41 @@
     </select>
 
     <select id="selectLatestBySymbolDateSlot" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND analysis_date = #{analysisDate}
-          AND run_slot = #{runSlot}
-          AND COALESCE(period_type, 'DAY') = #{periodType}
-          AND (period_key = #{periodKey} OR (period_key IS NULL AND #{periodType} = 'DAY'))
-        ORDER BY id DESC
+        SELECT t.* FROM stock_watch_technical_analysis t
+        JOIN stock_watch_analysis_observation_identity i
+          ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.analysis_date = #{analysisDate}
+          AND t.run_slot = #{runSlot}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          AND (t.period_key = #{periodKey} OR (t.period_key IS NULL AND #{periodType} = 'DAY'))
+        ORDER BY t.id DESC
         LIMIT 1
     </select>
 
     <select id="selectBySymbolDateRange" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND analysis_date &gt;= #{startDate}
-          AND analysis_date &lt;= #{endDate}
-          AND COALESCE(period_type, 'DAY') = #{periodType}
-        ORDER BY analysis_date DESC, gmt_create DESC, id DESC
+        SELECT t.* FROM stock_watch_technical_analysis t
+        <include refid="VisibleHistoryJoins"/>
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.analysis_date &gt;= #{startDate}
+          AND t.analysis_date &lt;= #{endDate}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          <include refid="VisibleHistoryPredicate"/>
+        ORDER BY t.analysis_date DESC, t.gmt_create DESC, t.id DESC
     </select>
 
     <select id="selectBySymbolPeriodKeys" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND COALESCE(period_type, 'DAY') = #{periodType}
+        SELECT t.* FROM stock_watch_technical_analysis t
+        <include refid="VisibleHistoryJoins"/>
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          <include refid="VisibleHistoryPredicate"/>
           <choose>
               <when test="periodKeys != null and periodKeys.size() > 0">
-                  AND period_key IN
+                  AND t.period_key IN
                   <foreach collection="periodKeys" item="key" open="(" separator="," close=")">
                       #{key}
                   </foreach>
@@ -98,56 +117,69 @@
                   AND 1 = 0
               </otherwise>
           </choose>
-        ORDER BY analysis_date DESC, gmt_create DESC, id DESC
+        ORDER BY t.analysis_date DESC, t.gmt_create DESC, t.id DESC
     </select>
 
     <select id="selectRecentBySymbol" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND COALESCE(period_type, 'DAY') = #{periodType}
-        ORDER BY gmt_create DESC, id DESC
+        SELECT t.* FROM stock_watch_technical_analysis t
+        <include refid="VisibleHistoryJoins"/>
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          <include refid="VisibleHistoryPredicate"/>
+        ORDER BY t.gmt_create DESC, t.id DESC
         LIMIT #{limit}
     </select>
 
     <select id="selectLatestSuccessfulBySymbolSince" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND status = 'SUCCESS'
-          AND COALESCE(period_type, 'DAY') = #{periodType}
-          AND gmt_create &gt;= #{since}
-        ORDER BY gmt_create DESC, id DESC
+        SELECT t.* FROM stock_watch_technical_analysis t
+        JOIN stock_watch_analysis_observation_identity i
+          ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.status = 'SUCCESS'
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          AND t.gmt_create &gt;= #{since}
+        ORDER BY t.gmt_create DESC, t.id DESC
         LIMIT 1
     </select>
 
     <select id="selectSuccessfulByDateRange" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND status = 'SUCCESS'
-          AND analysis_date &gt;= #{startDate}
-          AND analysis_date &lt;= #{endDate}
-          AND COALESCE(period_type, 'DAY') = #{periodType}
-        ORDER BY analysis_date ASC, gmt_create ASC, id ASC
-        LIMIT #{limit}
-    </select>
-
-    <select id="selectLatestSuccessfulDailyByDateRange" resultMap="BaseResultMap">
         SELECT t.* FROM stock_watch_technical_analysis t
+        <include refid="VisibleHistoryJoins"/>
         WHERE t.symbol = #{symbol}
           AND t.market = #{market}
           AND t.status = 'SUCCESS'
           AND t.analysis_date &gt;= #{startDate}
           AND t.analysis_date &lt;= #{endDate}
           AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          <include refid="VisibleHistoryPredicate"/>
+        ORDER BY t.analysis_date ASC, t.gmt_create ASC, t.id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectLatestSuccessfulDailyByDateRange" resultMap="BaseResultMap">
+        SELECT t.* FROM stock_watch_technical_analysis t
+        <include refid="VisibleHistoryJoins"/>
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.status = 'SUCCESS'
+          AND t.analysis_date &gt;= #{startDate}
+          AND t.analysis_date &lt;= #{endDate}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          <include refid="VisibleHistoryPredicate"/>
           AND t.id = (
               SELECT t2.id FROM stock_watch_technical_analysis t2
+              LEFT JOIN stock_watch_analysis_observation_identity i2 ON i2.canonical_task_id = t2.analysis_task_id
+              JOIN stock_watch_analysis_migration_state ms2
+                ON ms2.migration_key = 'stock-watch-v6' AND ms2.generation = 6 AND ms2.status = 'READY'
               WHERE t2.symbol = t.symbol
                 AND t2.market = t.market
                 AND t2.status = 'SUCCESS'
                 AND t2.analysis_date = t.analysis_date
                 AND COALESCE(t2.period_type, 'DAY') = COALESCE(t.period_type, 'DAY')
+                AND (i2.analysis_scope = 'TECHNICAL_RUNTIME'
+                     OR (t2.analysis_task_id IS NULL AND t2.id &lt;= ms2.legacy_analysis_cutoff_id))
               ORDER BY t2.gmt_create DESC, t2.id DESC
               LIMIT 1
           )
@@ -156,24 +188,28 @@
     </select>
 
     <select id="selectRecentSuccessfulSlotsByDateRange" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND status = 'SUCCESS'
-          AND analysis_date &gt;= #{startDate}
-          AND analysis_date &lt;= #{endDate}
-          AND COALESCE(period_type, 'DAY') = #{periodType}
-        ORDER BY analysis_date DESC, run_slot DESC, gmt_create DESC, id DESC
+        SELECT t.* FROM stock_watch_technical_analysis t
+        <include refid="VisibleHistoryJoins"/>
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.status = 'SUCCESS'
+          AND t.analysis_date &gt;= #{startDate}
+          AND t.analysis_date &lt;= #{endDate}
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          <include refid="VisibleHistoryPredicate"/>
+        ORDER BY t.analysis_date DESC, t.run_slot DESC, t.gmt_create DESC, t.id DESC
         LIMIT #{limit}
     </select>
 
     <select id="selectSuccessfulSince" resultMap="BaseResultMap">
-        SELECT * FROM stock_watch_technical_analysis
-        WHERE symbol = #{symbol}
-          AND market = #{market}
-          AND status = 'SUCCESS'
-          AND gmt_create &gt;= #{activeFrom}
-        ORDER BY gmt_create ASC, id ASC
+        SELECT t.* FROM stock_watch_technical_analysis t
+        JOIN stock_watch_analysis_observation_identity i
+          ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        WHERE t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.status = 'SUCCESS'
+          AND t.gmt_create &gt;= #{activeFrom}
+        ORDER BY t.gmt_create ASC, t.id ASC
         LIMIT #{limit}
     </select>
 </mapper>
