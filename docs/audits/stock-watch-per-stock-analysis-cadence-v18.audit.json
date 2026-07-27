@@ -1,0 +1,369 @@
+{
+  "goalContract": {
+    "version": "v0",
+    "source": [
+      "用户要求每只股票可配置不同分析频率，低关注股票每天收盘一次，并预留十分钟级别",
+      "用户要求技术分析与异动解释尽量由一次 DeepSeek 统一完成",
+      "用户计划未来使用账号池，业务设计不得与其冲突"
+    ],
+    "outcome": "形成一份可实施、可迁移、可回滚、可验证的个股分析频率技术方案，并明确当前能力与未来账号池边界。",
+    "stakeholders": [
+      "股票盯盘用户",
+      "后端调度与分析服务维护者",
+      "前端维护者",
+      "未来账号池与 Bridge 维护者"
+    ],
+    "mustAccept": [
+      {
+        "id": "G1",
+        "statement": "方案必须基于当前代码，区分行情扫描、模型分析和邮件投递三个 cadence。",
+        "verification": {
+          "statement": "以当前仓库代码确认三条链路及缺口。",
+          "surface": "code",
+          "minimumLevel": "static"
+        }
+      },
+      {
+        "id": "G2",
+        "statement": "方案必须支持每股 INTERVAL、DAILY_CLOSE、ON_ANOMALY、PAUSED 及 10 到 1440 分钟自定义间隔。",
+        "verification": {
+          "statement": "技术方案定义完整模式语义、合法组合和稳定槽位算法。",
+          "surface": "code",
+          "minimumLevel": "static"
+        }
+      },
+      {
+        "id": "G3",
+        "statement": "技术分析和异动解释应合并到统一分析需求，同时保证 canonical slot 和 provider submission 幂等。",
+        "verification": {
+          "statement": "技术方案定义需求合并、状态机、submission 闸门和异动升级语义。",
+          "surface": "code",
+          "minimumLevel": "static"
+        }
+      },
+      {
+        "id": "G4",
+        "statement": "业务层只能依赖逻辑能力网关，不得感知未来账号池的账号、Worker、Profile 或端口。",
+        "verification": {
+          "statement": "技术方案给出网关契约、字段白名单和架构约束测试。",
+          "surface": "code",
+          "minimumLevel": "static"
+        }
+      },
+      {
+        "id": "G5",
+        "statement": "方案必须覆盖数据模型、API、UI、灰度迁移、回滚和兼容策略。",
+        "verification": {
+          "statement": "技术方案逐项提供字段、接口、交互、阶段和回滚条件。",
+          "surface": "code",
+          "minimumLevel": "static"
+        }
+      },
+      {
+        "id": "G6",
+        "statement": "方案必须给出单元、集成、架构和真实冒烟验收标准，且不把设计完成误报成功能完成。",
+        "verification": {
+          "statement": "技术方案包含分层验证矩阵、完成谓词和剩余边界。",
+          "surface": "code",
+          "minimumLevel": "static"
+        }
+      },
+      {
+        "id": "G7",
+        "statement": "方案对十分钟级别和账号池的描述必须符合当前单 Worker 运行边界，不承诺未经证明的吞吐或双账号能力。",
+        "verification": {
+          "statement": "使用当前 Bridge 健康响应确认 single_worker 运行模式。",
+          "surface": "api",
+          "minimumLevel": "live"
+        }
+      }
+    ],
+    "constraints": [
+      "本轮只输出和审核技术方案，不修改业务代码",
+      "保留现有 one-request-per-canonical-observation 和 post-submit 不盲重试约束",
+      "不复用邮件投递频率作为分析频率",
+      "不把归档分组当作暂停分析"
+    ],
+    "nonGoals": [
+      "本轮不实现完整账号池 Broker",
+      "本轮不启用多账号并发",
+      "本轮不宣称 API、UI 或真实调度已经实现"
+    ],
+    "preferences": [
+      "采用可逐步灰度且能复用现有需求和任务幂等基础的方案",
+      "低关注股票默认可选择收盘一次并将异动延迟合并",
+      "容量不足时显式展示排队而不是静默降频"
+    ],
+    "assumptions": [
+      "PAUSED 默认只暂停自动分析，手工立即分析仍允许",
+      "现有股票初始迁移为 INTERVAL 30 分钟以保持主要行为",
+      "周月额外复盘由独立布尔开关控制"
+    ],
+    "unknowns": [
+      "用户是否最终接受 PAUSED 仍允许手工分析",
+      "现网股票规模与十分钟策略占比",
+      "未来账号池的公平性、配额和健康策略"
+    ]
+  },
+  "evidence": [
+    {
+      "id": "E1",
+      "statement": "StockWatchItem 当前没有分析模式或个股间隔字段。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/entity/StockWatchItem.java:8-18",
+      "freshness": "2026-07-22 当前工作树",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E2",
+      "statement": "技术分析当前由全局 fixedDelay 调度并直接遍历 scheduledRefs，日内槽位是固定 30 分钟列表。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java:69-94,188-210,363-398,3624-3637",
+      "freshness": "2026-07-22 当前工作树与 CodeGraph 索引一致",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E3",
+      "statement": "StockWatchDeliveryService 的 IMMEDIATE、INTERVAL、DAILY_CLOSE、MANUAL 控制投递，不控制分析生成。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchDeliveryService.java:327-352",
+      "freshness": "2026-07-22 当前工作树",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E4",
+      "statement": "现有异动需求服务已有 priority、notBefore、deadline、lease 和单次 provider reservation 基础，但目标 fact 字段按异动场景设计。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchAnalysisDemandService.java:46-178 and src/main/java/com/aimeeting/room/entity/StockWatchAnalysisDemand.java",
+      "freshness": "2026-07-22 当前工作树",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E5",
+      "statement": "Java admission 当前使用一个 PriorityBlockingQueue 和一个 worker，Node Bridge 使用全局 inFlight；客户端已有按 accountKey 隔离 Profile 和端口的能力。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchBridgeAdmissionService.java:23-31; scripts/deepseek-web-bridge.js:21-37; scripts/deepseek-web-client.js:125-157",
+      "freshness": "2026-07-22 当前工作树",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E6",
+      "statement": "本地 8791 Bridge 健康接口返回 mode deepseek_web_bridge、sharedTarget mode single_worker、busy false，并只列出 default worker。",
+      "kind": "direct",
+      "pointer": "GET http://127.0.0.1:8791/health executed 2026-07-22",
+      "freshness": "2026-07-22 live response",
+      "sourceType": "api_response",
+      "verification": {
+        "surface": "api",
+        "level": "live",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E7",
+      "statement": "v18 技术方案定义目标契约、模式、槽位算法、数据模型、需求状态机、能力网关、API、UI、容量、迁移、回滚、测试和验收。",
+      "kind": "direct",
+      "pointer": "docs/stock-watch-per-stock-analysis-cadence-plan-v18.md (entire file)",
+      "freshness": "2026-07-22 本轮生成并复核",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E8",
+      "statement": "当前监控服务已经把结构化异动解释归入同 observation 的技术分析任务，同时保留 GENERAL_LEGACY 独立 AI judge 分支。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchMonitorService.java:392-407,1794-1823; src/main/java/com/aimeeting/room/service/StockWatchAiJudgeService.java:69-94,704-708",
+      "freshness": "2026-07-22 当前工作树与 CodeGraph 调用链",
+      "sourceType": "artifact",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    }
+  ],
+  "claims": [
+    {
+      "id": "S1",
+      "statement": "当前系统没有每股分析频率，邮件 DAILY_CLOSE 也不能替代该能力。",
+      "type": "fact",
+      "dependsOn": ["E1", "E2", "E3"],
+      "supportingEvidence": ["E1", "E2", "E3"],
+      "hiddenAssumptions": [],
+      "falsifiers": ["存在另一个未追踪的持久化策略源实际控制 StockWatchTechnicalAnalysisService 的逐股 due"],
+      "alternativesConsidered": ["复用 delivery config；因语义和调用链不同而否决"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S2",
+      "statement": "仅在旧 fixedDelay 循环中增加 if 跳过无法可靠承载稳定十分钟槽位、积压治理和未来多 Worker。",
+      "type": "inference",
+      "dependsOn": ["E2", "E4", "E5"],
+      "supportingEvidence": ["E2", "E4", "E5"],
+      "hiddenAssumptions": ["模型调用时长可能接近或超过部分个股间隔"],
+      "falsifiers": ["旧循环被证明具有与执行耗时无关的稳定逐股调度和并发背压能力"],
+      "alternativesConsidered": ["候选 A 在旧循环中增加逐股 if"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S3",
+      "statement": "个股策略、稳定槽位规划器、统一需求队列和单 Worker 能力网关是本期最符合目标且范围受控的方案。",
+      "type": "recommendation",
+      "dependsOn": ["S1", "S2", "E7"],
+      "supportingEvidence": ["E7"],
+      "hiddenAssumptions": ["现有 demand 和 task 幂等基础可以按 additive migration 扩展"],
+      "falsifiers": ["详细实现时发现现有需求表无法在不破坏历史数据的情况下迁移", "容量测算证明当前单 Worker 对目标 canary 也完全不可用"],
+      "alternativesConsidered": ["旧循环加判断", "先建完整账号池再改 cadence"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S4",
+      "statement": "方案能让定时技术分析和异动解释共用统一分析需求，并对延迟异动、抢占、latest-wins 和 post-submit 不重试给出可执行语义。",
+      "type": "recommendation",
+      "dependsOn": ["E4", "E7", "E8"],
+      "supportingEvidence": ["E4", "E7", "E8"],
+      "hiddenAssumptions": ["统一 Prompt 能继续承载技术结论与异动语义两个输出职责"],
+      "falsifiers": ["集成测试显示同一 canonical observation 发生两次 provider submission", "DEFER 异动在重启后丢失"],
+      "alternativesConsidered": ["每次异动单独调用 DeepSeek；因重复调用和低频策略冲突而否决"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S5",
+      "statement": "逻辑能力网关与当前 single_worker 适配器兼容，并把未来账号池的物理路由保持在业务边界之外。",
+      "type": "recommendation",
+      "dependsOn": ["E5", "E6", "E7"],
+      "supportingEvidence": ["E5", "E6", "E7"],
+      "hiddenAssumptions": ["未来 Broker 可以实现相同的 capability、submissionKey 和结果契约"],
+      "falsifiers": ["实现需要 Scheduler 直接选择 accountKey 才能保持业务正确性"],
+      "alternativesConsidered": ["现在就把 accountKey 写入 demand；因耦合物理拓扑而否决"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S6",
+      "statement": "方案对旧股票默认、字段迁移、legacy 排除、shadow/canary、回滚和 UI 语义给出了完整路径。",
+      "type": "recommendation",
+      "dependsOn": ["E7"],
+      "supportingEvidence": ["E7"],
+      "hiddenAssumptions": ["部署支持先执行 additive schema migration 再切换 scheduler mode"],
+      "falsifiers": ["灰度时同一股票仍同时被 legacy 和 policy scheduler 提交", "旧 POST watchlist 覆盖 analysis policy"],
+      "alternativesConsidered": ["一次性全量切换；因缺少影子对比和回滚控制而否决"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S7",
+      "statement": "十分钟是策略配置能力而不是当前完成 SLA；完整账号池仍是后续工作，这一边界与 live single_worker 状态一致。",
+      "type": "fact",
+      "dependsOn": ["E5", "E6", "E7"],
+      "supportingEvidence": ["E5", "E6", "E7"],
+      "hiddenAssumptions": [],
+      "falsifiers": ["真实双账号并发和容量压测证明完整账号池已上线"],
+      "alternativesConsidered": ["把十分钟配置描述成十分钟内必达；因缺乏吞吐证据而否决"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S8",
+      "statement": "v18 已达到详细技术方案的完成标准，但尚未达到功能实现或生产验证标准。",
+      "type": "inference",
+      "dependsOn": ["S3", "S4", "S5", "S6", "S7", "E7"],
+      "supportingEvidence": ["E7"],
+      "hiddenAssumptions": ["本轮权威目标是设计和审核，而不是同步完成代码实施"],
+      "falsifiers": ["用户本轮要求同时实现、启动并验证全部功能", "方案缺失任一关键实现或回滚界面"],
+      "alternativesConsidered": ["直接进入实现；超出本轮明确请求"],
+      "verdict": "supported",
+      "confidence": "high"
+    }
+  ],
+  "conclusion": {
+    "statement": "采用候选 B。v18 方案在设计层面与用户目标对齐，可作为下一阶段实现基线；它不构成当前系统已支持逐股频率、十分钟完成 SLA或账号池已上线的证明。",
+    "dependsOn": ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"],
+    "goalTrace": [
+      {
+        "goalId": "G1",
+        "supportedBy": ["S1"],
+        "verification": ["E1", "E2", "E3"],
+        "status": "met"
+      },
+      {
+        "goalId": "G2",
+        "supportedBy": ["S3"],
+        "verification": ["E7"],
+        "status": "met"
+      },
+      {
+        "goalId": "G3",
+        "supportedBy": ["S4"],
+        "verification": ["E4", "E7", "E8"],
+        "status": "met"
+      },
+      {
+        "goalId": "G4",
+        "supportedBy": ["S5"],
+        "verification": ["E5", "E7"],
+        "status": "met"
+      },
+      {
+        "goalId": "G5",
+        "supportedBy": ["S6"],
+        "verification": ["E7"],
+        "status": "met"
+      },
+      {
+        "goalId": "G6",
+        "supportedBy": ["S8"],
+        "verification": ["E7"],
+        "status": "met"
+      },
+      {
+        "goalId": "G7",
+        "supportedBy": ["S7"],
+        "verification": ["E6"],
+        "status": "met"
+      }
+    ],
+    "remainingBoundaries": [
+      "尚未修改数据库、后端、前端或配置",
+      "尚未运行 Planner、Demand、API、UI 和真实调度验收",
+      "尚未做单 Worker 容量压测，无法承诺十分钟内完成",
+      "尚未证明真实双账号同时登录和并发分析",
+      "四项产品默认值仍可在实现前由用户调整"
+    ],
+    "verdict": "supported",
+    "goalVerdict": "aligned"
+  }
+}

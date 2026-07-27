@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchAlertDeliveryObligationMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchAlertDeliveryObligation">
+        <id column="id" property="id"/>
+        <result column="event_key" property="eventKey"/>
+        <result column="open_episode_key" property="openEpisodeKey"/>
+        <result column="config_id" property="configId"/>
+        <result column="rule_id" property="ruleId"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="recipient_hash" property="recipientHash"/>
+        <result column="recipient_address" property="recipientAddress"/>
+        <result column="sender_snapshot_json" property="senderSnapshotJson"/>
+        <result column="target_fact_observation_id" property="targetFactObservationId"/>
+        <result column="target_fact_observation_key" property="targetFactObservationKey"/>
+        <result column="target_source_time_epoch_ms" property="targetSourceTimeEpochMs"/>
+        <result column="trade_date" property="tradeDate"/>
+        <result column="signal_fingerprint" property="signalFingerprint"/>
+        <result column="inline_analysis_id" property="inlineAnalysisId"/>
+        <result column="analysis_demand_id" property="analysisDemandId"/>
+        <result column="deadline_at" property="deadlineAt"/>
+        <result column="episode_suppressed_until" property="episodeSuppressedUntil"/>
+        <result column="initial_subject" property="initialSubject"/>
+        <result column="initial_body" property="initialBody"/>
+        <result column="initial_message_id" property="initialMessageId"/>
+        <result column="initial_status" property="initialStatus"/>
+        <result column="initial_attempt_count" property="initialAttemptCount"/>
+        <result column="initial_next_attempt_at" property="initialNextAttemptAt"/>
+        <result column="initial_lease_token" property="initialLeaseToken"/>
+        <result column="initial_lease_until" property="initialLeaseUntil"/>
+        <result column="initial_sent_at" property="initialSentAt"/>
+        <result column="initial_error" property="initialError"/>
+        <result column="supplement_analysis_id" property="supplementAnalysisId"/>
+        <result column="supplement_subject" property="supplementSubject"/>
+        <result column="supplement_body" property="supplementBody"/>
+        <result column="supplement_message_id" property="supplementMessageId"/>
+        <result column="supplement_status" property="supplementStatus"/>
+        <result column="supplement_attempt_count" property="supplementAttemptCount"/>
+        <result column="supplement_next_attempt_at" property="supplementNextAttemptAt"/>
+        <result column="supplement_lease_token" property="supplementLeaseToken"/>
+        <result column="supplement_lease_until" property="supplementLeaseUntil"/>
+        <result column="supplement_sent_at" property="supplementSentAt"/>
+        <result column="supplement_error" property="supplementError"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_alert_delivery_obligation
+        (event_key, open_episode_key, config_id, rule_id, symbol, market, stock_name,
+         recipient_hash, recipient_address, sender_snapshot_json,
+         target_fact_observation_id, target_fact_observation_key, target_source_time_epoch_ms, trade_date,
+         signal_fingerprint, inline_analysis_id, analysis_demand_id, deadline_at,
+         initial_subject, initial_body, initial_message_id, initial_status, initial_attempt_count,
+         supplement_message_id, supplement_status, supplement_attempt_count, row_version)
+        VALUES
+        (#{eventKey}, #{openEpisodeKey}, #{configId}, #{ruleId}, #{symbol}, #{market}, #{stockName},
+         #{recipientHash}, #{recipientAddress}, #{senderSnapshotJson},
+         #{targetFactObservationId}, #{targetFactObservationKey}, #{targetSourceTimeEpochMs}, #{tradeDate},
+         #{signalFingerprint}, #{inlineAnalysisId}, #{analysisDemandId}, #{deadlineAt},
+         #{initialSubject}, #{initialBody}, #{initialMessageId}, #{initialStatus}, 0,
+         #{supplementMessageId}, #{supplementStatus}, 0, 0)
+    </insert>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_alert_delivery_obligation WHERE id=#{id}
+    </select>
+    <select id="selectByEventRecipient" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_alert_delivery_obligation
+        WHERE event_key=#{eventKey} AND recipient_hash=#{recipientHash} LIMIT 1
+    </select>
+    <select id="selectInitialDispatchable" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_alert_delivery_obligation
+        WHERE initial_status IN ('PENDING','RETRY','SENDING')
+          AND (initial_next_attempt_at IS NULL OR initial_next_attempt_at &lt;= #{now})
+          AND (initial_status != 'SENDING' OR initial_lease_until &lt;= #{now})
+        ORDER BY id ASC LIMIT #{limit}
+    </select>
+    <select id="selectSupplementDispatchable" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_alert_delivery_obligation
+        WHERE supplement_status IN ('READY','RETRY','SENDING')
+          AND (supplement_next_attempt_at IS NULL OR supplement_next_attempt_at &lt;= #{now})
+          AND (supplement_status != 'SENDING' OR supplement_lease_until &lt;= #{now})
+        ORDER BY id ASC LIMIT #{limit}
+    </select>
+    <select id="selectWaitingByDemandId" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_alert_delivery_obligation
+        WHERE analysis_demand_id=#{demandId} AND supplement_status='WAITING_ANALYSIS'
+        ORDER BY id ASC
+    </select>
+    <update id="releaseExpiredEpisode">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET open_episode_key=NULL, row_version=row_version+1
+        WHERE open_episode_key=#{openEpisodeKey}
+          AND episode_suppressed_until IS NOT NULL
+          AND episode_suppressed_until &lt;= #{now}
+    </update>
+    <update id="claimInitial">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET initial_status='SENDING', initial_lease_token=#{leaseToken},
+            initial_lease_until=#{leaseUntil}, initial_attempt_count=initial_attempt_count+1,
+            row_version=row_version+1
+        WHERE id=#{id} AND row_version=#{expectedRowVersion}
+          AND initial_status IN ('PENDING','RETRY','SENDING')
+          AND (initial_status != 'SENDING' OR initial_lease_until &lt;= #{now})
+    </update>
+    <update id="markInitialSent">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET initial_status='SENT', initial_sent_at=#{sentAt}, initial_error=NULL,
+            initial_lease_token=NULL, initial_lease_until=NULL,
+            episode_suppressed_until=#{suppressedUntil}, row_version=row_version+1
+        WHERE id=#{id} AND initial_status='SENDING' AND initial_lease_token=#{leaseToken}
+    </update>
+    <update id="markInitialRetry">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET initial_status='RETRY', initial_next_attempt_at=#{nextAttemptAt}, initial_error=#{error},
+            initial_lease_token=NULL, initial_lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND initial_status='SENDING' AND initial_lease_token=#{leaseToken}
+    </update>
+    <update id="markInitialDeadLetter">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET initial_status='DEAD_LETTER', initial_error=#{error}, open_episode_key=NULL,
+            initial_lease_token=NULL, initial_lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND initial_lease_token=#{leaseToken}
+    </update>
+    <update id="attachDemand">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET analysis_demand_id=#{demandId}, row_version=row_version+1
+        WHERE id=#{id} AND supplement_status='WAITING_ANALYSIS'
+    </update>
+    <update id="markSupplementReady">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET supplement_status='READY', supplement_analysis_id=#{analysisId},
+            supplement_subject=#{subject}, supplement_body=#{body},
+            supplement_next_attempt_at=NULL, supplement_error=NULL, row_version=row_version+1
+        WHERE id=#{id} AND analysis_demand_id=#{demandId}
+          AND supplement_status='WAITING_ANALYSIS'
+    </update>
+    <update id="claimSupplement">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET supplement_status='SENDING', supplement_lease_token=#{leaseToken},
+            supplement_lease_until=#{leaseUntil}, supplement_attempt_count=supplement_attempt_count+1,
+            row_version=row_version+1
+        WHERE id=#{id} AND row_version=#{expectedRowVersion}
+          AND supplement_status IN ('READY','RETRY','SENDING')
+          AND (supplement_status != 'SENDING' OR supplement_lease_until &lt;= #{now})
+    </update>
+    <update id="markSupplementSent">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET supplement_status='SENT', supplement_sent_at=#{sentAt}, supplement_error=NULL,
+            supplement_lease_token=NULL, supplement_lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND supplement_status='SENDING' AND supplement_lease_token=#{leaseToken}
+    </update>
+    <update id="markSupplementRetry">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET supplement_status='RETRY', supplement_next_attempt_at=#{nextAttemptAt}, supplement_error=#{error},
+            supplement_lease_token=NULL, supplement_lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND supplement_status='SENDING' AND supplement_lease_token=#{leaseToken}
+    </update>
+    <update id="markSupplementDeadLetterByDemand">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET supplement_status='DEAD_LETTER', supplement_error=#{error}, row_version=row_version+1
+        WHERE analysis_demand_id=#{demandId}
+          AND supplement_status IN ('WAITING_ANALYSIS','READY','RETRY','SENDING')
+    </update>
+    <update id="markSupplementDeadLetter">
+        UPDATE stock_watch_alert_delivery_obligation
+        SET supplement_status='DEAD_LETTER', supplement_error=#{error},
+            supplement_lease_token=NULL, supplement_lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND supplement_lease_token=#{leaseToken}
+    </update>
+    <select id="hasDurableCooldown" resultType="int">
+        SELECT COUNT(*) FROM stock_watch_alert_delivery_obligation
+        WHERE rule_id=#{ruleId} AND symbol=#{symbol} AND market=#{market}
+          AND signal_fingerprint=#{signalFingerprint}
+          AND initial_status='SENT' AND episode_suppressed_until &gt; #{now}
+    </select>
+</mapper>

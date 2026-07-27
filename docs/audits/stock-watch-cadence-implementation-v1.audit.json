@@ -1,0 +1,199 @@
+{
+  "goalContract": {
+    "version": "v1",
+    "source": [
+      "用户原始要求：每股独立分析频率、收盘一次、未来十分钟、统一技术与异动、兼容账号池",
+      "用户最新指令：继续，授权按已审核方案进入实现",
+      "仓库约束：保留 dirty worktree，完成测试、启动、真实 API/UI 验证"
+    ],
+    "outcome": "在当前应用中真实实现并验证每股独立分析策略，同时保持 canonical provider submission 幂等、三阶段分离及未来账号池边界。",
+    "stakeholders": ["股票盯盘用户", "调度与分析服务维护者", "前端维护者", "未来账号池维护者"],
+    "mustAccept": [
+      {
+        "id": "G1",
+        "statement": "每只股票可通过 API/UI 独立持久化 INTERVAL、DAILY_CLOSE、ON_ANOMALY、PAUSED，INTERVAL 支持 10 到 1440 分钟。",
+        "verification": {"statement": "集成测试并以真实 API/UI 回读至少两只不同策略股票。", "surface": "ui", "minimumLevel": "live"}
+      },
+      {
+        "id": "G2",
+        "statement": "DAILY_CLOSE 在普通交易日 close-ready 后同一 close slot 最多一次 provider submission，当日晚间可补、跨日不补。",
+        "verification": {"statement": "Planner/close-ready 集成测试及真实 demand/task ledger 收据。", "surface": "workflow", "minimumLevel": "live"}
+      },
+      {
+        "id": "G3",
+        "statement": "行情扫描、模型分析和邮件投递保持独立，邮件门控不能阻止按分析策略创建异动 demand。",
+        "verification": {"statement": "邮件缺配置、禁用、手动及 cooldown 场景的集成测试。", "surface": "code", "minimumLevel": "integration"}
+      },
+      {
+        "id": "G4",
+        "statement": "结构化异动和技术分析优先合并到一个 canonical analysis task；GENERAL_LEGACY 明确标记为独立例外且不再追加 unified demand。",
+        "verification": {"statement": "调用路径测试和 task/Bridge ledger 计数。", "surface": "workflow", "minimumLevel": "integration"}
+      },
+      {
+        "id": "G5",
+        "statement": "analysis_task 是唯一不可逆 provider 提交账本，重启、并发、租约恢复和策略变更不产生第二次提交。",
+        "verification": {"statement": "逐崩溃窗与并发 claim/reconcile 集成测试。", "surface": "code", "minimumLevel": "integration"}
+      },
+      {
+        "id": "G6",
+        "statement": "LEGACY/SHADOW/POLICY 使用持久化 ownership，策略插入和执行前重验 sourcePolicyVersion，避免双 scheduler 与旧策略竞态。",
+        "verification": {"statement": "ownership 切换、scheduler/update/reservation 竞态集成测试。", "surface": "code", "minimumLevel": "integration"}
+      },
+      {
+        "id": "G7",
+        "statement": "已有 MySQL/H2 schema 可安全迁移，POLICY 在 target fact nullable、active coalesce unique 和 ownership readiness 未满足时不能启用。",
+        "verification": {"statement": "H2 fresh schema、MySQL metadata 与迁移 dry-run。", "surface": "code", "minimumLevel": "integration"}
+      },
+      {
+        "id": "G8",
+        "statement": "业务层不出现 accountKey、workerId、profileRoot 或 debugPort 等账号池物理路由字段。",
+        "verification": {"statement": "架构约束静态测试和源码搜索。", "surface": "code", "minimumLevel": "static"}
+      },
+      {
+        "id": "G9",
+        "statement": "既有股票默认保持 INTERVAL 30，metadata 更新不覆盖策略，归档分组不等于暂停。",
+        "verification": {"statement": "迁移默认、乐观锁、metadata/policy 分离回归测试。", "surface": "code", "minimumLevel": "integration"}
+      },
+      {
+        "id": "G10",
+        "statement": "本轮保留用户既有工作树改动，并在完成后编译、测试、重启服务及真实 API/UI 冒烟。",
+        "verification": {"statement": "基线哈希、最终 diff、进程健康、API 与浏览器观察。", "surface": "ui", "minimumLevel": "live"}
+      }
+    ],
+    "constraints": [
+      "不实现完整账号池",
+      "不发送额外测试邮件",
+      "不破坏当前 v17 task、fact 和 delivery 语义",
+      "不覆盖或回退实施前 dirty/untracked 内容"
+    ],
+    "nonGoals": ["账号健康和物理路由", "精细容量 ETA/p95", "权威交易所半日市日历"],
+    "preferences": ["B-core 最小一致性骨架", "数据库约束优先于 JVM 标志", "安全跳过优先于陈旧数据模型调用"],
+    "assumptions": ["本地运行栈为单应用实例，切 POLICY 前不存在旧二进制实例", "PAUSED 只暂停自动模型分析，手工分析仍允许"],
+    "unknowns": ["真实 10 分钟策略占比和单 Worker 容量", "半日市权威日历来源"]
+  },
+  "evidence": [
+    {
+      "id": "E1",
+      "statement": "当前 StockWatchItem/Mapper 没有个股分析策略字段，技术 scheduler 仍全局 fixedDelay。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/entity/StockWatchItem.java:8-18; src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java:188-210,363-398",
+      "freshness": "2026-07-22 current worktree",
+      "sourceType": "artifact",
+      "verification": {"surface": "code", "level": "static", "result": "pass"}
+    },
+    {
+      "id": "E2",
+      "statement": "当前异动 analysis demand 由 AlertDeliveryService 在邮件门控后的路径创建。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchAlertDeliveryService.java:55-60; src/main/java/com/aimeeting/room/service/StockWatchMonitorService.java:1847-1883",
+      "freshness": "2026-07-22 current worktree",
+      "sourceType": "artifact",
+      "verification": {"surface": "code", "level": "static", "result": "pass"}
+    },
+    {
+      "id": "E3",
+      "statement": "当前 demand 在 canonical task 之前更新 providerSubmitCount，形成双账本恢复窗口；analysis_task 已有唯一 submission key。",
+      "kind": "direct",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchAnalysisDemandService.java:108-156; src/main/resources/sql/init.sql stock_watch_analysis_task uk_sw_analysis_task_submission",
+      "freshness": "2026-07-22 current worktree",
+      "sourceType": "artifact",
+      "verification": {"surface": "code", "level": "static", "result": "pass"}
+    },
+    {
+      "id": "E4",
+      "statement": "当前已有 demand 表 target fact 字段为 NOT NULL，CREATE TABLE IF NOT EXISTS 不能迁移现有列。",
+      "kind": "direct",
+      "pointer": "src/main/resources/sql/init.sql stock_watch_analysis_demand; src/main/java/com/aimeeting/room/config/StockWatchTechnicalSchemaInitializer.java:198-215",
+      "freshness": "2026-07-22 current worktree",
+      "sourceType": "artifact",
+      "verification": {"surface": "code", "level": "static", "result": "pass"}
+    },
+    {
+      "id": "E5",
+      "statement": "实施契约 v1 已纳入 Challenge 的双账本、邮件耦合、ownership、policy race、close-ready、ALTER 与 coalesce 修订。",
+      "kind": "direct",
+      "pointer": "docs/stock-watch-per-stock-analysis-cadence-plan-v18.md section 22",
+      "freshness": "2026-07-22 after Challenge and Optimize",
+      "sourceType": "artifact",
+      "verification": {"surface": "code", "level": "static", "result": "pass"}
+    },
+    {
+      "id": "E6",
+      "statement": "重叠 dirty/untracked 文件已冻结状态和 SHA-256，并声明不得覆盖或整体冒充本轮提交。",
+      "kind": "direct",
+      "pointer": "docs/audits/stock-watch-cadence-implementation-baseline-2026-07-22.md",
+      "freshness": "2026-07-22 before business edits",
+      "sourceType": "artifact",
+      "verification": {"surface": "code", "level": "static", "result": "pass"}
+    }
+  ],
+  "claims": [
+    {
+      "id": "S1",
+      "statement": "当前代码尚未满足 implementation Goal Contract，旧设计 aligned 结论不能继承。",
+      "type": "fact",
+      "dependsOn": ["E1", "E2", "E3", "E4"],
+      "supportingEvidence": ["E1", "E2", "E3", "E4"],
+      "hiddenAssumptions": [],
+      "falsifiers": ["当前工作树已存在未发现的完整个股 cadence 实现及 live 证据"],
+      "alternativesConsidered": [],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S2",
+      "statement": "修订后的 B-core 是当前三候选中最小且不牺牲关键一致性的实施方向。",
+      "type": "recommendation",
+      "dependsOn": ["S1", "E5"],
+      "supportingEvidence": ["E5"],
+      "hiddenAssumptions": ["canonical analysis_task 能继续作为唯一 provider submission identity"],
+      "falsifiers": ["实现测试证明 task identity 无法覆盖 scheduled 和 anomaly demand", "存在更小路径同时满足持久化槽位和不可逆提交"],
+      "alternativesConsidered": ["旧 fixedDelay 加 if", "先实现完整账号池"],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S3",
+      "statement": "当前工作树保护边界已冻结，但最终是否无夹带仍需完成后 diff 和暂存审查。",
+      "type": "fact",
+      "dependsOn": ["E6"],
+      "supportingEvidence": ["E6"],
+      "hiddenAssumptions": [],
+      "falsifiers": ["后续使用覆盖、reset 或整文件替换破坏基线"],
+      "alternativesConsidered": [],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S4",
+      "statement": "实施完成结论目前只能是 partial，必须以代码、集成、运行和 UI live 证据升级。",
+      "type": "inference",
+      "dependsOn": ["S1", "S2", "S3", "E5"],
+      "supportingEvidence": ["E5"],
+      "hiddenAssumptions": [],
+      "falsifiers": ["所有 G1-G10 已经有当前直接测试与 live 收据"],
+      "alternativesConsidered": ["直接继承设计审核 aligned；因目标版本变化而否决"],
+      "verdict": "supported",
+      "confidence": "high"
+    }
+  ],
+  "conclusion": {
+    "statement": "可以按修订后的 B-core 开始实现，但当前 implementation goal 仅部分完成；任何功能完成声明必须等待测试、重启及真实 API/UI/ledger 证据。",
+    "dependsOn": ["S1", "S2", "S3", "S4"],
+    "goalTrace": [
+      {"goalId": "G1", "supportedBy": ["S4"], "verification": ["E1", "E5"], "status": "partial"},
+      {"goalId": "G2", "supportedBy": ["S4"], "verification": ["E5"], "status": "partial"},
+      {"goalId": "G3", "supportedBy": ["S4"], "verification": ["E2", "E5"], "status": "partial"},
+      {"goalId": "G4", "supportedBy": ["S4"], "verification": ["E2", "E5"], "status": "partial"},
+      {"goalId": "G5", "supportedBy": ["S4"], "verification": ["E3", "E5"], "status": "partial"},
+      {"goalId": "G6", "supportedBy": ["S4"], "verification": ["E5"], "status": "partial"},
+      {"goalId": "G7", "supportedBy": ["S4"], "verification": ["E4", "E5"], "status": "partial"},
+      {"goalId": "G8", "supportedBy": ["S2"], "verification": ["E5"], "status": "partial"},
+      {"goalId": "G9", "supportedBy": ["S4"], "verification": ["E1", "E5"], "status": "partial"},
+      {"goalId": "G10", "supportedBy": ["S3", "S4"], "verification": ["E6"], "status": "partial"}
+    ],
+    "remainingBoundaries": ["业务代码尚未修改", "集成测试尚未运行", "服务尚未按新 schema 重启", "真实 API/UI/ledger 尚未验证"],
+    "verdict": "partial",
+    "goalVerdict": "partial"
+  }
+}

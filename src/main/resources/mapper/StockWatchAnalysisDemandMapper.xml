@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchAnalysisDemandMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchAnalysisDemand">
+        <id column="id" property="id"/>
+        <result column="demand_key" property="demandKey"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="capability" property="capability"/>
+        <result column="trigger_type" property="triggerType"/>
+        <result column="schedule_slot_key" property="scheduleSlotKey"/>
+        <result column="run_slot" property="runSlot"/>
+        <result column="coalesce_key" property="coalesceKey"/>
+        <result column="active_coalesce_key" property="activeCoalesceKey"/>
+        <result column="source_policy_version" property="sourcePolicyVersion"/>
+        <result column="reason_codes_json" property="reasonCodesJson"/>
+        <result column="trigger_context_json" property="triggerContextJson"/>
+        <result column="period_type" property="periodType"/>
+        <result column="target_fact_observation_id" property="targetFactObservationId"/>
+        <result column="target_fact_observation_key" property="targetFactObservationKey"/>
+        <result column="target_source_time_epoch_ms" property="targetSourceTimeEpochMs"/>
+        <result column="trade_date" property="tradeDate"/>
+        <result column="business_generation" property="businessGeneration"/>
+        <result column="retry_of_demand_id" property="retryOfDemandId"/>
+        <result column="superseded_by_demand_id" property="supersededByDemandId"/>
+        <result column="status" property="status"/>
+        <result column="priority" property="priority"/>
+        <result column="not_before" property="notBefore"/>
+        <result column="deadline_at" property="deadlineAt"/>
+        <result column="provider_submit_count" property="providerSubmitCount"/>
+        <result column="analysis_task_id" property="analysisTaskId"/>
+        <result column="analysis_id" property="analysisId"/>
+        <result column="lease_token" property="leaseToken"/>
+        <result column="lease_until" property="leaseUntil"/>
+        <result column="error_message" property="errorMessage"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_analysis_demand
+        (demand_key,symbol,market,stock_name,capability,trigger_type,schedule_slot_key,run_slot,
+         coalesce_key,active_coalesce_key,source_policy_version,reason_codes_json,trigger_context_json,
+         period_type,target_fact_observation_id,
+         target_fact_observation_key,target_source_time_epoch_ms,trade_date,business_generation,
+         retry_of_demand_id,superseded_by_demand_id,status,priority,not_before,deadline_at,provider_submit_count,row_version)
+        VALUES
+        (#{demandKey},#{symbol},#{market},#{stockName},#{capability},#{triggerType},#{scheduleSlotKey},#{runSlot},
+         #{coalesceKey},#{activeCoalesceKey},#{sourcePolicyVersion},#{reasonCodesJson},#{triggerContextJson},
+         #{periodType},#{targetFactObservationId},
+         #{targetFactObservationKey},#{targetSourceTimeEpochMs},#{tradeDate},#{businessGeneration},
+         #{retryOfDemandId},#{supersededByDemandId},#{status},#{priority},#{notBefore},#{deadlineAt},0,0)
+    </insert>
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_demand WHERE id=#{id}
+    </select>
+    <select id="selectByDemandKey" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_demand WHERE demand_key=#{demandKey} LIMIT 1
+    </select>
+    <select id="selectActiveByCoalesceKey" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_demand
+        WHERE active_coalesce_key=#{activeCoalesceKey}
+        LIMIT 1
+    </select>
+    <select id="selectDispatchable" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_demand
+        WHERE status IN ('PENDING','CLAIMED')
+          AND not_before &lt;= #{now} AND deadline_at &gt; #{now}
+          AND (status!='CLAIMED' OR lease_until &lt;= #{now})
+        ORDER BY priority DESC, id ASC LIMIT #{limit}
+    </select>
+    <select id="selectSubmitted" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_analysis_demand
+        WHERE status='SUBMITTED' ORDER BY id ASC LIMIT #{limit}
+    </select>
+    <update id="claim">
+        UPDATE stock_watch_analysis_demand
+        SET status='CLAIMED', lease_token=#{leaseToken}, lease_until=#{leaseUntil}, row_version=row_version+1
+        WHERE id=#{id} AND row_version=#{expectedRowVersion}
+          AND status IN ('PENDING','CLAIMED')
+          AND (status!='CLAIMED' OR lease_until &lt;= #{now})
+    </update>
+    <update id="reserveProviderSubmission">
+        UPDATE stock_watch_analysis_demand
+        SET provider_submit_count=1, row_version=row_version+1
+        WHERE id=#{id} AND status='CLAIMED' AND lease_token=#{leaseToken}
+          AND provider_submit_count=0
+    </update>
+    <update id="markSupersededIfUnsubmitted">
+        UPDATE stock_watch_analysis_demand
+        SET status='SUPERSEDED', active_coalesce_key=NULL, error_message=#{reason},
+            lease_token=NULL, lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id}
+          AND (status='PENDING' OR (status='CLAIMED' AND lease_until &lt;= #{now}))
+          AND analysis_task_id IS NULL
+    </update>
+    <update id="markClaimedSuperseded">
+        UPDATE stock_watch_analysis_demand
+        SET status='SUPERSEDED', active_coalesce_key=NULL, error_message=#{reason},
+            lease_token=NULL, lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND status='CLAIMED' AND lease_token=#{leaseToken}
+          AND analysis_task_id IS NULL
+    </update>
+    <update id="linkSuperseded">
+        UPDATE stock_watch_analysis_demand
+        SET superseded_by_demand_id=#{supersededByDemandId}, row_version=row_version+1
+        WHERE id=#{id} AND status='SUPERSEDED'
+    </update>
+    <update id="supersedePolicyMismatch">
+        UPDATE stock_watch_analysis_demand
+        SET status='SUPERSEDED', active_coalesce_key=NULL, error_message=#{reason},
+            lease_token=NULL, lease_until=NULL, row_version=row_version+1
+        WHERE symbol=#{symbol} AND market=#{market}
+          AND source_policy_version IS NOT NULL
+          AND source_policy_version != #{currentPolicyVersion}
+          AND status='PENDING' AND analysis_task_id IS NULL
+    </update>
+    <update id="markSubmitted">
+        UPDATE stock_watch_analysis_demand
+        SET status='SUBMITTED', analysis_task_id=#{analysisTaskId},
+            provider_submit_count=1, active_coalesce_key=NULL,
+            lease_token=NULL, lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND status='CLAIMED' AND lease_token=#{leaseToken}
+    </update>
+    <update id="markSatisfied">
+        UPDATE stock_watch_analysis_demand
+        SET status='SATISFIED', analysis_task_id=#{analysisTaskId}, analysis_id=#{analysisId},
+            provider_submit_count=CASE WHEN #{analysisTaskId} IS NULL THEN provider_submit_count ELSE 1 END,
+            active_coalesce_key=NULL, lease_token=NULL, lease_until=NULL,
+            error_message=NULL, row_version=row_version+1
+        WHERE id=#{id} AND status IN ('CLAIMED','SUBMITTED')
+    </update>
+    <update id="markDeadLetter">
+        UPDATE stock_watch_analysis_demand
+        SET status='DEAD_LETTER', error_message=#{error},
+            active_coalesce_key=NULL, lease_token=NULL, lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND status NOT IN ('SATISFIED','DEAD_LETTER')
+    </update>
+    <update id="releaseForRetry">
+        UPDATE stock_watch_analysis_demand
+        SET status='PENDING', not_before=#{notBefore}, error_message=#{error},
+            lease_token=NULL, lease_until=NULL, row_version=row_version+1
+        WHERE id=#{id} AND status='CLAIMED' AND lease_token=#{leaseToken}
+    </update>
+</mapper>

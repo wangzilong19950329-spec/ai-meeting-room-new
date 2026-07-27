@@ -1,0 +1,522 @@
+{
+  "goalContract": {
+    "version": "v2",
+    "source": [
+      {
+        "kind": "user_request",
+        "pointer": "latest continuation of per-stock cadence implementation",
+        "authority": "primary"
+      },
+      {
+        "kind": "repository_instruction",
+        "pointer": "AGENTS.md conclusion audit and evidence-first workflow",
+        "authority": "constraint"
+      }
+    ],
+    "outcome": "在本地应用中落地个股分析策略编辑、统一分析需求调度骨架和安全切换，并明确未完成的真实 provider canary 边界。",
+    "stakeholders": [
+      "股票盯盘用户",
+      "后端调度维护者",
+      "前端维护者",
+      "未来账号池维护者"
+    ],
+    "mustAccept": [
+      {
+        "id": "G1",
+        "statement": "每只股票有独立分析策略字段和 API/UI 编辑入口，支持 INTERVAL、DAILY_CLOSE、ON_ANOMALY、PAUSED 及 10 到 1440 分钟间隔。",
+        "verification": {
+          "statement": "编译、策略服务/列表/控制器测试、真实 API GET 与浏览器 UI 验证通过。",
+          "surface": "ui",
+          "minimumLevel": "live"
+        }
+      },
+      {
+        "id": "G2",
+        "statement": "非 legacy 结构化异动可通过统一 analysis demand 进入技术分析 DeepSeek prompt，邮件只作为通知出口；GENERAL_LEGACY 规则路径仍是显式例外。",
+        "verification": {
+          "statement": "需求服务/监控服务测试覆盖统一 demand 创建，技术分析测试覆盖 demand 上下文进入 prompt；真实 provider canary 仍未完成。",
+          "surface": "code",
+          "minimumLevel": "integration"
+        }
+      },
+      {
+        "id": "G3",
+        "statement": "POLICY scheduler 已能按策略创建 demand，LEGACY/POLICY 切换有 idle 检查、legacy 二次 ownership 检查和 demand 提交前策略复核；尚不是数据库级原子 fencing。",
+        "verification": {
+          "statement": "ownership 切换 API、cutover fence 测试、提交前策略复核测试和本地 POLICY reconcile 验证通过。",
+          "surface": "api",
+          "minimumLevel": "live"
+        }
+      },
+      {
+        "id": "G4",
+        "statement": "异动延后到下一计划和 active coalesce 并发冲突不会丢失活跃需求。",
+        "verification": {
+          "statement": "StockWatchAnalysisDemandService focused regression tests 通过；未做真实数据库唯一索引并发集成测试。",
+          "surface": "code",
+          "minimumLevel": "integration"
+        }
+      },
+      {
+        "id": "G5",
+        "statement": "打开 LLM 策略页不得因为 404 自动创建后端监控项；保存策略必须冻结当时股票与表单 payload。",
+        "verification": {
+          "statement": "前端源码检查、build 和浏览器 UI smoke 通过。",
+          "surface": "ui",
+          "minimumLevel": "live"
+        }
+      },
+      {
+        "id": "G6",
+        "statement": "本轮不得声明未经验证的真实 DeepSeek provider canary、账号池并发或权威交易日历能力。",
+        "verification": {
+          "statement": "最终报告保留明确边界，不把 dormant 或未触发路径说成已端到端证明。",
+          "surface": "workflow",
+          "minimumLevel": "static"
+        }
+      }
+    ],
+    "constraints": [
+      "不实现完整账号池",
+      "不发送测试邮件",
+      "不覆盖或回退用户已有 dirty worktree",
+      "不在非交易窗口强造真实 DeepSeek 自动调度结果"
+    ],
+    "nonGoals": [
+      "账号池 Broker 和多账号并发",
+      "邮件异步 worker 改造",
+      "权威交易所半日市日历",
+      "真实 DeepSeek demand canary"
+    ],
+    "preferences": [
+      "低风险增量激活",
+      "canonical analysis_task 保持 provider 提交边界",
+      "业务层不暴露 accountKey、workerId、debugPort 或 profileRoot"
+    ],
+    "assumptions": [
+      "本地 8127/3009/8791/9344 是用户要求启动和验证的开发栈",
+      "当前 23:50 已过当日 planner daily close deadline，POLICY reconcile 不应立即创建 demand"
+    ],
+    "unknowns": [
+      "真实交易时段第一轮 POLICY due demand 是否成功完成 DeepSeek 提交和投影",
+      "十分钟级别在单 worker 下的容量上限",
+      "未来账号池的 admission 公平性和健康策略"
+    ]
+  },
+  "evidence": [
+    {
+      "id": "E1",
+      "statement": "StockWatchItem、Mapper、SQL 和策略服务包含 per-stock analysis policy 字段与更新路径。",
+      "sourceType": "artifact",
+      "pointer": "src/main/java/com/aimeeting/room/entity/StockWatchItem.java; src/main/java/com/aimeeting/room/service/StockWatchAnalysisPolicyService.java; src/main/resources/mapper/StockWatchItemMapper.xml; src/main/resources/sql/init.sql",
+      "kind": "direct",
+      "freshness": "2026-07-22 current worktree",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E2",
+      "statement": "Frontend StockWatch.vue 提供 LLM 策略编辑器，404 只显示未保存草案，保存前冻结 stock identity 和 payload。",
+      "sourceType": "artifact",
+      "pointer": "frontend/src/views/StockWatch.vue loadAnalysisPolicy/saveAnalysisPolicy/buildAnalysisPolicyPayload/markAnalysisPolicyMissing",
+      "kind": "direct",
+      "freshness": "2026-07-22 current worktree",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E3",
+      "statement": "Demand service 保留 deferred anomaly，active coalesce unique race fallback 会返回活跃 demand。",
+      "sourceType": "artifact",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchAnalysisDemandService.java shouldReuseDeferredAnomalyForScheduled/insertDemand",
+      "kind": "direct",
+      "freshness": "2026-07-22 current worktree",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E4",
+      "statement": "Legacy scheduledAnalyze 在 claim running 后二次确认 ownership，POLICY 切换 API 在 legacy batch running 时返回 409。",
+      "sourceType": "artifact",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java scheduledAnalyze/isRunning; src/main/java/com/aimeeting/room/controller/StockWatchTechnicalAnalysisController.java switchSchedulerOwnership",
+      "kind": "direct",
+      "freshness": "2026-07-22 current worktree",
+      "verification": {
+        "surface": "code",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E5",
+      "statement": "前端 build 通过。",
+      "sourceType": "test_result",
+      "pointer": "npm run build in frontend at 2026-07-22 23:05",
+      "kind": "direct",
+      "freshness": "2026-07-22",
+      "verification": {
+        "surface": "code",
+        "level": "integration",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E6",
+      "statement": "Maven compile 和 focused tests 通过，80 tests、0 failures、0 errors、0 skipped。",
+      "sourceType": "test_result",
+      "pointer": "mvn -q -DskipTests compile && mvn -q -Dtest=StockWatchAnalysisDemandServiceTest,StockWatchAnalysisSchedulePlannerTest,StockWatchAnalysisPolicyServiceTest,StockWatchListServiceTest,StockWatchTechnicalAnalysisControllerTest,StockWatchMonitorServiceTest,StockWatchTechnicalAnalysisServiceTest test at 2026-07-22 23:31; Surefire total=80/0/0/0",
+      "kind": "direct",
+      "freshness": "2026-07-22",
+      "verification": {
+        "surface": "code",
+        "level": "integration",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E7",
+      "statement": "本地栈重启后 backend 8127、frontend 3009、DeepSeek bridge 8791、Chrome debug 9344 均可用；bridge health ok 且 single_worker。",
+      "sourceType": "api_response",
+      "pointer": "scripts/start-stock-watch-stack.sh and curl http://127.0.0.1:8791/health at 2026-07-22 23:47-23:50",
+      "kind": "direct",
+      "freshness": "2026-07-22 live",
+      "verification": {
+        "surface": "api",
+        "level": "live",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E8",
+      "statement": "API 登录、watchlist、688017 policy GET、POLICY ownership status、manual scheduler reconcile 成功；watchlist=24，688017=INTERVAL/30/IMMEDIATE_ANALYSIS，reconcile evaluatedStocks=24 created=0 reused=0 failed=0。",
+      "sourceType": "api_response",
+      "pointer": "curl local API smoke with X-Token at 2026-07-22 23:50",
+      "kind": "direct",
+      "freshness": "2026-07-22 live",
+      "verification": {
+        "surface": "api",
+        "level": "live",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E9",
+      "statement": "浏览器 UI smoke 登录后打开 688017 LLM 分析页，策略编辑器、统一分析文案、模式按钮、预设间隔、interval=30、anomaly=IMMEDIATE_ANALYSIS 可见，刷新后无新增 console error/warning。",
+      "sourceType": "browser_observation",
+      "pointer": "/var/folders/y9/6lz7q8555pqgh3y53ks0r5x00000gn/T/stock-watch-policy-ui-after-fixes-20260722.png and in-app browser observation at 2026-07-22 23:12",
+      "kind": "direct",
+      "freshness": "2026-07-22 live",
+      "verification": {
+        "surface": "ui",
+        "level": "live",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E10",
+      "statement": "本审计包将结论显式降级为 partial，并列出未运行真实 DeepSeek demand canary、未实现账号池、未实现邮件异步 worker 和未接权威交易日历。",
+      "sourceType": "workflow_observation",
+      "pointer": "docs/audits/stock-watch-cadence-implementation-v2.audit.json conclusion.remainingBoundaries",
+      "kind": "direct",
+      "freshness": "2026-07-22 current workflow",
+      "verification": {
+        "surface": "workflow",
+        "level": "static",
+        "result": "pass"
+      }
+    },
+    {
+      "id": "E11",
+      "statement": "技术分析 prompt 会携带 analysisDemand 触发上下文，且 provider submit 前会再次校验 demand 策略版本与自动分析许可。",
+      "sourceType": "test_result",
+      "pointer": "src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java buildPrompt/demandPromptPayload/projectPreparedTask/validateDemandPolicyStillCurrent; src/test/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisServiceTest.java demandPromptPayloadCarriesTriggerContextIntoUnifiedAnalysisPrompt/demandPolicyVersionChangeIsRejectedBeforeProviderSubmission",
+      "kind": "direct",
+      "freshness": "2026-07-22 current worktree",
+      "verification": {
+        "surface": "code",
+        "level": "integration",
+        "result": "pass"
+      }
+    }
+  ],
+  "claims": [
+    {
+      "id": "S1",
+      "statement": "G1 在当前本地栈中已达到 UI live 层验证，但未做两只股票的 live PUT 往返变更。",
+      "type": "inference",
+      "dependsOn": [
+        "E1",
+        "E2",
+        "E5",
+        "E6",
+        "E8",
+        "E9"
+      ],
+      "supportingEvidence": [
+        "E1",
+        "E2",
+        "E5",
+        "E6",
+        "E8",
+        "E9"
+      ],
+      "hiddenAssumptions": [
+        "focused tests sufficiently cover update semantics without mutating live user policies"
+      ],
+      "falsifiers": [
+        "保存按钮实际发送错误 payload",
+        "另一个股票的策略版本冲突无法恢复",
+        "UI 只展示默认值而后端不能持久化"
+      ],
+      "alternativesConsidered": [
+        "对真实股票做 PUT 后恢复；因会修改用户本地策略版本，本轮改用测试与 GET/UI 验证"
+      ],
+      "verdict": "supported",
+      "confidence": "medium"
+    },
+    {
+      "id": "S2",
+      "statement": "G2 的非 legacy 统一 demand 设计已在代码和聚焦测试层成立：monitor 可创建/复用统一 demand，runDemand 会把 demand 触发上下文送入技术分析 prompt；但 GENERAL_LEGACY 规则仍走旧 judge 路径，且没有完成真实 DeepSeek demand canary。",
+      "type": "inference",
+      "dependsOn": [
+        "E3",
+        "E6",
+        "E9",
+        "E11"
+      ],
+      "supportingEvidence": [
+        "E3",
+        "E6",
+        "E9",
+        "E11"
+      ],
+      "hiddenAssumptions": [
+        "runDemand 延续现有 canonical analysis_task 提交流程"
+      ],
+      "falsifiers": [
+        "GENERAL_LEGACY 规则被误称为统一 demand 路径",
+        "真实 dispatch 到 DeepSeek 后未生成 analysis_task",
+        "同一 demand 重放产生第二次 provider submit"
+      ],
+      "alternativesConsidered": [
+        "立即强跑 DeepSeek canary；当前非交易 due 窗口且会消耗真实 provider，本轮作为剩余边界"
+      ],
+      "verdict": "supported",
+      "confidence": "medium"
+    },
+    {
+      "id": "S3",
+      "statement": "G3 在当前本地 idle 场景下已激活 POLICY ownership，reconcile 不会在非 due 窗口立即触发 DeepSeek；idle 检查、legacy 二次 ownership 检查和提交前策略复核降低重叠风险，但不能证明数据库级原子切换。",
+      "type": "fact",
+      "dependsOn": [
+        "E4",
+        "E6",
+        "E8",
+        "E11"
+      ],
+      "supportingEvidence": [
+        "E4",
+        "E6",
+        "E8",
+        "E11"
+      ],
+      "hiddenAssumptions": [],
+      "falsifiers": [
+        "status 仍为 LEGACY",
+        "manual reconcile failed 或 created 非预期 demand",
+        "legacy running 时 POLICY switch 未被拒绝",
+        "策略版本变化后仍提交旧 demand 到 provider"
+      ],
+      "alternativesConsidered": [
+        "保持 LEGACY dormant；因会使个股策略不实际接管自动调度，已在 idle 状态切到 POLICY"
+      ],
+      "verdict": "supported",
+      "confidence": "high"
+    },
+    {
+      "id": "S4",
+      "statement": "G4 已由 focused regression tests 支持到服务层：deferred anomaly 不被 scheduled slot 覆盖，active coalesce race fallback 返回活跃 demand；真实数据库唯一索引并发集成测试未做。",
+      "type": "fact",
+      "dependsOn": [
+        "E3",
+        "E6"
+      ],
+      "supportingEvidence": [
+        "E3",
+        "E6"
+      ],
+      "hiddenAssumptions": [],
+      "falsifiers": [
+        "MyBatis SQL 在真实数据库下 DuplicateKeyException 分支与单测 mock 不一致",
+        "不同策略版本下 deferred anomaly 被错误复用"
+      ],
+      "alternativesConsidered": [],
+      "verdict": "supported",
+      "confidence": "medium"
+    },
+    {
+      "id": "S5",
+      "statement": "G5 的读污染和保存竞态已修复到源码和 UI smoke 层。",
+      "type": "inference",
+      "dependsOn": [
+        "E2",
+        "E5",
+        "E9"
+      ],
+      "supportingEvidence": [
+        "E2",
+        "E5",
+        "E9"
+      ],
+      "hiddenAssumptions": [
+        "未持久化股票的 404 场景未在 live UI 中再次选到并观察"
+      ],
+      "falsifiers": [
+        "切到未后端持久化股票仍自动 POST",
+        "快速切股保存仍把 A 股票表单写到 B 股票"
+      ],
+      "alternativesConsidered": [],
+      "verdict": "supported",
+      "confidence": "medium"
+    },
+    {
+      "id": "S6",
+      "statement": "最终结论必须降级为 partial：功能骨架和本地激活已完成，但真实 provider canary、账号池、邮件异步 worker 和权威交易日历未完成。",
+      "type": "recommendation",
+      "dependsOn": [
+        "S1",
+        "S2",
+        "S3",
+        "S4",
+        "S5",
+        "E7",
+        "E10"
+      ],
+      "supportingEvidence": [
+        "E7",
+        "E10"
+      ],
+      "hiddenAssumptions": [],
+      "falsifiers": [
+        "已经有真实 POLICY demand 到 DeepSeek 的成功 projection 证据",
+        "账号池和异步邮件 worker 已在本轮实现并验证"
+      ],
+      "alternativesConsidered": [
+        "声明完全完成；因缺少真实 DeepSeek demand canary 被否决",
+        "不切 POLICY；因会导致策略不接管自动调度被否决"
+      ],
+      "verdict": "supported",
+      "confidence": "high"
+    }
+  ],
+  "conclusion": {
+    "statement": "当前证据支持：个股分析策略 UI/API/调度骨架已落地，本地自动调度 ownership 已切到 POLICY，非 legacy 异动 demand 可进入统一技术分析 prompt，关键 UI 读污染、保存竞态、deferred anomaly 覆盖、active coalesce race 和切换重叠风险已做低风险修正；但切换不是数据库级原子 fencing，不能声明真实 DeepSeek demand provider canary、账号池并发、邮件异步 worker 或权威交易日历完成。",
+    "dependsOn": [
+      "S1",
+      "S2",
+      "S3",
+      "S4",
+      "S5",
+      "S6"
+    ],
+    "goalTrace": [
+      {
+        "goalId": "G1",
+        "supportedBy": [
+          "S1"
+        ],
+        "verification": [
+          "E1",
+          "E2",
+          "E5",
+          "E6",
+          "E8",
+          "E9"
+        ],
+        "status": "partial"
+      },
+      {
+        "goalId": "G2",
+        "supportedBy": [
+          "S2"
+        ],
+        "verification": [
+          "E3",
+          "E6",
+          "E9",
+          "E11"
+        ],
+        "status": "partial"
+      },
+      {
+        "goalId": "G3",
+        "supportedBy": [
+          "S3"
+        ],
+        "verification": [
+          "E4",
+          "E6",
+          "E8",
+          "E11"
+        ],
+        "status": "partial"
+      },
+      {
+        "goalId": "G4",
+        "supportedBy": [
+          "S4"
+        ],
+        "verification": [
+          "E3",
+          "E6"
+        ],
+        "status": "partial"
+      },
+      {
+        "goalId": "G5",
+        "supportedBy": [
+          "S5"
+        ],
+        "verification": [
+          "E2",
+          "E5",
+          "E9"
+        ],
+        "status": "partial"
+      },
+      {
+        "goalId": "G6",
+        "supportedBy": [
+          "S6"
+        ],
+        "verification": [
+          "E7",
+          "E8",
+          "E10"
+        ],
+        "status": "met"
+      }
+    ],
+    "verdict": "partial",
+    "goalVerdict": "partial",
+    "remainingBoundaries": [
+      "未运行真实 POLICY demand -> DeepSeek -> projection success canary",
+      "LEGACY/GENERAL_LEGACY 异动判断仍有显式旧路径，不属于统一 demand 证明范围",
+      "LEGACY/POLICY 切换不是数据库级原子 generation fencing",
+      "active coalesce race 只有服务层聚焦测试，未做真实数据库唯一索引并发集成测试",
+      "未实现账号池 Broker、多 worker 容量和公平性",
+      "未实现邮件投递异步 worker，现有发送链仍可能同步占用 monitor 路径",
+      "DAILY_CLOSE 使用 weekday 近似，不是权威交易所日历",
+      "未对 live 用户股票做 PUT 修改再恢复的双股票 API 往返测试"
+    ]
+  }
+}
