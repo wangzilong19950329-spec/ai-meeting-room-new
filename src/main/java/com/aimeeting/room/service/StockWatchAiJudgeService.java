@@ -44,6 +44,7 @@ public class StockWatchAiJudgeService {
 
     private final AiModelRouter aiModelRouter;
     private final StockWatchAnalysisTaskService analysisTaskService;
+    private final StockWatchBridgeAdmissionService bridgeAdmissionService;
 
     @Value("${stock-watch.ai-rules.bridge-url:http://127.0.0.1:8791/search}")
     private String bridgeUrl;
@@ -58,9 +59,11 @@ public class StockWatchAiJudgeService {
     private boolean bridgeFirst;
 
     public StockWatchAiJudgeService(AiModelRouter aiModelRouter,
-                                    StockWatchAnalysisTaskService analysisTaskService) {
+                                    StockWatchAnalysisTaskService analysisTaskService,
+                                    StockWatchBridgeAdmissionService bridgeAdmissionService) {
         this.aiModelRouter = aiModelRouter;
         this.analysisTaskService = analysisTaskService;
+        this.bridgeAdmissionService = bridgeAdmissionService;
     }
 
     public AiDecision judge(AiWatchRule rule, Map<String, Object> quote, ZonedDateTime now) {
@@ -690,12 +693,21 @@ public class StockWatchAiJudgeService {
                 .connectTimeout(Math.max(5, bridgeConnectTimeoutSeconds), TimeUnit.SECONDS)
                 .readTimeout(Math.max(30, bridgeReadTimeoutSeconds), TimeUnit.SECONDS)
                 .callTimeout(Math.max(40, bridgeReadTimeoutSeconds + 10), TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false)
                 .build();
         Request request = new Request.Builder()
                 .url(bridgeUrl)
                 .header("Content-Type", "application/json")
                 .post(RequestBody.create(body.toJSONString(), JSON_TYPE))
                 .build();
+        return bridgeAdmissionService.execute(
+                StockWatchBridgeAdmissionService.PRIORITY_GENERAL_LEGACY_RULE,
+                "legacy-rule:" + rule.getMarket() + "." + rule.getSymbol(),
+                () -> executeBridgeRequest(client, request)
+        );
+    }
+
+    private String executeBridgeRequest(OkHttpClient client, Request request) throws Exception {
         try (Response response = client.newCall(request).execute()) {
             String responseBody = response.body() == null ? "" : response.body().string();
             if (!response.isSuccessful()) {

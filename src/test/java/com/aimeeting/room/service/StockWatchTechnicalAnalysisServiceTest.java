@@ -3,9 +3,12 @@ package com.aimeeting.room.service;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
+import com.aimeeting.room.dao.StockWatchFactObservationMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalSessionMapper;
+import com.aimeeting.room.entity.StockWatchAnalysisDemand;
 import com.aimeeting.room.entity.StockWatchAnalysisTask;
+import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.entity.StockWatchTechnicalSession;
 import com.aimeeting.room.service.StockWatchAnalysisTaskService.Reservation;
@@ -45,7 +48,9 @@ class StockWatchTechnicalAnalysisServiceTest {
             mock(StockWatchAnalysisProjectionService.class),
             mock(StockWatchRiskPatternService.class),
             mock(StockWatchFactPersistenceService.class),
-            mock(StockWatchV6RuntimeGate.class)
+            mock(StockWatchFactObservationMapper.class),
+            mock(StockWatchV6RuntimeGate.class),
+            mock(StockWatchBridgeAdmissionService.class)
     );
 
     @Test
@@ -64,6 +69,94 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertEquals(true, ReflectionTestUtils.invokeMethod(service, "isTradingSession", at1530, "hk"));
         assertEquals(false, ReflectionTestUtils.invokeMethod(service, "isTradingSession", at1530, "sh"));
         assertEquals("15:30", ReflectionTestUtils.invokeMethod(service, "currentRunSlot", at1530, false, "hk"));
+    }
+
+    @Test
+    void scheduledAnalyzeRechecksLegacyOwnershipAfterClaimingRunner() {
+        StockWatchAnalysisSchedulerOwnershipService ownershipService =
+                mock(StockWatchAnalysisSchedulerOwnershipService.class);
+        when(ownershipService.isLegacyOwner()).thenReturn(true, false);
+        ReflectionTestUtils.setField(service, "schedulerOwnershipService", ownershipService);
+        ReflectionTestUtils.setField(service, "enabled", true);
+
+        service.scheduledAnalyze();
+
+        assertEquals("skipped_ownership_not_legacy", service.status().get("lastRunStatus"));
+        assertFalse(service.isRunning());
+    }
+
+    @Test
+    void demandPromptPayloadCarriesTriggerContextIntoUnifiedAnalysisPrompt() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = new StockWatchTechnicalAnalysisService(
+                mock(EastmoneyMarketDataService.class),
+                mock(StockWatchPredictionService.class),
+                mock(StockWatchListService.class),
+                mock(StockWatchTechnicalSessionMapper.class),
+                analysisMapper,
+                mock(StockWatchAnalysisTaskService.class),
+                mock(StockWatchAnalysisProjectionService.class),
+                mock(StockWatchRiskPatternService.class),
+                mock(StockWatchFactPersistenceService.class),
+                mock(StockWatchFactObservationMapper.class),
+                mock(StockWatchV6RuntimeGate.class),
+                mock(StockWatchBridgeAdmissionService.class)
+        );
+        when(analysisMapper.selectRecentBySymbol(
+                org.mockito.ArgumentMatchers.eq("688017"),
+                org.mockito.ArgumentMatchers.eq("sh"),
+                org.mockito.ArgumentMatchers.eq("DAY"),
+                org.mockito.ArgumentMatchers.eq(2))).thenReturn(Collections.emptyList());
+        Object ref = ReflectionTestUtils.invokeMethod(localService, "normalizeStockRef", "688017", "sh");
+        Object window = ReflectionTestUtils.invokeMethod(localService, "currentPeriodWindow",
+                "DAY", LocalDate.of(2026, 7, 22));
+        StockWatchTechnicalSession session = new StockWatchTechnicalSession();
+        session.setSessionKey("688017-sh-day");
+        session.setGeneration(3);
+        session.setContextChars(1024);
+        session.setContextLimitChars(80_000);
+        StockWatchAnalysisDemand demand = new StockWatchAnalysisDemand();
+        demand.setId(901L);
+        demand.setDemandKey("demand-901");
+        demand.setTriggerType("ANOMALY_DEFERRED");
+        demand.setScheduleSlotKey("DAY:2026-07-22:14:30");
+        demand.setRunSlot("14:30");
+        demand.setSourcePolicyVersion(7L);
+        demand.setReasonCodesJson("[\"quote_anomaly\"]");
+        demand.setTriggerContextJson("{\"source\":\"monitor\",\"mainInflow\":120000000}");
+
+        String prompt = ReflectionTestUtils.invokeMethod(localService, "buildPrompt",
+                ref, "迈瑞医疗", Collections.emptyMap(), Collections.emptyMap(),
+                new JSONObject(true), new JSONObject(true), Collections.emptyList(),
+                session, "anomaly_unified_demand", "DAY", window,
+                Collections.<StockWatchTechnicalAnalysis>emptyList(), demand);
+
+        assertNotNull(prompt);
+        assertTrue(prompt.contains("\"analysisDemand\""));
+        assertTrue(prompt.contains("\"triggerType\":\"ANOMALY_DEFERRED\""));
+        assertTrue(prompt.contains("\"quote_anomaly\""));
+        assertTrue(prompt.contains("\"mainInflow\":120000000"));
+    }
+
+    @Test
+    void demandPolicyVersionChangeIsRejectedBeforeProviderSubmission() {
+        StockWatchAnalysisPolicyService policyService = mock(StockWatchAnalysisPolicyService.class);
+        ReflectionTestUtils.setField(service, "analysisPolicyService", policyService);
+        StockWatchAnalysisDemand demand = new StockWatchAnalysisDemand();
+        demand.setSymbol("688017");
+        demand.setMarket("sh");
+        demand.setTriggerType("DAILY_CLOSE");
+        demand.setSourcePolicyVersion(7L);
+        StockWatchItem item = new StockWatchItem();
+        item.setEnabled(true);
+        item.setAnalysisMode("DAILY_CLOSE");
+        item.setAnalysisPolicyVersion(8L);
+        when(policyService.currentItem("688017", "sh")).thenReturn(item);
+
+        IllegalStateException error = assertThrows(IllegalStateException.class,
+                () -> ReflectionTestUtils.invokeMethod(service, "validateDemandPolicyStillCurrent", demand));
+
+        assertEquals("analysis_policy_version_changed", error.getMessage());
     }
 
     @Test
@@ -202,7 +295,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         StockWatchTechnicalAnalysisService localService = new StockWatchTechnicalAnalysisService(
                 marketDataService, mock(StockWatchPredictionService.class), mock(StockWatchListService.class),
                 sessionMapper, analysisMapper, taskService, projectionService, riskPatternService, factService,
-                mock(StockWatchV6RuntimeGate.class));
+                mock(StockWatchFactObservationMapper.class), mock(StockWatchV6RuntimeGate.class),
+                mock(StockWatchBridgeAdmissionService.class));
         ReflectionTestUtils.setField(localService, "tradingHoursOnly", false);
         ReflectionTestUtils.setField(localService, "contextLimitChars", 80_000);
 
@@ -254,7 +348,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertEquals("待创建", ((Map<?, ?>) result.get("session")).get("status"));
         org.mockito.Mockito.verify(taskService).findCanonical(
                 org.mockito.ArgumentMatchers.eq("002979"), org.mockito.ArgumentMatchers.eq("sz"),
-                org.mockito.ArgumentMatchers.eq("DAY"), org.mockito.ArgumentMatchers.startsWith("DAY:2026-07-17:"));
+                org.mockito.ArgumentMatchers.eq("DAY"), org.mockito.ArgumentMatchers.startsWith(
+                        "DAY:" + LocalDate.now(ZoneId.of("Asia/Shanghai")) + ":"));
         verifyNoInteractions(projectionService, sessionMapper);
         org.mockito.Mockito.verify(analysisMapper, org.mockito.Mockito.never())
                 .insert(org.mockito.ArgumentMatchers.any());
@@ -271,7 +366,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         StockWatchTechnicalAnalysisService localService = new StockWatchTechnicalAnalysisService(
                 marketDataService, mock(StockWatchPredictionService.class), mock(StockWatchListService.class),
                 sessionMapper, mock(StockWatchTechnicalAnalysisMapper.class), taskService, projectionService,
-                riskPatternService, factService, mock(StockWatchV6RuntimeGate.class));
+                riskPatternService, factService, mock(StockWatchFactObservationMapper.class),
+                mock(StockWatchV6RuntimeGate.class), mock(StockWatchBridgeAdmissionService.class));
         ReflectionTestUtils.setField(localService, "tradingHoursOnly", false);
 
         Map<String, Object> quote = new LinkedHashMap<>();
@@ -310,7 +406,8 @@ class StockWatchTechnicalAnalysisServiceTest {
                 mock(StockWatchListService.class), mock(StockWatchTechnicalSessionMapper.class), analysisMapper,
                 mock(StockWatchAnalysisTaskService.class), mock(StockWatchAnalysisProjectionService.class),
                 mock(StockWatchRiskPatternService.class), mock(StockWatchFactPersistenceService.class),
-                mock(StockWatchV6RuntimeGate.class));
+                mock(StockWatchFactObservationMapper.class), mock(StockWatchV6RuntimeGate.class),
+                mock(StockWatchBridgeAdmissionService.class));
         StockWatchAnalysisTask terminalTask = task(71L, "INVALID_RESPONSE", "digest-71");
         StockWatchTechnicalAnalysis existing = new StockWatchTechnicalAnalysis();
         existing.setId(701L);
@@ -336,7 +433,8 @@ class StockWatchTechnicalAnalysisServiceTest {
                 mock(StockWatchListService.class), mock(StockWatchTechnicalSessionMapper.class),
                 mock(StockWatchTechnicalAnalysisMapper.class), mock(StockWatchAnalysisTaskService.class),
                 mock(StockWatchAnalysisProjectionService.class), mock(StockWatchRiskPatternService.class),
-                mock(StockWatchFactPersistenceService.class), mock(StockWatchV6RuntimeGate.class));
+                mock(StockWatchFactPersistenceService.class), mock(StockWatchFactObservationMapper.class),
+                mock(StockWatchV6RuntimeGate.class), mock(StockWatchBridgeAdmissionService.class));
         StockWatchTechnicalSession session = new StockWatchTechnicalSession();
         session.setId(81L);
         String promptHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");

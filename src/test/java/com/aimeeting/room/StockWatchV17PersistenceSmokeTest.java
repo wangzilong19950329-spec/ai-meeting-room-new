@@ -1,5 +1,9 @@
 package com.aimeeting.room;
 
+import com.aimeeting.room.dao.StockWatchAlertDeliveryObligationMapper;
+import com.aimeeting.room.dao.StockWatchAnalysisDemandMapper;
+import com.aimeeting.room.entity.StockWatchAlertDeliveryObligation;
+import com.aimeeting.room.entity.StockWatchAnalysisDemand;
 import com.aimeeting.room.service.StockWatchAnalysisTaskService;
 import com.aimeeting.room.service.StockWatchAnalysisTaskService.Reservation;
 import com.aimeeting.room.service.StockWatchAnalysisProjectionService;
@@ -17,6 +21,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +38,7 @@ import com.aimeeting.room.entity.StockWatchTechnicalSession;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -48,6 +54,8 @@ class StockWatchV17PersistenceSmokeTest {
     @Autowired StockWatchAnalysisTaskService analysisTaskService;
     @Autowired StockWatchAnalysisProjectionService projectionService;
     @Autowired StockWatchTechnicalAnalysisMapper technicalAnalysisMapper;
+    @Autowired StockWatchAnalysisDemandMapper analysisDemandMapper;
+    @Autowired StockWatchAlertDeliveryObligationMapper alertDeliveryObligationMapper;
     @Autowired JdbcTemplate jdbcTemplate;
 
     @Test
@@ -242,6 +250,96 @@ class StockWatchV17PersistenceSmokeTest {
         assertTrue(terminal.isTerminalFailure());
         assertEquals(errorRecord.getId(), technicalAnalysisMapper.selectByAnalysisTaskId(
                 replay.getTask().getId()).getId());
+    }
+
+    @Test
+    void alertDemandAndDeliveryObligationStateFlowPersists() {
+        String unique = "smoke-alert-flow-" + System.nanoTime();
+        Date now = new Date();
+        Date before = Date.from(now.toInstant().minusSeconds(60));
+        Date after = Date.from(now.toInstant().plusSeconds(3600));
+
+        StockWatchAnalysisDemand demand = new StockWatchAnalysisDemand();
+        demand.setDemandKey(unique + "-demand");
+        demand.setSymbol("009990");
+        demand.setMarket("sz");
+        demand.setStockName("邮件补充测试股");
+        demand.setPeriodType("DAY");
+        demand.setTargetFactObservationId(901L);
+        demand.setTargetFactObservationKey(unique + "-fact");
+        demand.setTargetSourceTimeEpochMs(1_784_254_200_000L);
+        demand.setTradeDate(java.sql.Date.valueOf(LocalDate.of(2026, 7, 17)));
+        demand.setBusinessGeneration(1);
+        demand.setStatus("PENDING");
+        demand.setPriority(400);
+        demand.setNotBefore(before);
+        demand.setDeadlineAt(after);
+        demand.setRowVersion(0L);
+        assertEquals(1, analysisDemandMapper.insert(demand));
+        assertNotNull(demand.getId());
+        assertTrue(analysisDemandMapper.selectDispatchable(now, 100).stream()
+                .anyMatch(row -> demand.getId().equals(row.getId())));
+
+        assertEquals(1, analysisDemandMapper.claim(demand.getId(), 0L, unique + "-lease", after, now));
+        assertEquals(1, analysisDemandMapper.reserveProviderSubmission(demand.getId(), unique + "-lease"));
+        assertEquals(1, analysisDemandMapper.markSubmitted(demand.getId(), unique + "-lease", 991L));
+        assertEquals("SUBMITTED", analysisDemandMapper.selectById(demand.getId()).getStatus());
+
+        StockWatchAlertDeliveryObligation obligation = new StockWatchAlertDeliveryObligation();
+        obligation.setEventKey(unique + "-event");
+        obligation.setOpenEpisodeKey(unique + "-episode");
+        obligation.setConfigId(77L);
+        obligation.setRuleId("QUOTE_ANOMALY_V1");
+        obligation.setSymbol("009990");
+        obligation.setMarket("sz");
+        obligation.setStockName("邮件补充测试股");
+        obligation.setRecipientHash(unique + "-recipient");
+        obligation.setRecipientAddress("watch@example.com");
+        obligation.setSenderSnapshotJson("{\"type\":\"system\"}");
+        obligation.setTargetFactObservationId(901L);
+        obligation.setTargetFactObservationKey(unique + "-fact");
+        obligation.setTargetSourceTimeEpochMs(1_784_254_200_000L);
+        obligation.setTradeDate(java.sql.Date.valueOf(LocalDate.of(2026, 7, 17)));
+        obligation.setSignalFingerprint(unique + "-shape");
+        obligation.setAnalysisDemandId(demand.getId());
+        obligation.setDeadlineAt(after);
+        obligation.setInitialSubject("初始预警");
+        obligation.setInitialBody("同一行情事实的技术分析正在生成");
+        obligation.setInitialMessageId("initial-" + unique);
+        obligation.setInitialStatus("PENDING");
+        obligation.setSupplementMessageId("supplement-" + unique);
+        obligation.setSupplementStatus("WAITING_ANALYSIS");
+        obligation.setRowVersion(0L);
+        assertEquals(1, alertDeliveryObligationMapper.insert(obligation));
+        assertNotNull(obligation.getId());
+        assertTrue(alertDeliveryObligationMapper.selectInitialDispatchable(now, 100).stream()
+                .anyMatch(row -> obligation.getId().equals(row.getId())));
+
+        StockWatchAlertDeliveryObligation current = alertDeliveryObligationMapper.selectById(obligation.getId());
+        assertEquals(1, alertDeliveryObligationMapper.claimInitial(
+                current.getId(), current.getRowVersion(), unique + "-initial-lease", after, now));
+        assertEquals(1, alertDeliveryObligationMapper.markInitialSent(
+                current.getId(), unique + "-initial-lease", now, after));
+        assertEquals(1, alertDeliveryObligationMapper.hasDurableCooldown(
+                "QUOTE_ANOMALY_V1", "009990", "sz", unique + "-shape", now));
+
+        assertEquals(1, analysisDemandMapper.markSatisfied(demand.getId(), 991L, 992L));
+        assertEquals(1, alertDeliveryObligationMapper.selectWaitingByDemandId(demand.getId()).size());
+        assertEquals(1, alertDeliveryObligationMapper.markSupplementReady(
+                obligation.getId(), demand.getId(), 992L, "补充技术分析", "可信技术分析正文"));
+        assertTrue(alertDeliveryObligationMapper.selectSupplementDispatchable(now, 100).stream()
+                .anyMatch(row -> obligation.getId().equals(row.getId())));
+
+        current = alertDeliveryObligationMapper.selectById(obligation.getId());
+        assertEquals(1, alertDeliveryObligationMapper.claimSupplement(
+                current.getId(), current.getRowVersion(), unique + "-supplement-lease", after, now));
+        assertEquals(1, alertDeliveryObligationMapper.markSupplementSent(
+                current.getId(), unique + "-supplement-lease", now));
+
+        current = alertDeliveryObligationMapper.selectById(obligation.getId());
+        assertEquals("SENT", current.getInitialStatus());
+        assertEquals("SENT", current.getSupplementStatus());
+        assertEquals(992L, current.getSupplementAnalysisId());
     }
 
     @Test

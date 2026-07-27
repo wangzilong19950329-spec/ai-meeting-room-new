@@ -2,7 +2,9 @@ package com.aimeeting.room.service;
 
 import com.aimeeting.room.dao.StockWatchDeliveryConfigMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
+import com.aimeeting.room.entity.StockWatchAnalysisDemand;
 import com.aimeeting.room.entity.StockWatchDeliveryConfig;
+import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
@@ -27,9 +29,12 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
@@ -52,6 +57,9 @@ class StockWatchMonitorServiceTest {
     @Mock private StockWatchTechnicalAnalysisMapper technicalAnalysisMapper;
     @Mock private StockWatchRiskPatternService riskPatternService;
     @Mock private StockWatchFactPersistenceService factPersistenceService;
+    @Mock private StockWatchTechnicalContextService technicalContextService;
+    @Mock private StockWatchTechnicalEmailRenderer technicalEmailRenderer;
+    @Mock private StockWatchAlertDeliveryService alertDeliveryService;
 
     @TempDir private Path tempDir;
 
@@ -68,7 +76,10 @@ class StockWatchMonitorServiceTest {
                 marketDataService,
                 technicalAnalysisMapper,
                 riskPatternService,
-                factPersistenceService
+                factPersistenceService,
+                technicalContextService,
+                technicalEmailRenderer,
+                alertDeliveryService
         );
         ReflectionTestUtils.setField(service, "enabled", true);
         ReflectionTestUtils.setField(service, "notifyEnabled", true);
@@ -131,6 +142,8 @@ class StockWatchMonitorServiceTest {
 
         assertEquals("002979", evaluation.get("symbol"));
         assertEquals("sz", evaluation.get("market"));
+        assertNotNull(evaluation.get("riskPatternSummary"));
+        assertEquals(false, evaluation.get("triggered"));
         verify(riskPatternService).analyze(eq("002979"), eq("sz"), eq(quote), anyList(), any(ZonedDateTime.class));
         verify(factPersistenceService).observe(eq("002979"), eq("sz"), eq("雷赛智能"), eq(quote),
                 eq(riskPattern), any(ZonedDateTime.class));
@@ -616,15 +629,15 @@ class StockWatchMonitorServiceTest {
         when(aiJudgeService.judge(eq(rule), eq(quote), any(ZonedDateTime.class), anyMap()))
                 .thenReturn(decision(true));
         when(deliveryConfigMapper.selectBySymbolMarket("002979", "sz")).thenReturn(deliveryConfig(rule, "IMMEDIATE", 120));
-        when(notificationService.sendStockWatchAlertToRecipients(anyString(), anyString(), any(), any()))
-                .thenReturn(NotificationService.EmailSendResult.ok("msg-risk-delta"));
+        when(alertDeliveryService.createAndSend(any()))
+                .thenReturn(StockWatchAlertDeliveryService.DeliveryResult.sent("msg-risk-delta", 1));
 
         Map<?, ?> evaluation = runSingleAiEvaluation(rule, quote);
 
         assertTrue(Boolean.TRUE.equals(evaluation.get("notificationAttempted")));
         assertTrue(Boolean.TRUE.equals(evaluation.get("emailSent")));
         assertTrue(Boolean.TRUE.equals(evaluation.get("aiMaterialRiskDelta")));
-        verify(deliveryConfigMapper).updateDispatchStatus(eq(42L), eq("SENT"), anyString(), any());
+        verify(alertDeliveryService).createAndSend(any());
     }
 
     @Test
@@ -637,14 +650,150 @@ class StockWatchMonitorServiceTest {
         StockWatchDeliveryConfig config = deliveryConfig(rule, "INTERVAL", 30);
         config.setLastDispatchAt(new java.util.Date());
         when(deliveryConfigMapper.selectBySymbolMarket("002979", "sz")).thenReturn(config);
-        when(notificationService.sendStockWatchAlertToRecipients(anyString(), anyString(), any(), any()))
-                .thenReturn(NotificationService.EmailSendResult.ok("msg-interval"));
+        when(alertDeliveryService.createAndSend(any()))
+                .thenReturn(StockWatchAlertDeliveryService.DeliveryResult.sent("msg-interval", 1));
 
         Map<?, ?> evaluation = runSingleAiEvaluation(rule, quote);
 
         assertTrue(Boolean.TRUE.equals(evaluation.get("notificationAttempted")));
         assertTrue(Boolean.TRUE.equals(evaluation.get("emailSent")));
-        verify(deliveryConfigMapper).updateDispatchStatus(eq(42L), eq("SENT"), anyString(), any());
+        verify(alertDeliveryService).createAndSend(any());
+    }
+
+    @Test
+    void aiAlertEmailInlinesOnlyExactFactTechnicalAnalysis() {
+        AiWatchRule rule = notifyingRule("exact-inline-rule");
+        AiDecision decision = decision(true);
+        decision.setModel("deterministic-quote-anomaly-v1");
+        long targetSourceTime = ZonedDateTime.of(2026, 7, 17, 10, 30, 0, 0, CHINA_ZONE)
+                .toInstant().toEpochMilli();
+        Map<String, Object> event = aiEvent(rule, targetSourceTime);
+        StockWatchTechnicalAnalysis exact = technicalAnalysis(77L, "2026-07-17", "alert:fact-key-001", "同一事实分析");
+        when(technicalContextService.exactTrustedForSource("002979", "sz", targetSourceTime)).thenReturn(exact);
+        when(technicalEmailRenderer.render(eq(exact), eq("  同一行情事实可信技术分析")))
+                .thenReturn("\n  同一行情事实可信技术分析\n    exact-body\n");
+        when(deliveryConfigMapper.selectBySymbolMarket("002979", "sz"))
+                .thenReturn(deliveryConfig(rule, "IMMEDIATE", 120));
+        when(alertDeliveryService.createAndSend(any()))
+                .thenReturn(StockWatchAlertDeliveryService.DeliveryResult.sent("msg-exact", 1));
+
+        ReflectionTestUtils.invokeMethod(service, "sendAiTriggeredEmail", rule, decision, event,
+                ZonedDateTime.of(2026, 7, 17, 10, 31, 0, 0, CHINA_ZONE));
+
+        ArgumentCaptor<StockWatchAlertDeliveryService.AlertRequest> captor =
+                ArgumentCaptor.forClass(StockWatchAlertDeliveryService.AlertRequest.class);
+        verify(alertDeliveryService).createAndSend(captor.capture());
+        StockWatchAlertDeliveryService.AlertRequest request = captor.getValue();
+        assertEquals(77L, request.getInlineAnalysisId());
+        assertEquals(9001L, request.getTargetFactObservationId());
+        assertEquals("fact-key-001", request.getTargetFactObservationKey());
+        assertEquals(targetSourceTime, request.getTargetSourceTimeEpochMs());
+        assertTrue(request.getInitialBody().contains("同一行情事实可信技术分析"));
+        assertFalse(request.getInitialBody().contains("正在生成"));
+        verify(technicalContextService, never()).latestTrustedHistorical(anyString(), anyString(), anyLong());
+    }
+
+    @Test
+    void aiAlertEmailKeepsHistoricalContextButStillCreatesExactDemand() {
+        AiWatchRule rule = notifyingRule("history-context-rule");
+        AiDecision decision = decision(true);
+        decision.setModel("deterministic-quote-anomaly-v1");
+        decision.setAnalysis("Read timed out");
+        long targetSourceTime = ZonedDateTime.of(2026, 7, 17, 10, 30, 0, 0, CHINA_ZONE)
+                .toInstant().toEpochMilli();
+        Map<String, Object> event = aiEvent(rule, targetSourceTime);
+        event.put("analysis_demand_id", 321L);
+        StockWatchTechnicalAnalysis historical = technicalAnalysis(66L, "2026-07-17", "10:00", "上一轮分析");
+        when(technicalContextService.exactTrustedForSource("002979", "sz", targetSourceTime)).thenReturn(null);
+        when(technicalContextService.latestTrustedHistorical("002979", "sz", targetSourceTime)).thenReturn(historical);
+        when(technicalEmailRenderer.render(eq(historical), eq("  最近一次可信技术分析（仅作上下文）")))
+                .thenReturn("\n  最近一次可信技术分析（仅作上下文）\n    historical-body\n");
+        when(deliveryConfigMapper.selectBySymbolMarket("002979", "sz"))
+                .thenReturn(deliveryConfig(rule, "IMMEDIATE", 120));
+        when(alertDeliveryService.createAndSend(any()))
+                .thenReturn(StockWatchAlertDeliveryService.DeliveryResult.sent("msg-history", 1));
+
+        ReflectionTestUtils.invokeMethod(service, "sendAiTriggeredEmail", rule, decision, event,
+                ZonedDateTime.of(2026, 7, 17, 10, 31, 0, 0, CHINA_ZONE));
+
+        ArgumentCaptor<StockWatchAlertDeliveryService.AlertRequest> captor =
+                ArgumentCaptor.forClass(StockWatchAlertDeliveryService.AlertRequest.class);
+        verify(alertDeliveryService).createAndSend(captor.capture());
+        StockWatchAlertDeliveryService.AlertRequest request = captor.getValue();
+        assertNull(request.getInlineAnalysisId());
+        assertEquals(9001L, request.getTargetFactObservationId());
+        assertEquals("fact-key-001", request.getTargetFactObservationKey());
+        assertEquals(targetSourceTime, request.getTargetSourceTimeEpochMs());
+        assertEquals(321L, request.getAnalysisDemandId());
+        assertTrue(request.getInitialBody().contains("技术分析正在生成"));
+        assertTrue(request.getInitialBody().contains("最近一次可信技术分析（仅作上下文）"));
+        assertFalse(request.getInitialBody().contains("Read timed out"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void unifiedAnalysisDemandQueuesEvenWhenMailGateIsNotAttempted() {
+        AiWatchRule rule = notifyingRule("queued-demand-rule");
+        rule.setRequiredCapabilities(Collections.singletonList(StockWatchAiRuleService.CAPABILITY_QUOTE_ANOMALY_V1));
+        long targetSourceTime = ZonedDateTime.of(2026, 7, 17, 10, 30, 0, 0, CHINA_ZONE)
+                .toInstant().toEpochMilli();
+        Map<String, Object> event = aiEvent(rule, targetSourceTime);
+        event.put("triggered", true);
+        event.put("matched_signals", List.of("mainInflow=-7178万"));
+        event.put("trigger_evidence_policy", "deterministic");
+        event.put("trigger_evidence_gate_reason", "allowed");
+        StockWatchItem item = stockItem(rule);
+        StockWatchAnalysisDemand demand = new StockWatchAnalysisDemand();
+        demand.setId(909L);
+        demand.setDemandKey("demand-key-909");
+        demand.setTriggerType("ANOMALY_IMMEDIATE");
+        StockWatchAnalysisPolicyService policyService = org.mockito.Mockito.mock(StockWatchAnalysisPolicyService.class);
+        StockWatchAnalysisDemandService demandService = org.mockito.Mockito.mock(StockWatchAnalysisDemandService.class);
+        ReflectionTestUtils.setField(service, "analysisPolicyService", policyService);
+        ReflectionTestUtils.setField(service, "analysisDemandService", demandService);
+        ZonedDateTime now = ZonedDateTime.of(2026, 7, 17, 10, 31, 0, 0, CHINA_ZONE);
+        when(policyService.currentItem("002979", "sz")).thenReturn(item);
+        when(demandService.createAnomaly(eq(item), eq(9001L), eq("fact-key-001"), eq(targetSourceTime),
+                anyList(), anyMap(), eq(now))).thenReturn(demand);
+
+        ReflectionTestUtils.invokeMethod(service, "queueUnifiedAnalysisDemand", rule, event, now);
+
+        assertEquals("QUEUED", event.get("analysis_demand_status"));
+        assertEquals(909L, event.get("analysis_demand_id"));
+        assertEquals("demand-key-909", event.get("analysis_demand_key"));
+        ArgumentCaptor<List<String>> reasons = ArgumentCaptor.forClass(List.class);
+        verify(demandService).createAnomaly(eq(item), eq(9001L), eq("fact-key-001"), eq(targetSourceTime),
+                reasons.capture(), anyMap(), eq(now));
+        assertTrue(reasons.getValue().contains("AI_RULE_TRIGGERED"));
+        assertTrue(reasons.getValue().contains("mainInflow=-7178万"));
+        verify(alertDeliveryService, never()).createAndSend(any());
+    }
+
+    @Test
+    void aiAlertEmailRendersRiskPatternSummaryWhenComputed() {
+        AiWatchRule rule = notifyingRule("risk-summary-rule");
+        AiDecision decision = decision(true);
+        decision.setModel("deterministic-quote-anomaly-v1");
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("timestamp", "2026-07-17T10:31:00+08:00");
+        event.put("quote", quote(rule.getSymbol(), rule.getMarket(), rule.getName()));
+        event.put("ai_signal_shape_fingerprint", DEFAULT_SIGNAL_SHAPE);
+        event.put("riskPatternSummary", riskPatternSummary());
+        when(deliveryConfigMapper.selectBySymbolMarket("002979", "sz"))
+                .thenReturn(deliveryConfig(rule, "IMMEDIATE", 120));
+        when(alertDeliveryService.createAndSend(any()))
+                .thenReturn(StockWatchAlertDeliveryService.DeliveryResult.sent("msg-risk-summary", 1));
+
+        ReflectionTestUtils.invokeMethod(service, "sendAiTriggeredEmail", rule, decision, event,
+                ZonedDateTime.of(2026, 7, 17, 10, 31, 0, 0, CHINA_ZONE));
+
+        ArgumentCaptor<StockWatchAlertDeliveryService.AlertRequest> captor =
+                ArgumentCaptor.forClass(StockWatchAlertDeliveryService.AlertRequest.class);
+        verify(alertDeliveryService).createAndSend(captor.capture());
+        String body = captor.getValue().getInitialBody();
+        assertTrue(body.contains("价量风险结构识别（套路识别）"));
+        assertTrue(body.contains("R01 突破后未站稳风险"));
+        assertTrue(body.contains("L0 只识别可观察价量结构"));
     }
 
     @Test
@@ -694,6 +843,33 @@ class StockWatchMonitorServiceTest {
         return (Map<?, ?>) ((List<?>) result.get("evaluations")).get(0);
     }
 
+    private Map<String, Object> aiEvent(AiWatchRule rule, long targetSourceTime) {
+        Map<String, Object> event = new LinkedHashMap<>();
+        event.put("timestamp", "2026-07-17T10:31:00+08:00");
+        event.put("quote", quote(rule.getSymbol(), rule.getMarket(), rule.getName()));
+        event.put("target_fact_observation_id", 9001L);
+        event.put("target_fact_observation_key", "fact-key-001");
+        event.put("target_source_time_epoch_ms", targetSourceTime);
+        event.put("ai_signal_shape_fingerprint", DEFAULT_SIGNAL_SHAPE);
+        return event;
+    }
+
+    private Map<String, Object> riskPatternSummary() {
+        Map<String, Object> pattern = new LinkedHashMap<>();
+        pattern.put("patternId", "R01");
+        pattern.put("status", "triggered");
+        pattern.put("statusLabel", "命中");
+        pattern.put("riskStructureName", "突破后未站稳风险");
+        pattern.put("invalidatesWhen", "后续放量站稳突破位");
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("title", "价量风险结构识别（套路识别）");
+        summary.put("status", "ACTIVE");
+        summary.put("statusLabel", "有命中或关注结构");
+        summary.put("semanticBoundary", "L0 只识别可观察价量结构，不能证明操纵或真实主力身份。");
+        summary.put("patterns", Collections.singletonList(pattern));
+        return summary;
+    }
+
     private AiWatchRule notifyingRule(String id) {
         AiWatchRule rule = aiRule(id, "002979", "sz", "雷赛智能", "涨跌幅 changePercent 绝对值 >= 5 且 量比 volumeRatio >= 2");
         rule.setNotify(true);
@@ -711,6 +887,21 @@ class StockWatchMonitorServiceTest {
         config.setFrequencyType(frequencyType);
         config.setIntervalMinutes(intervalMinutes);
         return config;
+    }
+
+    private StockWatchItem stockItem(AiWatchRule rule) {
+        StockWatchItem item = new StockWatchItem();
+        item.setSymbol(rule.getSymbol());
+        item.setMarket(rule.getMarket());
+        item.setStockName(rule.getName());
+        item.setEnabled(true);
+        item.setAnalysisMode("INTERVAL");
+        item.setAnalysisIntervalMinutes(30);
+        item.setAnomalyTriggerMode("IMMEDIATE_ANALYSIS");
+        item.setWeeklyReviewEnabled(true);
+        item.setMonthlyReviewEnabled(true);
+        item.setAnalysisPolicyVersion(7L);
+        return item;
     }
 
     private void writeState(String json) throws Exception {

@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 public class StockWatchAiRuleService {
 
     public static final String CAPABILITY_GENERAL_LEGACY = "GENERAL_LEGACY";
+    public static final String CAPABILITY_QUOTE_ANOMALY_V1 = "QUOTE_ANOMALY_V1";
     public static final String CAPABILITY_L0_ADVISORY = "L0_ADVISORY";
     public static final String CAPABILITY_RISK_PATTERN_REQUIRED = "RISK_PATTERN_REQUIRED";
     public static final String TRIGGER_MODE_LEGACY_MODEL_RULE = "LEGACY_MODEL_RULE";
@@ -36,6 +37,7 @@ public class StockWatchAiRuleService {
     public static final String TRIGGER_MODE_REQUIRED = "REQUIRED";
     private static final List<String> ALLOWED_CAPABILITIES = Arrays.asList(
             CAPABILITY_GENERAL_LEGACY,
+            CAPABILITY_QUOTE_ANOMALY_V1,
             CAPABILITY_L0_ADVISORY,
             CAPABILITY_RISK_PATTERN_REQUIRED
     );
@@ -176,8 +178,28 @@ public class StockWatchAiRuleService {
         if (rule.getCooldownDays() == null || rule.getCooldownDays() < 0) {
             rule.setCooldownDays(1);
         }
+        if ((rule.getRequiredCapabilities() == null || rule.getRequiredCapabilities().isEmpty())
+                && isCanonicalQuoteAnomalyV1(rule.getConditionText())) {
+            rule.setRequiredCapabilities(new ArrayList<>(
+                    Collections.singletonList(CAPABILITY_QUOTE_ANOMALY_V1)));
+        }
         normalizeCapabilities(rule);
         return rule;
+    }
+
+    private boolean isCanonicalQuoteAnomalyV1(String conditionText) {
+        if (!StringUtils.hasText(conditionText)) return false;
+        String value = conditionText.toLowerCase(Locale.ROOT).replaceAll("\\s+", "");
+        return value.contains("仅基于quote结构化行情判断")
+                && value.contains("changepercent>=5")
+                && value.contains(">=9.5%")
+                && value.contains("<=-9.5%")
+                && value.contains("volumeratio>=2")
+                && value.contains("涨跌幅绝对值>=2")
+                && value.contains("maininflow绝对值>=100000000")
+                && value.contains("turnover>=5")
+                && value.contains("涨跌幅绝对值>=3")
+                && value.contains("满足任一条件");
     }
 
     private void normalizeCapabilities(AiWatchRule rule) {
@@ -372,6 +394,11 @@ public class StockWatchAiRuleService {
             return requiredCapabilities == null
                     || requiredCapabilities.isEmpty()
                     || requiredCapabilities.contains(CAPABILITY_GENERAL_LEGACY);
+        }
+
+        public boolean isQuoteAnomalyV1() {
+            return requiredCapabilities != null
+                    && requiredCapabilities.contains(CAPABILITY_QUOTE_ANOMALY_V1);
         }
 
         public boolean requiresRiskPattern() {

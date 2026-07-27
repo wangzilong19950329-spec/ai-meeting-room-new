@@ -343,6 +343,17 @@ const server = http.createServer(async (req, res) => {
       if (submissionKey) {
         const existing = requestLedger.lookup(submissionKey, requestDigest);
         if (sendLedgerResult(res, existing)) return;
+        const claim = requestLedger.begin(submissionKey, requestDigest, {
+          purpose: typeof parsed.purpose === 'string' ? parsed.purpose : null,
+          sessionKey: sessionKey || null,
+          accountKey: accountKey || null,
+          requestId
+        });
+        if (!claim.created) {
+          sendLedgerResult(res, claim);
+          return;
+        }
+        ledgerClaimed = true;
       }
       const closeTargetAfter = !sessionKey && isolatedSession && parsed.closeTargetAfter !== false;
       console.log(JSON.stringify({
@@ -357,6 +368,9 @@ const server = http.createServer(async (req, res) => {
       }));
       const available = await waitForFreeSlot();
       if (!available) {
+        if (ledgerClaimed) {
+          requestLedger.markFailedPreSubmit(submissionKey, requestDigest, 'bridge_queue_timeout');
+        }
         return sendJson(res, 429, { ok: false, error: 'bridge_busy', requestId });
       }
       slotAcquired = true;
@@ -376,18 +390,6 @@ const server = http.createServer(async (req, res) => {
         waitedMs: Date.now() - receivedAt
       }));
       await waitForCooldown();
-      if (submissionKey) {
-        const claim = requestLedger.begin(submissionKey, requestDigest, {
-          purpose: typeof parsed.purpose === 'string' ? parsed.purpose : null,
-          sessionKey: sessionKey || null,
-          accountKey: accountKey || null
-        });
-        if (!claim.created) {
-          sendLedgerResult(res, claim);
-          return;
-        }
-        ledgerClaimed = true;
-      }
       updateActiveRequest({ phase: 'prepare_target' });
       if (accountKey) {
         await prepareSharedTarget({ accountKey });
@@ -398,7 +400,21 @@ const server = http.createServer(async (req, res) => {
       const searchStartedAt = Date.now();
       // 给 searchQuery 加一个硬上限：超时立即返回错误，let finally 释放锁。
       const result = await Promise.race([
-        searchQuery(query, { isolatedSession, closeTargetAfter, sessionKey, forceNewSession, expectedJson, mode, accountKey }),
+        searchQuery(query, {
+          isolatedSession,
+          closeTargetAfter,
+          sessionKey,
+          forceNewSession,
+          expectedJson,
+          mode,
+          accountKey,
+          onSubmitting: ledgerClaimed
+            ? (metadata) => requestLedger.markSubmitting(submissionKey, requestDigest, metadata)
+            : null,
+          onSubmitted: ledgerClaimed
+            ? (metadata) => requestLedger.markSubmitted(submissionKey, requestDigest, metadata)
+            : null
+        }),
         new Promise((_, reject) => setTimeout(
           () => reject(new Error('searchQuery exceeded MAX_INFLIGHT_MS hard timeout')),
           MAX_INFLIGHT_MS
@@ -422,8 +438,15 @@ const server = http.createServer(async (req, res) => {
     } catch (error) {
       if (ledgerClaimed) {
         try {
-          requestLedger.markUnknown(submissionKey, requestDigest,
-            error && error.message ? error.message : String(error));
+          const current = requestLedger.lookup(submissionKey, requestDigest);
+          const reservationCount = Number(current.entry && current.entry.submitReservationCount || 0);
+          if (reservationCount === 0) {
+            requestLedger.markFailedPreSubmit(submissionKey, requestDigest,
+              error && error.message ? error.message : String(error));
+          } else {
+            requestLedger.markUnknown(submissionKey, requestDigest,
+              error && error.message ? error.message : String(error));
+          }
         } catch (ledgerError) {
           console.error(JSON.stringify({ ok: false, event: 'request_ledger_update_failed',
             submissionKey, message: ledgerError.message }));

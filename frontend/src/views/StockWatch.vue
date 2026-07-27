@@ -8,9 +8,10 @@
         </div>
       </div>
       <div class="header-actions">
-        <span class="status-chip success">L1 运行中</span>
+        <span v-if="demoModeActive" class="status-chip warning">演示数据</span>
+        <span :class="['status-chip', runtimeSchedulingTone]">{{ runtimeSchedulingLabel }}</span>
         <span class="status-chip neutral">{{ autoRefreshStatusLabel }}</span>
-        <span class="status-chip muted">LLM 关闭</span>
+        <span :class="['status-chip', runtimeProviderTone]">{{ runtimeProviderLabel }}</span>
         <button v-if="isDetail" class="plain-button back-button" type="button" @click="backToList">
           ← 返回列表
         </button>
@@ -64,6 +65,10 @@
         </div>
 
         <div class="watch-table">
+          <div v-if="filteredWatchlist.length === 0" class="empty-state">
+            <strong>暂无真实监控标的</strong>
+            <span>后端 watchlist 为空。添加股票后才会开始真实行情刷新。</span>
+          </div>
           <button
             v-for="stock in filteredWatchlist"
             :key="stock.symbol"
@@ -100,6 +105,7 @@
             <div class="refresh-cell">
               <strong>{{ stock.refresh.source }}</strong>
               <small>{{ stock.refresh.last }} → {{ stock.refresh.next }}</small>
+              <small class="analysis-cadence-line">{{ stockAnalysisCadenceLabel(stock) }}</small>
             </div>
           </button>
         </div>
@@ -149,6 +155,9 @@
               <i />
             </button>
           </article>
+          <article v-if="plugins.length === 0" class="plugin-empty-state">
+            暂无真实插件闸门配置。
+          </article>
         </section>
       </aside>
     </section>
@@ -177,57 +186,19 @@
       <main class="panel chart-panel">
         <div class="panel-bar">
           <div>
-            <p class="section-label">10-minute kline</p>
-            <h2>价格与关键位</h2>
+            <p class="section-label">intraday ohlc</p>
+            <h2>真实分钟行情</h2>
           </div>
-          <span class="source-badge">东方财富</span>
+          <span class="source-badge">{{ chartSourceLabel }}</span>
         </div>
 
         <div class="price-chart">
-          <svg viewBox="0 0 760 280" role="img" aria-label="10分钟价格趋势">
-            <defs>
-              <linearGradient id="watchArea" x1="0" x2="0" y1="0" y2="1">
-                <stop offset="0%" stop-color="#2563eb" stop-opacity=".18" />
-                <stop offset="100%" stop-color="#2563eb" stop-opacity="0" />
-              </linearGradient>
-            </defs>
-            <line x1="48" y1="44" x2="718" y2="44" class="grid-line" />
-            <line x1="48" y1="96" x2="718" y2="96" class="grid-line" />
-            <line x1="48" y1="148" x2="718" y2="148" class="grid-line" />
-            <line x1="48" y1="200" x2="718" y2="200" class="grid-line" />
-            <line x1="48" y1="226" x2="718" y2="226" class="axis-line" />
-            <polyline :points="priceAreaPoints" class="area-line" />
-            <polyline :points="priceChartPoints" :class="['price-line', marketMoveTone]" />
-            <line
-              v-for="line in selectedStock.technical.levels"
-              :key="line.label"
-              x1="48"
-              x2="718"
-              :y1="levelY(line.value)"
-              :y2="levelY(line.value)"
-              :class="line.type === 'support' ? 'support-line' : 'pressure-line'"
-            />
-            <text
-              v-for="line in selectedStock.technical.levels"
-              :key="`${line.label}-text`"
-              x="600"
-              :y="levelY(line.value) - 8"
-              class="level-text"
-            >
-              {{ line.label }} {{ line.value }}
-            </text>
-            <text x="48" y="260" class="axis-text">09:30</text>
-            <text x="348" y="260" class="axis-text">13:30</text>
-            <text x="678" y="260" class="axis-text">15:00</text>
-          </svg>
+          <IntradayBarChart v-if="chartState === 'VALID'" :bars="selectedIntradayBars" />
+          <BarUnavailableState v-else :state="chartState" :message="barUnavailableMessage" />
         </div>
 
         <div class="technical-grid">
-          <article v-for="item in technicalMetrics" :key="item.label" class="technical-tile">
-            <span>{{ item.label }}</span>
-            <strong :class="item.tone">{{ item.value }}</strong>
-            <small>{{ item.note }}</small>
-          </article>
+          <MetricCard v-for="item in technicalMetrics" :key="item.key" :metric="item" />
         </div>
       </main>
 
@@ -277,7 +248,7 @@
           <article>
             <span>最近执行</span>
             <strong>{{ selectedAnalysisSession.lastRun }}</strong>
-            <small>下一次 {{ selectedAnalysisSession.nextRun }}，失败会重试一次</small>
+            <small>{{ runtimeRetryLabel }}</small>
           </article>
           <article>
             <span>网页会话</span>
@@ -425,6 +396,32 @@
                   <span v-for="item in record.mainForceIntent.watchPoints" :key="item">{{ item }}</span>
                 </div>
               </div>
+              <div v-if="record.riskPatternSummary" class="analysis-risk-pattern">
+                <div>
+                  <strong>{{ record.riskPatternSummary.title }}</strong>
+                  <span>{{ record.riskPatternSummary.statusLabel }}</span>
+                </div>
+                <p v-if="record.riskPatternSummary.conclusionText" class="analysis-risk-pattern-conclusion">
+                  {{ record.riskPatternSummary.conclusionText }}
+                </p>
+                <p v-if="record.riskPatternSummary.valueText">
+                  {{ record.riskPatternSummary.valueText }}
+                </p>
+                <div v-if="record.riskPatternSummary.visiblePatterns.length" class="analysis-risk-pattern-tags">
+                  <div v-for="item in record.riskPatternSummary.visiblePatterns" :key="item.key">
+                    <span>{{ item.label }}</span>
+                    <small v-if="item.description">{{ item.description }}</small>
+                    <small v-if="item.invalidatesWhen">观察：{{ item.invalidatesWhen }}</small>
+                  </div>
+                </div>
+                <p v-if="record.riskPatternSummary.nextWatch" class="analysis-risk-pattern-note">
+                  下一步观察：{{ record.riskPatternSummary.nextWatch }}
+                </p>
+                <p v-if="record.riskPatternSummary.dataLimitText" class="analysis-risk-pattern-note">
+                  数据限制：{{ record.riskPatternSummary.dataLimitText }}
+                </p>
+                <p class="analysis-risk-pattern-boundary">{{ record.riskPatternSummary.semanticBoundary }}</p>
+              </div>
               <div class="analysis-evidence">
                 <span v-for="item in record.evidence" :key="item">{{ item }}</span>
               </div>
@@ -458,11 +455,23 @@
             </small>
           </div>
           <div class="config-actions">
-            <button class="plain-button" type="button" :disabled="deliveryLoading" @click="loadDeliveryConfig">
-              {{ deliveryLoading ? '刷新中' : '刷新配置' }}
+            <button
+              v-if="activeConfigSupportsPersistence"
+              class="plain-button"
+              type="button"
+              :disabled="activeConfigLoading"
+              @click="refreshActiveConfig"
+            >
+              {{ activeConfigRefreshLabel }}
             </button>
-            <button class="primary-button" type="button" :disabled="deliverySaving" @click="saveDeliveryConfig">
-              {{ deliverySaving ? '保存中' : '保存配置' }}
+            <button
+              v-if="activeConfigSupportsPersistence"
+              class="primary-button"
+              type="button"
+              :disabled="activeConfigSaving"
+              @click="saveActiveConfig"
+            >
+              {{ activeConfigSaveLabel }}
             </button>
           </div>
         </div>
@@ -483,6 +492,8 @@
 
         <div v-if="activeConfigTab === 'mail' && deliveryError" class="config-alert error">{{ deliveryError }}</div>
         <div v-else-if="activeConfigTab === 'mail' && deliveryNotice" class="config-alert success">{{ deliveryNotice }}</div>
+        <div v-if="activeConfigTab === 'llm' && analysisPolicyError" class="config-alert error">{{ analysisPolicyError }}</div>
+        <div v-else-if="activeConfigTab === 'llm' && analysisPolicyNotice" class="config-alert success">{{ analysisPolicyNotice }}</div>
 
         <div v-if="activeConfigTab === 'quote'" class="config-section">
           <div class="config-summary-grid">
@@ -581,13 +592,133 @@
           </template>
         </div>
 
-        <div v-else-if="activeConfigTab === 'llm'" class="config-section">
+        <div v-else-if="activeConfigTab === 'llm'" class="config-section llm-policy-section">
           <div class="config-summary-grid">
             <article>
               <span>分析节奏</span>
-              <strong>30 分钟</strong>
-              <small>DeepSeek 网页 provider；每只股票独立会话</small>
+              <strong>{{ selectedAnalysisCadenceLabel }}</strong>
+              <small>{{ selectedAnalysisPolicySubtitle }}</small>
             </article>
+            <article>
+              <span>异动升级</span>
+              <strong>{{ selectedAnomalyTriggerLabel }}</strong>
+              <small>命中后由统一分析需求决定是否调用 DeepSeek</small>
+            </article>
+            <article>
+              <span>下次计划</span>
+              <strong>{{ formatPolicyTime(selectedAnalysisSchedule.nextDueAt) }}</strong>
+              <small>{{ selectedAnalysisSchedule.reason || selectedAnalysisSchedule.requestedCadence }}</small>
+            </article>
+          </div>
+
+          <section class="analysis-policy-editor">
+            <div class="analysis-policy-head">
+              <div>
+                <p class="section-label">analysis policy</p>
+                <h3>单股 DeepSeek 分析策略</h3>
+                <small>技术面分析与结构化异动解读共用同一条分析需求；邮件只是最后通知出口，不再决定是否分析。</small>
+              </div>
+              <span class="policy-version-chip" :class="{ draft: !selectedAnalysisPolicyPersisted }">
+                {{ analysisPolicyVersionLabel }}
+              </span>
+            </div>
+
+            <div v-if="!selectedAnalysisPolicyPersisted" class="policy-boundary-note policy-draft-note">
+              <span>未启用自动分析</span>
+              <p>
+                当前股票还没有后端分析策略记录。下面只是待保存草案；只有点击“加入并保存策略”后，才会创建后端监控项并进入自动调度候选。
+              </p>
+            </div>
+
+            <div class="policy-mode-grid">
+              <button
+                v-for="option in ANALYSIS_MODE_OPTIONS"
+                :key="option.value"
+                type="button"
+                :class="{ active: analysisPolicyForm.mode === option.value }"
+                @click="setAnalysisMode(option.value)"
+              >
+                <strong>{{ option.label }}</strong>
+                <small>{{ option.desc }}</small>
+              </button>
+            </div>
+
+            <div class="policy-form-grid">
+              <label class="policy-field">
+                <span>自定义间隔（分钟）</span>
+                <input
+                  v-model.number="analysisPolicyForm.intervalMinutes"
+                  type="number"
+                  min="10"
+                  max="1440"
+                  step="10"
+                  :disabled="analysisPolicyForm.mode !== 'INTERVAL'"
+                  @change="clampAnalysisInterval"
+                />
+                <small>支持 10 到 1440 分钟。非 INTERVAL 模式下服务端会忽略该值。</small>
+              </label>
+
+              <div class="interval-preset-row" :class="{ disabled: analysisPolicyForm.mode !== 'INTERVAL' }">
+                <button
+                  v-for="minutes in ANALYSIS_INTERVAL_PRESETS"
+                  :key="minutes"
+                  type="button"
+                  :disabled="analysisPolicyForm.mode !== 'INTERVAL'"
+                  :class="{ active: analysisPolicyForm.intervalMinutes === minutes }"
+                  @click="setAnalysisInterval(minutes)"
+                >
+                  {{ intervalPresetLabel(minutes) }}
+                </button>
+              </div>
+
+              <label class="policy-field policy-field-wide">
+                <span>异动命中后的处理</span>
+                <select v-model="analysisPolicyForm.anomalyTriggerMode" :disabled="analysisPolicyForm.mode === 'PAUSED'">
+                  <option
+                    v-for="option in ANALYSIS_ANOMALY_TRIGGER_OPTIONS"
+                    :key="option.value"
+                    :value="option.value"
+                  >
+                    {{ option.label }}
+                  </option>
+                </select>
+                <small>{{ anomalyTriggerDescription(analysisPolicyForm.anomalyTriggerMode) }}</small>
+              </label>
+
+              <label :class="['policy-check-card', { disabled: !analysisReviewTogglesEnabled }]">
+                <input
+                  v-model="analysisPolicyForm.weeklyReviewEnabled"
+                  type="checkbox"
+                  :disabled="!analysisReviewTogglesEnabled"
+                />
+                <span>
+                  <strong>保留周复盘</strong>
+                  <small>周度复盘仍可作为低频上下文补充，不受日内间隔影响。</small>
+                </span>
+              </label>
+
+              <label :class="['policy-check-card', { disabled: !analysisReviewTogglesEnabled }]">
+                <input
+                  v-model="analysisPolicyForm.monthlyReviewEnabled"
+                  type="checkbox"
+                  :disabled="!analysisReviewTogglesEnabled"
+                />
+                <span>
+                  <strong>保留月复盘</strong>
+                  <small>月末统一复盘长期趋势；暂停/仅异动模式下关闭。</small>
+                </span>
+              </label>
+            </div>
+
+            <div class="policy-boundary-note">
+              <span>运行边界</span>
+              <p>
+                保存后只影响自动需求创建；已经提交到 DeepSeek 的任务不回滚。若服务端策略版本已变化，保存会被 409 拒绝，需刷新后重试。
+              </p>
+            </div>
+          </section>
+
+          <div class="config-summary-grid analysis-session-grid">
             <article>
               <span>会话状态</span>
               <strong>{{ selectedAnalysisSession.status }}</strong>
@@ -597,6 +728,11 @@
               <span>上下文轮换</span>
               <strong>{{ selectedAnalysisSession.contextUsage }}%</strong>
               <small>{{ selectedAnalysisSession.rotatePolicy }}</small>
+            </article>
+            <article>
+              <span>容量状态</span>
+              <strong>{{ selectedAnalysisSchedule.capacityStatus }}</strong>
+              <small>{{ selectedAnalysisSchedule.currentSlotKey || '当前无固定 slot' }}</small>
             </article>
           </div>
 
@@ -1371,6 +1507,11 @@
 <script setup>
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { createHttp } from '@/api/http'
+import IntradayBarChart from '@/modules/stock-watch/components/IntradayBarChart.vue'
+import BarUnavailableState from '@/modules/stock-watch/components/BarUnavailableState.vue'
+import MetricCard from '@/modules/stock-watch/components/MetricCard.vue'
+import { loadDemoState } from '@/modules/stock-watch/runtime/demoMode'
+import { useStockWatchRuntimeStatus } from '@/modules/stock-watch/composables/useStockWatchRuntimeStatus'
 
 const CUSTOM_WATCHLIST_KEY = 'stock-watch.custom-watchlist.v1'
 const CUSTOM_OBSERVATIONS_KEY = 'stock-watch.custom-observations.v1'
@@ -1383,11 +1524,52 @@ const ANALYSIS_PERIOD_TABS = [
   { label: '周度', value: 'WEEK', desc: '周五', runtime: '固定周五收盘后生成周复盘', windowLabel: '最近 12 周' },
   { label: '月度', value: 'MONTH', desc: '月末', runtime: '固定月末最后交易日生成月复盘', windowLabel: '最近 12 月' }
 ]
+const ANALYSIS_INTERVAL_PRESETS = [10, 30, 60, 120, 1440]
+const ANALYSIS_MODE_OPTIONS = [
+  {
+    label: '自定义间隔',
+    value: 'INTERVAL',
+    desc: '按分钟级 slot 生成统一 DeepSeek 分析需求'
+  },
+  {
+    label: '每日收盘',
+    value: 'DAILY_CLOSE',
+    desc: '收盘后只分析一次，适合非重点监控'
+  },
+  {
+    label: '仅异动触发',
+    value: 'ON_ANOMALY',
+    desc: '平时不跑定时分析，命中异动再分析'
+  },
+  {
+    label: '暂停',
+    value: 'PAUSED',
+    desc: '不自动分析，仅保留手动入口'
+  }
+]
+const ANALYSIS_ANOMALY_TRIGGER_OPTIONS = [
+  {
+    label: '立即统一分析',
+    value: 'IMMEDIATE_ANALYSIS',
+    desc: '异动命中后立即排队，技术面和异动含义一起交给 DeepSeek'
+  },
+  {
+    label: '延后到下一计划',
+    value: 'DEFER_TO_NEXT_SCHEDULE',
+    desc: '异动先记账，复用下一次计划分析窗口'
+  },
+  {
+    label: '只提醒不分析',
+    value: 'ALERT_ONLY',
+    desc: '只保留异动提醒，不额外启动 DeepSeek'
+  }
+]
 const stockWatchHttp = createHttp(20000)
 const technicalAnalysisHttp = createHttp(360000)
+const { status: runtimeStatus, error: runtimeStatusError, refresh: refreshRuntimeStatus } = useStockWatchRuntimeStatus()
 
 const viewMode = ref('list')
-const selectedSymbol = ref('688017')
+const selectedSymbol = ref('')
 const activeFilter = ref('all')
 const activeGroupFilter = ref('all')
 const selectedAnalysisDate = ref(analysisDateKey(new Date()))
@@ -1427,10 +1609,17 @@ const deliveryError = ref('')
 const deliveryNotice = ref('')
 const deliveryPreview = ref([])
 const deliveryStats = ref({ PENDING: 0, SENT: 0, FAILED: 0 })
+const analysisPolicyLoading = ref(false)
+const analysisPolicySaving = ref(false)
+const analysisPolicyError = ref('')
+const analysisPolicyNotice = ref('')
 const quoteRefreshing = ref(false)
 const quoteError = ref('')
 const quoteLastRefresh = ref('')
 const quoteRefreshMode = ref('manual')
+const loadingBars = ref(false)
+const barError = ref('')
+const demoModeActive = ref(false)
 const autoRefreshTimer = ref(null)
 const aiRules = ref([])
 const fcCards = ref([])
@@ -1513,6 +1702,16 @@ const deliveryForm = reactive({
   activeFrom: ''
 })
 
+const analysisPolicyForm = reactive({
+  mode: 'INTERVAL',
+  intervalMinutes: 30,
+  anomalyTriggerMode: 'IMMEDIATE_ANALYSIS',
+  weeklyReviewEnabled: true,
+  monthlyReviewEnabled: true,
+  version: 0,
+  modifiedAt: ''
+})
+
 const deletedEventIds = new Set()
 
 const severityTabs = [
@@ -1548,296 +1747,20 @@ const deliveryToneOptions = [
   { label: '风险', value: 'red' }
 ]
 
-const watchlist = reactive([
-  {
-    symbol: '688017',
-    name: '绿的谐波',
-    market: 'sh',
-    image: '',
-    price: '258.00',
-    change: 1.84,
-    status: '机会观察',
-    severity: 'opportunity',
-    refresh: {
-      source: '东方财富',
-      endpoint: 'quote + kline 10m',
-      last: '13:30',
-      next: '13:40'
-    },
-    priceSeries: [251.4, 252.8, 255.2, 254.1, 257.6, 259.2, 258.0, 260.1, 258.7],
-    technical: {
-      open: '254.20',
-      high: '261.30',
-      low: '250.80',
-      volume: '8.42亿',
-      ma5: '256.4',
-      ma10: '259.8',
-      ma20: '272.1',
-      rsi: '54.6',
-      macd: '-0.18',
-      vwap: '257.2',
-      vwapDeviation: '+0.31%',
-      volumeRatio: '1.28',
-      turnover: '2.6%',
-      atr: '4.1%',
-      bollWidth: '9.8%',
-      bias20: '-5.2%',
-      obvTrend: '转强',
-      rsRank: '68/100',
-      sectorStrength: '+1.6%',
-      mainInflow: '+1.1亿',
-      levels: [
-        { label: '压力', value: 287, type: 'pressure' },
-        { label: '支撑', value: 250, type: 'support' }
-      ]
-    },
-    rules: [],
-    sources: [
-      { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 10 分钟刷新', ok: true },
-      { name: 'Eastmoney kline', desc: '10 分钟 K 线，用于价格技术图', ok: true },
-      { name: 'AkShare fund_flow', desc: '主力净流入，字段容错匹配', ok: true }
-    ],
-    rawData: {
-      price: 258,
-      change_pct: 1.84,
-      net_inflow_3d: ['3.2e8', '1.1e8', '0.8e8'],
-      support_287_held: true
-    }
-  },
-  {
-    symbol: '300760',
-    name: '迈瑞医疗',
-    market: 'sz',
-    image: '',
-    price: '158.42',
-    change: -0.36,
-    status: '等待财报',
-    severity: 'info',
-    refresh: {
-      source: '东方财富',
-      endpoint: 'quote + financial',
-      last: '13:20',
-      next: '13:40'
-    },
-    priceSeries: [160.1, 159.8, 159.4, 158.9, 158.4, 158.8, 158.2, 158.6, 158.42],
-    technical: {
-      open: '159.10',
-      high: '160.80',
-      low: '157.90',
-      volume: '4.18亿',
-      ma5: '158.9',
-      ma10: '161.2',
-      ma20: '166.8',
-      rsi: '42.3',
-      macd: '-0.42',
-      vwap: '158.8',
-      vwapDeviation: '-0.24%',
-      volumeRatio: '0.86',
-      turnover: '0.8%',
-      atr: '2.3%',
-      bollWidth: '6.2%',
-      bias20: '-5.0%',
-      obvTrend: '走弱',
-      rsRank: '42/100',
-      sectorStrength: '-0.4%',
-      mainInflow: '-0.3亿',
-      levels: [
-        { label: '压力', value: 170, type: 'pressure' },
-        { label: '支撑', value: 155, type: 'support' }
-      ]
-    },
-    rules: [],
-    sources: [
-      { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 10 分钟刷新', ok: true },
-      { name: 'Financial abstract', desc: '季度财务摘要，不跟随高频轮询', ok: true },
-      { name: 'AkShare retry', desc: '字段名漂移，打印实际列名', ok: false }
-    ],
-    rawData: {
-      price: 158.42,
-      change_pct: -0.36,
-      data_source: 'stock_financial_abstract',
-      cadence: 'quarterly'
-    }
-  },
-  {
-    symbol: '002594',
-    name: '比亚迪',
-    market: 'sz',
-    image: '',
-    price: '214.76',
-    change: 0.52,
-    status: '利润验证',
-    severity: 'warning',
-    refresh: {
-      source: '东方财富',
-      endpoint: 'quote + kline 10m',
-      last: '13:30',
-      next: '13:40'
-    },
-    priceSeries: [210.8, 211.4, 212.0, 211.6, 213.2, 214.1, 214.8, 215.2, 214.76],
-    technical: {
-      open: '212.30',
-      high: '216.10',
-      low: '210.20',
-      volume: '16.7亿',
-      ma5: '213.8',
-      ma10: '211.9',
-      ma20: '208.4',
-      rsi: '61.2',
-      macd: '+0.31',
-      vwap: '213.9',
-      vwapDeviation: '+0.40%',
-      volumeRatio: '1.12',
-      turnover: '1.4%',
-      atr: '3.0%',
-      bollWidth: '7.4%',
-      bias20: '+3.1%',
-      obvTrend: '温和转强',
-      rsRank: '57/100',
-      sectorStrength: '+0.5%',
-      mainInflow: '+0.7亿',
-      levels: [
-        { label: '压力', value: 225, type: 'pressure' },
-        { label: '支撑', value: 205, type: 'support' }
-      ]
-    },
-    rules: [],
-    sources: [
-      { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 10 分钟刷新', ok: true },
-      { name: 'Eastmoney kline', desc: '10 分钟 K 线，用于价格技术图', ok: true },
-      { name: 'Benefit THS', desc: '利润表明细，季度任务', ok: true }
-    ],
-    rawData: {
-      price: 214.76,
-      change_pct: 0.52,
-      data_source: 'stock_financial_benefit_ths',
-      cadence: 'quarterly'
-    }
-  },
-  {
-    symbol: '600378',
-    name: '昊华科技',
-    market: 'sh',
-    image: '',
-    price: '63.89',
-    change: 10.0,
-    status: '异动监控',
-    severity: 'risk',
-    refresh: {
-      source: '东方财富',
-      endpoint: 'quote + ai-rule',
-      last: '13:30',
-      next: '14:00'
-    },
-    priceSeries: [58.08, 61.0, 63.89, 63.89, 63.89, 63.89, 63.89, 63.89, 63.89],
-    technical: {
-      open: '63.89',
-      high: '63.89',
-      low: '61.00',
-      volume: '48.43亿',
-      ma5: '待刷新',
-      ma10: '待刷新',
-      ma20: '待刷新',
-      rsi: '待刷新',
-      macd: '待刷新',
-      vwap: '待刷新',
-      vwapDeviation: '待刷新',
-      volumeRatio: '1.54',
-      turnover: '7.13%',
-      atr: '待刷新',
-      bollWidth: '待刷新',
-      bias20: '待刷新',
-      obvTrend: '待判定',
-      rsRank: '待刷新',
-      sectorStrength: '待刷新',
-      mainInflow: '-2.33亿',
-      levels: [
-        { label: '涨停', value: 63.89, type: 'pressure' },
-        { label: '昨收', value: 58.08, type: 'support' }
-      ]
-    },
-    rules: [],
-    sources: [
-      { name: 'Eastmoney quote', desc: '最新价 / 涨跌幅 / 成交额，交易时段 30 分钟刷新', ok: true },
-      { name: 'AI watch rule', desc: 'DeepSeek 仅基于结构化行情判断是否触发异动邮件', ok: true },
-      { name: 'Notification email', desc: '触发后发送到已配置邮箱，按规则冷却去重', ok: true }
-    ],
-    rawData: {
-      price: 63.89,
-      change_pct: 10.0,
-      turnover: 7.13,
-      volume_ratio: 1.54,
-      main_inflow: '-2.33e8'
-    }
-  }
-])
-
-const events = reactive([
-  {
-    eventId: 'lvde_20260604_A',
-    symbol: '688017',
-    stockName: '绿的谐波',
-    time: '13:30',
-    source: 'watcher.py',
-    severity: 'opportunity',
-    title: '价格回踩 + 主力净流入转正',
-    desc: 'price=258.0，inflow 已连续 2 日转正，等待第 3 日确认。'
-  },
-  {
-    eventId: 'lvde_20260604_BREAK_287',
-    symbol: '688017',
-    stockName: '绿的谐波',
-    time: '13:30',
-    source: 'watcher.py',
-    severity: 'risk',
-    title: '287 支撑失守预警',
-    desc: 'break_days 当前 3/5，尚未触发插件分析。'
-  },
-  {
-    eventId: 'mindray_20260606_quote',
-    symbol: '300760',
-    stockName: '迈瑞医疗',
-    time: '13:20',
-    source: 'eastmoney quote',
-    severity: 'info',
-    title: '东方财富行情快照刷新',
-    desc: 'latest=158.42，change=-0.36%，等待 Q2 财务摘要确认。'
-  },
-  {
-    eventId: 'byd_20260606_profit_check',
-    symbol: '002594',
-    stockName: '比亚迪',
-    time: '13:30',
-    source: 'dispatcher.py',
-    severity: 'warning',
-    title: '价格回升但仍等待利润验证',
-    desc: 'latest=214.76，change=+0.52%，Q2 经营利润字段待季度任务确认。'
-  },
-  {
-    eventId: 'system_retry_akshare',
-    symbol: null,
-    stockName: '',
-    time: '13:31',
-    source: 'dispatcher/logger',
-    severity: 'info',
-    title: 'AkShare 字段容错重试',
-    desc: '字段名漂移时打印实际列名，2-3 次 retry 后降级记录。'
-  }
-])
-
-const plugins = reactive([
-  { name: 'logger', desc: '默认开启，只存档事件', enabled: true },
-  { name: 'notify', desc: '默认关闭，邮件/企业微信/Server 酱', enabled: false },
-  { name: 'analysis', desc: '默认关闭，auto=false 二次确认', enabled: false }
-])
+const watchlist = reactive([])
+const events = reactive([])
+const plugins = reactive([])
+const emptyStock = createEmptyStock()
 
 onMounted(async () => {
-  await loadSavedStocks()
-  loadDeletedEvents()
-  loadSavedObservations()
-  loadAiRules()
-  refreshQuotes('页面打开')
-  startAutoQuoteRefresh()
+  const demoState = await loadDemoState()
+  if (demoState) {
+    demoModeActive.value = true
+    applyPageState(demoState)
+  } else {
+    await loadRealStockWatchState()
+  }
+  await refreshRuntimeForSelectedStock()
 })
 
 onUnmounted(() => {
@@ -1861,12 +1784,20 @@ watch(
     externalEvidence.value = null
     externalEvidenceError.value = ''
     externalEvidenceNotice.value = ''
+    analysisPolicyError.value = ''
+    analysisPolicyNotice.value = ''
+    syncAnalysisPolicyForm()
     if (viewMode.value === 'detail') {
+      loadIntradayBars()
+      refreshRuntimeForSelectedStock()
       loadDeliveryConfig()
       loadFcCards()
       loadPredictionHistory()
       if (activeConfigTab.value === 'external') {
         loadExternalEvidence(false)
+      }
+      if (activeConfigTab.value === 'llm') {
+        loadAnalysisPolicy(false)
       }
     }
   }
@@ -1878,18 +1809,35 @@ watch(
     if (viewMode.value === 'detail' && tab === 'external' && !externalEvidence.value) {
       loadExternalEvidence(false)
     }
+    if (viewMode.value === 'detail' && tab === 'llm') {
+      loadAnalysisPolicy(false)
+    }
   }
 )
 
 const isDetail = computed(() => viewMode.value === 'detail')
-const selectedStock = computed(() => watchlist.find((item) => item.symbol === selectedSymbol.value) || watchlist[0])
+const selectedStock = computed(() => watchlist.find((item) => item.symbol === selectedSymbol.value) || watchlist[0] || emptyStock)
+const selectedAnalysisPolicy = computed(() => normalizeAnalysisPolicyPayload(selectedStock.value?.analysisPolicy))
+const selectedAnalysisSchedule = computed(() => normalizeAnalysisSchedulePayload(selectedStock.value?.analysisSchedule))
+const selectedAnalysisPolicyPersisted = computed(() => hasPersistedAnalysisPolicy(selectedStock.value))
+const selectedAnalysisCadenceLabel = computed(() => stockAnalysisCadenceLabel(selectedStock.value))
+const selectedAnomalyTriggerLabel = computed(() => stockAnomalyTriggerLabel(selectedStock.value))
+const selectedAnalysisPolicySubtitle = computed(() => analysisPolicySubtitle(selectedAnalysisPolicy.value, selectedAnalysisPolicyPersisted.value))
+const analysisPolicyVersionLabel = computed(() => (
+  selectedAnalysisPolicyPersisted.value
+    ? `v${analysisPolicyForm.version} · ${formatPolicyTime(analysisPolicyForm.modifiedAt)}`
+    : '未保存 · 草案'
+))
+const analysisReviewTogglesEnabled = computed(() => (
+  analysisPolicyForm.mode === 'INTERVAL' || analysisPolicyForm.mode === 'DAILY_CLOSE'
+))
 const analysisPeriodTabs = ANALYSIS_PERIOD_TABS
 const selectedAnalysisPeriodTab = computed(() => (
   analysisPeriodTabs.find((tab) => tab.value === selectedAnalysisPeriodType.value) || analysisPeriodTabs[0]
 ))
 const selectedEvents = computed(() => (
   events
-    .filter((event) => event.symbol === selectedStock.value.symbol)
+    .filter((event) => event.symbol && event.symbol === selectedStock.value.symbol)
     .slice()
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
 ))
@@ -2004,6 +1952,27 @@ const deliveryFrequencyLabel = computed(() => {
   }
   return '仅手动发送'
 })
+const activeConfigSupportsPersistence = computed(() => ['llm', 'mail'].includes(activeConfigTab.value))
+const activeConfigLoading = computed(() => {
+  if (activeConfigTab.value === 'llm') return analysisPolicyLoading.value
+  if (activeConfigTab.value === 'mail') return deliveryLoading.value
+  return false
+})
+const activeConfigSaving = computed(() => {
+  if (activeConfigTab.value === 'llm') return analysisPolicySaving.value
+  if (activeConfigTab.value === 'mail') return deliverySaving.value
+  return false
+})
+const activeConfigRefreshLabel = computed(() => {
+  if (activeConfigLoading.value) return '刷新中'
+  if (activeConfigTab.value === 'llm') return '刷新策略'
+  return '刷新配置'
+})
+const activeConfigSaveLabel = computed(() => {
+  if (activeConfigSaving.value) return '保存中'
+  if (activeConfigTab.value === 'llm') return selectedAnalysisPolicyPersisted.value ? '保存策略' : '加入并保存策略'
+  return '保存配置'
+})
 const deliveryTriggerSummary = computed(() => {
   const parts = []
   if (deliveryForm.tones.length) parts.push(deliveryForm.tones.join('/'))
@@ -2028,8 +1997,76 @@ const autoRefreshStatusLabel = computed(() => (
   isTradingSessionNow() ? '10m 自动刷新' : '非交易时段手动'
 ))
 
+const runtimeSchedulingLabel = computed(() => {
+  if (runtimeStatusError.value) return '运行状态未知'
+  if (runtimeStatus.value?.status === 'DEGRADED') return '运行状态降级'
+  if (runtimeStatus.value?.analysisRunning) return '分析运行中'
+  if (runtimeStatus.value?.schedulingEnabled) return `调度 ${runtimeStatus.value.analysisMode || '已启用'}`
+  return '调度未启用'
+})
+const runtimeSchedulingTone = computed(() => {
+  if (runtimeStatusError.value) return 'muted'
+  if (runtimeStatus.value?.status === 'DEGRADED') return 'warning'
+  if (runtimeStatus.value?.analysisRunning || runtimeStatus.value?.schedulingEnabled) return 'success'
+  return 'muted'
+})
+const runtimeProviderLabel = computed(() => {
+  if (demoModeActive.value) return 'Demo 模式'
+  if (runtimeStatusError.value) return 'Provider 未知'
+  return runtimeStatus.value?.providerVersionState === 'CONFIGURED'
+    ? `${runtimeStatus.value.provider || 'Provider'} 已配置`
+    : 'Provider 未配置'
+})
+const runtimeProviderTone = computed(() => (
+  runtimeStatus.value?.providerVersionState === 'CONFIGURED' ? 'neutral' : 'muted'
+))
+const runtimeRetryLabel = computed(() => {
+  const policy = runtimeStatus.value?.retryPolicy
+  if (!policy) return `下一次 ${selectedAnalysisSession.value.nextRun}`
+  if (policy.status === 'UNKNOWN' || policy.retryable == null) return '重试状态不可判定'
+  if (!policy.retryable) return `下一次 ${runtimeStatus.value?.nextDueAt ? formatPolicyTime(runtimeStatus.value.nextDueAt) : selectedAnalysisSession.value.nextRun}，当前无待重试任务`
+  if (policy.maxAttempts == null) return `已提交 ${policy.currentAttempt || 0} 次；下次重试：${formatPolicyTime(policy.nextRetryAt)}`
+  return `第 ${policy.currentAttempt || 0} / ${policy.maxAttempts || 0} 次；下次重试：${formatPolicyTime(policy.nextRetryAt)}`
+})
+const selectedIntradayBars = computed(() => (
+  Array.isArray(selectedStock.value.intradayBars) ? selectedStock.value.intradayBars : []
+))
+const chartState = computed(() => {
+  if (loadingBars.value) return 'LOADING'
+  if (barError.value) return 'ERROR'
+  const sourceStatus = String(selectedStock.value.intradayBarStatus?.status || '').toUpperCase()
+  if (sourceStatus === 'SOURCE_ERROR') return 'ERROR'
+  if (sourceStatus === 'EMPTY') return 'EMPTY'
+  if (selectedIntradayBars.value.length === 0) return 'UNAVAILABLE'
+  if (sourceStatus === 'DEGRADED') return 'DEGRADED'
+  if (sourceStatus === 'INVALID') return 'INVALID'
+  if (selectedIntradayBars.value.some((bar) => bar.qualityStatus === 'INVALID')) return 'INVALID'
+  return 'VALID'
+})
+const barUnavailableMessage = computed(() => {
+  if (barError.value) return barError.value
+  const status = selectedStock.value.intradayBarStatus || {}
+  const summary = status.qualitySummary || {}
+  if (status.reason) return status.reason
+  if (chartState.value === 'INVALID' || chartState.value === 'DEGRADED') {
+    return `行情质量未通过校验：有效 ${summary.validBars || 0} / 总计 ${summary.totalBars || 0}`
+  }
+  return '尚未获取真实分钟行情'
+})
+const chartSourceLabel = computed(() => {
+  if (demoModeActive.value) return '演示 OHLC'
+  if (chartState.value === 'VALID') return '东方财富分钟行情'
+  const status = selectedStock.value.intradayBarStatus?.status
+  return status ? `真实 bars ${status}` : '真实 bars 待获取'
+})
+
 const metrics = computed(() => [
-  { label: '今日事件', value: '2', note: '1 机会 / 1 风险', tone: 'green' },
+  {
+    label: '今日事件',
+    value: String(events.length),
+    note: events.length ? '来自事件流' : '暂无真实事件',
+    tone: events.length ? 'green' : 'ink'
+  },
   { label: '监控标的', value: String(watchlist.length), note: stockGroupSummaryText.value, tone: 'ink' },
   {
     label: '行情刷新',
@@ -2037,7 +2074,12 @@ const metrics = computed(() => [
     note: quoteError.value || `${quoteRefreshMode.value} · 东方财富 quote`,
     tone: quoteError.value ? 'red' : 'blue'
   },
-  { label: 'AI 闸门', value: plugins.find((p) => p.name === 'analysis')?.enabled ? 'WAIT' : 'OFF', note: 'auto=false', tone: 'purple' }
+  {
+    label: 'AI 状态',
+    value: runtimeStatus.value?.analysisRunning ? 'RUNNING' : (runtimeStatus.value?.analysisMode || 'UNKNOWN'),
+    note: runtimeStatusError.value || runtimeStatus.value?.warnings?.[0] || runtimeStatus.value?.lastRunStatus || '等待运行状态',
+    tone: runtimeStatus.value?.status === 'DEGRADED' ? 'amber' : (runtimeStatus.value?.analysisRunning ? 'purple' : 'ink')
+  }
 ])
 
 const stockGroupSummaryText = computed(() => {
@@ -2050,16 +2092,14 @@ const stockGroupSummaryText = computed(() => {
 const technicalMetrics = computed(() => {
   const t = selectedStock.value.technical
   return [
-    { label: '开高低 / 成交额', value: `${t.open} / ${t.high} / ${t.low}`, note: `成交额 ${t.volume}`, tone: 'ink' },
-    { label: '均线 / 乖离', value: `${t.ma5} / ${t.ma10} / ${t.ma20}`, note: `MA20 乖离 ${t.bias20}`, tone: marketToneFromSignedValue(t.bias20, 'blue') },
-    { label: 'VWAP / 量比', value: `${t.vwap} / ${t.volumeRatio}`, note: `VWAP 偏离 ${t.vwapDeviation} · 换手 ${t.turnover}`, tone: marketToneFromSignedValue(t.vwapDeviation, 'blue') },
-    { label: '波动 / 布林带', value: `${t.atr} / ${t.bollWidth}`, note: 'ATR 与 BOLL 带宽', tone: 'amber' },
-    { label: 'RSI / MACD', value: `${t.rsi} / ${t.macd}`, note: '动量只做辅助确认', tone: marketToneFromSignedValue(t.macd, 'blue') },
-    { label: '资金 / OBV', value: `${t.mainInflow} / ${t.obvTrend}`, note: '主力净额与量价趋势', tone: marketToneFromSignedValue(t.mainInflow, 'ink') }
+    metricValue('ohlc', '开高低 / 成交额', [t.open, t.high, t.low], { reason: `成交额 ${t.volume}`, tone: 'ink' }),
+    metricValue('ma-bias', '均线 / 乖离', [t.ma5, t.ma10, t.ma20], { reason: `MA20 乖离 ${t.bias20}`, tone: marketToneFromSignedValue(t.bias20, 'blue') }),
+    metricValue('vwap-volume', 'VWAP / 量比', [t.vwap, t.volumeRatio], { reason: `VWAP 偏离 ${t.vwapDeviation} · 换手 ${t.turnover}`, tone: marketToneFromSignedValue(t.vwapDeviation, 'blue') }),
+    metricValue('volatility-boll', '波动 / 布林带', [t.atr, t.bollWidth], { reason: 'ATR 与 BOLL 带宽', tone: 'amber' }),
+    metricValue('rsi-macd', 'RSI / MACD', [t.rsi, t.macd], { reason: '动量只做辅助确认', tone: marketToneFromSignedValue(t.macd, 'blue') }),
+    metricValue('flow-obv', '资金 / OBV', [t.mainInflow, t.obvTrend], { reason: '主力净额与量价趋势', tone: marketToneFromSignedValue(t.mainInflow, 'ink') })
   ]
 })
-
-const marketMoveTone = computed(() => marketToneFromNumber(selectedStock.value.change, 'blue'))
 
 const signalMatrix = computed(() => {
   const t = selectedStock.value.technical
@@ -2089,26 +2129,6 @@ const signalMatrix = computed(() => {
       tone: Number.parseInt(t.rsRank, 10) >= 60 ? 'green' : 'blue'
     }
   ]
-})
-
-const priceRange = computed(() => {
-  const values = selectedStock.value.priceSeries
-  const levels = selectedStock.value.technical.levels.map((line) => line.value)
-  return {
-    min: Math.min(...values, ...levels),
-    max: Math.max(...values, ...levels)
-  }
-})
-
-const priceChartPoints = computed(() => {
-  const values = selectedStock.value.priceSeries
-  return values.map((value, index) => `${pointX(index, values.length)},${pointY(value)}`).join(' ')
-})
-
-const priceAreaPoints = computed(() => {
-  const values = selectedStock.value.priceSeries
-  const top = values.map((value, index) => `${pointX(index, values.length)},${pointY(value)}`).join(' ')
-  return `48,226 ${top} 718,226`
 })
 
 const triggerPreview = computed(() => {
@@ -2688,6 +2708,149 @@ async function loadExternalEvidence(showNotice = true) {
   }
 }
 
+function refreshActiveConfig() {
+  if (activeConfigTab.value === 'llm') {
+    return loadAnalysisPolicy(true)
+  }
+  if (activeConfigTab.value === 'mail') {
+    return loadDeliveryConfig()
+  }
+  return Promise.resolve()
+}
+
+function saveActiveConfig() {
+  if (activeConfigTab.value === 'llm') {
+    return saveAnalysisPolicy()
+  }
+  if (activeConfigTab.value === 'mail') {
+    return saveDeliveryConfig()
+  }
+  return Promise.resolve()
+}
+
+async function loadAnalysisPolicy(showNotice = false) {
+  const stock = selectedStock.value
+  if (!stock?.symbol) return
+  analysisPolicyLoading.value = true
+  analysisPolicyError.value = ''
+  if (showNotice) analysisPolicyNotice.value = ''
+  try {
+    const response = await stockWatchHttp.get(
+      `/stock-watch/watchlist/${encodeURIComponent(stock.market)}/${encodeURIComponent(stock.symbol)}/analysis-policy`,
+      { suppressErrorMessage: true }
+    )
+    applyAnalysisPolicyResponse(response?.data || {}, { syncForm: true })
+    if (showNotice) {
+      analysisPolicyNotice.value = '分析策略已刷新'
+    }
+  } catch (error) {
+    if (isMissingWatchStockError(error)) {
+      markAnalysisPolicyMissing(stock)
+      if (showNotice) {
+        analysisPolicyNotice.value = '该股票尚未加入后端监控；点击“加入并保存策略”后才会启用自动分析'
+      }
+      return
+    }
+    analysisPolicyError.value = resolveErrorMessage(error, '分析策略加载失败')
+  } finally {
+    analysisPolicyLoading.value = false
+  }
+}
+
+async function saveAnalysisPolicy() {
+  const stock = selectedStock.value
+  if (!stock?.symbol || analysisPolicySaving.value) return
+  clampAnalysisInterval()
+  const request = {
+    symbol: stock.symbol,
+    market: stock.market,
+    payload: buildAnalysisPolicyPayload({
+      mode: analysisPolicyForm.mode,
+      intervalMinutes: analysisPolicyForm.intervalMinutes,
+      anomalyTriggerMode: analysisPolicyForm.anomalyTriggerMode,
+      weeklyReviewEnabled: analysisPolicyForm.weeklyReviewEnabled,
+      monthlyReviewEnabled: analysisPolicyForm.monthlyReviewEnabled,
+      version: analysisPolicyForm.version
+    })
+  }
+  analysisPolicySaving.value = true
+  analysisPolicyError.value = ''
+  analysisPolicyNotice.value = ''
+  try {
+    await ensureBackendWatchStockForPolicy(stock, { syncForm: false })
+    const response = await stockWatchHttp.put(
+      `/stock-watch/watchlist/${encodeURIComponent(request.market)}/${encodeURIComponent(request.symbol)}/analysis-policy`,
+      request.payload,
+      { suppressErrorMessage: true }
+    )
+    applyAnalysisPolicyResponse(response?.data || {}, { syncForm: true })
+    analysisPolicyNotice.value = '单股分析策略已保存'
+  } catch (error) {
+    analysisPolicyError.value = resolveErrorMessage(error, '分析策略保存失败')
+  } finally {
+    analysisPolicySaving.value = false
+  }
+}
+
+async function ensureBackendWatchStockForPolicy(stock, options = {}) {
+  if (!stock?.symbol) return false
+  if (stock.analysisPolicy?.capability === 'stock.unified-analysis.v1' && Number.isFinite(Number(stock.analysisPolicy?.version))) {
+    return false
+  }
+  const saved = await saveBackendWatchStock(stock, { includeGroupKey: Boolean(stock.groupKeyExplicit) })
+  const merged = mergeWatchStock(saved || stock)
+  if (options.syncForm !== false && merged.symbol === selectedStock.value?.symbol && merged.market === selectedStock.value?.market) {
+    syncAnalysisPolicyForm(merged.analysisPolicy)
+  }
+  return true
+}
+
+function markAnalysisPolicyMissing(stock) {
+  if (!stock?.symbol) return
+  const target = watchlist.find((item) => item.symbol === stock.symbol && item.market === stock.market)
+  if (target) {
+    target.analysisPolicy = null
+    target.analysisSchedule = null
+  }
+  if (stock.symbol === selectedStock.value?.symbol && stock.market === selectedStock.value?.market) {
+    syncAnalysisPolicyForm(null)
+  }
+}
+
+function buildAnalysisPolicyPayload(source = analysisPolicyForm) {
+  const mode = normalizeAnalysisMode(source.mode)
+  const reviewEnabled = supportsAnalysisReview(mode)
+  return {
+    mode,
+    intervalMinutes: clampNumber(source.intervalMinutes, 10, 1440, 30),
+    anomalyTriggerMode: normalizeAnomalyTriggerMode(source.anomalyTriggerMode),
+    weeklyReviewEnabled: Boolean(source.weeklyReviewEnabled && reviewEnabled),
+    monthlyReviewEnabled: Boolean(source.monthlyReviewEnabled && reviewEnabled),
+    expectedVersion: Number(source.version) || 0
+  }
+}
+
+function applyAnalysisPolicyResponse(payload, options = {}) {
+  const stock = resolveAnalysisPolicyStock(payload)
+  if (!stock) return
+  stock.analysisPolicy = normalizeAnalysisPolicyPayload(payload.analysisPolicy)
+  stock.analysisSchedule = normalizeAnalysisSchedulePayload(payload.analysisSchedule)
+  if (options.syncForm !== false && stock.symbol === selectedStock.value?.symbol && stock.market === selectedStock.value?.market) {
+    syncAnalysisPolicyForm(stock.analysisPolicy)
+  }
+}
+
+function resolveAnalysisPolicyStock(payload) {
+  const fallback = selectedStock.value
+  const symbol = String(payload?.symbol || fallback?.symbol || '')
+  const market = String(payload?.market || fallback?.market || '')
+  return watchlist.find((item) => item.symbol === symbol && item.market === market) || fallback || null
+}
+
+function isMissingWatchStockError(error) {
+  return resolveErrorMessage(error, '').includes('监控股票不存在')
+}
+
 async function loadDeliveryConfig() {
   const stock = selectedStock.value
   if (!stock?.symbol) return
@@ -2941,10 +3104,44 @@ function normalizeAnalysisRecord(record) {
     mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus, record?.evidenceQuality),
     mainForceIntentStatus: record?.mainForceIntentStatus || '',
     mainForceIntentWarnings: normalizeEvidence(record?.mainForceIntentWarnings),
+    riskPatternSummary: normalizeRiskPatternSummary(record?.riskPatternSummary),
     sourceRecordIds: normalizeEvidence(record?.sourceRecordIds),
     promptHash: record?.promptHash || record?.status || '',
     conversationUrl: record?.conversationUrl || '',
     traceable: isTraceableDeepseekUrl(record?.conversationUrl)
+  }
+}
+
+function normalizeRiskPatternSummary(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const patterns = Array.isArray(raw.patterns) ? raw.patterns : []
+  const visiblePatterns = patterns
+    .filter((item) => ['triggered', 'watch'].includes(String(item?.status || '').toLowerCase()))
+    .map((item) => ({
+      key: `${item.patternId || ''}-${item.status || ''}`,
+      label: `${item.patternId || '--'} ${item.riskStructureName || '--'} · ${item.statusLabel || item.status || '--'}`,
+      description: item.description || '',
+      invalidatesWhen: item.invalidatesWhen || ''
+    }))
+  const skippedReasons = normalizeEvidence(raw.skippedReasons).slice(0, 2)
+  if (!visiblePatterns.length && skippedReasons.length) {
+    visiblePatterns.push({
+      key: 'skipped',
+      label: `跳过：${skippedReasons.join('；')}`,
+      description: '',
+      invalidatesWhen: ''
+    })
+  }
+  return {
+    title: raw.title || '价量风险结构识别',
+    status: raw.status || '',
+    statusLabel: raw.statusLabel || '--',
+    semanticBoundary: raw.semanticBoundary || 'L0 只识别可观察价量结构，不能证明操纵或真实主力身份。',
+    conclusionText: raw.conclusionText || '',
+    valueText: raw.valueText || '',
+    nextWatch: raw.nextWatch || '',
+    dataLimitText: raw.dataLimitText || '',
+    visiblePatterns
   }
 }
 
@@ -3068,6 +3265,29 @@ function marketToneFromNumber(value, neutralTone = 'ink') {
   return value > 0 ? 'red' : 'green'
 }
 
+function metricValue(key, label, values, options = {}) {
+  const normalizedValues = values.map((value) => String(value ?? '').trim())
+  const invalid = normalizedValues.some((value) => /^(nan|null|undefined)$/i.test(value))
+  const presentValues = normalizedValues.filter(hasMetricValue)
+  const status = invalid ? 'INVALID' : (presentValues.length ? 'VALID' : 'UNAVAILABLE')
+  return {
+    key,
+    label,
+    status,
+    value: presentValues.length ? presentValues.join(' / ') : '--',
+    reason: status === 'VALID' ? options.reason : (options.unavailableReason || '真实数据源未返回该指标'),
+    tone: options.tone || 'ink',
+    source: options.source || 'runtime'
+  }
+}
+
+function hasMetricValue(value) {
+  const text = String(value ?? '').trim()
+  return Boolean(text)
+    && text !== '--'
+    && !['待抓取', '待计算', '未计算', 'N/A'].includes(text.toUpperCase())
+}
+
 function selectAnalysisPeriod(period) {
   if (!period?.key) return
   selectedAnalysisPeriodKey.value = period.key
@@ -3174,6 +3394,11 @@ function isTradingSessionNow(now = new Date()) {
 }
 
 async function refreshQuotes(mode = '手动') {
+  if (demoModeActive.value) {
+    quoteLastRefresh.value = currentTimeLabel()
+    quoteRefreshMode.value = '演示'
+    return
+  }
   if (quoteRefreshing.value || watchlist.length === 0) {
     return
   }
@@ -3231,20 +3456,7 @@ function applyQuoteToStock(quote) {
   stock.technical.volumeRatio = formatNumberValue(quote.volumeRatio)
   stock.technical.turnover = formatPercentValue(quote.turnover)
   stock.technical.mainInflow = formatSignedMoney(quote.mainInflow)
-  stock.technical.vwap = formatPrice(quote.price)
-  stock.technical.vwapDeviation = '实时价'
   stock.technical.rsRank = stock.technical.rsRank === '--' ? '待计算' : stock.technical.rsRank
-
-  const series = buildQuoteSeries(quote)
-  if (series.length > 1) {
-    stock.priceSeries = series
-  }
-  if (quote.high != null && quote.low != null) {
-    stock.technical.levels = [
-      { label: '压力', value: Number(quote.high), type: 'pressure' },
-      { label: '支撑', value: Number(quote.low), type: 'support' }
-    ]
-  }
 
   stock.rawData = {
     ...stock.rawData,
@@ -3562,6 +3774,79 @@ function countStockGroup(groupKey) {
   return watchlist.filter((stock) => normalizeStockGroupKey(stock.groupKey) === groupKey).length
 }
 
+function createEmptyTechnical() {
+  return {
+    open: '--',
+    high: '--',
+    low: '--',
+    volume: '--',
+    ma5: '--',
+    ma10: '--',
+    ma20: '--',
+    rsi: '--',
+    macd: '--',
+    vwap: '--',
+    vwapDeviation: '--',
+    volumeRatio: '--',
+    turnover: '--',
+    atr: '--',
+    bollWidth: '--',
+    bias20: '--',
+    obvTrend: '--',
+    rsRank: '--',
+    sectorStrength: '--',
+    mainInflow: '--',
+    levels: []
+  }
+}
+
+function createEmptyIntradayBarStatus(reason = '分钟行情未加载') {
+  return {
+    status: 'UNAVAILABLE',
+    reason,
+    source: '',
+    provider: '',
+    fetchedAt: '',
+    asOfTime: '',
+    qualitySummary: {
+      totalBars: 0,
+      validBars: 0,
+      invalidBars: 0
+    }
+  }
+}
+
+function createEmptyStock() {
+  return {
+    symbol: '',
+    name: '暂无标的',
+    market: '--',
+    image: '',
+    groupKey: 'watch',
+    groupKeyExplicit: false,
+    manual: false,
+    createdAt: '',
+    price: '--',
+    change: 0,
+    status: '未加载',
+    severity: 'info',
+    refresh: {
+      source: '--',
+      endpoint: '真实 watchlist 未加载',
+      last: '--',
+      next: '--'
+    },
+    intradayBars: [],
+    intradayBarStatus: createEmptyIntradayBarStatus(),
+    technical: createEmptyTechnical(),
+    rules: [],
+    sources: [],
+    analysisPolicy: null,
+    analysisSchedule: null,
+    rawData: {}
+  }
+}
+
 function createManualStock({
   symbol,
   market,
@@ -3569,7 +3854,9 @@ function createManualStock({
   image = '',
   groupKey = 'watch',
   groupKeyExplicit = true,
-  createdAt = new Date().toISOString()
+  createdAt = new Date().toISOString(),
+  analysisPolicy = null,
+  analysisSchedule = null
 }) {
   return {
     symbol,
@@ -3586,42 +3873,20 @@ function createManualStock({
     severity: 'info',
     refresh: {
       source: '待配置',
-      endpoint: 'quote + kline',
+      endpoint: 'quote snapshot',
       last: '--',
       next: '--'
     },
-    priceSeries: [0, 0, 0, 0, 0, 0, 0, 0, 0],
-    technical: {
-      open: '--',
-      high: '--',
-      low: '--',
-      volume: '--',
-      ma5: '--',
-      ma10: '--',
-      ma20: '--',
-      rsi: '--',
-      macd: '--',
-      vwap: '--',
-      vwapDeviation: '--',
-      volumeRatio: '--',
-      turnover: '--',
-      atr: '--',
-      bollWidth: '--',
-      bias20: '--',
-      obvTrend: '待抓取',
-      rsRank: '--',
-      sectorStrength: '--',
-      mainInflow: '--',
-      levels: [
-        { label: '支撑', value: 0, type: 'support' },
-        { label: '压力', value: 0, type: 'pressure' }
-      ]
-    },
+    intradayBars: [],
+    intradayBarStatus: createEmptyIntradayBarStatus(),
+    technical: createEmptyTechnical(),
     rules: [],
     sources: [
       { name: 'Manual watchlist', desc: '用户手动添加', ok: true },
       { name: 'Quote source', desc: '待接入行情抓取', ok: false }
     ],
+    analysisPolicy: analysisPolicy ? normalizeAnalysisPolicyPayload(analysisPolicy) : null,
+    analysisSchedule: analysisSchedule ? normalizeAnalysisSchedulePayload(analysisSchedule) : null,
     rawData: {
       source: 'manual',
       created_at: createdAt
@@ -3629,7 +3894,243 @@ function createManualStock({
   }
 }
 
-async function loadSavedStocks() {
+async function loadRealStockWatchState() {
+  const localStocks = loadSavedStocks()
+  await syncLocalStocksToBackend(localStocks)
+  const backendLoaded = await loadBackendWatchlist()
+  if (!backendLoaded) {
+    replaceReactiveArray(watchlist, [])
+    selectedSymbol.value = ''
+    quoteError.value = '后端 watchlist 加载失败；未使用本地缓存冒充真实监控列表'
+    return
+  }
+
+  loadDeletedEvents()
+  loadSavedObservations()
+  await loadAiRules()
+  ensureSelectedSymbol()
+  await refreshQuotes('页面打开')
+  startAutoQuoteRefresh()
+  persistCustomStocks()
+}
+
+function replaceReactiveArray(target, items) {
+  target.splice(0, target.length, ...items)
+}
+
+function ensureSelectedSymbol() {
+  if (watchlist.some((stock) => stock.symbol === selectedSymbol.value)) {
+    return
+  }
+  selectedSymbol.value = watchlist[0]?.symbol || ''
+}
+
+function applyPageState(state) {
+  const pageState = state || {}
+  replaceReactiveArray(watchlist, (pageState.watchlist || []).map(normalizePageStock).filter((stock) => stock.symbol))
+  replaceReactiveArray(events, Array.isArray(pageState.events) ? pageState.events : [])
+  replaceReactiveArray(plugins, Array.isArray(pageState.plugins) ? pageState.plugins : [])
+  selectedSymbol.value = pageState.selectedSymbol || watchlist[0]?.symbol || ''
+  quoteLastRefresh.value = currentTimeLabel()
+  quoteRefreshMode.value = pageState.demo ? '演示' : '初始化'
+}
+
+function normalizePageStock(item = {}) {
+  const normalized = normalizeStockCode(`${item.symbol || ''}.${item.market || ''}`)
+  if (!normalized) return createEmptyStock()
+  const stock = createManualStock({
+    symbol: normalized.symbol,
+    market: normalized.market,
+    name: resolveStockDisplayName(normalized, item.name || item.stockName),
+    image: String(item.image || item.imageUrl || ''),
+    groupKey: item.groupKey,
+    groupKeyExplicit: Boolean(String(item.groupKey || '').trim()),
+    createdAt: item.createdAt || new Date().toISOString(),
+    analysisPolicy: item.analysisPolicy,
+    analysisSchedule: item.analysisSchedule
+  })
+  const envelope = normalizeIntradayEnvelope(item.intradayBarStatus || {
+    status: Array.isArray(item.intradayBars) && item.intradayBars.length ? 'VALID' : 'UNAVAILABLE',
+    reason: Array.isArray(item.intradayBars) && item.intradayBars.length ? '' : '分钟行情未加载',
+    bars: item.intradayBars || []
+  })
+  const { bars, ...barStatus } = envelope
+  return {
+    ...stock,
+    ...item,
+    symbol: stock.symbol,
+    market: stock.market,
+    name: item.name || item.stockName || stock.name,
+    groupKey: normalizeStockGroupKey(item.groupKey || stock.groupKey),
+    refresh: {
+      ...stock.refresh,
+      ...(item.refresh || {})
+    },
+    technical: {
+      ...createEmptyTechnical(),
+      ...(item.technical || {}),
+      levels: Array.isArray(item.technical?.levels) ? item.technical.levels : []
+    },
+    rules: Array.isArray(item.rules) ? item.rules : [],
+    sources: Array.isArray(item.sources) ? item.sources : stock.sources,
+    intradayBars: bars,
+    intradayBarStatus: barStatus,
+    rawData: item.rawData || stock.rawData
+  }
+}
+
+async function loadIntradayBars(stock = selectedStock.value) {
+  if (demoModeActive.value) {
+    return
+  }
+  if (!stock?.symbol || !stock?.market) {
+    barError.value = ''
+    return
+  }
+  loadingBars.value = true
+  barError.value = ''
+  try {
+    const response = await stockWatchHttp.get('/stock-watch/intraday-bars', {
+      params: {
+        symbol: stock.symbol,
+        market: stock.market
+      },
+      suppressErrorMessage: true
+    })
+    applyIntradayEnvelopeToStock(stock, normalizeIntradayEnvelope(response?.data))
+  } catch (error) {
+    const message = resolveErrorMessage(error, '分钟行情加载失败')
+    stock.intradayBars = []
+    stock.intradayBarStatus = createEmptyIntradayBarStatus(message)
+    stock.intradayBarStatus.status = 'SOURCE_ERROR'
+    barError.value = message
+  } finally {
+    loadingBars.value = false
+  }
+}
+
+function applyIntradayEnvelopeToStock(stock, envelope) {
+  stock.intradayBars = envelope.bars
+  stock.intradayBarStatus = {
+    status: envelope.status,
+    reason: envelope.reason,
+    source: envelope.source,
+    provider: envelope.provider,
+    fetchedAt: envelope.fetchedAt,
+    asOfTime: envelope.asOfTime,
+    qualitySummary: envelope.qualitySummary
+  }
+}
+
+function normalizeIntradayEnvelope(payload) {
+  if (Array.isArray(payload)) {
+    const bars = normalizeIntradayBars(payload)
+    return {
+      ...createEmptyIntradayBarStatus(bars.length ? '' : '分钟行情为空'),
+      status: bars.length ? summarizeBarStatus(bars) : 'EMPTY',
+      bars
+    }
+  }
+  const source = payload || {}
+  const bars = normalizeIntradayBars(source.bars)
+  const summary = source.qualitySummary || {}
+  const status = String(source.status || (bars.length ? summarizeBarStatus(bars) : 'EMPTY')).toUpperCase()
+  return {
+    status,
+    reason: String(source.reason || ''),
+    source: String(source.source || ''),
+    provider: String(source.provider || ''),
+    fetchedAt: String(source.fetchedAt || ''),
+    asOfTime: String(source.asOfTime || ''),
+    qualitySummary: {
+      totalBars: Number(summary.totalBars ?? bars.length) || 0,
+      validBars: Number(summary.validBars ?? bars.filter((bar) => bar.qualityStatus === 'VALID').length) || 0,
+      invalidBars: Number(summary.invalidBars ?? bars.filter((bar) => bar.qualityStatus === 'INVALID').length) || 0
+    },
+    bars
+  }
+}
+
+function normalizeIntradayBars(rawBars) {
+  if (!Array.isArray(rawBars)) return []
+  return rawBars.map(normalizeIntradayBar).filter(Boolean)
+}
+
+function normalizeIntradayBar(raw, index) {
+  if (!raw || typeof raw !== 'object') return null
+  const bar = {
+    startTime: String(raw.startTime || raw.time || ''),
+    endTime: String(raw.endTime || ''),
+    open: numberOrNull(raw.open),
+    high: numberOrNull(raw.high),
+    low: numberOrNull(raw.low),
+    close: numberOrNull(raw.close),
+    volume: numberOrNull(raw.volume),
+    amount: numberOrNull(raw.amount)
+  }
+  bar.qualityStatus = normalizeBarQuality(raw.qualityStatus, bar)
+  bar.key = `${bar.startTime || index}-${index}`
+  return bar
+}
+
+function normalizeBarQuality(status, bar) {
+  const explicit = String(status || '').toUpperCase()
+  if (explicit === 'INVALID') return 'INVALID'
+  const values = [bar.open, bar.high, bar.low, bar.close]
+  if (values.some((value) => value == null)) return 'INVALID'
+  if (bar.high < Math.max(bar.open, bar.close, bar.low)) return 'INVALID'
+  if (bar.low > Math.min(bar.open, bar.close, bar.high)) return 'INVALID'
+  return 'VALID'
+}
+
+function summarizeBarStatus(bars) {
+  if (!bars.length) return 'EMPTY'
+  const invalidCount = bars.filter((bar) => bar.qualityStatus === 'INVALID').length
+  if (invalidCount === 0) return 'VALID'
+  return invalidCount === bars.length ? 'INVALID' : 'DEGRADED'
+}
+
+function numberOrNull(value) {
+  if (value == null || value === '') return null
+  const number = Number(value)
+  return Number.isFinite(number) ? number : null
+}
+
+async function refreshRuntimeForSelectedStock() {
+  if (demoModeActive.value) {
+    runtimeStatus.value = demoRuntimeStatus()
+    runtimeStatusError.value = ''
+    return
+  }
+  await refreshRuntimeStatus(selectedStock.value)
+}
+
+function demoRuntimeStatus() {
+  return {
+    status: 'DEMO',
+    schedulingEnabled: false,
+    analysisRunning: false,
+    analysisMode: 'DEMO',
+    provider: 'Demo',
+    providerVersionState: 'DEMO',
+    lastRunAt: null,
+    lastRunStatus: '演示数据',
+    nextDueAt: null,
+    pendingJobs: null,
+    retryJobs: null,
+    retryPolicy: {
+      maxAttempts: 0,
+      currentAttempt: 0,
+      backoffStrategy: 'NONE',
+      nextRetryAt: null,
+      retryable: false,
+      lastErrorCode: null
+    },
+    warnings: ['演示模式开启，未读取真实运行状态']
+  }
+}
+
+function loadSavedStocks() {
   const localStocks = []
   try {
     const saved = JSON.parse(window.localStorage.getItem(CUSTOM_WATCHLIST_KEY) || '[]')
@@ -3647,37 +4148,40 @@ async function loadSavedStocks() {
           createdAt: item.createdAt || new Date().toISOString()
         })
         localStocks.push(stock)
-        mergeWatchStock(stock)
       })
     }
   } catch (error) {
     console.warn('Failed to load custom watchlist', error)
   }
-
-  await syncLocalStocksToBackend(localStocks)
-  await loadBackendWatchlist()
-  persistCustomStocks()
+  return localStocks
 }
 
 async function loadBackendWatchlist() {
   try {
     const response = await stockWatchHttp.get('/stock-watch/watchlist', { suppressErrorMessage: true })
     const items = Array.isArray(response?.data) ? response.data : []
+    const backendStocks = []
     items.forEach((item) => {
       const normalized = normalizeStockCode(`${item.symbol || ''}.${item.market || ''}`)
       if (!normalized) return
-      mergeWatchStock(createManualStock({
+      backendStocks.push(createManualStock({
         symbol: normalized.symbol,
         market: normalized.market,
         name: resolveStockDisplayName(normalized, item.name || item.stockName),
         image: String(item.image || item.imageUrl || ''),
         groupKey: item.groupKey,
         groupKeyExplicit: Boolean(String(item.groupKey || '').trim()),
-        createdAt: item.createdAt || new Date().toISOString()
+        createdAt: item.createdAt || new Date().toISOString(),
+        analysisPolicy: item.analysisPolicy,
+        analysisSchedule: item.analysisSchedule
       }))
     })
+    replaceReactiveArray(watchlist, backendStocks)
+    ensureSelectedSymbol()
+    return true
   } catch (error) {
     console.warn('Failed to load backend watchlist', error)
+    return false
   }
 }
 
@@ -3713,7 +4217,9 @@ async function saveBackendWatchStock(stock, options = {}) {
     image: saved.image || saved.imageUrl || stock.image,
     groupKey: saved.groupKey || stock.groupKey,
     groupKeyExplicit: true,
-    createdAt: stock.createdAt || new Date().toISOString()
+    createdAt: stock.createdAt || new Date().toISOString(),
+    analysisPolicy: saved.analysisPolicy || stock.analysisPolicy,
+    analysisSchedule: saved.analysisSchedule || stock.analysisSchedule
   })
 }
 
@@ -3727,6 +4233,12 @@ function mergeWatchStock(stock) {
     existing.groupKeyExplicit = existing.groupKeyExplicit || stock.groupKeyExplicit
     existing.manual = existing.manual || stock.manual
     existing.createdAt = existing.createdAt || stock.createdAt
+    if (stock.analysisPolicy) {
+      existing.analysisPolicy = normalizeAnalysisPolicyPayload(stock.analysisPolicy)
+    }
+    if (stock.analysisSchedule) {
+      existing.analysisSchedule = normalizeAnalysisSchedulePayload(stock.analysisSchedule)
+    }
     return existing
   }
   watchlist.push(stock)
@@ -3892,6 +4404,144 @@ function clampNumber(value, min, max, fallback) {
   return Math.min(max, Math.max(min, number))
 }
 
+function normalizeAnalysisMode(raw) {
+  const value = String(raw || 'INTERVAL').trim().toUpperCase()
+  return ANALYSIS_MODE_OPTIONS.some((option) => option.value === value) ? value : 'INTERVAL'
+}
+
+function normalizeAnomalyTriggerMode(raw) {
+  const value = String(raw || 'IMMEDIATE_ANALYSIS').trim().toUpperCase()
+  return ANALYSIS_ANOMALY_TRIGGER_OPTIONS.some((option) => option.value === value) ? value : 'IMMEDIATE_ANALYSIS'
+}
+
+function normalizeAnalysisPolicyPayload(raw) {
+  const source = raw?.analysisPolicy && !raw.mode ? raw.analysisPolicy : (raw || {})
+  const mode = normalizeAnalysisMode(source.mode)
+  const intervalMinutes = clampNumber(source.intervalMinutes, 10, 1440, 30)
+  return {
+    capability: source.capability || 'stock.unified-analysis.v1',
+    mode,
+    intervalMinutes,
+    anomalyTriggerMode: normalizeAnomalyTriggerMode(source.anomalyTriggerMode),
+    weeklyReviewEnabled: source.weeklyReviewEnabled == null ? true : Boolean(source.weeklyReviewEnabled),
+    monthlyReviewEnabled: source.monthlyReviewEnabled == null ? true : Boolean(source.monthlyReviewEnabled),
+    version: Number(source.version || 0),
+    modifiedAt: source.modifiedAt || ''
+  }
+}
+
+function normalizeAnalysisSchedulePayload(raw) {
+  const source = raw || {}
+  return {
+    due: Boolean(source.due),
+    reason: String(source.reason || '待加载'),
+    currentSlotKey: String(source.currentSlotKey || ''),
+    nextDueAt: source.nextDueAt || '',
+    requestedCadence: String(source.requestedCadence || 'INTERVAL'),
+    capacityStatus: String(source.capacityStatus || 'UNBOUNDED')
+  }
+}
+
+function syncAnalysisPolicyForm(policy = selectedAnalysisPolicy.value) {
+  const normalized = normalizeAnalysisPolicyPayload(policy)
+  analysisPolicyForm.mode = normalized.mode
+  analysisPolicyForm.intervalMinutes = normalized.intervalMinutes
+  analysisPolicyForm.anomalyTriggerMode = normalized.anomalyTriggerMode
+  analysisPolicyForm.weeklyReviewEnabled = normalized.weeklyReviewEnabled && supportsAnalysisReview(normalized.mode)
+  analysisPolicyForm.monthlyReviewEnabled = normalized.monthlyReviewEnabled && supportsAnalysisReview(normalized.mode)
+  analysisPolicyForm.version = normalized.version
+  analysisPolicyForm.modifiedAt = normalized.modifiedAt
+}
+
+function hasPersistedAnalysisPolicy(stock) {
+  return stock?.analysisPolicy?.capability === 'stock.unified-analysis.v1'
+    && Number.isFinite(Number(stock.analysisPolicy?.version))
+}
+
+function supportsAnalysisReview(mode) {
+  return mode === 'INTERVAL' || mode === 'DAILY_CLOSE'
+}
+
+function setAnalysisMode(mode) {
+  const normalized = normalizeAnalysisMode(mode)
+  analysisPolicyForm.mode = normalized
+  if (normalized === 'INTERVAL') {
+    analysisPolicyForm.intervalMinutes = clampNumber(analysisPolicyForm.intervalMinutes, 10, 1440, 30)
+  }
+  if (normalized === 'ON_ANOMALY') {
+    analysisPolicyForm.anomalyTriggerMode = 'IMMEDIATE_ANALYSIS'
+    analysisPolicyForm.weeklyReviewEnabled = false
+    analysisPolicyForm.monthlyReviewEnabled = false
+  }
+  if (normalized === 'PAUSED') {
+    analysisPolicyForm.anomalyTriggerMode = 'ALERT_ONLY'
+    analysisPolicyForm.weeklyReviewEnabled = false
+    analysisPolicyForm.monthlyReviewEnabled = false
+  }
+}
+
+function setAnalysisInterval(minutes) {
+  analysisPolicyForm.intervalMinutes = clampNumber(minutes, 10, 1440, 30)
+}
+
+function clampAnalysisInterval() {
+  analysisPolicyForm.intervalMinutes = clampNumber(analysisPolicyForm.intervalMinutes, 10, 1440, 30)
+}
+
+function stockAnalysisCadenceLabel(stock) {
+  if (!hasPersistedAnalysisPolicy(stock)) return '未保存策略'
+  const policy = normalizeAnalysisPolicyPayload(stock?.analysisPolicy)
+  if (policy.mode === 'DAILY_CLOSE') return '每日收盘一次'
+  if (policy.mode === 'ON_ANOMALY') return '仅异动触发'
+  if (policy.mode === 'PAUSED') return '暂停自动分析'
+  return `每 ${intervalPresetLabel(policy.intervalMinutes)}`
+}
+
+function stockAnomalyTriggerLabel(stock) {
+  if (!hasPersistedAnalysisPolicy(stock)) return '待保存后启用'
+  const policy = normalizeAnalysisPolicyPayload(stock?.analysisPolicy)
+  const option = ANALYSIS_ANOMALY_TRIGGER_OPTIONS.find((item) => item.value === policy.anomalyTriggerMode)
+  return option?.label || '立即统一分析'
+}
+
+function analysisPolicySubtitle(policy, persisted = true) {
+  if (!persisted) return '后端未创建策略记录；当前显示为待保存草案'
+  const normalized = normalizeAnalysisPolicyPayload(policy)
+  if (normalized.mode === 'DAILY_CLOSE') return '收盘窗口创建一次统一分析需求'
+  if (normalized.mode === 'ON_ANOMALY') return '无异动时不占用 DeepSeek provider'
+  if (normalized.mode === 'PAUSED') return '自动调度暂停，手动分析入口仍保留'
+  return 'DeepSeek 网页 provider；每只股票独立会话'
+}
+
+function intervalPresetLabel(minutes) {
+  const value = clampNumber(minutes, 10, 1440, 30)
+  if (value >= 60 && value % 60 === 0) {
+    return `${value / 60} 小时`
+  }
+  return `${value} 分钟`
+}
+
+function anomalyTriggerDescription(value) {
+  const option = ANALYSIS_ANOMALY_TRIGGER_OPTIONS.find((item) => item.value === normalizeAnomalyTriggerMode(value))
+  return option?.desc || '异动命中后立即排队统一分析'
+}
+
+function formatPolicyTime(value) {
+  if (!value) return '--'
+  const normalized = String(value).replace(/\[[^\]]+\]$/, '')
+  const date = new Date(normalized)
+  if (!Number.isFinite(date.getTime())) return String(value)
+  if (date.getTime() <= 0) return '未修改'
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(date)
+}
+
 function buildObservationSnapshot(stock) {
   const tech = stock.technical
   return [
@@ -3977,19 +4627,6 @@ function shiftAnalysisDate(date, offsetDays) {
   const shifted = new Date(date)
   shifted.setDate(shifted.getDate() + offsetDays)
   return shifted
-}
-
-function buildQuoteSeries(quote) {
-  return [
-    quote.previousClose,
-    quote.open,
-    quote.low,
-    quote.price,
-    quote.high,
-    quote.price
-  ]
-    .filter((value) => value != null && Number.isFinite(Number(value)))
-    .map((value) => Number(value))
 }
 
 function formatPrice(value) {
@@ -4080,19 +4717,6 @@ function formatExternalMoney(value) {
   return formatMoney(value)
 }
 
-function pointX(index, total) {
-  return 48 + (670 * index) / Math.max(total - 1, 1)
-}
-
-function pointY(value) {
-  const { min, max } = priceRange.value
-  const ratio = (value - min) / Math.max(max - min, 1)
-  return 226 - ratio * 182
-}
-
-function levelY(value) {
-  return pointY(value)
-}
 </script>
 
 <style scoped>
@@ -4228,6 +4852,7 @@ button:disabled {
 .status-chip.success { color: #047857; background: #dff8ec; }
 .status-chip.neutral { color: #1d4ed8; background: #e8f0ff; }
 .status-chip.muted { color: #475569; background: #f1f5f9; }
+.status-chip.warning { color: #92400e; background: #fef3c7; }
 
 .metric-strip {
   display: grid;
@@ -4947,6 +5572,76 @@ svg {
   border: 1px solid #dbeafe;
   border-radius: 8px;
   background: #f8fbff;
+}
+
+.analysis-risk-pattern {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+  background: #fffbeb;
+}
+
+.analysis-risk-pattern > div:first-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+}
+
+.analysis-risk-pattern strong {
+  color: #92400e;
+  font-size: 12px;
+}
+
+.analysis-risk-pattern span {
+  color: #78350f;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.analysis-risk-pattern p {
+  margin: 0;
+  color: #475569;
+  line-height: 1.55;
+}
+
+.analysis-risk-pattern-conclusion {
+  color: #111827 !important;
+  font-weight: 700;
+}
+
+.analysis-risk-pattern-tags {
+  display: grid;
+  gap: 6px;
+}
+
+.analysis-risk-pattern-tags > div {
+  display: grid;
+  gap: 3px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: #fef3c7;
+}
+
+.analysis-risk-pattern-tags span {
+  color: #854d0e;
+}
+
+.analysis-risk-pattern-tags small {
+  color: #92400e;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.analysis-risk-pattern-note {
+  color: #78350f !important;
+}
+
+.analysis-risk-pattern-boundary {
+  color: #64748b !important;
+  font-size: 11px;
 }
 
 .analysis-main-force > div:first-child {
@@ -6278,6 +6973,7 @@ pre {
 .status-chip.success { color: #047857; background: #dff8ec; }
 .status-chip.neutral { color: #075985; background: #e0f2fe; }
 .status-chip.muted { color: #475569; background: #e8edf2; }
+.status-chip.warning { color: #92400e; background: #fef3c7; }
 
 .metric-strip {
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -7505,9 +8201,245 @@ pre {
   line-height: 1.55;
 }
 
+.analysis-cadence-line {
+  margin-top: 3px;
+  color: #2563eb !important;
+  font-weight: 900;
+}
+
+.llm-policy-section {
+  display: grid;
+  gap: 16px;
+}
+
+.analysis-policy-editor {
+  display: grid;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid rgba(37, 99, 235, .18);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(37, 99, 235, .10), transparent 34%),
+    linear-gradient(135deg, #ffffff 0%, #f8fbff 100%);
+}
+
+.analysis-policy-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.analysis-policy-head h3 {
+  margin: 2px 0 4px;
+  color: #0f172a;
+  font-size: 22px;
+  letter-spacing: -.02em;
+}
+
+.analysis-policy-head small,
+.policy-field small,
+.policy-check-card small,
+.policy-boundary-note p {
+  color: #64748b;
+  line-height: 1.55;
+}
+
+.policy-version-chip {
+  flex: 0 0 auto;
+  padding: 8px 11px;
+  border: 1px solid rgba(37, 99, 235, .18);
+  border-radius: 999px;
+  color: #1d4ed8;
+  background: #eff6ff;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.policy-version-chip.draft {
+  border-color: rgba(245, 158, 11, .28);
+  color: #92400e;
+  background: #fffbeb;
+}
+
+.policy-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.policy-mode-grid button {
+  min-height: 104px;
+  padding: 13px;
+  border: 1px solid rgba(148, 163, 184, .28);
+  border-radius: 18px;
+  color: #334155;
+  background: rgba(255, 255, 255, .86);
+  text-align: left;
+  cursor: pointer;
+}
+
+.policy-mode-grid button.active {
+  border-color: rgba(37, 99, 235, .42);
+  color: #172554;
+  background: #eff6ff;
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, .16);
+}
+
+.policy-mode-grid strong,
+.policy-mode-grid small {
+  display: block;
+}
+
+.policy-mode-grid strong {
+  margin-bottom: 7px;
+  font-size: 15px;
+  font-weight: 950;
+}
+
+.policy-mode-grid small {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.policy-form-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, .78fr) minmax(280px, 1fr);
+  gap: 12px;
+}
+
+.policy-field {
+  display: grid;
+  gap: 8px;
+  min-height: 114px;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, .24);
+  border-radius: 18px;
+  background: #ffffff;
+}
+
+.policy-field-wide {
+  grid-column: 1 / -1;
+}
+
+.policy-field > span {
+  color: #334155;
+  font-size: 13px;
+  font-weight: 950;
+}
+
+.policy-field input,
+.policy-field select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid rgba(148, 163, 184, .36);
+  border-radius: 12px;
+  color: #0f172a;
+  background: #ffffff;
+  font-weight: 900;
+}
+
+.policy-field input:disabled,
+.policy-field select:disabled {
+  color: #94a3b8;
+  background: #f8fafc;
+}
+
+.interval-preset-row {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+  align-content: start;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, .24);
+  border-radius: 18px;
+  background: #ffffff;
+}
+
+.interval-preset-row button {
+  min-height: 42px;
+  border: 1px solid rgba(148, 163, 184, .28);
+  border-radius: 12px;
+  color: #334155;
+  background: #f8fafc;
+  font-size: 12px;
+  font-weight: 950;
+  cursor: pointer;
+}
+
+.interval-preset-row button.active {
+  border-color: rgba(37, 99, 235, .38);
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.interval-preset-row.disabled {
+  opacity: .58;
+}
+
+.policy-check-card {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  min-height: 92px;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, .24);
+  border-radius: 18px;
+  background: #ffffff;
+}
+
+.policy-check-card input {
+  margin-top: 3px;
+}
+
+.policy-check-card strong,
+.policy-check-card small {
+  display: block;
+}
+
+.policy-check-card strong {
+  margin-bottom: 4px;
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 950;
+}
+
+.policy-check-card.disabled {
+  opacity: .58;
+}
+
+.policy-boundary-note {
+  padding: 12px 14px;
+  border: 1px solid rgba(245, 158, 11, .24);
+  border-radius: 18px;
+  background: #fffbeb;
+}
+
+.policy-boundary-note span {
+  display: block;
+  margin-bottom: 4px;
+  color: #92400e;
+  font-size: 12px;
+  font-weight: 950;
+}
+
+.policy-boundary-note p {
+  margin: 0;
+}
+
+.analysis-session-grid {
+  margin-top: 0;
+}
+
 @media (max-width: 1280px) {
   .stock-row {
     grid-template-columns: 8px 48px 1fr 112px 150px;
+  }
+
+  .policy-mode-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
@@ -7572,6 +8504,18 @@ pre {
   .observation-inline-head {
     flex-direction: column;
   }
+
+  .analysis-policy-head {
+    flex-direction: column;
+  }
+
+  .policy-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .policy-field-wide {
+    grid-column: auto;
+  }
 }
 
 @media (max-width: 560px) {
@@ -7632,6 +8576,11 @@ pre {
 
   .prediction-stat-grid,
   .prediction-list {
+    grid-template-columns: 1fr;
+  }
+
+  .policy-mode-grid,
+  .interval-preset-row {
     grid-template-columns: 1fr;
   }
 }

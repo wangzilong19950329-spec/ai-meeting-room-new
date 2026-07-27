@@ -46,6 +46,10 @@ class RequestLedger {
       submissionKey,
       requestDigest,
       status: 'IN_FLIGHT',
+      submitPhase: 'CLAIMED',
+      submitReservationCount: 0,
+      confirmedSubmitInvocationCount: 0,
+      possibleSubmitUpperBound: 0,
       metadata,
       createdAt: now,
       updatedAt: now
@@ -55,11 +59,71 @@ class RequestLedger {
     return { status: 'IN_FLIGHT', entry, created: true };
   }
 
+  markSubmitting(submissionKey, requestDigest, metadata = {}) {
+    const existing = this.requireMatching(submissionKey, requestDigest);
+    if (existing.status !== 'IN_FLIGHT'
+      || Number(existing.submitReservationCount || 0) !== 0) {
+      throw new Error('request_ledger_submit_reservation_conflict');
+    }
+    existing.submitPhase = 'SUBMITTING';
+    existing.submitReservationCount = 1;
+    existing.possibleSubmitUpperBound = 1;
+    existing.metadata = { ...(existing.metadata || {}), ...metadata };
+    existing.updatedAt = new Date().toISOString();
+    this.persist();
+    return existing;
+  }
+
+  markSubmitted(submissionKey, requestDigest, metadata = {}) {
+    const existing = this.requireMatching(submissionKey, requestDigest);
+    if (existing.status !== 'IN_FLIGHT'
+      || Number(existing.submitReservationCount || 0) !== 1
+      || Number(existing.confirmedSubmitInvocationCount || 0) !== 0) {
+      throw new Error('request_ledger_submit_confirmation_conflict');
+    }
+    existing.submitPhase = 'SUBMITTED';
+    existing.confirmedSubmitInvocationCount = 1;
+    existing.metadata = { ...(existing.metadata || {}), ...metadata };
+    existing.updatedAt = new Date().toISOString();
+    this.persist();
+    return existing;
+  }
+
   complete(submissionKey, requestDigest, result) {
     const existing = this.requireMatching(submissionKey, requestDigest);
+    const contentStatus = String(result && result.contentStatus || '').trim().toLowerCase();
+    const answerText = String(result && result.answerText || '').trim();
+    if (contentStatus === 'incomplete' || !answerText) {
+      return this.markInvalid(submissionKey, requestDigest,
+        contentStatus === 'incomplete' ? 'provider_response_incomplete' : 'provider_response_empty');
+    }
     existing.status = 'SUCCESS';
+    existing.submitPhase = 'COMPLETED';
     existing.result = result;
     existing.error = null;
+    existing.updatedAt = new Date().toISOString();
+    this.persist();
+    return existing;
+  }
+
+  markFailedPreSubmit(submissionKey, requestDigest, error) {
+    const existing = this.requireMatching(submissionKey, requestDigest);
+    if (Number(existing.submitReservationCount || 0) !== 0) {
+      throw new Error('request_ledger_pre_submit_failure_after_reservation');
+    }
+    existing.status = 'FAILED_PRE_SUBMIT';
+    existing.submitPhase = 'FAILED_PRE_SUBMIT';
+    existing.error = error || 'provider_not_submitted';
+    existing.updatedAt = new Date().toISOString();
+    this.persist();
+    return existing;
+  }
+
+  markInvalid(submissionKey, requestDigest, error) {
+    const existing = this.requireMatching(submissionKey, requestDigest);
+    existing.status = 'INVALID';
+    existing.submitPhase = 'INVALID';
+    existing.error = error || 'provider_response_invalid';
     existing.updatedAt = new Date().toISOString();
     this.persist();
     return existing;
@@ -68,6 +132,7 @@ class RequestLedger {
   markUnknown(submissionKey, requestDigest, error) {
     const existing = this.requireMatching(submissionKey, requestDigest);
     existing.status = 'UNKNOWN';
+    existing.submitPhase = 'UNKNOWN';
     existing.error = error || 'provider_outcome_unknown';
     existing.updatedAt = new Date().toISOString();
     this.persist();
@@ -106,8 +171,20 @@ class RequestLedger {
     this.entries = Object.fromEntries(retained.map((entry) => [entry.submissionKey, entry]));
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
-    fs.writeFileSync(temporaryPath, JSON.stringify(this.entries, null, 2));
+    const fileDescriptor = fs.openSync(temporaryPath, 'w');
+    try {
+      fs.writeFileSync(fileDescriptor, JSON.stringify(this.entries, null, 2));
+      fs.fsyncSync(fileDescriptor);
+    } finally {
+      fs.closeSync(fileDescriptor);
+    }
     fs.renameSync(temporaryPath, this.filePath);
+    const directoryDescriptor = fs.openSync(path.dirname(this.filePath), 'r');
+    try {
+      fs.fsyncSync(directoryDescriptor);
+    } finally {
+      fs.closeSync(directoryDescriptor);
+    }
   }
 
   summary() {

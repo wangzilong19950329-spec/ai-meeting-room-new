@@ -5,12 +5,15 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.aimeeting.room.dao.StockWatchDeliveryConfigMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
+import com.aimeeting.room.entity.StockWatchAnalysisDemand;
 import com.aimeeting.room.entity.StockWatchDeliveryConfig;
+import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
 import com.aimeeting.room.service.StockWatchRiskPatternService.RiskPatternResult;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -61,6 +64,14 @@ public class StockWatchMonitorService {
     private final StockWatchTechnicalAnalysisMapper technicalAnalysisMapper;
     private final StockWatchRiskPatternService riskPatternService;
     private final StockWatchFactPersistenceService factPersistenceService;
+    private final StockWatchTechnicalContextService technicalContextService;
+    private final StockWatchTechnicalEmailRenderer technicalEmailRenderer;
+    private final StockWatchAlertDeliveryService alertDeliveryService;
+    private final StockWatchRiskPatternSummaryRenderer riskPatternSummaryRenderer = new StockWatchRiskPatternSummaryRenderer();
+    @Autowired(required = false)
+    private StockWatchAnalysisPolicyService analysisPolicyService;
+    @Autowired(required = false)
+    private StockWatchAnalysisDemandService analysisDemandService;
     private final Map<String, RuleState> ruleStates = new LinkedHashMap<>();
     private final Set<String> sentSignalKeys = new LinkedHashSet<>();
     private final Map<String, String> lastAlertAtByStock = new LinkedHashMap<>();
@@ -115,7 +126,10 @@ public class StockWatchMonitorService {
                                     EastmoneyMarketDataService marketDataService,
                                     StockWatchTechnicalAnalysisMapper technicalAnalysisMapper,
                                     StockWatchRiskPatternService riskPatternService,
-                                    StockWatchFactPersistenceService factPersistenceService) {
+                                    StockWatchFactPersistenceService factPersistenceService,
+                                    StockWatchTechnicalContextService technicalContextService,
+                                    StockWatchTechnicalEmailRenderer technicalEmailRenderer,
+                                    StockWatchAlertDeliveryService alertDeliveryService) {
         this.stockQuoteService = stockQuoteService;
         this.notificationService = notificationService;
         this.aiRuleService = aiRuleService;
@@ -125,6 +139,9 @@ public class StockWatchMonitorService {
         this.technicalAnalysisMapper = technicalAnalysisMapper;
         this.riskPatternService = riskPatternService;
         this.factPersistenceService = factPersistenceService;
+        this.technicalContextService = technicalContextService;
+        this.technicalEmailRenderer = technicalEmailRenderer;
+        this.alertDeliveryService = alertDeliveryService;
     }
 
     @Scheduled(
@@ -188,6 +205,15 @@ public class StockWatchMonitorService {
         List<Map<String, Object>> evaluations = new ArrayList<>();
         Map<String, RiskPatternResult> riskPatternsByStock = buildRiskPatterns(aiRules, quoteBySymbol, now);
         List<Map<String, Object>> factObservations = persistRiskFacts(riskPatternsByStock, quoteBySymbol, now);
+        Map<String, Map<String, Object>> factReceiptByStock = factObservations.stream()
+                .filter(item -> StringUtils.hasText(text(item.get("symbol"), ""))
+                        && StringUtils.hasText(text(item.get("market"), "")))
+                .collect(Collectors.toMap(
+                        item -> stockKey(text(item.get("symbol"), ""), text(item.get("market"), "")),
+                        item -> item,
+                        (left, ignored) -> left,
+                        LinkedHashMap::new
+                ));
         for (SupportBreakRule rule : rules) {
             Map<String, Object> quote = quoteBySymbol.get(rule.symbol);
             Map<String, Object> evaluation = evaluateRule(rule, quote, now, notify);
@@ -199,6 +225,7 @@ public class StockWatchMonitorService {
                     rule,
                     quote,
                     riskPatternsByStock.get(stockKey(rule.getSymbol(), rule.getMarket())),
+                    factReceiptByStock.get(stockKey(rule.getSymbol(), rule.getMarket())),
                     now,
                     notify
             );
@@ -231,7 +258,9 @@ public class StockWatchMonitorService {
         status.put("sentSignalCount", sentSignalKeys.size());
         status.put("lastAlertAtByStock", new LinkedHashMap<>(lastAlertAtByStock));
         status.put("aiAlertStateCount", lastAiAlerts.size());
-        status.put("aiRuleCount", aiRuleService.listEnabled().size());
+        List<AiWatchRule> aiRules = aiRuleService.listEnabled();
+        status.put("aiRuleCount", aiRules.size());
+        status.put("riskPatternEnabledRuleCount", aiRules.stream().filter(AiWatchRule::usesRiskPattern).count());
         return status;
     }
 
@@ -337,6 +366,7 @@ public class StockWatchMonitorService {
     private Map<String, Object> evaluateAiRule(AiWatchRule rule,
                                                Map<String, Object> quote,
                                                RiskPatternResult riskPattern,
+                                               Map<String, Object> factReceipt,
                                                ZonedDateTime now,
                                                boolean notify) {
         Map<String, Object> result = new LinkedHashMap<>();
@@ -367,9 +397,11 @@ public class StockWatchMonitorService {
         }
 
         Map<String, Object> aiContext = buildAiContext(rule, quote, riskPattern, now, rule.isGeneralLegacy());
-        AiDecision decision = rule.isGeneralLegacy()
+        AiDecision decision = rule.isQuoteAnomalyV1()
+                ? aiJudgeService.judgeDeterministic(rule, quote)
+                : (rule.isGeneralLegacy()
                 ? aiJudgeService.judge(rule, quote, now, aiContext)
-                : aiJudgeService.judgeDeterministic(rule, quote);
+                : aiJudgeService.judgeDeterministic(rule, quote));
         if (rule.requiresRiskPattern() && riskPattern != null && riskPattern.hasTriggeredPattern()) {
             decision.setTriggered(true);
             decision.setShouldNotify(true);
@@ -393,6 +425,7 @@ public class StockWatchMonitorService {
                 ? AlertSendResult.notAttempted()
                 : AlertSendResult.skipped(alertGate.reason);
 
+        Map<String, Object> riskPatternSummary = riskPatternSummaryRenderer.summarize(riskPattern, factReceipt);
         Map<String, Object> event = new LinkedHashMap<>();
         event.put("event_id", "ai_watch_" + rule.getSymbol() + "_" + rule.getMarket() + "_" + rule.getId() + "_" + today);
         event.put("timestamp", now.format(EVENT_TIME_FORMATTER));
@@ -415,10 +448,18 @@ public class StockWatchMonitorService {
         event.put("missing_data", decision.getMissingData());
         event.put("belief_update", decision.getBeliefUpdate());
         event.put("quote", quote);
+        if (validFactReceipt(factReceipt)) {
+            event.put("target_fact_observation_id", longNumber(factReceipt.get("observationId")));
+            event.put("target_fact_observation_key", text(factReceipt.get("observationKey"), ""));
+            event.put("target_source_time_epoch_ms", longNumber(factReceipt.get("sourceTimeEpochMs")));
+        }
         event.put("ai_context_status", aiContextStatus(aiContext));
         event.put("ai_context_missing_data", aiContext == null ? Collections.emptyList() : aiContext.get("missingData"));
         if (riskPattern != null) {
             event.put("risk_pattern_observations", riskPattern.getObservations());
+            if (riskPatternSummary != null) {
+                event.put("riskPatternSummary", riskPatternSummary);
+            }
         }
         appendAiContextHistoryMetadata(event, aiContext);
         event.put("ai_alert_state_key", aiAlertStateKey(rule));
@@ -430,6 +471,7 @@ public class StockWatchMonitorService {
         event.put("ai_alert_signal_shape_changed", alertGate.signalShapeChanged);
         event.put("ai_alert_severity_rank_up", alertGate.severityRankUp);
         event.put("ai_alert_material_risk_delta", alertGate.materialRiskDelta);
+        queueUnifiedAnalysisDemand(rule, event, now);
 
         if (notificationAttempted) {
             alertResult = sendAiTriggeredEmail(rule, decision, event, now);
@@ -449,6 +491,9 @@ public class StockWatchMonitorService {
                 ? "deterministic_match_indicator_not_probability"
                 : "model_reported_rule_match_confidence_not_calibrated_price_probability");
         result.put("riskPatternObservations", riskPattern == null ? null : riskPattern.getObservations());
+        if (riskPatternSummary != null) {
+            result.put("riskPatternSummary", riskPatternSummary);
+        }
         result.put("confidenceMet", confidenceMet);
         result.put("decision", decision);
         result.put("reason", decision.getReason());
@@ -497,6 +542,10 @@ public class StockWatchMonitorService {
         }
         if (!decision.isShouldNotify()) {
             return AiAlertGate.blocked("decisionShouldNotifyFalse", false);
+        }
+        if (alertDeliveryService.hasDurableCooldown(rule.getId(), rule.getSymbol(), rule.getMarket(),
+                snapshot.signalShapeFingerprint, now)) {
+            return AiAlertGate.blocked("durableDeliveryCooldown", true);
         }
 
         String stateKey = aiAlertStateKey(rule);
@@ -1705,6 +1754,72 @@ public class StockWatchMonitorService {
         return new ArrayList<>(values.subList(from, to));
     }
 
+    private void queueUnifiedAnalysisDemand(AiWatchRule rule,
+                                            Map<String, Object> event,
+                                            ZonedDateTime now) {
+        if (rule == null || event == null || !bool(event.get("triggered"), false)) {
+            return;
+        }
+        if (rule.isGeneralLegacy()) {
+            event.put("analysis_demand_status", "SKIPPED_GENERAL_LEGACY");
+            return;
+        }
+        if (!validFactEvent(event)) {
+            event.put("analysis_demand_status", "SKIPPED_NO_FACT");
+            return;
+        }
+        if (analysisPolicyService == null || analysisDemandService == null) {
+            event.put("analysis_demand_status", "SKIPPED_SERVICE_UNAVAILABLE");
+            return;
+        }
+        try {
+            StockWatchItem item = analysisPolicyService.currentItem(rule.getSymbol(), rule.getMarket());
+            List<String> reasonCodes = new ArrayList<>();
+            reasonCodes.add("AI_RULE_TRIGGERED");
+            Object matchedSignals = event.get("matched_signals");
+            if (matchedSignals instanceof Collection) {
+                for (Object signal : (Collection<?>) matchedSignals) {
+                    String value = text(signal, "");
+                    if (StringUtils.hasText(value)) reasonCodes.add(value);
+                }
+            }
+            Map<String, Object> triggerContext = new LinkedHashMap<>();
+            triggerContext.put("eventId", event.get("event_id"));
+            triggerContext.put("ruleId", rule.getId());
+            triggerContext.put("signalFingerprint", event.get("ai_signal_shape_fingerprint"));
+            triggerContext.put("riskTier", event.get("ai_risk_tier"));
+            triggerContext.put("triggerEvidencePolicy", event.get("trigger_evidence_policy"));
+            triggerContext.put("triggerEvidenceGateReason", event.get("trigger_evidence_gate_reason"));
+            StockWatchAnalysisDemand demand = analysisDemandService.createAnomaly(
+                    item,
+                    longNumber(event.get("target_fact_observation_id")),
+                    text(event.get("target_fact_observation_key"), ""),
+                    longNumber(event.get("target_source_time_epoch_ms")),
+                    reasonCodes,
+                    triggerContext,
+                    now
+            );
+            if (demand == null) {
+                event.put("analysis_demand_status", "SKIPPED_BY_POLICY");
+                return;
+            }
+            event.put("analysis_demand_status", "QUEUED");
+            event.put("analysis_demand_id", demand.getId());
+            event.put("analysis_demand_key", demand.getDemandKey());
+            event.put("analysis_demand_trigger_type", demand.getTriggerType());
+        } catch (Exception e) {
+            event.put("analysis_demand_status", "ERROR");
+            event.put("analysis_demand_error", shortError(e));
+            log.warn("stock-watch unified analysis demand queue failed symbol={}.{} ruleId={} error={}",
+                    rule.getSymbol(), rule.getMarket(), rule.getId(), shortError(e));
+        }
+    }
+
+    private String shortError(Exception e) {
+        if (e == null) return "unknown_error";
+        return StringUtils.hasText(e.getMessage()) ? e.getMessage() : e.getClass().getSimpleName();
+    }
+
     private AlertSendResult sendTriggeredEmail(SupportBreakRule rule,
                                                String name,
                                                String reason,
@@ -1750,13 +1865,40 @@ public class StockWatchMonitorService {
         appendQuoteLine(content, quote, "换手率", "turnover", "%");
         appendQuoteLine(content, quote, "主力净流入", "mainInflow");
 
-        appendSection(content, deterministic ? "三、本地复核说明" : "三、DeepSeek 分析建议");
-        appendParagraph(content, firstNonBlank(decision.getAnalysis(), deterministic
-                ? "本轮仅保留可复核的本地确定性事实。"
-                : "本轮 DeepSeek 未返回明确分析建议。"), "  ");
-        appendLine(content, deterministic ? "判断来源" : "分析模型", firstNonBlank(decision.getModel(), "--"));
+        Long targetSourceTime = longNumber(event.get("target_source_time_epoch_ms"));
+        StockWatchTechnicalAnalysis inlineAnalysis = targetSourceTime == null ? null
+                : technicalContextService.exactTrustedForSource(
+                rule.getSymbol(), rule.getMarket(), targetSourceTime);
+        StockWatchTechnicalAnalysis recentContextAnalysis = targetSourceTime == null || inlineAnalysis != null ? null
+                : technicalContextService.latestTrustedHistorical(
+                rule.getSymbol(), rule.getMarket(), targetSourceTime);
+        Object riskSummary = event.get("riskPatternSummary");
+        if (riskSummary instanceof Map) {
+            String renderedRisk = riskPatternSummaryRenderer.renderMailBlock((Map<String, Object>) riskSummary, "  ");
+            if (StringUtils.hasText(renderedRisk)) {
+                appendSection(content, "三、价量风险结构识别（套路识别）");
+                content.append(renderedRisk);
+            }
+        }
 
-        appendSection(content, "四、触发依据");
+        appendSection(content, "四、技术分析");
+        if (inlineAnalysis != null) {
+            content.append(technicalEmailRenderer.render(inlineAnalysis, "  同一行情事实可信技术分析"));
+        } else if (validFactEvent(event)) {
+            appendParagraph(content,
+                    "同一行情事实的技术分析正在生成。初始提醒先发送，分析完成后将另发一封“补充技术分析”邮件。",
+                    "  ");
+            if (recentContextAnalysis != null) {
+                content.append(technicalEmailRenderer.render(recentContextAnalysis, "  最近一次可信技术分析（仅作上下文）"));
+            }
+        } else {
+            appendParagraph(content,
+                    "本轮缺少可追溯的标准行情事实，未提交模型分析，也不会把模型异常文本当作技术分析。",
+                    "  ");
+        }
+        appendLine(content, "触发判断来源", firstNonBlank(decision.getModel(), "--"));
+
+        appendSection(content, "五、触发依据");
         appendParagraph(content, firstNonBlank(decision.getReason(), "未返回触发依据。"), "  ");
         if (decision.getMissingData() != null && !decision.getMissingData().isEmpty()) {
             content.append("\n  数据缺失：\n");
@@ -1765,14 +1907,16 @@ public class StockWatchMonitorService {
             }
         }
 
-        appendSection(content, "五、观察条件");
+        appendSection(content, "六、观察条件");
         appendParagraph(content, compactCondition(rule.getConditionText()), "  ");
-        return sendAiAlertWithFrequencyGate(rule, subject, content.toString(), now);
+        return sendAiAlertWithFrequencyGate(rule, subject, content.toString(), event, inlineAnalysis, now);
     }
 
     private AlertSendResult sendAiAlertWithFrequencyGate(AiWatchRule rule,
                                                          String subject,
                                                          String content,
+                                                         Map<String, Object> event,
+                                                         StockWatchTechnicalAnalysis inlineAnalysis,
                                                          ZonedDateTime now) {
         StockWatchDeliveryConfig config = deliveryConfigMapper.selectBySymbolMarket(rule.getSymbol(), rule.getMarket());
         if (config == null) {
@@ -1792,19 +1936,31 @@ public class StockWatchMonitorService {
             return AlertSendResult.skipped("deliveryFrequencyBlocked: " + gate.reason);
         }
 
-        NotificationService.EmailSendResult sendResult = notificationService.sendStockWatchAlertToRecipients(
-                subject,
-                content,
-                recipients,
-                null
-        );
+        StockWatchAlertDeliveryService.AlertRequest request =
+                new StockWatchAlertDeliveryService.AlertRequest();
+        request.setConfigId(config.getId());
+        request.setRuleId(rule.getId());
+        request.setSymbol(rule.getSymbol());
+        request.setMarket(rule.getMarket());
+        request.setStockName(rule.getName());
+        request.setRecipients(recipients);
+        request.setTargetFactObservationId(longNumber(event.get("target_fact_observation_id")));
+        request.setTargetFactObservationKey(text(event.get("target_fact_observation_key"), null));
+        request.setTargetSourceTimeEpochMs(longNumber(event.get("target_source_time_epoch_ms")));
+        request.setTradeDate(java.sql.Date.valueOf(now.toLocalDate()));
+        request.setSignalFingerprint(text(event.get("ai_signal_shape_fingerprint"), ""));
+        request.setInlineAnalysisId(inlineAnalysis == null ? null : inlineAnalysis.getId());
+        request.setAnalysisDemandId(longNumber(event.get("analysis_demand_id")));
+        request.setDeadlineAt(Date.from(now.plusHours(6).toInstant()));
+        request.setInitialSubject(subject);
+        request.setInitialBody(content);
+        StockWatchAlertDeliveryService.DeliveryResult sendResult =
+                alertDeliveryService.createAndSend(request);
         if (sendResult.isSuccess()) {
-            deliveryConfigMapper.updateDispatchStatus(config.getId(), "SENT", "Stock Watch 预警已发送：" + subject, new Date());
             markStockAlertSent(stockKey(config.getSymbol(), config.getMarket()), now);
             return AlertSendResult.sent(sendResult.getMessageId(), "使用单股邮件配置发送");
         }
-        String error = firstNonBlank(sendResult.getErrorMessage(), "SMTP 发送失败");
-        deliveryConfigMapper.updateDispatchStatus(config.getId(), "FAILED", "Stock Watch 预警发送失败：" + error, null);
+        String error = firstNonBlank(sendResult.getError(), "SMTP 发送失败");
         return AlertSendResult.failed(error);
     }
 
@@ -2518,6 +2674,38 @@ public class StockWatchMonitorService {
         if (value == null) return fallback;
         String text = String.valueOf(value).trim();
         return text.isEmpty() ? fallback : text;
+    }
+
+    private String text(Object raw, String fallback) {
+        if (raw == null) return fallback;
+        String value = String.valueOf(raw).trim();
+        return value.isEmpty() ? fallback : value;
+    }
+
+    private Long longNumber(Object raw) {
+        if (raw == null) return null;
+        try {
+            return raw instanceof Number ? ((Number) raw).longValue()
+                    : Long.parseLong(String.valueOf(raw).trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean validFactReceipt(Map<String, Object> receipt) {
+        if (receipt == null || receipt.isEmpty()) return false;
+        String status = text(receipt.get("status"), "").toUpperCase(Locale.ROOT);
+        return !"ERROR".equals(status) && !"SKIPPED".equals(status)
+                && longNumber(receipt.get("observationId")) != null
+                && StringUtils.hasText(text(receipt.get("observationKey"), ""))
+                && longNumber(receipt.get("sourceTimeEpochMs")) != null;
+    }
+
+    private boolean validFactEvent(Map<String, Object> event) {
+        return event != null
+                && longNumber(event.get("target_fact_observation_id")) != null
+                && StringUtils.hasText(text(event.get("target_fact_observation_key"), ""))
+                && longNumber(event.get("target_source_time_epoch_ms")) != null;
     }
 
     private Double number(Object raw, Double fallback) {

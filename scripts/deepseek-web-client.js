@@ -1593,9 +1593,23 @@ async function searchQuery(query, options = {}) {
     const baseline = await captureSearchState(client);
     const searchStartedAt = Date.now();
     await sleepWithJitter(PRE_SUBMIT_DELAY_MS);
+    if (typeof options.onSubmitting === 'function') {
+      await options.onSubmitting({
+        targetId: target.targetId || null,
+        sessionKey: options.sessionKey || target.sessionKey || null,
+        turnSignature: buildTurnSignature(query.trim())
+      });
+    }
     const submit = await submitQuery(client, query.trim());
     if (!submit || !submit.ok) {
       throw new Error(`Failed to submit query: ${JSON.stringify(submit)}`);
+    }
+    if (typeof options.onSubmitted === 'function') {
+      await options.onSubmitted({
+        targetId: target.targetId || null,
+        sessionKey: options.sessionKey || target.sessionKey || null,
+        turnSignature: buildTurnSignature(query.trim())
+      });
     }
     await sleepWithJitter(POST_SUBMIT_SETTLE_MS, 600);
     const raw = await waitForAnswer(client, baseline, {

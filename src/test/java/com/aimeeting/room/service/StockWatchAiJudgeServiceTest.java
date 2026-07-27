@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -43,11 +44,12 @@ class StockWatchAiJudgeServiceTest {
 
     @Mock private AiModelRouter aiModelRouter;
     @Mock private StockWatchAnalysisTaskService analysisTaskService;
+    @Mock private StockWatchBridgeAdmissionService bridgeAdmissionService;
     @Mock private Reservation reservation;
     @InjectMocks private StockWatchAiJudgeService service;
 
     @BeforeEach
-    void setUpTaskReservation() {
+    void setUpTaskReservation() throws Exception {
         StockWatchAnalysisTask task = new StockWatchAnalysisTask();
         task.setId(1L);
         task.setSubmissionKey("test-submission");
@@ -57,6 +59,8 @@ class StockWatchAiJudgeServiceTest {
                 anyString(), anyString(), anyInt(), anyString(), any())).thenReturn(reservation);
         when(reservation.isNewSubmission()).thenReturn(true);
         lenient().when(reservation.getTask()).thenReturn(task);
+        lenient().when(bridgeAdmissionService.execute(anyInt(), anyString(), any()))
+                .thenAnswer(invocation -> ((Callable<?>) invocation.getArgument(2)).call());
     }
 
     @Test

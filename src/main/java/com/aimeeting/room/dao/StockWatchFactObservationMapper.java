@@ -8,5 +8,7 @@ import org.apache.ibatis.annotations.Param;
 public interface StockWatchFactObservationMapper {
     int insert(StockWatchFactObservation observation);
 
+    StockWatchFactObservation selectById(@Param("id") Long id);
+
     StockWatchFactObservation selectByObservationKey(@Param("observationKey") String observationKey);
 }

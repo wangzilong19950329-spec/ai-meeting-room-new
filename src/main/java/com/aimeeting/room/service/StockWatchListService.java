@@ -18,6 +18,7 @@ public class StockWatchListService {
 
     private final StockWatchItemMapper itemMapper;
     private final StockQuoteService stockQuoteService;
+    private final StockWatchAnalysisPolicyService analysisPolicyService;
 
     public List<Map<String, Object>> listEnabled() {
         return itemMapper.selectEnabled().stream()
@@ -44,6 +45,7 @@ public class StockWatchListService {
         item.setEnabled(bool(body.get("enabled"), true));
         item.setSource(text(body, "source", existing == null ? "manual" : firstNonBlank(existing.getSource(), "manual")));
         item.setGroupKey(normalizeGroupKey(text(body, "groupKey", text(body, "group", "")), existing));
+        analysisPolicyService.applyDefaults(item);
         if (existing == null) {
             itemMapper.insert(item);
         } else {
@@ -87,6 +89,7 @@ public class StockWatchListService {
         payload.put("source", firstNonBlank(item.getSource(), "manual"));
         payload.put("groupKey", normalizeGroupKey(item.getGroupKey(), null));
         payload.put("groupName", groupName(item.getGroupKey()));
+        analysisPolicyService.decorate(item, payload);
         return payload;
     }
 

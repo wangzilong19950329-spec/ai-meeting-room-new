@@ -297,6 +297,13 @@ CREATE TABLE IF NOT EXISTS stock_watch_item (
     enabled TINYINT DEFAULT 1 NOT NULL,
     source VARCHAR(32) DEFAULT 'manual' NOT NULL,
     group_key VARCHAR(32) DEFAULT 'watch' NOT NULL,
+    analysis_mode VARCHAR(32) DEFAULT 'INTERVAL' NOT NULL,
+    analysis_interval_minutes INT DEFAULT 30,
+    anomaly_trigger_mode VARCHAR(32) DEFAULT 'IMMEDIATE_ANALYSIS' NOT NULL,
+    weekly_review_enabled TINYINT DEFAULT 1 NOT NULL,
+    monthly_review_enabled TINYINT DEFAULT 1 NOT NULL,
+    analysis_policy_version BIGINT DEFAULT 0 NOT NULL,
+    analysis_policy_modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -600,3 +607,105 @@ CREATE TABLE IF NOT EXISTS stock_watch_delivery_log (
 CREATE UNIQUE INDEX IF NOT EXISTS uk_sw_delivery_once ON stock_watch_delivery_log(analysis_id, recipient_hash);
 CREATE INDEX IF NOT EXISTS idx_sw_delivery_config_status ON stock_watch_delivery_log(config_id, status);
 CREATE INDEX IF NOT EXISTS idx_sw_delivery_symbol_time ON stock_watch_delivery_log(symbol, market, gmt_create);
+
+CREATE TABLE IF NOT EXISTS stock_watch_analysis_demand (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    demand_key VARCHAR(128) NOT NULL UNIQUE,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    stock_name VARCHAR(128),
+    capability VARCHAR(64) NOT NULL DEFAULT 'TECHNICAL_PLUS_ANOMALY',
+    trigger_type VARCHAR(32) NOT NULL DEFAULT 'ANOMALY_DEFERRED',
+    schedule_slot_key VARCHAR(128),
+    run_slot VARCHAR(64),
+    coalesce_key VARCHAR(192),
+    active_coalesce_key VARCHAR(192),
+    source_policy_version BIGINT,
+    reason_codes_json CLOB,
+    trigger_context_json CLOB,
+    period_type VARCHAR(16) NOT NULL DEFAULT 'DAY',
+    target_fact_observation_id BIGINT,
+    target_fact_observation_key VARCHAR(64),
+    target_source_time_epoch_ms BIGINT,
+    trade_date DATE NOT NULL,
+    business_generation INT NOT NULL DEFAULT 1,
+    retry_of_demand_id BIGINT,
+    superseded_by_demand_id BIGINT,
+    status VARCHAR(32) NOT NULL,
+    priority INT NOT NULL DEFAULT 400,
+    not_before TIMESTAMP NOT NULL,
+    deadline_at TIMESTAMP NOT NULL,
+    provider_submit_count INT NOT NULL DEFAULT 0,
+    analysis_task_id BIGINT,
+    analysis_id BIGINT,
+    lease_token VARCHAR(64),
+    lease_until TIMESTAMP,
+    error_message CLOB,
+    row_version BIGINT NOT NULL DEFAULT 0,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_sw_analysis_demand_active_coalesce ON stock_watch_analysis_demand(active_coalesce_key);
+CREATE INDEX IF NOT EXISTS idx_sw_analysis_demand_dispatch ON stock_watch_analysis_demand(status, not_before, priority);
+
+CREATE TABLE IF NOT EXISTS stock_watch_analysis_scheduler_ownership (
+    id INT PRIMARY KEY,
+    mode VARCHAR(16) NOT NULL,
+    generation BIGINT NOT NULL DEFAULT 0,
+    row_version BIGINT NOT NULL DEFAULT 0,
+    last_error CLOB,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+MERGE INTO stock_watch_analysis_scheduler_ownership (id, mode, generation, row_version)
+KEY(id) VALUES (1, 'LEGACY', 0, 0);
+
+CREATE TABLE IF NOT EXISTS stock_watch_alert_delivery_obligation (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_key VARCHAR(128) NOT NULL,
+    open_episode_key VARCHAR(128) UNIQUE,
+    config_id BIGINT,
+    rule_id VARCHAR(64) NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    stock_name VARCHAR(128),
+    recipient_hash VARCHAR(64) NOT NULL,
+    recipient_address VARCHAR(320) NOT NULL,
+    sender_snapshot_json CLOB,
+    target_fact_observation_id BIGINT,
+    target_fact_observation_key VARCHAR(64),
+    target_source_time_epoch_ms BIGINT,
+    trade_date DATE,
+    signal_fingerprint VARCHAR(512) NOT NULL,
+    inline_analysis_id BIGINT,
+    analysis_demand_id BIGINT,
+    deadline_at TIMESTAMP NOT NULL,
+    episode_suppressed_until TIMESTAMP,
+    initial_subject VARCHAR(512) NOT NULL,
+    initial_body CLOB NOT NULL,
+    initial_message_id VARCHAR(255) NOT NULL,
+    initial_status VARCHAR(32) NOT NULL,
+    initial_attempt_count INT NOT NULL DEFAULT 0,
+    initial_next_attempt_at TIMESTAMP,
+    initial_lease_token VARCHAR(64),
+    initial_lease_until TIMESTAMP,
+    initial_sent_at TIMESTAMP,
+    initial_error CLOB,
+    supplement_analysis_id BIGINT,
+    supplement_subject VARCHAR(512),
+    supplement_body CLOB,
+    supplement_message_id VARCHAR(255) NOT NULL,
+    supplement_status VARCHAR(32) NOT NULL,
+    supplement_attempt_count INT NOT NULL DEFAULT 0,
+    supplement_next_attempt_at TIMESTAMP,
+    supplement_lease_token VARCHAR(64),
+    supplement_lease_until TIMESTAMP,
+    supplement_sent_at TIMESTAMP,
+    supplement_error CLOB,
+    row_version BIGINT NOT NULL DEFAULT 0,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    UNIQUE(event_key, recipient_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_alert_initial_dispatch ON stock_watch_alert_delivery_obligation(initial_status, initial_next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_sw_alert_supplement_dispatch ON stock_watch_alert_delivery_obligation(supplement_status, supplement_next_attempt_at);

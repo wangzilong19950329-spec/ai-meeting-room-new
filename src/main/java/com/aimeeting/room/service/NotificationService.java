@@ -7,14 +7,17 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.mail.SimpleMailMessage;
 import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
+import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.mail.internet.MimeMessage;
 
 /**
  * 会议结论通知服务。
@@ -81,6 +84,14 @@ public class NotificationService {
                                                            String alertContent,
                                                            List<String> recipients,
                                                            EmailSenderConfig senderConfig) {
+        return sendStockWatchAlertToRecipients(alertTitle, alertContent, recipients, senderConfig, null);
+    }
+
+    public EmailSendResult sendStockWatchAlertToRecipients(String alertTitle,
+                                                           String alertContent,
+                                                           List<String> recipients,
+                                                           EmailSenderConfig senderConfig,
+                                                           String logicalMessageId) {
         List<String> normalizedRecipients = recipients == null
                 ? List.of()
                 : recipients.stream()
@@ -97,22 +108,29 @@ public class NotificationService {
             return EmailSendResult.fail("SMTP 未配置或 JavaMailSender 未初始化");
         }
 
-        SimpleMailMessage message = new SimpleMailMessage();
-        message.setTo(normalizedRecipients.toArray(new String[0]));
         String from = senderConfig != null && !isBlank(senderConfig.getFrom())
                 ? senderConfig.getFrom()
                 : firstNonBlank(emailFrom, mailUsername);
-        if (!isBlank(from)) {
-            message.setFrom(from);
-        }
-        message.setSubject(firstNonBlank(alertTitle, "Stock Watch 通知"));
-        message.setText(firstNonBlank(alertContent, "Stock Watch 有新的分析结论。"));
 
         try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, false, StandardCharsets.UTF_8.name());
+            helper.setTo(normalizedRecipients.toArray(new String[0]));
+            if (!isBlank(from)) {
+                helper.setFrom(from);
+            }
+            helper.setSubject(firstNonBlank(alertTitle, "Stock Watch 通知"));
+            helper.setText(firstNonBlank(alertContent, "Stock Watch 有新的分析结论。"), false);
+            String stableId = isBlank(logicalMessageId)
+                    ? "stock-watch-" + UUID.randomUUID()
+                    : logicalMessageId.trim();
+            message.setHeader("Message-ID", "<" + stableId.replaceAll("[^A-Za-z0-9._-]", "_")
+                    + "@stock-watch.local>");
+            message.setHeader("X-Stock-Watch-Delivery-Key", stableId);
             mailSender.send(message);
-            String messageId = "stock-watch-" + UUID.randomUUID();
-            log.info("股票盯盘邮件发送成功: subject={}, recipients={}", message.getSubject(), maskRecipients(normalizedRecipients));
-            return EmailSendResult.ok(messageId);
+            log.info("股票盯盘邮件发送成功: subject={}, recipients={}, logicalMessageId={}",
+                    helper.getMimeMessage().getSubject(), maskRecipients(normalizedRecipients), stableId);
+            return EmailSendResult.ok(stableId);
         } catch (Exception e) {
             log.warn("股票盯盘邮件发送失败: {}", e.getMessage());
             return EmailSendResult.fail(e.getMessage());

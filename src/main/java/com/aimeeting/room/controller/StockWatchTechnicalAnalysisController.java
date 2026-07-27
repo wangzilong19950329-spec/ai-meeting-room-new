@@ -3,6 +3,8 @@ package com.aimeeting.room.controller;
 import com.aimeeting.room.common.ApiResponse;
 import com.aimeeting.room.service.AnalysisReuseOnlyMissException;
 import com.aimeeting.room.service.StockWatchTechnicalAnalysisService;
+import com.aimeeting.room.service.StockWatchAnalysisScheduler;
+import com.aimeeting.room.service.StockWatchAnalysisSchedulerOwnershipService;
 import com.aimeeting.room.service.StockWatchPredictionService;
 import com.aimeeting.room.service.StockSymbol;
 import lombok.RequiredArgsConstructor;
@@ -26,6 +28,8 @@ public class StockWatchTechnicalAnalysisController {
 
     private final StockWatchTechnicalAnalysisService technicalAnalysisService;
     private final StockWatchPredictionService predictionService;
+    private final StockWatchAnalysisSchedulerOwnershipService schedulerOwnershipService;
+    private final StockWatchAnalysisScheduler analysisScheduler;
 
     @GetMapping
     public ApiResponse<Map<String, Object>> history(@RequestParam("symbol") String symbol,
@@ -40,7 +44,31 @@ public class StockWatchTechnicalAnalysisController {
 
     @GetMapping("/status")
     public ApiResponse<Map<String, Object>> status() {
-        return ApiResponse.ok(technicalAnalysisService.status());
+        Map<String, Object> status = new LinkedHashMap<>(technicalAnalysisService.status());
+        status.put("schedulerOwnership", schedulerOwnershipService.snapshot());
+        return ApiResponse.ok(status);
+    }
+
+    @PostMapping("/scheduler/ownership")
+    public ApiResponse<Map<String, Object>> switchSchedulerOwnership(@RequestBody Map<String, Object> body) {
+        try {
+            String mode = body == null ? null : String.valueOf(body.get("mode"));
+            if ("POLICY".equalsIgnoreCase(mode) && technicalAnalysisService.isRunning()) {
+                return ApiResponse.fail(409, "Legacy技术分析批次仍在运行，请等待结束后再切换POLICY调度");
+            }
+            Object expected = body == null ? null : body.get("expectedVersion");
+            Long expectedVersion = expected == null ? null : Long.parseLong(String.valueOf(expected));
+            return ApiResponse.ok(schedulerOwnershipService.switchMode(mode, expectedVersion));
+        } catch (StockWatchAnalysisSchedulerOwnershipService.OwnershipConflictException conflict) {
+            return ApiResponse.fail(409, conflict.getMessage());
+        } catch (Exception invalid) {
+            return ApiResponse.fail(400, invalid.getMessage());
+        }
+    }
+
+    @PostMapping("/scheduler/reconcile")
+    public ApiResponse<Map<String, Object>> reconcileScheduler() {
+        return ApiResponse.ok(analysisScheduler.reconcileNow());
     }
 
     @GetMapping("/predictions")

@@ -30,4 +30,8 @@
     <select id="selectByObservationKey" resultMap="BaseResultMap">
         SELECT * FROM stock_watch_fact_observation WHERE observation_key = #{observationKey}
     </select>
+
+    <select id="selectById" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_fact_observation WHERE id = #{id}
+    </select>
 </mapper>

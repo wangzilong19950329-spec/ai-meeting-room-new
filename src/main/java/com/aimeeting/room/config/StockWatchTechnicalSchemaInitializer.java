@@ -26,6 +26,13 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "enabled TINYINT NOT NULL DEFAULT 1,"
                     + "source VARCHAR(32) NOT NULL DEFAULT 'manual',"
                     + "group_key VARCHAR(32) NOT NULL DEFAULT 'watch',"
+                    + "analysis_mode VARCHAR(32) NOT NULL DEFAULT 'INTERVAL',"
+                    + "analysis_interval_minutes INT DEFAULT 30,"
+                    + "anomaly_trigger_mode VARCHAR(32) NOT NULL DEFAULT 'IMMEDIATE_ANALYSIS',"
+                    + "weekly_review_enabled TINYINT NOT NULL DEFAULT 1,"
+                    + "monthly_review_enabled TINYINT NOT NULL DEFAULT 1,"
+                    + "analysis_policy_version BIGINT NOT NULL DEFAULT 0,"
+                    + "analysis_policy_modified_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
                     + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
                     + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
                     + "PRIMARY KEY (id),"
@@ -34,6 +41,13 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "KEY idx_sw_item_group (group_key, enabled, symbol, market)"
                     + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
             safeAddColumn("stock_watch_item", "group_key", "VARCHAR(32) NOT NULL DEFAULT 'watch'");
+            safeAddColumn("stock_watch_item", "analysis_mode", "VARCHAR(32) NOT NULL DEFAULT 'INTERVAL'");
+            safeAddColumn("stock_watch_item", "analysis_interval_minutes", "INT DEFAULT 30");
+            safeAddColumn("stock_watch_item", "anomaly_trigger_mode", "VARCHAR(32) NOT NULL DEFAULT 'IMMEDIATE_ANALYSIS'");
+            safeAddColumn("stock_watch_item", "weekly_review_enabled", "TINYINT NOT NULL DEFAULT 1");
+            safeAddColumn("stock_watch_item", "monthly_review_enabled", "TINYINT NOT NULL DEFAULT 1");
+            safeAddColumn("stock_watch_item", "analysis_policy_version", "BIGINT NOT NULL DEFAULT 0");
+            safeAddColumn("stock_watch_item", "analysis_policy_modified_at", "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP");
             safeExecute("CREATE INDEX idx_sw_item_group ON stock_watch_item(group_key, enabled, symbol, market)");
 
             jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_technical_session ("
@@ -193,6 +207,82 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "UNIQUE KEY uk_sw_delivery_once (analysis_id, recipient_hash),"
                     + "KEY idx_sw_delivery_config_status (config_id, status),"
                     + "KEY idx_sw_delivery_symbol_time (symbol, market, gmt_create)"
+                    + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+            jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_analysis_demand ("
+                    + "id BIGINT NOT NULL AUTO_INCREMENT,demand_key VARCHAR(128) NOT NULL,"
+                    + "symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,stock_name VARCHAR(128),"
+                    + "capability VARCHAR(64) NOT NULL DEFAULT 'TECHNICAL_PLUS_ANOMALY',"
+                    + "trigger_type VARCHAR(32) NOT NULL DEFAULT 'ANOMALY_DEFERRED',"
+                    + "schedule_slot_key VARCHAR(128),run_slot VARCHAR(64),coalesce_key VARCHAR(192),active_coalesce_key VARCHAR(192),"
+                    + "source_policy_version BIGINT,reason_codes_json TEXT,trigger_context_json MEDIUMTEXT,"
+                    + "period_type VARCHAR(16) NOT NULL DEFAULT 'DAY',"
+                    + "target_fact_observation_id BIGINT,target_fact_observation_key VARCHAR(64),"
+                    + "target_source_time_epoch_ms BIGINT,trade_date DATE NOT NULL,"
+                    + "business_generation INT NOT NULL DEFAULT 1,retry_of_demand_id BIGINT,"
+                    + "superseded_by_demand_id BIGINT,"
+                    + "status VARCHAR(32) NOT NULL,priority INT NOT NULL DEFAULT 400,"
+                    + "not_before DATETIME NOT NULL,deadline_at DATETIME NOT NULL,"
+                    + "provider_submit_count INT NOT NULL DEFAULT 0,analysis_task_id BIGINT,analysis_id BIGINT,"
+                    + "lease_token VARCHAR(64),lease_until DATETIME,error_message TEXT,"
+                    + "row_version BIGINT NOT NULL DEFAULT 0,"
+                    + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                    + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                    + "PRIMARY KEY (id),UNIQUE KEY uk_sw_analysis_demand_key (demand_key),"
+                    + "UNIQUE KEY uk_sw_analysis_demand_active_coalesce (active_coalesce_key),"
+                    + "KEY idx_sw_analysis_demand_dispatch (status,not_before,priority),"
+                    + "KEY idx_sw_analysis_demand_task (analysis_task_id)"
+                    + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            safeAddColumn("stock_watch_analysis_demand", "capability", "VARCHAR(64) NOT NULL DEFAULT 'TECHNICAL_PLUS_ANOMALY'");
+            safeAddColumn("stock_watch_analysis_demand", "trigger_type", "VARCHAR(32) NOT NULL DEFAULT 'ANOMALY_DEFERRED'");
+            safeAddColumn("stock_watch_analysis_demand", "schedule_slot_key", "VARCHAR(128)");
+            safeAddColumn("stock_watch_analysis_demand", "run_slot", "VARCHAR(64)");
+            safeAddColumn("stock_watch_analysis_demand", "coalesce_key", "VARCHAR(192)");
+            safeAddColumn("stock_watch_analysis_demand", "active_coalesce_key", "VARCHAR(192)");
+            safeAddColumn("stock_watch_analysis_demand", "source_policy_version", "BIGINT");
+            safeAddColumn("stock_watch_analysis_demand", "reason_codes_json", "TEXT");
+            safeAddColumn("stock_watch_analysis_demand", "trigger_context_json", "MEDIUMTEXT");
+            safeAddColumn("stock_watch_analysis_demand", "superseded_by_demand_id", "BIGINT");
+            safeExecute("ALTER TABLE stock_watch_analysis_demand MODIFY target_fact_observation_id BIGINT NULL");
+            safeExecute("ALTER TABLE stock_watch_analysis_demand MODIFY target_fact_observation_key VARCHAR(64) NULL");
+            safeExecute("ALTER TABLE stock_watch_analysis_demand MODIFY target_source_time_epoch_ms BIGINT NULL");
+            safeExecute("CREATE UNIQUE INDEX uk_sw_analysis_demand_active_coalesce ON stock_watch_analysis_demand(active_coalesce_key)");
+
+            jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_analysis_scheduler_ownership ("
+                    + "id INT NOT NULL,mode VARCHAR(16) NOT NULL,generation BIGINT NOT NULL DEFAULT 0,"
+                    + "row_version BIGINT NOT NULL DEFAULT 0,last_error TEXT,"
+                    + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                    + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                    + "PRIMARY KEY (id)"
+                    + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+            safeExecute("INSERT IGNORE INTO stock_watch_analysis_scheduler_ownership(id,mode,generation,row_version) VALUES (1,'LEGACY',0,0)");
+
+            jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_alert_delivery_obligation ("
+                    + "id BIGINT NOT NULL AUTO_INCREMENT,event_key VARCHAR(128) NOT NULL,"
+                    + "open_episode_key VARCHAR(128),config_id BIGINT,rule_id VARCHAR(64) NOT NULL,"
+                    + "symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,stock_name VARCHAR(128),"
+                    + "recipient_hash VARCHAR(64) NOT NULL,recipient_address VARCHAR(320) NOT NULL,"
+                    + "sender_snapshot_json TEXT,target_fact_observation_id BIGINT,"
+                    + "target_fact_observation_key VARCHAR(64),target_source_time_epoch_ms BIGINT,trade_date DATE,"
+                    + "signal_fingerprint VARCHAR(512) NOT NULL,inline_analysis_id BIGINT,analysis_demand_id BIGINT,"
+                    + "deadline_at DATETIME NOT NULL,episode_suppressed_until DATETIME,"
+                    + "initial_subject VARCHAR(512) NOT NULL,initial_body MEDIUMTEXT NOT NULL,"
+                    + "initial_message_id VARCHAR(255) NOT NULL,initial_status VARCHAR(32) NOT NULL,"
+                    + "initial_attempt_count INT NOT NULL DEFAULT 0,initial_next_attempt_at DATETIME,"
+                    + "initial_lease_token VARCHAR(64),initial_lease_until DATETIME,initial_sent_at DATETIME,initial_error TEXT,"
+                    + "supplement_analysis_id BIGINT,supplement_subject VARCHAR(512),supplement_body MEDIUMTEXT,"
+                    + "supplement_message_id VARCHAR(255) NOT NULL,supplement_status VARCHAR(32) NOT NULL,"
+                    + "supplement_attempt_count INT NOT NULL DEFAULT 0,supplement_next_attempt_at DATETIME,"
+                    + "supplement_lease_token VARCHAR(64),supplement_lease_until DATETIME,"
+                    + "supplement_sent_at DATETIME,supplement_error TEXT,row_version BIGINT NOT NULL DEFAULT 0,"
+                    + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                    + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                    + "PRIMARY KEY (id),"
+                    + "UNIQUE KEY uk_sw_alert_obligation_event_recipient (event_key,recipient_hash),"
+                    + "UNIQUE KEY uk_sw_alert_obligation_open_episode (open_episode_key),"
+                    + "KEY idx_sw_alert_initial_dispatch (initial_status,initial_next_attempt_at),"
+                    + "KEY idx_sw_alert_supplement_dispatch (supplement_status,supplement_next_attempt_at),"
+                    + "KEY idx_sw_alert_demand (analysis_demand_id,supplement_status)"
                     + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 
             jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_fc_card ("

@@ -12,6 +12,9 @@ public interface StockWatchItemMapper {
 
     int update(StockWatchItem record);
 
+    int updateAnalysisPolicy(@Param("record") StockWatchItem record,
+                             @Param("expectedVersion") Long expectedVersion);
+
     StockWatchItem selectBySymbolMarket(@Param("symbol") String symbol,
                                         @Param("market") String market);
 

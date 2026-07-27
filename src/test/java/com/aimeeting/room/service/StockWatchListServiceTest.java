@@ -23,12 +23,13 @@ class StockWatchListServiceTest {
 
     @Mock private StockWatchItemMapper itemMapper;
     @Mock private StockQuoteService stockQuoteService;
+    @Mock private StockWatchAnalysisPolicyService analysisPolicyService;
 
     private StockWatchListService service;
 
     @BeforeEach
     void setUp() {
-        service = new StockWatchListService(itemMapper, stockQuoteService);
+        service = new StockWatchListService(itemMapper, stockQuoteService, analysisPolicyService);
     }
 
     @Test
