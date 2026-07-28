@@ -1,0 +1,40 @@
+{
+  "schema_version": "phase1.market_behavior_view.v1",
+  "claim_set": [
+    {
+      "claim_id": "c1",
+      "kind": "observation",
+      "fact_refs": [
+        "fact.last_price",
+        "fact.previous_close",
+        "fact.price_change_pct"
+      ],
+      "statement": "The latest fixture price is above the previous close.",
+      "confidence": "low"
+    },
+    {
+      "claim_id": "c2",
+      "kind": "risk_context",
+      "fact_refs": [
+        "fact.position_locked_quantity",
+        "fact.available_quantity"
+      ],
+      "statement": "The position has no available quantity under the fixture T plus one constraint.",
+      "confidence": "low"
+    }
+  ],
+  "uncertainty": [
+    "fixture data only",
+    "amount semantics unknown",
+    "no order book or full session bars"
+  ],
+  "prohibited_capabilities_used": false,
+  "numeric_outputs": [
+    {
+      "value": 0.9934,
+      "meaning": "price change percent",
+      "fact_ref": "fact.price_change_pct"
+    }
+  ],
+  "recommendation": null
+}

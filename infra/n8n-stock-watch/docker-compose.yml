@@ -1,0 +1,127 @@
+name: ai-meeting-room-n8n-stock-watch
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ai-meeting-room-sw-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD}
+      POSTGRES_DB: postgres
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/bootstrap:/bootstrap:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  db-bootstrap:
+    image: postgres:16-alpine
+    env_file:
+      - .env
+    volumes:
+      - ./sql/bootstrap:/bootstrap:ro
+    command: ["/bin/sh", "/bootstrap/000_create_databases_and_roles.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  db-migrate:
+    image: postgres:16-alpine
+    env_file:
+      - .env
+    volumes:
+      - ./sql/migrations:/migrations:ro
+      - ./scripts:/scripts:ro
+    command: ["/bin/sh", "/scripts/apply-migrations.sh"]
+    depends_on:
+      db-bootstrap:
+        condition: service_completed_successfully
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION}
+    container_name: ai-meeting-room-sw-n8n
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
+      DB_POSTGRESDB_USER: ${N8N_DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: public
+      TZ: ${TZ:-Asia/Shanghai}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Asia/Shanghai}
+      N8N_HOST: 127.0.0.1
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+      N8N_SECURE_COOKIE: "false"
+      N8N_DIAGNOSTICS_ENABLED: ${N8N_DIAGNOSTICS_ENABLED}
+      N8N_HIRING_BANNER_ENABLED: ${N8N_HIRING_BANNER_ENABLED}
+      N8N_PERSONALIZATION_ENABLED: ${N8N_PERSONALIZATION_ENABLED}
+      N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS: ${N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS}
+      N8N_PYTHON_ENABLED: ${N8N_PYTHON_ENABLED:-false}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      MODEL_PROVIDER: ${MODEL_PROVIDER}
+      NOTIFY_ENABLED: ${NOTIFY_ENABLED}
+      JAVA_BRIDGE_ENABLED: ${JAVA_BRIDGE_ENABLED:-false}
+      JAVA_API_BASE_URL: ${JAVA_API_BASE_URL:-http://host.docker.internal:8127}
+      DEEPSEEK_ENABLED: ${DEEPSEEK_ENABLED:-false}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-http://host.docker.internal:8789/v1}
+      SMTP_ENABLED: ${SMTP_ENABLED:-false}
+    ports:
+      - "127.0.0.1:${N8N_HOST_PORT:-5678}:5678"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./prompts:/prompts:ro
+      - ./schemas:/schemas:ro
+      - ./fixtures:/fixtures:ro
+      - ./runtime:/runtime
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+
+  n8n-import:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION}
+    profiles: ["tools"]
+    env_file:
+      - .env
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${N8N_DB_NAME}
+      DB_POSTGRESDB_USER: ${N8N_DB_USER}
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: public
+      TZ: ${TZ:-Asia/Shanghai}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Asia/Shanghai}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+      MODEL_PROVIDER: ${MODEL_PROVIDER}
+      NOTIFY_ENABLED: ${NOTIFY_ENABLED}
+      JAVA_BRIDGE_ENABLED: ${JAVA_BRIDGE_ENABLED:-false}
+      JAVA_API_BASE_URL: ${JAVA_API_BASE_URL:-http://host.docker.internal:8127}
+      DEEPSEEK_ENABLED: ${DEEPSEEK_ENABLED:-false}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-http://host.docker.internal:8789/v1}
+      SMTP_ENABLED: ${SMTP_ENABLED:-false}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+      - ./runtime:/runtime
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
+  n8n_data:

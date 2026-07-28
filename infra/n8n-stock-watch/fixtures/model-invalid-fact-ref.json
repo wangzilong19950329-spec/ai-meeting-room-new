@@ -1,0 +1,20 @@
+{
+  "schema_version": "phase1.market_behavior_view.v1",
+  "claim_set": [
+    {
+      "claim_id": "bad-ref",
+      "kind": "observation",
+      "fact_refs": [
+        "fact.not_in_packet"
+      ],
+      "statement": "This claim references a fact that does not exist in the packet.",
+      "confidence": "low"
+    }
+  ],
+  "uncertainty": [
+    "fixture data only"
+  ],
+  "prohibited_capabilities_used": false,
+  "numeric_outputs": [],
+  "recommendation": null
+}

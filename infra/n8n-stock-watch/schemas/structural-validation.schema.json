@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phase1.structural_validation.v1",
+  "type": "object",
+  "required": ["status", "errors", "checked_fact_refs", "forbidden_content_hits"],
+  "properties": {
+    "status": { "enum": ["accepted", "rejected"] },
+    "errors": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "checked_fact_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_content_hits": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

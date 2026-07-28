@@ -1,0 +1,26 @@
+{
+  "fixture_name": "quote-stale.json",
+  "source_kind": "fixture",
+  "symbol": "002594",
+  "market": "sz",
+  "exchange_symbol": "002594.sz",
+  "currency": "CNY",
+  "last_price": 274.5,
+  "previous_close": 271.8,
+  "open": 272.1,
+  "high": 276.2,
+  "low": 270.9,
+  "volume": 15321000,
+  "amount": null,
+  "main_inflow": null,
+  "quote_time": "2026-07-28T01:30:00.000Z",
+  "fetched_at": "2026-07-28T02:00:30.000Z",
+  "previous_snapshot": {
+    "last_price": 273.2,
+    "quote_time": "2026-07-28T01:29:00.000Z"
+  },
+  "field_semantics": {
+    "amount": "unknown",
+    "main_inflow": "unknown"
+  }
+}

@@ -1,0 +1,3 @@
+{
+  "schema_version": "phase1.market_behavior_view.v1",
+  "claim_set": [

@@ -1,0 +1,20 @@
+{
+  "schema_version": "phase1.market_behavior_view.v1",
+  "claim_set": [
+    {
+      "claim_id": "forbidden-text",
+      "kind": "risk_context",
+      "fact_refs": [
+        "fact.last_price"
+      ],
+      "statement": "This output includes a buy action instruction, which Phase1 must reject.",
+      "confidence": "low"
+    }
+  ],
+  "uncertainty": [
+    "fixture data only"
+  ],
+  "prohibited_capabilities_used": false,
+  "numeric_outputs": [],
+  "recommendation": null
+}

@@ -1,0 +1,453 @@
+{
+  "id": "SW01Phase1POC",
+  "name": "SW-01 POC Manual Pipeline",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "ManualTrigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const quote = {\n  \"fixture_name\": \"quote-valid.json\",\n  \"source_kind\": \"fixture\",\n  \"symbol\": \"002594\",\n  \"market\": \"sz\",\n  \"exchange_symbol\": \"002594.sz\",\n  \"currency\": \"CNY\",\n  \"last_price\": 274.5,\n  \"previous_close\": 271.8,\n  \"open\": 272.1,\n  \"high\": 276.2,\n  \"low\": 270.9,\n  \"volume\": 15321000,\n  \"amount\": null,\n  \"main_inflow\": null,\n  \"quote_time\": \"2026-07-28T02:00:00.000Z\",\n  \"fetched_at\": \"2026-07-28T02:00:30.000Z\",\n  \"previous_snapshot\": {\n    \"last_price\": 273.2,\n    \"quote_time\": \"2026-07-28T01:59:00.000Z\"\n  },\n  \"field_semantics\": {\n    \"amount\": \"unknown\",\n    \"main_inflow\": \"unknown\"\n  }\n};\nreturn [{ json: { quote_fixture: quote } }];"
+      },
+      "id": "LoadQuoteFixture",
+      "name": "Load Quote Fixture",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst q = item.quote_fixture;\n\nfunction requireNumber(name, value) {\n  if (typeof value !== 'number' || !Number.isFinite(value)) {\n    throw new Error(name + ' must be a finite number');\n  }\n}\n\n['last_price', 'previous_close', 'open', 'high', 'low', 'volume'].forEach((name) => requireNumber(name, q[name]));\n\nconst quoteTimeMs = Date.parse(q.quote_time);\nconst fetchedAtMs = Date.parse(q.fetched_at);\nif (!Number.isFinite(quoteTimeMs) || !Number.isFinite(fetchedAtMs)) {\n  throw new Error('quote_time and fetched_at must be ISO timestamps');\n}\nif (q.field_semantics.amount !== 'unknown' || q.field_semantics.main_inflow !== 'unknown') {\n  throw new Error('Phase1 requires unknown semantics for amount and main_inflow before they can be used');\n}\n\nconst normalized = {\n  fixture_name: q.fixture_name,\n  source_kind: q.source_kind,\n  symbol: q.symbol,\n  market: q.market,\n  exchange_symbol: q.exchange_symbol,\n  currency: q.currency,\n  last_price: q.last_price,\n  previous_close: q.previous_close,\n  open: q.open,\n  high: q.high,\n  low: q.low,\n  volume: q.volume,\n  amount: q.amount,\n  main_inflow: q.main_inflow,\n  quote_time: new Date(quoteTimeMs).toISOString(),\n  fetched_at: new Date(fetchedAtMs).toISOString(),\n  previous_snapshot: q.previous_snapshot,\n  field_semantics: q.field_semantics,\n};\n\nreturn [{ json: { ...item, normalized_quote: normalized } }];"
+      },
+      "id": "NormalizeQuote",
+      "name": "Normalize Quote",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst q = item.normalized_quote;\nconst freshnessSeconds = Math.round((Date.parse(q.fetched_at) - Date.parse(q.quote_time)) / 1000);\nconst errors = [];\n\nif (freshnessSeconds < 0) errors.push('fetched_at is earlier than quote_time');\nif (freshnessSeconds > 300) errors.push('quote is stale');\nif (q.high < q.low) errors.push('high is below low');\nif (q.last_price < q.low || q.last_price > q.high) errors.push('last_price is outside day range');\n\nif (errors.length) {\n  throw new Error('Quote Quality Gate rejected fixture: ' + errors.join('; '));\n}\n\nreturn [{ json: { ...item, quality_status: 'fresh_fixture', quote_freshness_seconds: freshnessSeconds } }];"
+      },
+      "id": "QuoteQualityGate",
+      "name": "Quote Quality Gate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst q = item.normalized_quote;\nconst previous = q.previous_snapshot || {};\n\nconst bars = [\n  {\n    time: previous.quote_time || q.quote_time,\n    close: previous.last_price || q.previous_close,\n    source: 'previous_snapshot'\n  },\n  {\n    time: q.quote_time,\n    open: q.open,\n    high: q.high,\n    low: q.low,\n    close: q.last_price,\n    volume: q.volume,\n    source: 'single_quote_approximation'\n  }\n];\n\nreturn [{\n  json: {\n    ...item,\n    approximate_bars: bars,\n    approximation_note: 'Bars are approximate fixture-derived context, not full-session market bars.'\n  }\n}];"
+      },
+      "id": "BuildApproxBars",
+      "name": "Build Approx Bars",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst q = item.normalized_quote;\nconst position = {\n  \"fixture_name\": \"position-t1-locked.json\",\n  \"symbol\": \"002594\",\n  \"market\": \"sz\",\n  \"total_quantity\": 1000,\n  \"available_quantity\": 0,\n  \"locked_quantity\": 1000,\n  \"lock_reason\": \"T_PLUS_ONE\",\n  \"as_of\": \"2026-07-28T02:00:30.000Z\"\n};\n\nconst round4 = (value) => Math.round(value * 10000) / 10000;\nconst priceChangePct = round4(((q.last_price - q.previous_close) / q.previous_close) * 100);\nconst dayRangePct = round4(((q.high - q.low) / q.previous_close) * 100);\n\nconst facts = [\n  { id: 'fact.last_price', value: q.last_price, unit: q.currency, source: q.source_kind, quality: 'fixture' },\n  { id: 'fact.previous_close', value: q.previous_close, unit: q.currency, source: q.source_kind, quality: 'fixture' },\n  { id: 'fact.price_change_pct', value: priceChangePct, unit: 'percent', source: q.source_kind, quality: 'derived_from_fixture' },\n  { id: 'fact.day_range_pct', value: dayRangePct, unit: 'percent', source: q.source_kind, quality: 'derived_from_fixture' },\n  { id: 'fact.quote_freshness_seconds', value: item.quote_freshness_seconds, unit: 'seconds', source: q.source_kind, quality: 'quality_gate' },\n  { id: 'fact.amount_semantics', value: q.field_semantics.amount, unit: 'enum', source: 'api_discovery', quality: 'unknown_semantics' },\n  { id: 'fact.position_total_quantity', value: position.total_quantity, unit: 'shares', source: position.fixture_name, quality: 'fixture' },\n  { id: 'fact.available_quantity', value: position.available_quantity, unit: 'shares', source: position.fixture_name, quality: 'fixture' },\n  { id: 'fact.position_locked_quantity', value: position.locked_quantity, unit: 'shares', source: position.fixture_name, quality: 'fixture' }\n];\n\nreturn [{ json: { ...item, position_fixture: position, facts } }];"
+      },
+      "id": "CalculateFacts",
+      "name": "Calculate Facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst registry = {};\nfor (const fact of item.facts) {\n  if (registry[fact.id]) throw new Error('Duplicate fact id: ' + fact.id);\n  registry[fact.id] = fact;\n}\nreturn [{ json: { ...item, fact_registry: registry } }];"
+      },
+      "id": "BuildFactRegistry",
+      "name": "Build Fact Registry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst q = item.normalized_quote;\n\nfunction stableStringify(value) {\n  if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';\n  if (value && typeof value === 'object') {\n    return '{' + Object.keys(value).sort().map((key) => JSON.stringify(key) + ':' + stableStringify(value[key])).join(',') + '}';\n  }\n  return JSON.stringify(value);\n}\n\nfunction fnv1a32(input) {\n  let hash = 0x811c9dc5;\n  for (let i = 0; i < input.length; i += 1) {\n    hash ^= input.charCodeAt(i);\n    hash = Math.imul(hash, 0x01000193) >>> 0;\n  }\n  return hash.toString(16).padStart(8, '0');\n}\n\nconst modelInput = {\n  symbol: q.symbol,\n  market: q.market,\n  quote_time: q.quote_time,\n  facts: item.facts,\n  approximate_bars: item.approximate_bars,\n  approximation_note: item.approximation_note\n};\n\nconst packetCore = {\n  schema_version: 'phase1.market_fact_packet.v1',\n  source_kind: q.source_kind,\n  symbol: q.symbol,\n  market: q.market,\n  quote_time: q.quote_time,\n  facts: item.facts,\n  approximate_bars: item.approximate_bars,\n  model_input: modelInput\n};\n\nconst packetHash = 'fnv1a32:' + fnv1a32(stableStringify(packetCore));\nconst packet = {\n  ...packetCore,\n  packet_hash: packetHash,\n  hash_algorithm: 'fnv1a32-local-stable'\n};\n\nreturn [{\n  json: {\n    ...item,\n    packet,\n    packet_hash: packetHash,\n    packet_stable_material: stableStringify(packetCore)\n  }\n}];"
+      },
+      "id": "BuildPacketHash",
+      "name": "Build Packet + Hash",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst configured = 'MOCK';\nif (configured !== 'MOCK') {\n  throw new Error('Phase1 only permits MODEL_PROVIDER=MOCK');\n}\nreturn [{ json: { ...item, model_provider: configured } }];"
+      },
+      "id": "ResolveMODELPROVIDER",
+      "name": "Resolve MODEL_PROVIDER",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1760,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst mockView = {\n  \"schema_version\": \"phase1.market_behavior_view.v1\",\n  \"claim_set\": [\n    {\n      \"claim_id\": \"c1\",\n      \"kind\": \"observation\",\n      \"fact_refs\": [\n        \"fact.last_price\",\n        \"fact.previous_close\",\n        \"fact.price_change_pct\"\n      ],\n      \"statement\": \"The latest fixture price is above the previous close.\",\n      \"confidence\": \"low\"\n    },\n    {\n      \"claim_id\": \"c2\",\n      \"kind\": \"risk_context\",\n      \"fact_refs\": [\n        \"fact.position_locked_quantity\",\n        \"fact.available_quantity\"\n      ],\n      \"statement\": \"The position has no available quantity under the fixture T plus one constraint.\",\n      \"confidence\": \"low\"\n    }\n  ],\n  \"uncertainty\": [\n    \"fixture data only\",\n    \"amount semantics unknown\",\n    \"no order book or full session bars\"\n  ],\n  \"prohibited_capabilities_used\": false,\n  \"numeric_outputs\": [\n    {\n      \"value\": 0.9934,\n      \"meaning\": \"price change percent\",\n      \"fact_ref\": \"fact.price_change_pct\"\n    }\n  ],\n  \"recommendation\": null\n};\nreturn [{\n  json: {\n    ...item,\n    raw_model_response: JSON.stringify(mockView),\n    model_source: 'fixture:model-valid.json'\n  }\n}];"
+      },
+      "id": "MOCKMarketBehavior",
+      "name": "MOCK Market Behavior",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nlet parsed;\ntry {\n  parsed = JSON.parse(item.raw_model_response);\n} catch (error) {\n  throw new Error('Strict JSON parse failed: ' + error.message);\n}\nif (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {\n  throw new Error('Strict JSON parse failed: response must be an object');\n}\nreturn [{ json: { ...item, behavior_view: parsed } }];"
+      },
+      "id": "ParseStrictJSON",
+      "name": "Parse Strict JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst view = item.behavior_view;\nconst factRegistry = item.fact_registry;\nconst errors = [];\nconst checkedFactRefs = [];\nconst forbiddenHits = [];\nconst forbiddenPatterns = [\n  /\\bwin\\s*rate\\b/i,\n  /\\bcvar\\b/i,\n  /\\btarget\\s*position\\b/i,\n  /\\bautomated\\s*action\\b/i,\n  /\\bmarket\\s*manipulation\\b/i,\n  /\\bhidden\\s*actor/i,\n  /\\bbuy\\b/i,\n  /\\bsell\\b/i\n];\n\nif (view.schema_version !== 'phase1.market_behavior_view.v1') {\n  errors.push('schema_version mismatch');\n}\nif (!Array.isArray(view.claim_set)) errors.push('claim_set must be an array');\nif (!Array.isArray(view.uncertainty)) errors.push('uncertainty must be an array');\nif (!Array.isArray(view.numeric_outputs)) errors.push('numeric_outputs must be an array');\nif (view.prohibited_capabilities_used !== false) errors.push('prohibited_capabilities_used must be false');\nif (view.recommendation !== null) errors.push('recommendation must be null in Phase1');\n\nfor (const claim of view.claim_set || []) {\n  if (!Array.isArray(claim.fact_refs) || claim.fact_refs.length === 0) {\n    errors.push('claim ' + claim.claim_id + ' has no fact_refs');\n    continue;\n  }\n  for (const ref of claim.fact_refs) {\n    checkedFactRefs.push(ref);\n    if (!factRegistry[ref]) errors.push('unknown fact_ref: ' + ref);\n  }\n  for (const pattern of forbiddenPatterns) {\n    if (pattern.test(claim.statement || '')) forbiddenHits.push(pattern.source);\n  }\n}\n\nfor (const output of view.numeric_outputs || []) {\n  checkedFactRefs.push(output.fact_ref);\n  if (!factRegistry[output.fact_ref]) errors.push('numeric output references unknown fact_ref: ' + output.fact_ref);\n}\n\nif (forbiddenHits.length) errors.push('forbidden content detected: ' + forbiddenHits.join(','));\n\nconst validation = {\n  status: errors.length ? 'rejected' : 'accepted',\n  errors,\n  checked_fact_refs: Array.from(new Set(checkedFactRefs)),\n  forbidden_content_hits: Array.from(new Set(forbiddenHits))\n};\n\nif (validation.status !== 'accepted') {\n  throw new Error('Structural Claim Validator rejected model output: ' + errors.join('; '));\n}\n\nreturn [{\n  json: {\n    ...item,\n    validation,\n    validation_status: validation.status,\n    validation_errors: validation.errors\n  }\n}];"
+      },
+      "id": "StructuralClaimValidator",
+      "name": "Structural Claim Validator",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst position = item.position_fixture;\nconst locked = Number(position.locked_quantity || 0);\nconst available = Number(position.available_quantity || 0);\nconst riskItems = [];\n\nif (available === 0 && locked > 0) {\n  riskItems.push({\n    code: 'T1_LOCKED',\n    severity: 'high',\n    description: 'Full fixture position is unavailable under the T plus one constraint.',\n    fact_refs: ['fact.position_locked_quantity', 'fact.available_quantity']\n  });\n}\n\nriskItems.push({\n  code: 'FACT_LIMITED_SCOPE',\n  severity: 'medium',\n  description: 'Quote fixture and approximate bars are not full-session market evidence.',\n  fact_refs: ['fact.quote_freshness_seconds', 'fact.amount_semantics']\n});\n\nreturn [{\n  json: {\n    ...item,\n    report_type: 'STRESS_ONLY',\n    report_status: 'generated',\n    risk_items: riskItems\n  }\n}];"
+      },
+      "id": "CalculateSTRESSONLY",
+      "name": "Calculate STRESS_ONLY",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst q = item.normalized_quote;\nconst lines = [\n  '# Stock Watch Stress Snapshot',\n  '',\n  'Mode: STRESS_ONLY',\n  'Symbol: ' + q.market + ':' + q.symbol,\n  'Packet hash: ' + item.packet_hash,\n  'Quality: ' + item.quality_status,\n  '',\n  '## Fixture Scope',\n  '- Source: fixture quote and fixture position only.',\n  '- Amount and main inflow semantics remain unknown.',\n  '- Approximate bars are context only.',\n  '',\n  '## Stress Constraints',\n  '- Total quantity: ' + item.position_fixture.total_quantity,\n  '- Available quantity: ' + item.position_fixture.available_quantity,\n  '- Locked quantity: ' + item.position_fixture.locked_quantity,\n  '- Lock reason: ' + item.position_fixture.lock_reason,\n  '',\n  '## Risk Items',\n  ...item.risk_items.map((risk) => '- [' + risk.severity + '] ' + risk.code + ': ' + risk.description),\n  '',\n  '## Boundary',\n  'No action instruction or numeric forecast is generated.'\n];\n\nreturn [{ json: { ...item, report_markdown: lines.join('\\n') } }];"
+      },
+      "id": "RenderMarkdown",
+      "name": "Render Markdown",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2860,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const item = $input.first().json;\nconst completedAt = new Date().toISOString();\nconst jobKey = [\n  'phase1',\n  item.normalized_quote.market,\n  item.normalized_quote.symbol,\n  item.normalized_quote.quote_time,\n  item.packet_hash\n].join(':');\n\nconst persistPayload = {\n  job_key: jobKey,\n  trigger_source: 'manual_poc',\n  symbol: item.normalized_quote.symbol,\n  market: item.normalized_quote.market,\n  fixture_name: item.normalized_quote.fixture_name,\n  model_provider: item.model_provider,\n  job_status: 'completed',\n  started_at: item.normalized_quote.fetched_at,\n  completed_at: completedAt,\n  quality_status: item.quality_status,\n  packet: item.packet,\n  fact_registry: item.fact_registry,\n  behavior_view: item.behavior_view,\n  model_status: 'accepted',\n  validation_status: item.validation_status,\n  validation_errors: item.validation_errors,\n  validation: item.validation,\n  report_type: item.report_type,\n  report_status: item.report_status,\n  report_markdown: item.report_markdown,\n  risk_items: item.risk_items\n};\n\nreturn [{ json: { ...item, persist_payload: persistPayload } }];"
+      },
+      "id": "BuildPersistencePayload",
+      "name": "Build Persistence Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH payload AS (\n  SELECT $1::jsonb AS p\n),\njob_row AS (\n  INSERT INTO sw_analysis_job (\n    job_key,\n    trigger_source,\n    symbol,\n    market,\n    fixture_name,\n    model_provider,\n    status,\n    started_at,\n    completed_at\n  )\n  SELECT\n    p->>'job_key',\n    p->>'trigger_source',\n    p->>'symbol',\n    p->>'market',\n    p->>'fixture_name',\n    p->>'model_provider',\n    p->>'job_status',\n    (p->>'started_at')::timestamptz,\n    (p->>'completed_at')::timestamptz\n  FROM payload\n  ON CONFLICT (job_key) DO UPDATE SET\n    status = EXCLUDED.status,\n    completed_at = EXCLUDED.completed_at\n  RETURNING id\n),\npacket_row AS (\n  INSERT INTO sw_market_fact_packet (\n    job_id,\n    packet_hash,\n    symbol,\n    market,\n    quote_time,\n    source_kind,\n    quality_status,\n    fact_registry,\n    packet\n  )\n  SELECT\n    job_row.id,\n    p->'packet'->>'packet_hash',\n    p->>'symbol',\n    p->>'market',\n    (p->'packet'->>'quote_time')::timestamptz,\n    p->'packet'->>'source_kind',\n    p->>'quality_status',\n    p->'fact_registry',\n    p->'packet'\n  FROM payload, job_row\n  ON CONFLICT (packet_hash) DO UPDATE SET\n    job_id = EXCLUDED.job_id,\n    fact_registry = EXCLUDED.fact_registry,\n    packet = EXCLUDED.packet,\n    quality_status = EXCLUDED.quality_status\n  RETURNING id\n),\nmodel_row AS (\n  INSERT INTO sw_model_run (\n    job_id,\n    packet_id,\n    provider,\n    status,\n    raw_response\n  )\n  SELECT\n    job_row.id,\n    packet_row.id,\n    p->>'model_provider',\n    p->>'model_status',\n    p->'behavior_view'\n  FROM payload, job_row, packet_row\n  ON CONFLICT (packet_id, provider) DO UPDATE SET\n    job_id = EXCLUDED.job_id,\n    status = EXCLUDED.status,\n    raw_response = EXCLUDED.raw_response,\n    created_at = now()\n  RETURNING id\n),\nview_row AS (\n  INSERT INTO sw_behavior_view (\n    model_run_id,\n    view\n  )\n  SELECT\n    model_row.id,\n    p->'behavior_view'\n  FROM payload, model_row\n  ON CONFLICT (model_run_id) DO UPDATE SET\n    view = EXCLUDED.view,\n    created_at = now()\n  RETURNING id\n),\nvalidation_row AS (\n  INSERT INTO sw_structural_validation (\n    model_run_id,\n    status,\n    errors,\n    validation\n  )\n  SELECT\n    model_row.id,\n    p->>'validation_status',\n    p->'validation_errors',\n    p->'validation'\n  FROM payload, model_row\n  ON CONFLICT (model_run_id) DO UPDATE SET\n    status = EXCLUDED.status,\n    errors = EXCLUDED.errors,\n    validation = EXCLUDED.validation,\n    created_at = now()\n  RETURNING id\n),\nreport_row AS (\n  INSERT INTO sw_protection_report (\n    job_id,\n    packet_id,\n    model_run_id,\n    validation_id,\n    report_type,\n    status,\n    markdown,\n    risk_items\n  )\n  SELECT\n    job_row.id,\n    packet_row.id,\n    model_row.id,\n    validation_row.id,\n    p->>'report_type',\n    p->>'report_status',\n    p->>'report_markdown',\n    p->'risk_items'\n  FROM payload, job_row, packet_row, model_row, validation_row\n  ON CONFLICT (packet_id) DO UPDATE SET\n    job_id = EXCLUDED.job_id,\n    model_run_id = EXCLUDED.model_run_id,\n    validation_id = EXCLUDED.validation_id,\n    status = EXCLUDED.status,\n    markdown = EXCLUDED.markdown,\n    risk_items = EXCLUDED.risk_items,\n    created_at = now()\n  RETURNING id\n)\nSELECT\n  job_row.id AS job_id,\n  packet_row.id AS packet_id,\n  model_row.id AS model_run_id,\n  validation_row.id AS validation_id,\n  report_row.id AS report_id,\n  (SELECT p->'packet'->>'packet_hash' FROM payload) AS packet_hash,\n  (SELECT p->>'report_type' FROM payload) AS report_type\nFROM job_row, packet_row, model_row, validation_row, report_row;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ JSON.stringify($json.persist_payload) }}"
+        }
+      },
+      "id": "PersistPhase1Records",
+      "name": "Persist Phase1 Records",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3300,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "SWPostgresLocal",
+          "name": "SW PostgreSQL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const row = $input.first().json;\nreturn [{\n  json: {\n    phase: 'Phase1',\n    workflow: 'SW-01 POC Manual Pipeline',\n    status: 'completed',\n    job_id: row.job_id,\n    packet_id: row.packet_id,\n    model_run_id: row.model_run_id,\n    validation_id: row.validation_id,\n    report_id: row.report_id,\n    packet_hash: row.packet_hash,\n    report_type: row.report_type\n  }\n}];"
+      },
+      "id": "Phase1ResultSummary",
+      "name": "Phase1 Result Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3520,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Load Quote Fixture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Quote Fixture": {
+      "main": [
+        [
+          {
+            "node": "Normalize Quote",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Quote": {
+      "main": [
+        [
+          {
+            "node": "Quote Quality Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quote Quality Gate": {
+      "main": [
+        [
+          {
+            "node": "Build Approx Bars",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Approx Bars": {
+      "main": [
+        [
+          {
+            "node": "Calculate Facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Facts": {
+      "main": [
+        [
+          {
+            "node": "Build Fact Registry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Fact Registry": {
+      "main": [
+        [
+          {
+            "node": "Build Packet + Hash",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Packet + Hash": {
+      "main": [
+        [
+          {
+            "node": "Resolve MODEL_PROVIDER",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve MODEL_PROVIDER": {
+      "main": [
+        [
+          {
+            "node": "MOCK Market Behavior",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MOCK Market Behavior": {
+      "main": [
+        [
+          {
+            "node": "Parse Strict JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Strict JSON": {
+      "main": [
+        [
+          {
+            "node": "Structural Claim Validator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Structural Claim Validator": {
+      "main": [
+        [
+          {
+            "node": "Calculate STRESS_ONLY",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate STRESS_ONLY": {
+      "main": [
+        [
+          {
+            "node": "Render Markdown",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render Markdown": {
+      "main": [
+        [
+          {
+            "node": "Build Persistence Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Persistence Payload": {
+      "main": [
+        [
+          {
+            "node": "Persist Phase1 Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persist Phase1 Records": {
+      "main": [
+        [
+          {
+            "node": "Phase1 Result Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "phase1-local-generated",
+  "triggerCount": 0,
+  "tags": []
+}

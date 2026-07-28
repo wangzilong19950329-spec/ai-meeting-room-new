@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phase1.market_behavior_view.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "claim_set",
+    "uncertainty",
+    "prohibited_capabilities_used",
+    "numeric_outputs",
+    "recommendation"
+  ],
+  "properties": {
+    "schema_version": { "const": "phase1.market_behavior_view.v1" },
+    "claim_set": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["claim_id", "kind", "fact_refs", "statement", "confidence"],
+        "properties": {
+          "claim_id": { "type": "string" },
+          "kind": { "type": "string" },
+          "fact_refs": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^fact\\." }
+          },
+          "statement": { "type": "string" },
+          "confidence": { "type": "string" }
+        }
+      }
+    },
+    "uncertainty": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "prohibited_capabilities_used": { "type": "boolean" },
+    "numeric_outputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["value", "meaning", "fact_ref"],
+        "properties": {
+          "value": { "type": "number" },
+          "meaning": { "type": "string" },
+          "fact_ref": { "type": "string", "pattern": "^fact\\." }
+        }
+      }
+    },
+    "recommendation": {}
+  }
+}

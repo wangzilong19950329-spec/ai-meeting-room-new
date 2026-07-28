@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "phase1.market_fact_packet.v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "packet_hash",
+    "hash_algorithm",
+    "source_kind",
+    "symbol",
+    "market",
+    "quote_time",
+    "facts",
+    "model_input"
+  ],
+  "properties": {
+    "schema_version": { "const": "phase1.market_fact_packet.v1" },
+    "packet_hash": { "type": "string", "minLength": 8 },
+    "hash_algorithm": { "type": "string" },
+    "source_kind": { "type": "string" },
+    "symbol": { "type": "string" },
+    "market": { "type": "string" },
+    "quote_time": { "type": "string", "format": "date-time" },
+    "facts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "value", "unit", "source", "quality"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^fact\\." },
+          "value": {},
+          "unit": { "type": "string" },
+          "source": { "type": "string" },
+          "quality": { "type": "string" }
+        }
+      }
+    },
+    "model_input": { "type": "object" }
+  }
+}
