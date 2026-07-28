@@ -139,6 +139,83 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
+    void buildPromptOmitsNonEvaluableHistoryTextFromModelInput() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalAnalysis recent = analysisRecord(
+                1001L, 501L, "看涨", "历史方向锚定-最近同周期", "旧结论不应进入Prompt");
+        when(analysisMapper.selectRecentBySymbol(
+                org.mockito.ArgumentMatchers.eq("09988"),
+                org.mockito.ArgumentMatchers.eq("hk"),
+                org.mockito.ArgumentMatchers.eq("DAY"),
+                org.mockito.ArgumentMatchers.eq(2))).thenReturn(Collections.singletonList(recent));
+        Map<String, Object> ledgerItem = promptRecord(
+                1002L, "看涨", "历史方向锚定-两周账本", "两周旧结论不应进入Prompt");
+        JSONObject historyCatalog = historyCatalog(entry(
+                1002L, 502L, "NO_TEST_DEFINITION", "NOT_EVALUABLE", false));
+
+        String prompt = ReflectionTestUtils.invokeMethod(localService, "buildPrompt",
+                stockRef(localService, "09988", "hk"), "阿里巴巴-W",
+                Collections.emptyMap(), Collections.emptyMap(),
+                new JSONObject(true), historyCatalog, Collections.singletonList(ledgerItem),
+                session(), "manual_api", "DAY", periodWindow(localService),
+                Collections.<StockWatchTechnicalAnalysis>emptyList(), null);
+        JSONObject payload = promptPayload(prompt);
+
+        assertEquals(0, payload.getJSONArray("recentSamePeriodAnalysis").size());
+        assertEquals(0, payload.getJSONArray("recentTwoWeekAnalysisLedger").size());
+        assertEquals(0, payload.getJSONObject("historyEvidenceCatalog").getJSONArray("entries").size());
+        assertEquals(0, payload.getJSONObject("historySummary").getIntValue("eligibleCount"));
+        assertEquals(1, payload.getJSONObject("historySummary").getIntValue("omittedRawCount"));
+        assertEquals(1, payload.getJSONObject("historySummary").getIntValue("omittedSamePeriodCount"));
+        assertEquals(0, payload.getJSONObject("recentTwoWeekCoverage").getIntValue("promptIncludedCount"));
+        assertFalse(prompt.contains("历史方向锚定-最近同周期"));
+        assertFalse(prompt.contains("历史方向锚定-两周账本"));
+        assertTrue(prompt.contains("不可评估历史原文已省略"));
+    }
+
+    @Test
+    void buildPromptKeepsOnlyEligibleAttributedHistory() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalAnalysis recent = analysisRecord(
+                2001L, 601L, "看涨", "可评估历史保留", "被支持的历史经验可以进入Prompt");
+        when(analysisMapper.selectRecentBySymbol(
+                org.mockito.ArgumentMatchers.eq("09988"),
+                org.mockito.ArgumentMatchers.eq("hk"),
+                org.mockito.ArgumentMatchers.eq("DAY"),
+                org.mockito.ArgumentMatchers.eq(2))).thenReturn(Collections.singletonList(recent));
+        Map<String, Object> eligibleLedger = promptRecord(
+                2001L, "看涨", "可评估历史保留", "被支持的历史经验可以进入Prompt");
+        Map<String, Object> ineligibleLedger = promptRecord(
+                2002L, "看涨", "不可评估历史剔除", "没有测试定义的历史不能进入Prompt");
+        JSONObject historyCatalog = historyCatalog(
+                entry(2001L, 601L, "ATTRIBUTABLE", "SUPPORTED", true),
+                entry(2002L, 602L, "NO_TEST_DEFINITION", "NOT_EVALUABLE", false));
+
+        String prompt = ReflectionTestUtils.invokeMethod(localService, "buildPrompt",
+                stockRef(localService, "09988", "hk"), "阿里巴巴-W",
+                Collections.emptyMap(), Collections.emptyMap(),
+                new JSONObject(true), historyCatalog, List.of(eligibleLedger, ineligibleLedger),
+                session(), "manual_api", "DAY", periodWindow(localService),
+                Collections.<StockWatchTechnicalAnalysis>emptyList(), null);
+        JSONObject payload = promptPayload(prompt);
+        JSONArray ledger = payload.getJSONArray("recentTwoWeekAnalysisLedger");
+        JSONArray entries = payload.getJSONObject("historyEvidenceCatalog").getJSONArray("entries");
+
+        assertEquals(1, payload.getJSONArray("recentSamePeriodAnalysis").size());
+        assertEquals(1, ledger.size());
+        assertEquals(1, entries.size());
+        assertEquals("SUPPORTED", ledger.getJSONObject(0).getString("aggregateVerdict"));
+        assertEquals(true, ledger.getJSONObject(0).getBooleanValue("narrowingEligible"));
+        assertEquals("SUPPORTED", entries.getJSONObject(0).getString("aggregateVerdict"));
+        assertEquals(1, payload.getJSONObject("historySummary").getIntValue("eligibleCount"));
+        assertEquals(1, payload.getJSONObject("historySummary").getIntValue("omittedRawCount"));
+        assertTrue(prompt.contains("可评估历史保留"));
+        assertFalse(prompt.contains("不可评估历史剔除"));
+    }
+
+    @Test
     void demandPolicyVersionChangeIsRejectedBeforeProviderSubmission() {
         StockWatchAnalysisPolicyService policyService = mock(StockWatchAnalysisPolicyService.class);
         ReflectionTestUtils.setField(service, "analysisPolicyService", policyService);
@@ -835,6 +912,141 @@ class StockWatchTechnicalAnalysisServiceTest {
         LocalDate result = ReflectionTestUtils.invokeMethod(service, "sourceTradeDate", payload, LocalDate.of(2026, 7, 10));
 
         assertEquals(LocalDate.of(2026, 7, 8), result);
+    }
+
+    private StockWatchTechnicalAnalysisService serviceWithAnalysisMapper(StockWatchTechnicalAnalysisMapper analysisMapper) {
+        return new StockWatchTechnicalAnalysisService(
+                mock(EastmoneyMarketDataService.class),
+                mock(StockWatchPredictionService.class),
+                mock(StockWatchListService.class),
+                mock(StockWatchTechnicalSessionMapper.class),
+                analysisMapper,
+                mock(StockWatchAnalysisTaskService.class),
+                mock(StockWatchAnalysisProjectionService.class),
+                mock(StockWatchRiskPatternService.class),
+                mock(StockWatchFactPersistenceService.class),
+                mock(StockWatchFactObservationMapper.class),
+                mock(StockWatchV6RuntimeGate.class),
+                mock(StockWatchBridgeAdmissionService.class)
+        );
+    }
+
+    private Object stockRef(StockWatchTechnicalAnalysisService target, String symbol, String market) {
+        return ReflectionTestUtils.invokeMethod(target, "normalizeStockRef", symbol, market);
+    }
+
+    private Object periodWindow(StockWatchTechnicalAnalysisService target) {
+        return ReflectionTestUtils.invokeMethod(target, "currentPeriodWindow",
+                "DAY", LocalDate.of(2026, 7, 28));
+    }
+
+    private StockWatchTechnicalSession session() {
+        StockWatchTechnicalSession session = new StockWatchTechnicalSession();
+        session.setSessionKey("09988-hk-day");
+        session.setGeneration(6);
+        session.setContextChars(4096);
+        session.setContextLimitChars(80_000);
+        return session;
+    }
+
+    private JSONObject promptPayload(String prompt) {
+        String marker = "输入数据：";
+        int index = prompt.indexOf(marker);
+        assertTrue(index >= 0);
+        return JSON.parseObject(prompt.substring(index + marker.length()).trim());
+    }
+
+    private StockWatchTechnicalAnalysis analysisRecord(Long id,
+                                                       Long taskId,
+                                                       String stance,
+                                                       String title,
+                                                       String conclusion) {
+        StockWatchTechnicalAnalysis record = new StockWatchTechnicalAnalysis();
+        record.setId(id);
+        record.setAnalysisTaskId(taskId);
+        record.setAnalysisDate(java.sql.Date.valueOf(LocalDate.of(2026, 7, 28)));
+        record.setRunSlot("11:20");
+        record.setPeriodType("DAY");
+        record.setStatus("SUCCESS");
+        record.setStance(stance);
+        record.setTone("green");
+        record.setConfidence(0.82);
+        record.setTitle(title);
+        record.setConclusion(conclusion);
+        record.setEvidenceJson("[\"历史证据文本\"]");
+        record.setMissingDataJson("[]");
+        JSONObject intent = new JSONObject(true);
+        intent.put("contractVersion", 6);
+        intent.put("intent", "ACCUMULATE");
+        intent.put("confidence", 0.45);
+        record.setMainForceIntentJson(intent.toJSONString());
+        return record;
+    }
+
+    private Map<String, Object> promptRecord(Long id, String stance, String title, String conclusion) {
+        Map<String, Object> record = new LinkedHashMap<>();
+        record.put("id", id);
+        record.put("date", "2026-07-28");
+        record.put("time", "11:20");
+        record.put("status", "SUCCESS");
+        record.put("stance", stance);
+        record.put("tone", "green");
+        record.put("confidence", "82%");
+        record.put("title", title);
+        record.put("conclusion", conclusion);
+        record.put("evidence", jsonArray("历史证据文本"));
+        record.put("missingData", new JSONArray());
+        record.put("narrowingEligible", false);
+        return record;
+    }
+
+    private JSONObject historyCatalog(JSONObject... entries) {
+        JSONObject catalog = new JSONObject(true);
+        catalog.put("schema", "stock-watch-history-catalog-v1");
+        catalog.put("lookbackStart", "2026-07-15");
+        catalog.put("lookbackEnd", "2026-07-28");
+        catalog.put("selectionPolicy", "latest_success_per_date_slot_then_chronological");
+        catalog.put("entries", jsonArray((Object[]) entries));
+        catalog.put("catalogDigest", ReflectionTestUtils.invokeMethod(service, "historyCatalogDigest", catalog));
+        return catalog;
+    }
+
+    private JSONObject entry(Long analysisId,
+                             Long taskId,
+                             String attributionStatus,
+                             String aggregateVerdict,
+                             boolean narrowingEligible) {
+        JSONObject entry = new JSONObject(true);
+        entry.put("historyRef", "analysis:" + analysisId);
+        entry.put("analysisId", analysisId);
+        entry.put("analysisTaskId", taskId);
+        entry.put("claimRef", taskId == null ? null : "analysisTask:" + taskId + ":mainForceIntent");
+        entry.put("claimDigest", "digest-" + analysisId);
+        JSONObject claim = new JSONObject(true);
+        claim.put("intent", "ACCUMULATE");
+        claim.put("timeWindow", "INTRADAY");
+        claim.put("confidence", 0.45);
+        entry.put("claim", claim);
+        entry.put("evidenceQuality", "SERVER_PROFILE_V1");
+        entry.put("attributionStatus", attributionStatus);
+        entry.put("tests", "ATTRIBUTABLE".equals(attributionStatus) ? jsonArray(intentTest(analysisId)) : new JSONArray());
+        entry.put("aggregateVerdict", aggregateVerdict);
+        entry.put("narrowingEligible", narrowingEligible);
+        return entry;
+    }
+
+    private JSONObject intentTest(Long analysisId) {
+        JSONObject test = new JSONObject(true);
+        test.put("testRef", "intentTest:" + analysisId);
+        test.put("metricPath", "quote.changePercent");
+        test.put("operator", "GTE");
+        test.put("target", 1.0);
+        test.put("verdict", "SUPPORTED");
+        test.put("ageCount", 1);
+        test.put("observedCount", 1);
+        test.put("requiredObservedCount", 1);
+        test.put("lastEvaluatedSourceDate", "2026-07-28");
+        return test;
     }
 
     private StockWatchAnalysisTask task(Long id, String status, String digest) {

@@ -105,6 +105,9 @@ public class StockWatchTechnicalAnalysisService {
     private static final Set<String> STRONG_MAIN_FORCE_INTENTS = new LinkedHashSet<>(Arrays.asList(
             "ACCUMULATE", "DISTRIBUTE", "WASH", "PULL_UP", "SUPPORT", "SUPPRESS", "ROTATE"
     ));
+    private static final Set<String> HISTORY_NARROWING_VERDICTS = new LinkedHashSet<>(Arrays.asList(
+            "SUPPORTED", "FALSIFIED"
+    ));
     private static final java.util.regex.Pattern EVIDENCE_PATH_PATTERN = java.util.regex.Pattern.compile(
             "(?:evidenceSignals|externalEvidenceCatalog)\\.[A-Za-z0-9_.$\\[\\]-]+"
     );
@@ -1533,12 +1536,15 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("sourceDailyAnalyses", sourceRecords.stream()
                 .map(this::toPromptSourceRecordPayload)
                 .collect(Collectors.toList()));
-        payload.put("recentSamePeriodAnalysis", recent);
-        payload.put("recentTwoWeekAnalysisLedger", recentTwoWeekLedger);
-        payload.put("historyEvidenceCatalog", historyCatalog);
+        HistoryPromptContext historyContext = buildHistoryPromptContext(recent, recentTwoWeekLedger, historyCatalog);
+        payload.put("recentSamePeriodAnalysis", historyContext.recentSamePeriodAnalysis);
+        payload.put("recentTwoWeekAnalysisLedger", historyContext.recentTwoWeekAnalysisLedger);
+        payload.put("historyEvidenceCatalog", historyContext.historyEvidenceCatalog);
+        payload.put("historySummary", historyContext.summary);
         payload.put("recentTwoWeekCoverage", Map.of(
                 "lookbackDays", 14,
                 "includedCount", recentTwoWeekLedger.size(),
+                "promptIncludedCount", historyContext.recentTwoWeekAnalysisLedger.size(),
                 "selectionPolicy", "latest_success_per_date_slot_then_chronological"
         ));
         Map<String, Object> sessionPayload = new LinkedHashMap<>();
@@ -1568,9 +1574,9 @@ public class StockWatchTechnicalAnalysisService {
                 "externalEvidenceCatalog是本轮实际发送给你的紧凑外部证据目录，目录外新闻不得引用；marketData.shareholderCounts是股东户数变化线索。若相关字段为空，只能在missingData复制dataQuality.requiredMissing或optionalMissing里的对应项。",
                 "marketData.dataPacking说明本轮为节省上下文已截取最近序列；完整原始行情快照由系统另存，不要抱怨未提供更早原始明细。",
                 "evidenceSignals是程序从marketData派生的资金流、价量、位置和完整证据原子；服务器会独立计算可信画像，你的主力判断只作为审计假设，不能覆盖服务器画像。",
-                "marketData.riskPatternObservations是程序计算的R01-R04事实；historyEvidenceCatalog是服务端冻结的历史归因真值。不得把marketData.factObservationReceipt.testVerdicts当成完整历史账本。",
+                "marketData.riskPatternObservations是程序计算的R01-R04事实；historyEvidenceCatalog是服务端冻结历史归因真值的eligible-only子集。不得把marketData.factObservationReceipt.testVerdicts当成完整历史账本。",
                 "R01-R04只证明可观察的价量风险结构，不能证明操纵、坐庄、对倒、账户组或任何主体的真实身份与违法意图。",
-                "recentTwoWeekAnalysisLedger包含最近两周逐slot分析；请比较每次假设与后续事实如何支持、削弱或证伪，并据此缩小本轮待验证范围，但旧记录的evidenceQuality和narrowingEligible必须原样尊重。",
+                "historySummary说明历史裁剪结果；recentSamePeriodAnalysis、recentTwoWeekAnalysisLedger和historyEvidenceCatalog只包含已归因为SUPPORTED或FALSIFIED且narrowingEligible=true的历史记录。eligibleCount=0时，不得把历史stance分布、旧结论或旧mainForceIntent用于本轮方向判断或缩小范围。",
                 "responseContractVersion固定为6。mainForceIntent只是审计假设，字段为positioningIntent, executionTactic, confidence, assumptions, risk, watchPoints, historyAssessment。",
                 "positioningIntent只能取ACCUMULATE/DISTRIBUTE/NEUTRAL/UNKNOWN；executionTactic只能取PULL_UP/WASH/SUPPORT/SUPPRESS/ROTATE/NONE/UNKNOWN。",
                 "新闻只能作为背景，不得把新闻与压价、建仓、出货等动机写成已证实事实；不要输出服务器证据原子之外的新数值。",
@@ -1615,6 +1621,142 @@ public class StockWatchTechnicalAnalysisService {
         JSONObject triggerContext = parseObject(text(demand.getTriggerContextJson(), ""));
         payload.put("triggerContext", triggerContext == null ? new JSONObject(true) : triggerContext);
         return payload;
+    }
+
+    private HistoryPromptContext buildHistoryPromptContext(List<Map<String, Object>> recentSamePeriod,
+                                                           List<Map<String, Object>> recentTwoWeekLedger,
+                                                           JSONObject historyCatalog) {
+        Map<Long, JSONObject> entriesByAnalysisId = historyEntriesByAnalysisId(historyCatalog);
+        JSONArray promptEntries = new JSONArray();
+        JSONObject omittedVerdicts = new JSONObject(true);
+        JSONObject omittedAttributionStatuses = new JSONObject(true);
+        int totalCatalogEntries = 0;
+        int omittedCatalogEntries = 0;
+        for (JSONObject entry : entriesByAnalysisId.values()) {
+            totalCatalogEntries++;
+            if (isHistoryNarrowingEligible(entry)) {
+                promptEntries.add(copyHistoryEntryForPrompt(entry));
+            } else {
+                omittedCatalogEntries++;
+                incrementCount(omittedVerdicts, text(entry.get("aggregateVerdict"), "UNKNOWN"));
+                incrementCount(omittedAttributionStatuses, text(entry.get("attributionStatus"), "UNKNOWN"));
+            }
+        }
+
+        List<Map<String, Object>> promptRecent = filterHistoryRecordsForPrompt(recentSamePeriod, entriesByAnalysisId);
+        List<Map<String, Object>> promptLedger = filterHistoryRecordsForPrompt(recentTwoWeekLedger, entriesByAnalysisId);
+        JSONObject promptCatalog = promptHistoryCatalog(historyCatalog, promptEntries);
+
+        JSONObject summary = new JSONObject(true);
+        summary.put("schema", "stock-watch-history-summary-v1");
+        summary.put("selectionPolicy", "eligible_attributed_history_only");
+        summary.put("eligibilityVerdicts", new ArrayList<>(HISTORY_NARROWING_VERDICTS));
+        summary.put("catalogValid", verifyHistoryCatalogDigest(historyCatalog));
+        summary.put("catalogEntryCount", totalCatalogEntries);
+        summary.put("eligibleCount", promptEntries.size());
+        summary.put("omittedCatalogEntryCount", omittedCatalogEntries);
+        summary.put("rawLedgerCount", safeSize(recentTwoWeekLedger));
+        summary.put("promptLedgerCount", promptLedger.size());
+        summary.put("omittedRawCount", Math.max(0, safeSize(recentTwoWeekLedger) - promptLedger.size()));
+        summary.put("rawSamePeriodCount", safeSize(recentSamePeriod));
+        summary.put("promptSamePeriodCount", promptRecent.size());
+        summary.put("omittedSamePeriodCount", Math.max(0, safeSize(recentSamePeriod) - promptRecent.size()));
+        summary.put("omittedVerdicts", omittedVerdicts);
+        summary.put("omittedAttributionStatuses", omittedAttributionStatuses);
+        summary.put("guidance", promptEntries.isEmpty()
+                ? "没有可用于缩小本轮判断的历史；不可评估历史原文已省略，禁止按历史方向投票。"
+                : "仅可将narrowingEligible=true且裁决为SUPPORTED/FALSIFIED的历史用于缩小本轮判断。");
+        return new HistoryPromptContext(promptRecent, promptLedger, promptCatalog, summary);
+    }
+
+    private Map<Long, JSONObject> historyEntriesByAnalysisId(JSONObject historyCatalog) {
+        Map<Long, JSONObject> entries = new LinkedHashMap<>();
+        if (historyCatalog == null) return entries;
+        for (Object value : toObjectList(historyCatalog.get("entries"))) {
+            JSONObject entry = asJsonObject(value);
+            Long analysisId = longNumber(entry == null ? null : entry.get("analysisId"));
+            if (entry != null && analysisId != null) {
+                entries.put(analysisId, entry);
+            }
+        }
+        return entries;
+    }
+
+    private List<Map<String, Object>> filterHistoryRecordsForPrompt(List<Map<String, Object>> records,
+                                                                     Map<Long, JSONObject> entriesByAnalysisId) {
+        if (records == null || records.isEmpty() || entriesByAnalysisId == null || entriesByAnalysisId.isEmpty()) {
+            return Collections.emptyList();
+        }
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (Map<String, Object> record : records) {
+            Long analysisId = longNumber(record == null ? null : record.get("id"));
+            JSONObject entry = analysisId == null ? null : entriesByAnalysisId.get(analysisId);
+            if (isHistoryNarrowingEligible(entry)) {
+                result.add(toEligiblePromptRecord(record, entry));
+            }
+        }
+        return result;
+    }
+
+    private Map<String, Object> toEligiblePromptRecord(Map<String, Object> record, JSONObject entry) {
+        Map<String, Object> payload = new LinkedHashMap<>();
+        if (record != null) payload.putAll(record);
+        payload.put("historyRef", entry.get("historyRef"));
+        payload.put("aggregateVerdict", entry.get("aggregateVerdict"));
+        payload.put("attributionStatus", entry.get("attributionStatus"));
+        payload.put("narrowingEligible", true);
+        payload.put("testRefs", historyTestRefs(entry));
+        return payload;
+    }
+
+    private JSONArray historyTestRefs(JSONObject entry) {
+        JSONArray refs = new JSONArray();
+        for (Object value : toObjectList(entry == null ? null : entry.get("tests"))) {
+            JSONObject test = asJsonObject(value);
+            String ref = text(test == null ? null : test.get("testRef"), "");
+            if (StringUtils.hasText(ref)) refs.add(ref);
+        }
+        return refs;
+    }
+
+    private JSONObject promptHistoryCatalog(JSONObject source, JSONArray entries) {
+        JSONObject catalog = new JSONObject(true);
+        catalog.put("schema", "stock-watch-history-catalog-v1");
+        catalog.put("lookbackStart", source == null ? null : source.get("lookbackStart"));
+        catalog.put("lookbackEnd", source == null ? null : source.get("lookbackEnd"));
+        catalog.put("selectionPolicy", "eligible_attributed_history_only");
+        catalog.put("sourceSelectionPolicy", source == null ? null : source.get("selectionPolicy"));
+        catalog.put("entries", entries == null ? new JSONArray() : entries);
+        catalog.put("catalogDigest", historyCatalogDigest(catalog));
+        return catalog;
+    }
+
+    private JSONObject copyHistoryEntryForPrompt(JSONObject entry) {
+        JSONObject copy = new JSONObject(true);
+        for (String key : Arrays.asList("historyRef", "analysisId", "analysisTaskId", "claimRef",
+                "claimDigest", "claim", "evidenceQuality", "narrowingEligible", "attributionStatus",
+                "tests", "aggregateVerdict")) {
+            copy.put(key, entry.get(key));
+        }
+        return copy;
+    }
+
+    private boolean isHistoryNarrowingEligible(JSONObject entry) {
+        if (entry == null) {
+            return false;
+        }
+        boolean verdictEligible = HISTORY_NARROWING_VERDICTS.contains(text(entry.get("aggregateVerdict"), "")
+                .toUpperCase(Locale.ROOT));
+        return bool(entry.get("narrowingEligible"), verdictEligible) && verdictEligible;
+    }
+
+    private void incrementCount(JSONObject counts, String rawKey) {
+        String key = StringUtils.hasText(rawKey) ? rawKey : "UNKNOWN";
+        counts.put(key, counts.getIntValue(key) + 1);
+    }
+
+    private int safeSize(List<?> values) {
+        return values == null ? 0 : values.size();
     }
 
     private List<Map<String, Object>> recentTwoWeekLedger(StockRef ref,
@@ -1662,7 +1804,6 @@ public class StockWatchTechnicalAnalysisService {
                     ? "SERVER_PROFILE_V1"
                     : (taskId == null ? "LEGACY_UNVERIFIED" : "LEGACY_PATH_MEMBERSHIP_ONLY");
             entry.put("evidenceQuality", evidenceQuality);
-            entry.put("narrowingEligible", false);
             String attributionStatus = taskId == null || claim == null || claim.isEmpty()
                     ? "LEGACY_UNBOUND"
                     : (tests.isEmpty() ? "NO_TEST_DEFINITION" : "ATTRIBUTABLE");
@@ -1682,7 +1823,9 @@ public class StockWatchTechnicalAnalysisService {
                 testPayloads.add(testPayload);
             }
             entry.put("tests", testPayloads);
-            entry.put("aggregateVerdict", aggregateHistoryVerdict(attributionStatus, tests));
+            String aggregateVerdict = aggregateHistoryVerdict(attributionStatus, tests);
+            entry.put("aggregateVerdict", aggregateVerdict);
+            entry.put("narrowingEligible", HISTORY_NARROWING_VERDICTS.contains(aggregateVerdict));
             entries.add(entry);
         }
         JSONObject catalog = new JSONObject(true);
@@ -4103,6 +4246,23 @@ public class StockWatchTechnicalAnalysisService {
         private int promptChars;
         private String missingDataJson;
         private String historyCatalogJson;
+    }
+
+    private static class HistoryPromptContext {
+        private final List<Map<String, Object>> recentSamePeriodAnalysis;
+        private final List<Map<String, Object>> recentTwoWeekAnalysisLedger;
+        private final JSONObject historyEvidenceCatalog;
+        private final JSONObject summary;
+
+        private HistoryPromptContext(List<Map<String, Object>> recentSamePeriodAnalysis,
+                                     List<Map<String, Object>> recentTwoWeekAnalysisLedger,
+                                     JSONObject historyEvidenceCatalog,
+                                     JSONObject summary) {
+            this.recentSamePeriodAnalysis = recentSamePeriodAnalysis;
+            this.recentTwoWeekAnalysisLedger = recentTwoWeekAnalysisLedger;
+            this.historyEvidenceCatalog = historyEvidenceCatalog;
+            this.summary = summary;
+        }
     }
 
     private static class AnalysisPayload {
