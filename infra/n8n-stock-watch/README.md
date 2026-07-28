@@ -42,3 +42,5 @@ infra/n8n-stock-watch/scripts/export-workflows.sh
 infra/n8n-stock-watch/scripts/run-security-audit.sh
 infra/n8n-stock-watch/scripts/verify-recovery-readiness.sh
 ```
+
+For handoff and day-to-day operation, see `docs/operations-handoff.md`.

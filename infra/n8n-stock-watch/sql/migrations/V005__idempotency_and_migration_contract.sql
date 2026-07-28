@@ -73,3 +73,4 @@ BEGIN
     ALTER TABLE sw_protection_report ADD CONSTRAINT sw_protection_report_packet_key UNIQUE (packet_id);
   END IF;
 END $$;
+

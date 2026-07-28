@@ -66,3 +66,4 @@ CREATE TABLE IF NOT EXISTS sw_protection_report (
   created_at timestamptz NOT NULL DEFAULT now(),
   CONSTRAINT sw_protection_report_type_chk CHECK (report_type = 'STRESS_ONLY')
 );
+

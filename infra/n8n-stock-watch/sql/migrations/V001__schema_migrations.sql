@@ -3,3 +3,4 @@ CREATE TABLE IF NOT EXISTS sw_schema_migrations (
   checksum text NOT NULL,
   applied_at timestamptz NOT NULL DEFAULT now()
 );
+
