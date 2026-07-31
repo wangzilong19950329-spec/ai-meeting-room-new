@@ -308,7 +308,7 @@ CREATE TABLE IF NOT EXISTS `stock_watch_technical_session` (
     `status`              VARCHAR(32)  NOT NULL DEFAULT 'ACTIVE' COMMENT 'ACTIVE/CONTEXT_ROTATED/MANUAL_ROTATED',
     `generation`          INT          NOT NULL DEFAULT 1      COMMENT '会话代数',
     `context_chars`       INT          NOT NULL DEFAULT 0      COMMENT '近似累计上下文字符数',
-    `context_limit_chars` INT          NOT NULL DEFAULT 80000  COMMENT '近似上下文阈值',
+    `context_limit_chars` INT          NOT NULL DEFAULT 500000 COMMENT '近似上下文阈值',
     `last_run_at`         DATETIME                              COMMENT '最近分析时间',
     `last_run_status`     VARCHAR(64)                           COMMENT '最近分析状态',
     `last_error`          TEXT                                  COMMENT '最近错误',

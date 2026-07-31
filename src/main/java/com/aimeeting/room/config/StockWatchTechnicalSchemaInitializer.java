@@ -62,7 +62,7 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "status VARCHAR(32) NOT NULL DEFAULT 'ACTIVE',"
                     + "generation INT NOT NULL DEFAULT 1,"
                     + "context_chars INT NOT NULL DEFAULT 0,"
-                    + "context_limit_chars INT NOT NULL DEFAULT 80000,"
+                    + "context_limit_chars INT NOT NULL DEFAULT 500000,"
                     + "last_run_at DATETIME,"
                     + "last_run_status VARCHAR(64),"
                     + "last_error TEXT,"

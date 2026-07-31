@@ -324,7 +324,7 @@ CREATE TABLE IF NOT EXISTS stock_watch_technical_session (
     status VARCHAR(32) DEFAULT 'ACTIVE' NOT NULL,
     generation INT DEFAULT 1 NOT NULL,
     context_chars INT DEFAULT 0 NOT NULL,
-    context_limit_chars INT DEFAULT 80000 NOT NULL,
+    context_limit_chars INT DEFAULT 500000 NOT NULL,
     last_run_at TIMESTAMP,
     last_run_status VARCHAR(64),
     last_error CLOB,

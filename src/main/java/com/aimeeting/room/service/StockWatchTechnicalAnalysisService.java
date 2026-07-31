@@ -101,6 +101,9 @@ public class StockWatchTechnicalAnalysisService {
     private static final List<String> MAIN_FORCE_WINDOWS = Arrays.asList("INTRADAY", "THREE_DAY", "FIVE_DAY", "TWENTY_DAY");
     private static final int RESPONSE_CONTRACT_VERSION = 6;
     private static final String RESPONSE_CONTRACT_NAME = "stock-analysis-response-v6";
+    private static final int DEFAULT_CONTEXT_LIMIT_CHARS = 500_000;
+    private static final int LEGACY_CONTEXT_LIMIT_CHARS = 80_000;
+    private static final double DEFAULT_CONTEXT_ROTATE_RATIO = 1.0d;
     private static final Set<Integer> SUPPORTED_RESPONSE_CONTRACTS = new LinkedHashSet<>(Arrays.asList(5, 6));
     private static final Set<String> STRONG_MAIN_FORCE_INTENTS = new LinkedHashSet<>(Arrays.asList(
             "ACCUMULATE", "DISTRIBUTE", "WASH", "PULL_UP", "SUPPORT", "SUPPRESS", "ROTATE"
@@ -142,10 +145,10 @@ public class StockWatchTechnicalAnalysisService {
     @Value("${stock-watch.technical-analysis.symbols:${stock-watch.monitor.symbols:688017.sh,300760.sz,002594.sz}}")
     private String configuredSymbols;
 
-    @Value("${stock-watch.technical-analysis.context-limit-chars:80000}")
+    @Value("${stock-watch.technical-analysis.context-limit-chars:500000}")
     private int contextLimitChars;
 
-    @Value("${stock-watch.technical-analysis.context-rotate-ratio:0.85}")
+    @Value("${stock-watch.technical-analysis.context-rotate-ratio:1.0}")
     private double contextRotateRatio;
 
     @Value("${stock-watch.technical-analysis.bridge-url:http://127.0.0.1:8791/search}")
@@ -1330,12 +1333,22 @@ public class StockWatchTechnicalAnalysisService {
     }
 
     private boolean shouldRotate(StockWatchTechnicalSession session) {
-        int limit = session.getContextLimitChars() == null || session.getContextLimitChars() <= 0
-                ? contextLimitChars
-                : session.getContextLimitChars();
+        int limit = effectiveContextLimitChars(session);
         int used = session.getContextChars() == null ? 0 : session.getContextChars();
-        double ratio = contextRotateRatio <= 0 || contextRotateRatio > 1 ? 0.85 : contextRotateRatio;
+        double ratio = contextRotateRatio <= 0 || contextRotateRatio > 1 ? DEFAULT_CONTEXT_ROTATE_RATIO : contextRotateRatio;
         return used >= Math.round(limit * ratio);
+    }
+
+    private int effectiveContextLimitChars(StockWatchTechnicalSession session) {
+        int configured = contextLimitChars <= 0 ? DEFAULT_CONTEXT_LIMIT_CHARS : contextLimitChars;
+        Integer stored = session == null ? null : session.getContextLimitChars();
+        if (stored == null || stored <= 0) {
+            return configured;
+        }
+        if (stored == LEGACY_CONTEXT_LIMIT_CHARS && configured > stored) {
+            return configured;
+        }
+        return stored;
     }
 
     private BridgeResult callDeepSeekBridge(String prompt,
@@ -1551,7 +1564,7 @@ public class StockWatchTechnicalAnalysisService {
         sessionPayload.put("sessionKey", session.getSessionKey());
         sessionPayload.put("generation", session.getGeneration());
         sessionPayload.put("contextChars", session.getContextChars());
-        sessionPayload.put("contextLimitChars", session.getContextLimitChars());
+        sessionPayload.put("contextLimitChars", effectiveContextLimitChars(session));
         payload.put("session", sessionPayload);
 
         String periodInstruction;
@@ -3392,9 +3405,7 @@ public class StockWatchTechnicalAnalysisService {
             payload.put("nextRun", nextRunLabel(ZonedDateTime.now(CHINA_ZONE), fallbackRef.market));
             return payload;
         }
-        int limit = session.getContextLimitChars() == null || session.getContextLimitChars() <= 0
-                ? contextLimitChars
-                : session.getContextLimitChars();
+        int limit = effectiveContextLimitChars(session);
         int used = session.getContextChars() == null ? 0 : session.getContextChars();
         String url = text(session.getConversationUrl(), "");
         payload.put("id", session.getId());

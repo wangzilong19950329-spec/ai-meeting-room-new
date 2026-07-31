@@ -361,6 +361,39 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
+    void legacyStoredContextLimitUsesCurrentDeepSeekContextBudget() {
+        ReflectionTestUtils.setField(service, "contextLimitChars", 500_000);
+        ReflectionTestUtils.setField(service, "contextRotateRatio", 1.0d);
+        StockWatchTechnicalSession session = new StockWatchTechnicalSession();
+        session.setSymbol("300750");
+        session.setMarket("sz");
+        session.setStockName("宁德时代");
+        session.setPeriodType("DAY");
+        session.setSessionKey("stock-watch-day-sz-300750-g64");
+        session.setStatus("ACTIVE");
+        session.setGeneration(64);
+        session.setContextLimitChars(80_000);
+        session.setContextChars(100_000);
+
+        assertEquals(false, ReflectionTestUtils.invokeMethod(service, "shouldRotate", session));
+        assertEquals(Integer.valueOf(500_000),
+                ReflectionTestUtils.invokeMethod(service, "effectiveContextLimitChars", session));
+        Object ref = ReflectionTestUtils.invokeMethod(service, "normalizeStockRef", "300750", "sz");
+        Map<?, ?> payload = ReflectionTestUtils.invokeMethod(service, "toSessionPayload", session, ref, "DAY");
+        assertEquals(20, payload.get("contextUsage"));
+        assertEquals("复用中", payload.get("status"));
+
+        session.setContextChars(500_000);
+        assertEquals(true, ReflectionTestUtils.invokeMethod(service, "shouldRotate", session));
+
+        session.setContextLimitChars(120_000);
+        session.setContextChars(120_000);
+        assertEquals(true, ReflectionTestUtils.invokeMethod(service, "shouldRotate", session));
+        assertEquals(Integer.valueOf(120_000),
+                ReflectionTestUtils.invokeMethod(service, "effectiveContextLimitChars", session));
+    }
+
+    @Test
     void missingRequiredMarketDataReturnsTransientDataUnavailableWithoutModelTask() {
         EastmoneyMarketDataService marketDataService = mock(EastmoneyMarketDataService.class);
         StockWatchTechnicalSessionMapper sessionMapper = mock(StockWatchTechnicalSessionMapper.class);

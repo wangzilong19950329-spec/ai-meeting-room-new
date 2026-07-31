@@ -171,8 +171,8 @@ stock-watch:
     scan-interval-ms: ${STOCK_WATCH_TECH_SCAN_INTERVAL_MS:1800000}
     initial-delay-ms: ${STOCK_WATCH_TECH_INITIAL_DELAY_MS:90000}
     symbols: ${STOCK_WATCH_TECH_SYMBOLS:${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}}
-    context-limit-chars: ${STOCK_WATCH_TECH_CONTEXT_LIMIT_CHARS:80000}
-    context-rotate-ratio: ${STOCK_WATCH_TECH_CONTEXT_ROTATE_RATIO:0.85}
+    context-limit-chars: ${STOCK_WATCH_TECH_CONTEXT_LIMIT_CHARS:500000}
+    context-rotate-ratio: ${STOCK_WATCH_TECH_CONTEXT_ROTATE_RATIO:1.0}
     bridge-url: ${STOCK_WATCH_TECH_BRIDGE_URL:http://127.0.0.1:8791/search}
     debug-port: ${STOCK_WATCH_TECH_DEBUG_PORT:9344}
     connect-timeout-seconds: ${STOCK_WATCH_TECH_CONNECT_TIMEOUT_SECONDS:10}
