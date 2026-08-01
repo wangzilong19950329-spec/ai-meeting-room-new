@@ -19,6 +19,22 @@ infra/n8n-stock-watch/scripts/import-workflows.sh
 infra/n8n-stock-watch/scripts/smoke-test-phase1.sh
 ```
 
+Run the CATL real-quote variant:
+
+```bash
+infra/n8n-stock-watch/scripts/smoke-test-phase1-catl-real.sh
+```
+
+This fetches `300750.sz` from Eastmoney, renders a temporary runtime workflow,
+executes it in n8n, and verifies the persisted report. The position and model
+remain Phase1 fixtures. During a closed market session, the quote is labeled
+`closed_session_snapshot` rather than fresh intraday data.
+
+The validation workflow uses the separate inactive ID
+`SW01Phase1POCCatlReal`, so the default `SW01Phase1POC` definition remains
+available. Its MOCK response is derived from the current fact registry and is
+rejected if a numeric output disagrees with the referenced fact.
+
 Open n8n at:
 
 ```text
@@ -32,6 +48,7 @@ http://127.0.0.1:5678
 - n8n binds only to `127.0.0.1`.
 - The workflow is imported with `active=false`.
 - `MODEL_PROVIDER=MOCK` and `NOTIFY_ENABLED=false`.
+- The real-quote smoke test does not enable DeepSeek, the Java bridge, email, or scheduling.
 
 ## Useful Commands
 

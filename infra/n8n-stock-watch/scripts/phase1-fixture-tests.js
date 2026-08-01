@@ -38,14 +38,28 @@ function normalizeQuote(q) {
 
 function quoteQualityGate(q) {
   const freshnessSeconds = Math.round((Date.parse(q.fetched_at) - Date.parse(q.quote_time)) / 1000);
+  const isRealQuote = q.source_kind === 'eastmoney_real';
+  const allowedSessionStates = ['OPEN', 'MIDDAY_BREAK', 'CLOSED'];
+  const hasValidSessionState = allowedSessionStates.includes(q.market_session_state);
+  const isClosedSession = isRealQuote && hasValidSessionState && q.market_session_state !== 'OPEN';
+  assert(!isRealQuote || hasValidSessionState, 'market_session_state is invalid');
   assert(freshnessSeconds >= 0, 'fetched_at is earlier than quote_time');
-  assert(freshnessSeconds <= 300, 'quote is stale');
+  assert(freshnessSeconds <= 300 || isClosedSession, 'quote is stale');
   assert(q.high >= q.low, 'high is below low');
   assert(q.last_price >= q.low && q.last_price <= q.high, 'last_price outside day range');
-  return freshnessSeconds;
+  return {
+    freshnessSeconds,
+    qualityStatus: isRealQuote
+      ? (isClosedSession ? 'closed_session_snapshot' : 'fresh_real')
+      : 'fresh_fixture',
+    limitations: isClosedSession && freshnessSeconds > 300
+      ? ['QUOTE_STALE_OUTSIDE_TRADING_SESSION']
+      : []
+  };
 }
 
 function buildFacts(quote, position, freshnessSeconds) {
+  assert(position.symbol === quote.symbol && position.market === quote.market, 'position fixture does not match quote identity');
   const round4 = (value) => Math.round(value * 10000) / 10000;
   return [
     { id: 'fact.last_price', value: quote.last_price, unit: quote.currency, source: quote.source_kind, quality: 'fixture' },
@@ -132,7 +146,18 @@ function validateBehaviorView(view, registry) {
     }
   }
   for (const output of view.numeric_outputs || []) {
-    if (!registry[output.fact_ref]) errors.push(`numeric output references unknown fact_ref: ${output.fact_ref}`);
+    const fact = registry[output.fact_ref];
+    if (!fact) {
+      errors.push(`numeric output references unknown fact_ref: ${output.fact_ref}`);
+      continue;
+    }
+    if (typeof output.value !== 'number' || !Number.isFinite(output.value)) {
+      errors.push(`numeric output is not finite for fact_ref: ${output.fact_ref}`);
+      continue;
+    }
+    if (typeof fact.value !== 'number' || !Number.isFinite(fact.value) || output.value !== fact.value) {
+      errors.push(`numeric output does not match fact value: ${output.fact_ref}`);
+    }
   }
 
   if (errors.length) {
@@ -152,15 +177,32 @@ function runTest(name, fn) {
   }
 }
 
+const renderedWorkflow = readJson('workflows/phase1/SW-01-POC-Manual-Pipeline.json');
+
+function runRenderedCodeNode(name, json) {
+  const node = renderedWorkflow.nodes.find((candidate) => candidate.name === name);
+  assert(node && node.parameters && node.parameters.jsCode, `rendered node not found: ${name}`);
+  const input = { first: () => ({ json }) };
+  return new Function('$input', node.parameters.jsCode)(input)[0].json;
+}
+
 const validQuote = normalizeQuote(readJson('fixtures/quote-valid.json'));
 const position = readJson('fixtures/position-t1-locked.json');
-const validFreshness = quoteQualityGate(validQuote);
-const facts = buildFacts(validQuote, position, validFreshness);
+const validQuality = quoteQualityGate(validQuote);
+const facts = buildFacts(validQuote, position, validQuality.freshnessSeconds);
 const registry = registryFromFacts(facts);
 const packet = buildPacket(validQuote, facts);
 
 runTest('valid quote passes quality gate', () => {
-  assert(validFreshness === 30, `expected freshness 30, got ${validFreshness}`);
+  assert(validQuality.freshnessSeconds === 30, `expected freshness 30, got ${validQuality.freshnessSeconds}`);
+  assert(validQuality.qualityStatus === 'fresh_fixture', `unexpected status ${validQuality.qualityStatus}`);
+});
+
+runTest('rendered workflow default quote passes quality gate', () => {
+  const normalized = runRenderedCodeNode('Normalize Quote', { quote_fixture: validQuote });
+  const quality = runRenderedCodeNode('Quote Quality Gate', normalized);
+  assert(quality.quality_status === 'fresh_fixture', `unexpected rendered status ${quality.quality_status}`);
+  assert(quality.quote_freshness_seconds === 30, 'rendered workflow freshness changed');
 });
 
 runTest('stale quote is rejected', () => {
@@ -174,6 +216,90 @@ runTest('stale quote is rejected', () => {
   assert(rejected, 'stale quote was not rejected');
 });
 
+runTest('closed-session real quote retains stale snapshot boundary', () => {
+  const closedQuote = normalizeQuote({
+    ...validQuote,
+    source_kind: 'eastmoney_real',
+    market_session_state: 'CLOSED',
+    quote_time: '2026-07-31T07:34:42.000Z',
+    fetched_at: '2026-08-01T07:34:42.000Z'
+  });
+  const quality = quoteQualityGate(closedQuote);
+  assert(quality.qualityStatus === 'closed_session_snapshot', `unexpected status ${quality.qualityStatus}`);
+  assert(quality.limitations.includes('QUOTE_STALE_OUTSIDE_TRADING_SESSION'), 'missing stale snapshot limitation');
+});
+
+runTest('open-session stale real quote is rejected', () => {
+  const staleOpenQuote = normalizeQuote({
+    ...validQuote,
+    source_kind: 'eastmoney_real',
+    market_session_state: 'OPEN',
+    quote_time: '2026-07-31T02:00:00.000Z',
+    fetched_at: '2026-07-31T02:10:00.000Z'
+  });
+  let rejected = false;
+  try {
+    quoteQualityGate(staleOpenQuote);
+  } catch (error) {
+    rejected = /stale/.test(error.message);
+  }
+  assert(rejected, 'open-session stale real quote was not rejected');
+});
+
+runTest('rendered workflow rejects open-session stale real quote', () => {
+  const normalized = runRenderedCodeNode('Normalize Quote', {
+    quote_fixture: {
+      ...validQuote,
+      source_kind: 'eastmoney_real',
+      market_session_state: 'OPEN',
+      quote_time: '2026-07-31T02:00:00.000Z',
+      fetched_at: '2026-07-31T02:10:00.000Z'
+    }
+  });
+  let rejected = false;
+  try {
+    runRenderedCodeNode('Quote Quality Gate', normalized);
+  } catch (error) {
+    rejected = /stale/.test(error.message);
+  }
+  assert(rejected, 'rendered workflow accepted an open-session stale quote');
+});
+
+runTest('invalid real market session state is rejected', () => {
+  let rejected = false;
+  try {
+    quoteQualityGate({
+      ...validQuote,
+      source_kind: 'eastmoney_real',
+      market_session_state: 'NOT_OPEN',
+      quote_time: '2026-07-31T02:00:00.000Z',
+      fetched_at: '2026-07-31T02:10:00.000Z'
+    });
+  } catch (error) {
+    rejected = /market_session_state/.test(error.message);
+  }
+  assert(rejected, 'invalid real market session state was not rejected');
+});
+
+runTest('rendered workflow rejects invalid real market session state', () => {
+  const normalized = runRenderedCodeNode('Normalize Quote', {
+    quote_fixture: {
+      ...validQuote,
+      source_kind: 'eastmoney_real',
+      market_session_state: 'NOT_OPEN',
+      quote_time: '2026-07-31T02:00:00.000Z',
+      fetched_at: '2026-07-31T02:10:00.000Z'
+    }
+  });
+  let rejected = false;
+  try {
+    runRenderedCodeNode('Quote Quality Gate', normalized);
+  } catch (error) {
+    rejected = /market_session_state/.test(error.message);
+  }
+  assert(rejected, 'rendered workflow accepted an invalid market session state');
+});
+
 runTest('packet hash is stable', () => {
   const packet2 = buildPacket(validQuote, facts);
   assert(packet.packet_hash === packet2.packet_hash, 'packet hash changed for identical input');
@@ -181,6 +307,54 @@ runTest('packet hash is stable', () => {
 
 runTest('valid model output is accepted', () => {
   validateBehaviorView(readJson('fixtures/model-valid.json'), registry);
+});
+
+runTest('rendered MOCK derives CATL direction and numeric output from facts', () => {
+  const catlRegistry = {
+    ...registry,
+    'fact.price_change_pct': {
+      ...registry['fact.price_change_pct'],
+      value: -1.6373,
+      source: 'eastmoney_real',
+      quality: 'derived_from_source_quote'
+    }
+  };
+  const mocked = runRenderedCodeNode('MOCK Market Behavior', {
+    normalized_quote: { ...validQuote, source_kind: 'eastmoney_real' },
+    fact_registry: catlRegistry
+  });
+  const parsed = runRenderedCodeNode('Parse Strict JSON', mocked);
+  const output = parsed.behavior_view.numeric_outputs[0];
+  assert(output.value === -1.6373, `MOCK numeric output drifted: ${output.value}`);
+  assert(parsed.behavior_view.claim_set[0].statement.includes('below'), 'MOCK did not derive the negative direction');
+  runRenderedCodeNode('Structural Claim Validator', parsed);
+});
+
+runTest('numeric model output inconsistent with fact is rejected', () => {
+  const inconsistent = JSON.parse(JSON.stringify(readJson('fixtures/model-valid.json')));
+  inconsistent.numeric_outputs[0].value = -999;
+  let rejected = false;
+  try {
+    validateBehaviorView(inconsistent, registry);
+  } catch (error) {
+    rejected = /does not match fact value/.test(error.message);
+  }
+  assert(rejected, 'inconsistent numeric model output was not rejected');
+});
+
+runTest('rendered validator rejects numeric output inconsistent with fact', () => {
+  const inconsistent = JSON.parse(JSON.stringify(readJson('fixtures/model-valid.json')));
+  inconsistent.numeric_outputs[0].value = -999;
+  let rejected = false;
+  try {
+    runRenderedCodeNode('Structural Claim Validator', {
+      behavior_view: inconsistent,
+      fact_registry: registry
+    });
+  } catch (error) {
+    rejected = /does not match fact value/.test(error.message);
+  }
+  assert(rejected, 'rendered validator accepted inconsistent numeric output');
 });
 
 runTest('invalid JSON is rejected', () => {
@@ -217,4 +391,27 @@ runTest('T plus one fixture produces locked state', () => {
   assert(position.total_quantity === 1000, 'unexpected total quantity');
   assert(position.available_quantity === 0, 'expected no available quantity');
   assert(position.locked_quantity === 1000, 'expected locked quantity');
+});
+
+runTest('position fixture cannot be reused across symbols', () => {
+  let rejected = false;
+  try {
+    buildFacts({ ...validQuote, symbol: '300750' }, position, validQuality.freshnessSeconds);
+  } catch (error) {
+    rejected = /does not match/.test(error.message);
+  }
+  assert(rejected, 'cross-symbol position fixture was not rejected');
+});
+
+runTest('rendered workflow rejects cross-symbol position fixture', () => {
+  let rejected = false;
+  try {
+    runRenderedCodeNode('Calculate Facts', {
+      normalized_quote: { ...validQuote, symbol: '300750' },
+      quote_freshness_seconds: validQuality.freshnessSeconds
+    });
+  } catch (error) {
+    rejected = /does not match/.test(error.message);
+  }
+  assert(rejected, 'rendered workflow reused a cross-symbol position fixture');
 });

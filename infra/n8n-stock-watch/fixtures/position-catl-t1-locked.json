@@ -1,0 +1,10 @@
+{
+  "fixture_name": "position-catl-t1-locked.json",
+  "symbol": "300750",
+  "market": "sz",
+  "total_quantity": 1000,
+  "available_quantity": 0,
+  "locked_quantity": 1000,
+  "lock_reason": "T_PLUS_ONE",
+  "as_of": "2026-08-01T06:00:00.000Z"
+}

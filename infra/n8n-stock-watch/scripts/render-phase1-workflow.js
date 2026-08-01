@@ -3,12 +3,25 @@ const fs = require('fs');
 const path = require('path');
 
 const root = path.resolve(__dirname, '..');
-const readJson = (relativePath) =>
-  JSON.parse(fs.readFileSync(path.join(root, relativePath), 'utf8'));
+const resolveRootPath = (configuredPath, fallbackPath) => {
+  const selected = configuredPath || fallbackPath;
+  return path.isAbsolute(selected) ? selected : path.join(root, selected);
+};
+const readJson = (configuredPath, fallbackPath) =>
+  JSON.parse(fs.readFileSync(resolveRootPath(configuredPath, fallbackPath), 'utf8'));
 
-const quoteFixture = readJson('fixtures/quote-valid.json');
-const positionFixture = readJson('fixtures/position-t1-locked.json');
-const modelFixture = readJson('fixtures/model-valid.json');
+const quoteFixture = readJson(process.env.PHASE1_QUOTE_FIXTURE_PATH, 'fixtures/quote-valid.json');
+const positionFixture = readJson(process.env.PHASE1_POSITION_FIXTURE_PATH, 'fixtures/position-t1-locked.json');
+const modelFixture = readJson(null, 'fixtures/model-valid.json');
+const workflowOutputPath = resolveRootPath(
+  process.env.PHASE1_WORKFLOW_OUTPUT,
+  'workflows/phase1/SW-01-POC-Manual-Pipeline.json'
+);
+const workflowId = process.env.PHASE1_WORKFLOW_ID || 'SW01Phase1POC';
+const workflowName = process.env.PHASE1_WORKFLOW_NAME || 'SW-01 POC Manual Pipeline';
+if (!/^[A-Za-z0-9_-]+$/.test(workflowId)) {
+  throw new Error('PHASE1_WORKFLOW_ID must contain only letters, digits, underscore, or hyphen');
+}
 
 const sql = `
 WITH payload AS (
@@ -218,6 +231,16 @@ const normalized = {
   field_semantics: q.field_semantics,
 };
 
+for (const optionalName of [
+  'stock_name',
+  'source_url',
+  'market_session_state',
+  'market_session_basis',
+  'raw_eastmoney'
+]) {
+  if (q[optionalName] !== undefined) normalized[optionalName] = q[optionalName];
+}
+
 return [{ json: { ...item, normalized_quote: normalized } }];
 `.trim(),
 
@@ -226,23 +249,45 @@ const item = $input.first().json;
 const q = item.normalized_quote;
 const freshnessSeconds = Math.round((Date.parse(q.fetched_at) - Date.parse(q.quote_time)) / 1000);
 const errors = [];
+const isRealQuote = q.source_kind === 'eastmoney_real';
+const allowedSessionStates = ['OPEN', 'MIDDAY_BREAK', 'CLOSED'];
+const hasValidSessionState = allowedSessionStates.includes(q.market_session_state);
+const isClosedSession = isRealQuote && hasValidSessionState && q.market_session_state !== 'OPEN';
+const qualityLimitations = [];
 
+if (isRealQuote && !hasValidSessionState) errors.push('market_session_state is invalid');
 if (freshnessSeconds < 0) errors.push('fetched_at is earlier than quote_time');
-if (freshnessSeconds > 300) errors.push('quote is stale');
+if (freshnessSeconds > 300 && !isClosedSession) errors.push('quote is stale');
 if (q.high < q.low) errors.push('high is below low');
 if (q.last_price < q.low || q.last_price > q.high) errors.push('last_price is outside day range');
 
-if (errors.length) {
-  throw new Error('Quote Quality Gate rejected fixture: ' + errors.join('; '));
+if (isClosedSession && freshnessSeconds > 300) {
+  qualityLimitations.push('QUOTE_STALE_OUTSIDE_TRADING_SESSION');
 }
 
-return [{ json: { ...item, quality_status: 'fresh_fixture', quote_freshness_seconds: freshnessSeconds } }];
+if (errors.length) {
+  throw new Error('Quote Quality Gate rejected quote: ' + errors.join('; '));
+}
+
+const qualityStatus = isRealQuote
+  ? (isClosedSession ? 'closed_session_snapshot' : 'fresh_real')
+  : 'fresh_fixture';
+
+return [{
+  json: {
+    ...item,
+    quality_status: qualityStatus,
+    quality_limitations: qualityLimitations,
+    quote_freshness_seconds: freshnessSeconds
+  }
+}];
 `.trim(),
 
   buildApproxBars: `
 const item = $input.first().json;
 const q = item.normalized_quote;
 const previous = q.previous_snapshot || {};
+const isFixture = q.source_kind === 'fixture';
 
 const bars = [
   {
@@ -265,7 +310,9 @@ return [{
   json: {
     ...item,
     approximate_bars: bars,
-    approximation_note: 'Bars are approximate fixture-derived context, not full-session market bars.'
+    approximation_note: isFixture
+      ? 'Bars are approximate fixture-derived context, not full-session market bars.'
+      : 'Bars are approximate quote-derived context, not full-session market bars.'
   }
 }];
 `.trim(),
@@ -274,16 +321,22 @@ return [{
 const item = $input.first().json;
 const q = item.normalized_quote;
 const position = ${JSON.stringify(positionFixture, null, 2)};
+if (position.symbol !== q.symbol || position.market !== q.market) {
+  throw new Error('Position fixture does not match quote identity');
+}
+const isFixture = q.source_kind === 'fixture';
+const quoteQuality = isFixture ? 'fixture' : 'source_quote';
+const derivedQuality = isFixture ? 'derived_from_fixture' : 'derived_from_source_quote';
 
 const round4 = (value) => Math.round(value * 10000) / 10000;
 const priceChangePct = round4(((q.last_price - q.previous_close) / q.previous_close) * 100);
 const dayRangePct = round4(((q.high - q.low) / q.previous_close) * 100);
 
 const facts = [
-  { id: 'fact.last_price', value: q.last_price, unit: q.currency, source: q.source_kind, quality: 'fixture' },
-  { id: 'fact.previous_close', value: q.previous_close, unit: q.currency, source: q.source_kind, quality: 'fixture' },
-  { id: 'fact.price_change_pct', value: priceChangePct, unit: 'percent', source: q.source_kind, quality: 'derived_from_fixture' },
-  { id: 'fact.day_range_pct', value: dayRangePct, unit: 'percent', source: q.source_kind, quality: 'derived_from_fixture' },
+  { id: 'fact.last_price', value: q.last_price, unit: q.currency, source: q.source_kind, quality: quoteQuality },
+  { id: 'fact.previous_close', value: q.previous_close, unit: q.currency, source: q.source_kind, quality: quoteQuality },
+  { id: 'fact.price_change_pct', value: priceChangePct, unit: 'percent', source: q.source_kind, quality: derivedQuality },
+  { id: 'fact.day_range_pct', value: dayRangePct, unit: 'percent', source: q.source_kind, quality: derivedQuality },
   { id: 'fact.quote_freshness_seconds', value: item.quote_freshness_seconds, unit: 'seconds', source: q.source_kind, quality: 'quality_gate' },
   { id: 'fact.amount_semantics', value: q.field_semantics.amount, unit: 'enum', source: 'api_discovery', quality: 'unknown_semantics' },
   { id: 'fact.position_total_quantity', value: position.total_quantity, unit: 'shares', source: position.fixture_name, quality: 'fixture' },
@@ -345,6 +398,21 @@ const packetCore = {
   model_input: modelInput
 };
 
+if (q.source_kind !== 'fixture') {
+  packetCore.source_metadata = {
+    stock_name: q.stock_name || null,
+    exchange_symbol: q.exchange_symbol,
+    source_url: q.source_url || null,
+    fetched_at: q.fetched_at,
+    market_session_state: q.market_session_state || null,
+    market_session_basis: q.market_session_basis || null,
+    quote_freshness_seconds: item.quote_freshness_seconds,
+    quality_status: item.quality_status,
+    quality_limitations: item.quality_limitations || [],
+    raw_eastmoney: q.raw_eastmoney || null
+  };
+}
+
 const packetHash = 'fnv1a32:' + fnv1a32(stableStringify(packetCore));
 const packet = {
   ...packetCore,
@@ -374,6 +442,28 @@ return [{ json: { ...item, model_provider: configured } }];
   mockMarketBehavior: `
 const item = $input.first().json;
 const mockView = ${JSON.stringify(modelFixture, null, 2)};
+const priceChangeFact = item.fact_registry['fact.price_change_pct'];
+if (!priceChangeFact || typeof priceChangeFact.value !== 'number' || !Number.isFinite(priceChangeFact.value)) {
+  throw new Error('MOCK requires numeric fact.price_change_pct');
+}
+
+const relation = priceChangeFact.value > 0 ? 'above' : (priceChangeFact.value < 0 ? 'below' : 'equal to');
+const priceClaim = mockView.claim_set.find((claim) => claim.claim_id === 'c1');
+if (!priceClaim) throw new Error('MOCK template is missing claim c1');
+priceClaim.statement = 'The latest ' + (item.normalized_quote.source_kind === 'fixture' ? 'fixture' : 'source')
+  + ' price is ' + relation + ' the previous close.';
+
+for (const output of mockView.numeric_outputs) {
+  const fact = item.fact_registry[output.fact_ref];
+  if (!fact || typeof fact.value !== 'number' || !Number.isFinite(fact.value)) {
+    throw new Error('MOCK numeric output requires numeric fact: ' + output.fact_ref);
+  }
+  output.value = fact.value;
+}
+
+if (item.normalized_quote.source_kind !== 'fixture') {
+  mockView.uncertainty[0] = 'single real-source quote snapshot only';
+}
 return [{
   json: {
     ...item,
@@ -440,7 +530,18 @@ for (const claim of view.claim_set || []) {
 
 for (const output of view.numeric_outputs || []) {
   checkedFactRefs.push(output.fact_ref);
-  if (!factRegistry[output.fact_ref]) errors.push('numeric output references unknown fact_ref: ' + output.fact_ref);
+  const fact = factRegistry[output.fact_ref];
+  if (!fact) {
+    errors.push('numeric output references unknown fact_ref: ' + output.fact_ref);
+    continue;
+  }
+  if (typeof output.value !== 'number' || !Number.isFinite(output.value)) {
+    errors.push('numeric output is not finite for fact_ref: ' + output.fact_ref);
+    continue;
+  }
+  if (typeof fact.value !== 'number' || !Number.isFinite(fact.value) || output.value !== fact.value) {
+    errors.push('numeric output does not match fact value: ' + output.fact_ref);
+  }
 }
 
 if (forbiddenHits.length) errors.push('forbidden content detected: ' + forbiddenHits.join(','));
@@ -485,7 +586,9 @@ if (available === 0 && locked > 0) {
 riskItems.push({
   code: 'FACT_LIMITED_SCOPE',
   severity: 'medium',
-  description: 'Quote fixture and approximate bars are not full-session market evidence.',
+  description: item.normalized_quote.source_kind === 'fixture'
+    ? 'Quote fixture and approximate bars are not full-session market evidence.'
+    : 'Single-source quote and approximate bars are not full-session market evidence.',
   fact_refs: ['fact.quote_freshness_seconds', 'fact.amount_semantics']
 });
 
@@ -502,6 +605,7 @@ return [{
   renderMarkdown: `
 const item = $input.first().json;
 const q = item.normalized_quote;
+const isFixture = q.source_kind === 'fixture';
 const lines = [
   '# Stock Watch Stress Snapshot',
   '',
@@ -510,8 +614,17 @@ const lines = [
   'Packet hash: ' + item.packet_hash,
   'Quality: ' + item.quality_status,
   '',
-  '## Fixture Scope',
-  '- Source: fixture quote and fixture position only.',
+  isFixture ? '## Fixture Scope' : '## Source Scope',
+  isFixture
+    ? '- Source: fixture quote and fixture position only.'
+    : '- Quote source: Eastmoney real quote endpoint; position remains a Phase1 fixture.',
+  ...(isFixture ? [] : [
+    '- Stock name: ' + (q.stock_name || 'unknown'),
+    '- Market session state: ' + (q.market_session_state || 'unknown'),
+    '- Quote time: ' + q.quote_time,
+    '- Fetched at: ' + q.fetched_at,
+    '- Quality limitations: ' + ((item.quality_limitations || []).join(', ') || 'none')
+  ]),
   '- Amount and main inflow semantics remain unknown.',
   '- Approximate bars are context only.',
   '',
@@ -574,7 +687,7 @@ const row = $input.first().json;
 return [{
   json: {
     phase: 'Phase1',
-    workflow: 'SW-01 POC Manual Pipeline',
+    workflow: ${JSON.stringify(workflowName)},
     status: 'completed',
     job_id: row.job_id,
     packet_id: row.packet_id,
@@ -666,8 +779,8 @@ for (let i = 0; i < chain.length - 1; i += 1) {
 }
 
 const workflow = {
-  id: 'SW01Phase1POC',
-  name: 'SW-01 POC Manual Pipeline',
+  id: workflowId,
+  name: workflowName,
   active: false,
   nodes,
   connections,
@@ -676,12 +789,11 @@ const workflow = {
   },
   staticData: null,
   pinData: {},
-  versionId: 'phase1-local-generated',
+  versionId: 'phase1-local-generated-' + workflowId,
   triggerCount: 0,
   tags: []
 };
 
-const outDir = path.join(root, 'workflows', 'phase1');
-fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(path.join(outDir, 'SW-01-POC-Manual-Pipeline.json'), JSON.stringify(workflow, null, 2) + '\n');
-console.log('rendered workflows/phase1/SW-01-POC-Manual-Pipeline.json');
+fs.mkdirSync(path.dirname(workflowOutputPath), { recursive: true });
+fs.writeFileSync(workflowOutputPath, JSON.stringify(workflow, null, 2) + '\n');
+console.log('rendered ' + path.relative(root, workflowOutputPath));

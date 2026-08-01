@@ -49,6 +49,52 @@ markdown_forbidden_scan=ok
 phase1 smoke passed
 ```
 
+## CATL Real Quote Smoke Test
+
+```bash
+infra/n8n-stock-watch/scripts/smoke-test-phase1-catl-real.sh
+```
+
+Expected proof during a closed market session:
+
+```text
+symbol=300750
+market=sz
+stock_name=宁德时代
+quote_time=<provider quote timestamp>
+fetched_at=<local fetch timestamp>
+market_session_state=CLOSED
+source_host=push2delay.eastmoney.com
+position_fixture=position-catl-t1-locked.json
+model_provider=MOCK
+fact_price_change=<derived percent>
+model_price_change=<same derived percent>
+price_claim=<direction consistent with the percent sign>
+model_fact_consistency=ok
+price_claim_direction=ok
+source_kind=eastmoney_real
+quality_status=closed_session_snapshot
+report_type=STRESS_ONLY
+report_status=generated
+validation_status=accepted
+session_quality_consistency=ok
+has_t1_locked=true
+markdown_forbidden_scan=ok
+workflow=SW01Phase1POC|SW-01 POC Manual Pipeline|false
+workflow=SW01Phase1POCCatlReal|SW-01 POC CATL Real Quote Validation|false
+phase1 CATL real quote smoke passed
+```
+
+During an open session, the expected quality value is `fresh_real`. An open-session
+quote older than five minutes is rejected. The script uses a CATL-specific T+1
+position fixture and keeps `MODEL_PROVIDER=MOCK`; it does not enable DeepSeek,
+the Java bridge, email, or scheduling.
+
+The real-quote smoke imports the temporary snapshot as a separate inactive
+workflow, `SW-01 POC CATL Real Quote Validation`. It also imports the default
+fixture workflow and verifies that both definitions remain inactive and
+independently addressable.
+
 ## Inspect Workflow Binding
 
 ```bash
