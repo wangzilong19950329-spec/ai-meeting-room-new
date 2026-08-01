@@ -555,6 +555,7 @@ class StockWatchTechnicalAnalysisServiceTest {
                 "{\"quote\":{\"price\":58.51}}", 91L, 58.51, promptHash, 1234, "[]",
                 emptyHistoryCatalog().toJSONString());
         JSONObject envelope = new JSONObject(true);
+        envelope.put("promptPayloadVersion", 2);
         envelope.put("projectionJson", projectionJson);
         envelope.put("projectionDigest", ReflectionTestUtils.invokeMethod(localService, "sha256", projectionJson));
         StockWatchAnalysisTask responseTask = task(82L, "RESPONSE_RECEIVED", promptHash);
@@ -576,6 +577,165 @@ class StockWatchTechnicalAnalysisServiceTest {
         IllegalStateException error = assertThrows(IllegalStateException.class,
                 () -> ReflectionTestUtils.invokeMethod(localService, "restoreFrozenProjection", reservation));
         assertTrue(error.getMessage().contains("digest_mismatch"));
+    }
+
+    @Test
+    void promptDataQualityProjectionRemovesRequestTraceAndPreservesSemantics() {
+        Map<String, Object> raw = traceHeavyMarketData();
+
+        Map<?, ?> promptMarketData = ReflectionTestUtils.invokeMethod(service, "toPromptMarketDataPayload",
+                raw, "DAY");
+        JSONObject dataQuality = JSON.parseObject(JSON.toJSONString(promptMarketData.get("dataQuality")));
+        JSONObject sourceStatus = dataQuality.getJSONObject("sourceStatus");
+        JSONObject dailyKline = sourceStatus.getJSONObject("dailyKline");
+        JSONObject marketBenchmark = sourceStatus.getJSONObject("marketBenchmark");
+        String compactJson = dataQuality.toJSONString();
+
+        assertEquals(true, dailyKline.getBooleanValue("ok"));
+        assertEquals(120, dailyKline.getIntValue("count"));
+        assertEquals("eastmoney", dailyKline.getString("selectedProvider"));
+        assertEquals("klines", dailyKline.getString("series"));
+        assertEquals("qfq", dailyKline.getString("adjustment"));
+        assertEquals(false, dailyKline.getBooleanValue("fallbackUsed"));
+        assertEquals(true, marketBenchmark.getBooleanValue("fresh"));
+        assertEquals("2026-07-30", marketBenchmark.getString("sourceTradeDate"));
+        assertEquals("tencent", marketBenchmark.getString("selectedProvider"));
+        assertEquals("none", marketBenchmark.getString("adjustment"));
+        assertEquals("unexpected_end_of_stream", marketBenchmark.getString("fallbackReason"));
+        assertEquals("amount", marketBenchmark.getJSONArray("missingFields").getString(0));
+        assertEquals("minuteTrends5d:unexpected_end_of_stream",
+                dataQuality.getJSONArray("optionalMissing").getString(0));
+        assertEquals("stockDetail:http_502", dataQuality.getJSONArray("optionalMissing").getString(1));
+        assertFalse(compactJson.contains("requests"));
+        assertFalse(compactJson.contains("lastUrl"));
+        assertFalse(compactJson.contains("paramsHash"));
+        assertFalse(compactJson.contains("responseHash"));
+        assertFalse(compactJson.contains("responseBytes"));
+        assertFalse(compactJson.contains("requestedAt"));
+        assertFalse(compactJson.contains("https://"));
+        assertFalse(compactJson.contains("http://"));
+    }
+
+    @Test
+    void promptDataQualityProjectionContainsNoRequestImplementationKeysRecursively() {
+        Map<String, Object> raw = traceHeavyMarketData();
+        Map<?, ?> promptMarketData = ReflectionTestUtils.invokeMethod(service, "toPromptMarketDataPayload",
+                raw, "DAY");
+
+        assertNoForbiddenKeysRecursively(promptMarketData.get("dataQuality"), Set.of(
+                "durationMs", "sourceType", "requestCount", "requests", "lastUrl", "url", "baseUrl",
+                "effectiveBaseUrl", "params", "paramsHash", "lastParamsHash", "responseHash",
+                "lastResponseHash", "responseBytes", "requestedAt", "method", "attempt", "httpStatus"
+        ));
+    }
+
+    @Test
+    void promptDataQualityProjectionDoesNotMutateCanonicalMarketData() {
+        Map<String, Object> raw = traceHeavyMarketData();
+        String before = JSON.toJSONString(raw.get("dataQuality"));
+
+        ReflectionTestUtils.invokeMethod(service, "toPromptMarketDataPayload", raw, "DAY");
+
+        assertEquals(before, JSON.toJSONString(raw.get("dataQuality")));
+        assertTrue(JSON.toJSONString(raw.get("dataQuality")).contains("requests"));
+    }
+
+    @Test
+    void promptMarketDataProjectionPreservesSourceTradeDateQualityExactly() {
+        Map<String, Object> raw = traceHeavyMarketData();
+        String expected = JSON.toJSONString(raw.get("sourceTradeDateQuality"));
+
+        Map<?, ?> promptMarketData = ReflectionTestUtils.invokeMethod(service, "toPromptMarketDataPayload",
+                raw, "DAY");
+
+        assertEquals(expected, JSON.toJSONString(promptMarketData.get("sourceTradeDateQuality")));
+    }
+
+    @Test
+    void promptDataQualityProjectionCutsTraceHeavyFixtureByAtLeastEightyPercent() {
+        Map<String, Object> raw = traceHeavyMarketData();
+        int rawChars = JSON.toJSONString(raw.get("dataQuality")).length();
+
+        Map<?, ?> projected = ReflectionTestUtils.invokeMethod(service, "toPromptDataQualityPayload",
+                raw.get("dataQuality"));
+        int projectedChars = JSON.toJSONString(projected).length();
+
+        assertTrue(projectedChars <= rawChars * 0.20,
+                "projectedChars=" + projectedChars + " rawChars=" + rawChars);
+    }
+
+    @Test
+    void promptPayloadVersionIsRecordedAndLegacyFrozenProjectionRemainsReadable() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        when(analysisMapper.selectRecentBySymbol(
+                org.mockito.ArgumentMatchers.eq("002979"),
+                org.mockito.ArgumentMatchers.eq("sz"),
+                org.mockito.ArgumentMatchers.eq("DAY"),
+                org.mockito.ArgumentMatchers.eq(2))).thenReturn(Collections.emptyList());
+        String prompt = ReflectionTestUtils.invokeMethod(localService, "buildPrompt",
+                stockRef(localService, "002979", "sz"), "雷赛智能",
+                Collections.emptyMap(), Collections.emptyMap(),
+                emptyExternalEvidenceCatalog(), emptyHistoryCatalog(), Collections.emptyList(),
+                session(), "manual_api", "DAY", periodWindow(localService),
+                Collections.<StockWatchTechnicalAnalysis>emptyList(), null);
+        assertEquals(2, promptPayload(prompt).getIntValue("promptPayloadVersion"));
+
+        StockWatchTechnicalSession session = new StockWatchTechnicalSession();
+        session.setId(81L);
+        String promptHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");
+        String projectionJson = ReflectionTestUtils.invokeMethod(localService, "frozenProjectionJson",
+                session, "雷赛智能", LocalDate.of(2026, 7, 16), "10:30", "DAY", "2026-07-16",
+                "[701]", "{\"fundFlowEvidence\":{\"anchorMainInflowYuan\":1}}",
+                emptyExternalEvidenceCatalog().toJSONString(),
+                "{\"quote\":{\"price\":58.51}}", 91L, 58.51, promptHash, 1234, "[]",
+                emptyHistoryCatalog().toJSONString());
+        JSONObject projection = JSON.parseObject(projectionJson);
+        assertEquals(2, projection.getIntValue("promptPayloadVersion"));
+        JSONObject envelope = new JSONObject(true);
+        envelope.put("promptPayloadVersion", 2);
+        envelope.put("projectionJson", projectionJson);
+        envelope.put("projectionDigest", ReflectionTestUtils.invokeMethod(localService, "sha256", projectionJson));
+        StockWatchAnalysisTask responseTask = task(82L, "RESPONSE_RECEIVED", promptHash);
+        responseTask.setPeriodType("DAY");
+        responseTask.setRequestEnvelopeJson(envelope.toJSONString());
+        Reservation reservation = Reservation.existing(responseTask, "different-current-digest");
+
+        Object frozen = ReflectionTestUtils.invokeMethod(localService, "restoreFrozenProjection", reservation);
+
+        assertEquals(2, ReflectionTestUtils.getField(frozen, "promptPayloadVersion"));
+
+        envelope.put("promptPayloadVersion", 3);
+        responseTask.setRequestEnvelopeJson(envelope.toJSONString());
+        Object envelopeOnlyMismatch = ReflectionTestUtils.invokeMethod(localService,
+                "restoreFrozenProjection", reservation);
+        assertEquals(2, ReflectionTestUtils.getField(envelopeOnlyMismatch, "promptPayloadVersion"));
+
+        projection.remove("promptPayloadVersion");
+        String legacyProjectionJson = projection.toJSONString();
+        JSONObject legacyEnvelope = new JSONObject(true);
+        legacyEnvelope.put("projectionJson", legacyProjectionJson);
+        legacyEnvelope.put("projectionDigest", ReflectionTestUtils.invokeMethod(localService, "sha256", legacyProjectionJson));
+        responseTask.setRequestEnvelopeJson(legacyEnvelope.toJSONString());
+
+        Object legacyFrozen = ReflectionTestUtils.invokeMethod(localService, "restoreFrozenProjection", reservation);
+
+        assertEquals(0, ReflectionTestUtils.getField(legacyFrozen, "promptPayloadVersion"));
+    }
+
+    @Test
+    void promptReasonCodePreservesStableSourceSemanticsAndRedactsTransportDetails() {
+        assertEquals("market_benchmark_stale:latest=2026_07_29:source=2026_07_30",
+                ReflectionTestUtils.invokeMethod(service, "promptReasonCode",
+                        "market_benchmark_stale:latest=2026-07-29:source=2026-07-30"));
+        assertEquals("daily_kline_primary_failed_and_fallback_unsupported:http_502",
+                ReflectionTestUtils.invokeMethod(service, "promptReasonCode",
+                        "daily_kline_primary_failed_and_fallback_unsupported:http_502 https://example.test/api"));
+        assertEquals("unsupported_hk_benchmark",
+                ReflectionTestUtils.invokeMethod(service, "promptReasonCode", "unsupported_hk_benchmark"));
+        assertEquals("unexpected_end_of_stream",
+                ReflectionTestUtils.invokeMethod(service, "promptReasonCode",
+                        "unexpected end of stream on https://example.test/path?token=secret"));
     }
 
     @Test
@@ -1248,6 +1408,113 @@ class StockWatchTechnicalAnalysisServiceTest {
         }
         raw.put("latestNews", news);
         return raw;
+    }
+
+    private Map<String, Object> traceHeavyMarketData() {
+        Map<String, Object> raw = new LinkedHashMap<>();
+        Map<String, Object> sourceTradeDateQuality = new LinkedHashMap<>();
+        sourceTradeDateQuality.put("selectedSourceTradeDate", "2026-07-30");
+        sourceTradeDateQuality.put("quoteTradeDate", "2026-07-30");
+        sourceTradeDateQuality.put("dailyKlineTradeDate", "2026-07-30");
+        sourceTradeDateQuality.put("selectedSource", "quote.timestamp");
+        sourceTradeDateQuality.put("consistent", true);
+        sourceTradeDateQuality.put("fresh", true);
+        raw.put("sourceTradeDateQuality", sourceTradeDateQuality);
+
+        Map<String, Object> dailyKline = sourceStatus(true, 120, "eastmoney");
+        dailyKline.put("series", "klines");
+        dailyKline.put("adjustment", "qfq");
+        dailyKline.put("fallbackUsed", false);
+        dailyKline.put("requests", jsonArray(
+                requestTrace("eastmoney", 1, "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.002979&lmt=120", false),
+                requestTrace("eastmoney", 2, "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.002979&lmt=120&retry=2", false),
+                requestTrace("eastmoney", 3, "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=0.002979&lmt=120&retry=3", true)
+        ));
+
+        Map<String, Object> benchmark = sourceStatus(true, 120, "tencent");
+        benchmark.put("series", "day");
+        benchmark.put("adjustment", "none");
+        benchmark.put("missingFields", jsonArray("amount", "turnoverPct"));
+        benchmark.put("fallbackUsed", true);
+        benchmark.put("fallbackReason", "eastmoney:unexpected end of stream on https://push2his.eastmoney.com");
+        Map<String, Object> benchmarkRequest = requestTrace("tencent", 2,
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001,day,,,120,", true);
+        benchmarkRequest.put("sourceTradeDate", "2026-07-30");
+        benchmarkRequest.put("fresh", true);
+        benchmarkRequest.put("series", "day");
+        benchmarkRequest.put("adjustment", "none");
+        benchmarkRequest.put("missingFields", jsonArray("amount", "turnoverPct"));
+        benchmarkRequest.put("fallbackReason", "eastmoney:unexpected end of stream on https://push2his.eastmoney.com");
+        benchmark.put("requests", jsonArray(
+                requestTrace("eastmoney", 1, "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=1.000001", false),
+                benchmarkRequest
+        ));
+
+        Map<String, Object> sourceStatus = new LinkedHashMap<>();
+        sourceStatus.put("dailyKline", dailyKline);
+        sourceStatus.put("marketBenchmark", benchmark);
+        Map<String, Object> dataQuality = new LinkedHashMap<>();
+        dataQuality.put("requiredMissing", new JSONArray());
+        dataQuality.put("optionalMissing", jsonArray(
+                "minuteTrends5d:unexpected end of stream on https://push2.eastmoney.com/api/qt/stock/trends2/get",
+                "stockDetail:http_502 https://push2.eastmoney.com/api/qt/stock/get"
+        ));
+        dataQuality.put("canPredict", true);
+        dataQuality.put("sourceStatus", sourceStatus);
+        raw.put("dataQuality", dataQuality);
+        return raw;
+    }
+
+    private Map<String, Object> sourceStatus(boolean ok, int count, String selectedProvider) {
+        Map<String, Object> status = new LinkedHashMap<>();
+        status.put("ok", ok);
+        status.put("durationMs", 4512);
+        status.put("sourceType", "HTTP_JSON");
+        status.put("requestCount", 3);
+        status.put("count", count);
+        status.put("selectedProvider", selectedProvider);
+        status.put("lastUrl", "https://example.test/api?secret=should-not-enter-prompt");
+        status.put("lastParamsHash", "sha256:last-params");
+        status.put("lastResponseHash", "sha256:last-response");
+        return status;
+    }
+
+    private Map<String, Object> requestTrace(String provider, int attempt, String url, boolean ok) {
+        Map<String, Object> trace = new LinkedHashMap<>();
+        trace.put("provider", provider);
+        trace.put("sourceType", "HTTP_JSON");
+        trace.put("method", "GET");
+        trace.put("attempt", attempt);
+        trace.put("baseUrl", "https://example.test/base");
+        trace.put("effectiveBaseUrl", "http://example.test/base");
+        trace.put("url", url);
+        trace.put("params", Map.of("secid", "0.002979", "token", "secret"));
+        trace.put("paramsHash", "sha256:params-" + attempt);
+        trace.put("requestedAt", "2026-07-30T15:00:00+08:00");
+        trace.put("httpStatus", ok ? 200 : 502);
+        trace.put("durationMs", 300 + attempt);
+        trace.put("responseBytes", ok ? 4096 : 0);
+        trace.put("responseHash", "sha256:response-" + attempt);
+        if (!ok) {
+            trace.put("reason", "unexpected end of stream on " + url);
+        }
+        trace.put("ok", ok);
+        return trace;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertNoForbiddenKeysRecursively(Object value, Set<String> forbidden) {
+        if (value instanceof Map) {
+            for (Map.Entry<?, ?> entry : ((Map<?, ?>) value).entrySet()) {
+                String key = String.valueOf(entry.getKey());
+                assertFalse(forbidden.contains(key), "forbidden key in prompt dataQuality: " + key);
+                assertNoForbiddenKeysRecursively(entry.getValue(), forbidden);
+            }
+        } else if (value instanceof Iterable) {
+            for (Object item : (Iterable<Object>) value) {
+                assertNoForbiddenKeysRecursively(item, forbidden);
+            }
+        }
     }
 
     private Map<String, Object> flowRow(String time, double main, double superLarge, double large) {

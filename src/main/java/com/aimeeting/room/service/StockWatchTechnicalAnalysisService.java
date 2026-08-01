@@ -100,10 +100,31 @@ public class StockWatchTechnicalAnalysisService {
     );
     private static final List<String> MAIN_FORCE_WINDOWS = Arrays.asList("INTRADAY", "THREE_DAY", "FIVE_DAY", "TWENTY_DAY");
     private static final int RESPONSE_CONTRACT_VERSION = 6;
+    private static final int PROMPT_PAYLOAD_VERSION = 2;
     private static final String RESPONSE_CONTRACT_NAME = "stock-analysis-response-v6";
     private static final int DEFAULT_CONTEXT_LIMIT_CHARS = 500_000;
     private static final int LEGACY_CONTEXT_LIMIT_CHARS = 80_000;
     private static final double DEFAULT_CONTEXT_ROTATE_RATIO = 1.0d;
+    private static final List<String> PROMPT_SOURCE_STATUS_FIELDS = Arrays.asList(
+            "ok", "reason", "count", "selectedProvider",
+            "fallbackUsed", "fallbackReason",
+            "series", "adjustment", "missingFields",
+            "sourceTradeDate", "fresh"
+    );
+    private static final Set<String> TRACE_PROMOTABLE_FIELDS = new LinkedHashSet<>(Arrays.asList(
+            "series", "adjustment", "missingFields", "sourceTradeDate", "fresh", "fallbackReason"
+    ));
+    private static final Set<String> PROMPT_STABLE_REASON_CODES = new LinkedHashSet<>(Arrays.asList(
+            "canonical_quote_unavailable",
+            "canonical_quote_symbol_mismatch",
+            "canonical_quote_market_mismatch",
+            "daily_kline_primary_failed_and_fallback_unsupported",
+            "invalid_kline",
+            "market_benchmark_stale",
+            "need_at_least_30_bars",
+            "quote_unavailable",
+            "unsupported_hk_benchmark"
+    ));
     private static final Set<Integer> SUPPORTED_RESPONSE_CONTRACTS = new LinkedHashSet<>(Arrays.asList(5, 6));
     private static final Set<String> STRONG_MAIN_FORCE_INTENTS = new LinkedHashSet<>(Arrays.asList(
             "ACCUMULATE", "DISTRIBUTE", "WASH", "PULL_UP", "SUPPORT", "SUPPRESS", "ROTATE"
@@ -620,6 +641,7 @@ public class StockWatchTechnicalAnalysisService {
             Map<String, Object> requestEnvelope = new LinkedHashMap<>();
             requestEnvelope.put("schema", "stock-analysis-v3");
             requestEnvelope.put("responseContractVersion", RESPONSE_CONTRACT_VERSION);
+            requestEnvelope.put("promptPayloadVersion", PROMPT_PAYLOAD_VERSION);
             requestEnvelope.put("symbol", ref.symbol);
             requestEnvelope.put("market", ref.market);
             requestEnvelope.put("periodType", periodType);
@@ -1117,6 +1139,7 @@ public class StockWatchTechnicalAnalysisService {
         JSONObject projection = new JSONObject(true);
         projection.put("schema", "stock-analysis-projection-v3");
         projection.put("responseContractVersion", RESPONSE_CONTRACT_VERSION);
+        projection.put("promptPayloadVersion", PROMPT_PAYLOAD_VERSION);
         projection.put("sessionId", session == null ? null : session.getId());
         projection.put("stockName", stockName);
         projection.put("sourceTradeDate", sourceTradeDate == null ? null : sourceTradeDate.toString());
@@ -1157,6 +1180,10 @@ public class StockWatchTechnicalAnalysisService {
             throw new IllegalStateException("analysis_projection_envelope_schema_invalid");
         }
         FrozenProjection frozen = new FrozenProjection();
+        int projectionPromptPayloadVersion = projection.containsKey("promptPayloadVersion")
+                ? projection.getIntValue("promptPayloadVersion")
+                : envelope.getIntValue("promptPayloadVersion");
+        frozen.promptPayloadVersion = projectionPromptPayloadVersion;
         frozen.responseContractVersion = projection.getIntValue("responseContractVersion");
         if (!SUPPORTED_RESPONSE_CONTRACTS.contains(frozen.responseContractVersion)) {
             throw new IllegalStateException("analysis_projection_response_contract_unsupported:"
@@ -1538,6 +1565,7 @@ public class StockWatchTechnicalAnalysisService {
         if (alertDemand != null) {
             payload.put("analysisDemand", demandPromptPayload(alertDemand));
         }
+        payload.put("promptPayloadVersion", PROMPT_PAYLOAD_VERSION);
         payload.put("periodType", periodType);
         payload.put("periodWindow", window.toPayload());
         payload.put("stock", stockName + " " + ref.symbol + "." + ref.market);
@@ -2034,7 +2062,9 @@ public class StockWatchTechnicalAnalysisService {
         payload.put("financials", headObjects(raw.get("financials"), 3));
         payload.put("announcements", headObjects(raw.get("announcements"), 5));
         payload.put("shareholderCounts", headObjects(raw.get("shareholderCounts"), 3));
-        copyIfPresent(raw, payload, "dataQuality");
+        if (raw.containsKey("dataQuality")) {
+            payload.put("dataQuality", toPromptDataQualityPayload(raw.get("dataQuality")));
+        }
 
         Map<String, Object> packing = new LinkedHashMap<>();
         packing.put("mode", "compact_for_deepseek_prompt");
@@ -2048,6 +2078,134 @@ public class StockWatchTechnicalAnalysisService {
         packing.put("shareholderCountsLatestCount", 3);
         payload.put("dataPacking", packing);
         return payload;
+    }
+
+    private Map<String, Object> toPromptDataQualityPayload(Object raw) {
+        JSONObject dataQuality = asJsonObject(raw);
+        Map<String, Object> projected = new LinkedHashMap<>();
+        if (dataQuality == null || dataQuality.isEmpty()) {
+            return projected;
+        }
+        projected.put("requiredMissing", compactPromptMissingItems(dataQuality.get("requiredMissing")));
+        projected.put("optionalMissing", compactPromptMissingItems(dataQuality.get("optionalMissing")));
+        if (dataQuality.containsKey("canPredict")) {
+            projected.put("canPredict", dataQuality.get("canPredict"));
+        }
+        JSONObject sourceStatus = asJsonObject(dataQuality.get("sourceStatus"));
+        Map<String, Object> projectedSources = new LinkedHashMap<>();
+        if (sourceStatus != null) {
+            for (String sourceName : sourceStatus.keySet()) {
+                projectedSources.put(sourceName, toPromptSourceStatusPayload(sourceStatus.get(sourceName)));
+            }
+        }
+        projected.put("sourceStatus", projectedSources);
+        return projected;
+    }
+
+    private Map<String, Object> toPromptSourceStatusPayload(Object raw) {
+        JSONObject status = asJsonObject(raw);
+        Map<String, Object> projected = new LinkedHashMap<>();
+        if (status == null) {
+            return projected;
+        }
+        JSONObject lastRequest = lastObject(toObjectList(status.get("requests")));
+        for (String field : PROMPT_SOURCE_STATUS_FIELDS) {
+            Object value = status.get(field);
+            if (value == null && TRACE_PROMOTABLE_FIELDS.contains(field) && lastRequest != null) {
+                value = lastRequest.get(field);
+            }
+            if ("reason".equals(field) || "fallbackReason".equals(field)) {
+                value = promptReasonCode(value);
+            }
+            if (shouldIncludePromptValue(value)) {
+                projected.put(field, value);
+            }
+        }
+        return projected;
+    }
+
+    private List<String> compactPromptMissingItems(Object raw) {
+        List<String> result = new ArrayList<>();
+        for (Object value : toObjectList(raw)) {
+            String item = text(value, "");
+            if (!StringUtils.hasText(item)) {
+                continue;
+            }
+            int separator = item.indexOf(':');
+            if (separator > 0) {
+                String source = item.substring(0, separator).trim();
+                String reason = promptReasonCode(item.substring(separator + 1));
+                if (StringUtils.hasText(source) && StringUtils.hasText(reason)) {
+                    result.add(source + ":" + reason);
+                } else if (StringUtils.hasText(source)) {
+                    result.add(source + ":upstream_error");
+                }
+            } else {
+                String reason = promptReasonCode(item);
+                if (StringUtils.hasText(reason)) {
+                    result.add(reason);
+                }
+            }
+        }
+        return result;
+    }
+
+    private String promptReasonCode(Object raw) {
+        String value = text(raw, "");
+        if (!StringUtils.hasText(value)) {
+            return "";
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT)
+                .replace('-', '_')
+                .replace(' ', '_');
+        for (String code : PROMPT_STABLE_REASON_CODES) {
+            if (normalized.equals(code)) {
+                return code;
+            }
+            if (normalized.startsWith(code + ":")) {
+                return compactStablePromptReason(normalized, code);
+            }
+        }
+        java.util.regex.Matcher http = java.util.regex.Pattern.compile("http_?(\\d{3})").matcher(normalized);
+        if (http.find()) {
+            return "http_" + http.group(1);
+        }
+        if (normalized.contains("unexpected_end_of_stream")) {
+            return "unexpected_end_of_stream";
+        }
+        if (normalized.contains("timed_out") || normalized.contains("timeout")) {
+            return "timeout";
+        }
+        if (normalized.contains("invalid_json")) {
+            return "invalid_json";
+        }
+        if (normalized.contains("need_at_least_30_bars")) {
+            return "need_at_least_30_bars";
+        }
+        return "upstream_error";
+    }
+
+    private String compactStablePromptReason(String normalized, String code) {
+        if ("market_benchmark_stale".equals(code)) {
+            String sanitized = normalized.replaceAll("https?://\\S+", "")
+                    .replaceAll("[^a-z0-9_:=.\\-]", "_")
+                    .replaceAll("_+", "_");
+            return sanitized.length() <= 160 ? sanitized : code;
+        }
+        String nested = promptReasonCode(normalized.substring(code.length() + 1));
+        return StringUtils.hasText(nested) && !"upstream_error".equals(nested)
+                ? code + ":" + nested
+                : code;
+    }
+
+    private boolean shouldIncludePromptValue(Object value) {
+        if (value == null) {
+            return false;
+        }
+        if (value instanceof Number || value instanceof Boolean || value instanceof List) {
+            return true;
+        }
+        return StringUtils.hasText(text(value, ""));
     }
 
     @SuppressWarnings("unchecked")
@@ -4240,6 +4398,7 @@ public class StockWatchTechnicalAnalysisService {
     }
 
     private static class FrozenProjection {
+        private int promptPayloadVersion;
         private int responseContractVersion;
         private Long sessionId;
         private String stockName;
