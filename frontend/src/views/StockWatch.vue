@@ -317,21 +317,49 @@
               <div>
                 <strong>{{ predictionListTitle }}</strong>
                 <small>
-                  {{ visiblePredictionRecords.length }} / {{ filteredPredictionRecords.length }} 条
+                  <template v-if="predictionGroupByDay">已显示 {{ visiblePredictionGroups.length }} / {{ predictionGroups.length }} 天 · 匹配 {{ filteredPredictionRecords.length }} 条</template>
+                  <template v-else>{{ visiblePredictionCount }} / {{ filteredPredictionRecords.length }} 条</template>
                   <template v-if="filteredPredictionRecords.length !== predictionRecords.length">
                     · 全部 {{ predictionRecords.length }} 条
                   </template>
-                  <template v-if="hiddenPredictionCount > 0"> · 已折叠 {{ hiddenPredictionCount }} 条</template>
+                  <template v-if="predictionGroupByDay && hiddenPredictionGroupCount > 0"> · 还有 {{ hiddenPredictionGroupCount }} 天</template>
+                  <template v-else-if="hiddenPredictionCount > 0"> · 已折叠 {{ hiddenPredictionCount }} 条</template>
                 </small>
               </div>
               <div class="prediction-list-actions">
+                <label class="prediction-filter">
+                  方向
+                  <select v-model="predictionDirectionFilter" aria-label="筛选预测方向" @change="predictionHorizonFilter = 'all'">
+                    <option value="all">全部</option>
+                    <option value="UP">看涨</option>
+                    <option value="DOWN">看跌</option>
+                    <option value="SIDEWAYS">震荡</option>
+                  </select>
+                </label>
+                <label v-if="predictionDirectionFilter === 'UP' || predictionDirectionFilter === 'DOWN'" class="prediction-filter">
+                  期限
+                  <select v-model="predictionHorizonFilter" aria-label="筛选预测期限">
+                    <option value="all">全部</option>
+                    <option value="T1">T+1</option>
+                    <option value="T5">T+5</option>
+                  </select>
+                </label>
+                <button
+                  class="plain-button compact"
+                  :class="{ active: predictionGroupByDay }"
+                  type="button"
+                  :aria-pressed="predictionGroupByDay"
+                  @click="togglePredictionGroupByDay"
+                >
+                  {{ predictionGroupByDay ? '逐条查看' : '按天聚合' }}
+                </button>
                 <button
                   v-if="hasPredictionOverflow"
                   class="plain-button compact"
                   type="button"
                   @click="togglePredictionListExpanded"
                 >
-                  {{ predictionListExpanded ? '收起' : `展开剩余 ${hiddenPredictionCount} 条` }}
+                  {{ predictionListExpanded ? '收起' : `显示剩余 ${predictionGroupByDay ? hiddenPredictionGroupCount + ' 天' : hiddenPredictionCount + ' 条'}` }}
                 </button>
                 <button
                   v-if="predictionListMode !== 'all'"
@@ -343,32 +371,58 @@
                 </button>
               </div>
             </div>
-            <div v-if="filteredPredictionRecords.length" class="prediction-list">
-              <article v-for="prediction in visiblePredictionRecords" :key="prediction.id" class="prediction-card">
-                <div class="prediction-card-top">
-                  <span :class="['prediction-direction', predictionDirectionTone(prediction.direction)]">
-                    {{ prediction.horizon }} · {{ predictionDirectionLabel(prediction.direction) }}
+            <div v-if="filteredPredictionRecords.length" class="prediction-list" :class="{ 'by-day': predictionGroupByDay }">
+              <div
+                v-for="group in visiblePredictionGroups"
+                :key="group.key"
+                :class="predictionGroupByDay ? 'prediction-day-card' : 'prediction-single-group'"
+              >
+                <button
+                  v-if="predictionGroupByDay"
+                  class="prediction-day-toggle"
+                  type="button"
+                  :aria-expanded="expandedPredictionDates.includes(group.date)"
+                  :aria-controls="expandedPredictionDates.includes(group.date) ? `prediction-day-${group.date}` : undefined"
+                  @click="togglePredictionDay(group.date)"
+                >
+                  <span class="prediction-day-heading">
+                    <strong>{{ group.date }}</strong>
+                    <small>{{ group.predictions.length }} 条预测 · {{ predictionDaySummary(group.predictions) }}</small>
                   </span>
-                  <span :class="['prediction-status', prediction.status === 'EVALUATED' && prediction.currentPolicyDirectionHit != null ? (prediction.currentPolicyDirectionHit ? 'hit' : 'miss') : 'pending']">
-                    {{ predictionListMode === 'diverged' ? '方向背离' : predictionStatusLabel(prediction) }}
-                  </span>
+                  <span class="prediction-day-expand">{{ expandedPredictionDates.includes(group.date) ? '收起' : '展开' }} <span aria-hidden="true">{{ expandedPredictionDates.includes(group.date) ? '⌃' : '⌄' }}</span></span>
+                </button>
+                <div
+                  v-if="!predictionGroupByDay || expandedPredictionDates.includes(group.date)"
+                  :id="predictionGroupByDay ? `prediction-day-${group.date}` : undefined"
+                  :class="predictionGroupByDay ? 'prediction-day-details' : 'prediction-flat-records'"
+                >
+                  <article v-for="prediction in group.predictions" :key="prediction.id" class="prediction-card">
+                    <div class="prediction-card-top">
+                      <span :class="['prediction-direction', predictionDirectionTone(prediction.direction)]">
+                        {{ prediction.horizon }} · {{ predictionDirectionLabel(prediction.direction) }}
+                      </span>
+                      <span :class="['prediction-status', prediction.status === 'EVALUATED' && prediction.currentPolicyDirectionHit != null ? (prediction.currentPolicyDirectionHit ? 'hit' : 'miss') : 'pending']">
+                        {{ predictionListMode === 'diverged' ? '方向背离' : predictionStatusLabel(prediction) }}
+                      </span>
+                    </div>
+                    <strong>{{ prediction.targetLow }} – {{ prediction.targetHigh }}</strong>
+                    <p>起点 {{ prediction.sourcePrice }} · 概率 {{ formatMetricPercent((prediction.probability || 0) * 100) }} · 失效线 {{ prediction.invalidationPrice || '--' }}</p>
+                    <small>生成时间 {{ prediction.generatedAt || `${prediction.forecastDate} --:--` }}</small>
+                    <small v-if="prediction.status === 'EVALUATED'">
+                      {{ prediction.evaluatedTradeDate }} 收盘 {{ prediction.actualClose }}，实际收益 {{ formatSignedPercent(finiteOrNull(prediction.actualReturnPct) ?? prediction.directionalReviewReturnPct) }}
+                      <template v-if="finiteOrNull(prediction.actualReturnPct) == null && prediction.directionalReviewReturnPct != null">（据收盘价计算）</template>
+                      <template v-if="prediction.evaluatedAt"> · 验真时间 {{ prediction.evaluatedAt }}</template>
+                    </small>
+                    <small v-if="prediction.status === 'EVALUATED' && prediction.directionHit != null && prediction.currentPolicyDirectionHit != null && prediction.currentPolicyDirectionHit !== prediction.directionHit">
+                      原始验真{{ prediction.directionHit ? '命中' : '未中' }}（生成时口径）；上方为现行口径复核
+                    </small>
+                    <small v-if="prediction.directionDiverged != null">
+                      收益正负口径：{{ prediction.directionDiverged ? '方向背离' : '不背离（命中）' }}
+                    </small>
+                    <small v-if="prediction.status !== 'EVALUATED'">等待第 {{ prediction.tradingDays }} 个后续交易日</small>
+                  </article>
                 </div>
-                <strong>{{ prediction.targetLow }} – {{ prediction.targetHigh }}</strong>
-                <p>起点 {{ prediction.sourcePrice }} · 概率 {{ formatMetricPercent((prediction.probability || 0) * 100) }} · 失效线 {{ prediction.invalidationPrice || '--' }}</p>
-                <small>生成时间 {{ prediction.generatedAt || `${prediction.forecastDate} --:--` }}</small>
-                <small v-if="prediction.status === 'EVALUATED'">
-                  {{ prediction.evaluatedTradeDate }} 收盘 {{ prediction.actualClose }}，实际收益 {{ formatSignedPercent(finiteOrNull(prediction.actualReturnPct) ?? prediction.directionalReviewReturnPct) }}
-                  <template v-if="finiteOrNull(prediction.actualReturnPct) == null && prediction.directionalReviewReturnPct != null">（据收盘价计算）</template>
-                  <template v-if="prediction.evaluatedAt"> · 验真时间 {{ prediction.evaluatedAt }}</template>
-                </small>
-                <small v-if="prediction.status === 'EVALUATED' && prediction.directionHit != null && prediction.currentPolicyDirectionHit != null && prediction.currentPolicyDirectionHit !== prediction.directionHit">
-                  原始验真{{ prediction.directionHit ? '命中' : '未中' }}（生成时口径）；上方为现行口径复核
-                </small>
-                <small v-if="prediction.directionDiverged != null">
-                  收益正负口径：{{ prediction.directionDiverged ? '方向背离' : '不背离（命中）' }}
-                </small>
-                <small v-if="prediction.status !== 'EVALUATED'">等待第 {{ prediction.tradingDays }} 个后续交易日</small>
-              </article>
+              </div>
             </div>
             <article v-else class="prediction-empty">{{ predictionListEmptyText }}</article>
           </template>
@@ -1621,6 +1675,10 @@ const predictionPolicyCaption = computed(() => {
 })
 const predictionListMode = ref('all')
 const predictionListExpanded = ref(false)
+const predictionGroupByDay = ref(false)
+const predictionDirectionFilter = ref('all')
+const predictionHorizonFilter = ref('all')
+const expandedPredictionDates = ref([])
 const showAddStockDialog = ref(false)
 const showObservationDialog = ref(false)
 const showAiRuleDialog = ref(false)
@@ -1814,6 +1872,9 @@ watch(
   () => {
     predictionListMode.value = 'all'
     predictionListExpanded.value = false
+    predictionDirectionFilter.value = 'all'
+    predictionHorizonFilter.value = 'all'
+    expandedPredictionDates.value = []
     externalEvidence.value = null
     externalEvidenceError.value = ''
     externalEvidenceNotice.value = ''
@@ -1875,28 +1936,56 @@ const selectedEvents = computed(() => (
     .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
 ))
 const filteredPredictionRecords = computed(() => {
+  let records = predictionRecords.value
   if (predictionListMode.value === 'evaluated') {
-    return predictionRecords.value.filter((prediction) => prediction.status === 'EVALUATED')
+    records = records.filter((prediction) => prediction.status === 'EVALUATED')
   }
   if (predictionListMode.value === 'diverged') {
-    return predictionRecords.value.filter((prediction) => prediction.directionDiverged === true)
+    records = records.filter((prediction) => prediction.directionDiverged === true)
   }
-  return predictionRecords.value
+  if (predictionDirectionFilter.value !== 'all') {
+    records = records.filter((prediction) => prediction.direction === predictionDirectionFilter.value)
+  }
+  if (predictionDirectionFilter.value !== 'all' && predictionHorizonFilter.value !== 'all') {
+    records = records.filter((prediction) => prediction.horizon === predictionHorizonFilter.value)
+  }
+  return records
 })
-const hasPredictionOverflow = computed(() => filteredPredictionRecords.value.length > PREDICTION_COLLAPSED_LIMIT)
-const visiblePredictionRecords = computed(() => {
-  if (predictionListExpanded.value || !hasPredictionOverflow.value) return filteredPredictionRecords.value
-  return filteredPredictionRecords.value.slice(0, PREDICTION_COLLAPSED_LIMIT)
+const predictionGroups = computed(() => {
+  if (!predictionGroupByDay.value) {
+    return filteredPredictionRecords.value.map((prediction) => ({
+      key: `prediction-${prediction.id}`,
+      predictions: [prediction]
+    }))
+  }
+  const groups = new Map()
+  filteredPredictionRecords.value.forEach((prediction) => {
+    const date = prediction.forecastDate || prediction.generatedAt?.slice(0, 10) || '日期未知'
+    if (!groups.has(date)) groups.set(date, { key: date, date, predictions: [] })
+    groups.get(date).predictions.push(prediction)
+  })
+  return [...groups.values()].sort((left, right) => right.date.localeCompare(left.date))
 })
-const hiddenPredictionCount = computed(() => (
-  Math.max(filteredPredictionRecords.value.length - visiblePredictionRecords.value.length, 0)
+const hasPredictionOverflow = computed(() => predictionGroups.value.length > PREDICTION_COLLAPSED_LIMIT)
+const visiblePredictionGroups = computed(() => (
+  predictionListExpanded.value ? predictionGroups.value : predictionGroups.value.slice(0, PREDICTION_COLLAPSED_LIMIT)
 ))
+const visiblePredictionCount = computed(() => visiblePredictionGroups.value.reduce((count, group) => count + group.predictions.length, 0))
+const hiddenPredictionCount = computed(() => (
+  Math.max(filteredPredictionRecords.value.length - visiblePredictionCount.value, 0)
+))
+const hiddenPredictionGroupCount = computed(() => Math.max(predictionGroups.value.length - visiblePredictionGroups.value.length, 0))
+watch([predictionDirectionFilter, predictionHorizonFilter], () => {
+  predictionListExpanded.value = false
+  expandedPredictionDates.value = []
+})
 const predictionListTitle = computed(() => {
   if (predictionListMode.value === 'evaluated') return '验真结果列表'
   if (predictionListMode.value === 'diverged') return '方向背离样本'
   return '最近预测列表'
 })
 const predictionListEmptyText = computed(() => {
+  if (predictionDirectionFilter.value !== 'all') return '当前筛选条件下暂无预测记录。'
   if (predictionListMode.value === 'evaluated') return '暂无已验真的预测结果。'
   if (predictionListMode.value === 'diverged') return '本次加载的预测中暂无方向背离样本。'
   return '暂无预测记录。'
@@ -2711,20 +2800,45 @@ function predictionStatusLabel(prediction) {
   return prediction.currentPolicyDirectionHit ? '复核命中' : '复核未中'
 }
 
+function predictionDaySummary(predictions) {
+  const counts = new Map()
+  predictions.forEach((prediction) => {
+    const horizon = prediction.horizon === 'T1' ? 'T+1' : prediction.horizon === 'T5' ? 'T+5' : (prediction.horizon || '未知期限')
+    const label = `${horizon} ${predictionDirectionLabel(prediction.direction)}`
+    counts.set(label, (counts.get(label) || 0) + 1)
+  })
+  return [...counts].map(([label, count]) => `${label} ${count}`).join(' · ')
+}
+
+function togglePredictionGroupByDay() {
+  predictionGroupByDay.value = !predictionGroupByDay.value
+  predictionListExpanded.value = false
+  expandedPredictionDates.value = []
+}
+
+function togglePredictionDay(date) {
+  expandedPredictionDates.value = expandedPredictionDates.value.includes(date)
+    ? expandedPredictionDates.value.filter((item) => item !== date)
+    : [...expandedPredictionDates.value, date]
+}
+
 function showEvaluatedPredictions() {
   predictionListMode.value = 'evaluated'
   predictionListExpanded.value = false
+  expandedPredictionDates.value = []
 }
 
 function showDivergedPredictions() {
   if (!hasReturnSignDivergence.value) return
   predictionListMode.value = 'diverged'
   predictionListExpanded.value = false
+  expandedPredictionDates.value = []
 }
 
 function showAllPredictions() {
   predictionListMode.value = 'all'
   predictionListExpanded.value = false
+  expandedPredictionDates.value = []
 }
 
 function togglePredictionListExpanded() {
@@ -5861,8 +5975,27 @@ svg {
 .prediction-list-actions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.prediction-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #475467;
+  font-size: 12px;
+}
+
+.prediction-filter select {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #101828;
+  font: inherit;
 }
 
 .plain-button.compact {
@@ -5871,11 +6004,86 @@ svg {
   font-size: 12px;
 }
 
+.prediction-list-actions .plain-button.active {
+  border-color: #14b8a6;
+  color: #0f766e;
+  background: #f0fdfa;
+}
+
 .prediction-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
   margin-top: 12px;
+}
+
+.prediction-list.by-day {
+  grid-template-columns: 1fr;
+}
+
+.prediction-single-group,
+.prediction-flat-records {
+  display: contents;
+}
+
+.prediction-day-card {
+  min-width: 0;
+  border: 1px solid #dfe7ef;
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+}
+
+.prediction-day-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 14px;
+  border: 0;
+  background: transparent;
+  color: #101828;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.prediction-day-toggle:hover,
+.prediction-day-toggle:focus-visible {
+  background: #f0fdfa;
+}
+
+.prediction-day-heading {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.prediction-day-heading strong {
+  font-size: 16px;
+}
+
+.prediction-day-heading small {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.prediction-day-expand {
+  flex: none;
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prediction-day-details {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border-top: 1px solid #e4e9f0;
+  background: #f7fafc;
 }
 
 .prediction-card {
@@ -8631,8 +8839,18 @@ pre {
     flex-direction: column;
   }
 
+  .prediction-list-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .prediction-list-actions {
+    justify-content: flex-start;
+  }
+
   .prediction-stat-grid,
-  .prediction-list {
+  .prediction-list,
+  .prediction-day-details {
     grid-template-columns: 1fr;
   }
 
