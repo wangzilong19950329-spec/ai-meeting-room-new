@@ -12,6 +12,7 @@
         <result column="forecast_date" property="forecastDate"/>
         <result column="source_price" property="sourcePrice"/>
         <result column="direction" property="direction"/>
+        <result column="direction_policy_version" property="directionPolicyVersion"/>
         <result column="probability" property="probability"/>
         <result column="target_low" property="targetLow"/>
         <result column="target_high" property="targetHigh"/>
@@ -41,11 +42,11 @@
     <insert id="insert" useGeneratedKeys="true" keyProperty="id">
         INSERT INTO stock_watch_prediction
         (analysis_id, symbol, market, stock_name, horizon_code, horizon_trading_days, forecast_date,
-         source_price, direction, probability, target_low, target_high, expected_return_low,
+         source_price, direction, direction_policy_version, probability, target_low, target_high, expected_return_low,
          expected_return_high, invalidation_price, rationale, input_snapshot_json, status)
         VALUES
         (#{analysisId}, #{symbol}, #{market}, #{stockName}, #{horizonCode}, #{horizonTradingDays}, #{forecastDate},
-         #{sourcePrice}, #{direction}, #{probability}, #{targetLow}, #{targetHigh}, #{expectedReturnLow},
+         #{sourcePrice}, #{direction}, #{directionPolicyVersion}, #{probability}, #{targetLow}, #{targetHigh}, #{expectedReturnLow},
          #{expectedReturnHigh}, #{invalidationPrice}, #{rationale}, #{inputSnapshotJson}, #{status})
     </insert>
 

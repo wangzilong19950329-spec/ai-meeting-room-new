@@ -16,6 +16,7 @@ public class StockWatchPrediction {
     private Date forecastDate;
     private Double sourcePrice;
     private String direction;
+    private String directionPolicyVersion;
     private Double probability;
     private Double targetLow;
     private Double targetHigh;

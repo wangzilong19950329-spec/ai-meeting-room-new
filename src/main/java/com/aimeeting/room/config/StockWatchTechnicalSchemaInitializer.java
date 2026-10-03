@@ -137,6 +137,7 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "forecast_date DATE NOT NULL,"
                     + "source_price DECIMAL(18,4) NOT NULL,"
                     + "direction VARCHAR(16) NOT NULL,"
+                    + "direction_policy_version VARCHAR(32) NOT NULL DEFAULT 'LEGACY_1PCT',"
                     + "probability DECIMAL(6,5),"
                     + "target_low DECIMAL(18,4),"
                     + "target_high DECIMAL(18,4),"
@@ -166,6 +167,9 @@ public class StockWatchTechnicalSchemaInitializer {
                     + "KEY idx_sw_prediction_symbol_date (symbol, market, forecast_date),"
                     + "KEY idx_sw_prediction_status (status, forecast_date)"
                     + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+            safeAddColumn("stock_watch_prediction", "direction_policy_version",
+                    "VARCHAR(32) NOT NULL DEFAULT 'LEGACY_1PCT'");
 
             jdbcTemplate.execute("CREATE TABLE IF NOT EXISTS stock_watch_delivery_config ("
                     + "id BIGINT NOT NULL AUTO_INCREMENT,"

@@ -373,6 +373,7 @@ CREATE TABLE IF NOT EXISTS `stock_watch_prediction` (
     `forecast_date`           DATE         NOT NULL,
     `source_price`            DECIMAL(18,4) NOT NULL,
     `direction`               VARCHAR(16)  NOT NULL,
+    `direction_policy_version` VARCHAR(32) NOT NULL DEFAULT 'LEGACY_1PCT',
     `probability`             DECIMAL(6,5),
     `target_low`              DECIMAL(18,4),
     `target_high`             DECIMAL(18,4),

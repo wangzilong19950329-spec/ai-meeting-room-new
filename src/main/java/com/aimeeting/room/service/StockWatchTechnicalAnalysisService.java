@@ -642,6 +642,7 @@ public class StockWatchTechnicalAnalysisService {
             requestEnvelope.put("schema", "stock-analysis-v3");
             requestEnvelope.put("responseContractVersion", RESPONSE_CONTRACT_VERSION);
             requestEnvelope.put("promptPayloadVersion", PROMPT_PAYLOAD_VERSION);
+            requestEnvelope.put("directionPolicyVersion", StockWatchPredictionService.CURRENT_DIRECTION_POLICY);
             requestEnvelope.put("symbol", ref.symbol);
             requestEnvelope.put("market", ref.market);
             requestEnvelope.put("periodType", periodType);
@@ -755,6 +756,8 @@ public class StockWatchTechnicalAnalysisService {
         String projectionExternalEvidenceCatalogJson = frozen == null
                 ? externalEvidenceCatalogJson : frozen.externalEvidenceCatalogJson;
         String projectionDataSnapshotJson = frozen == null ? dataSnapshotJson : frozen.dataSnapshotJson;
+        String projectionDirectionPolicyVersion = frozen == null
+                ? StockWatchPredictionService.CURRENT_DIRECTION_POLICY : frozen.directionPolicyVersion;
         String projectionMissingDataJson = frozen == null ? missingDataJson : frozen.missingDataJson;
         String projectionHistoryCatalogJson = frozen == null ? historyCatalogJson : frozen.historyCatalogJson;
         JSONObject projectionEvidenceSignals = parseObject(projectionEvidenceSignalJson);
@@ -868,7 +871,7 @@ public class StockWatchTechnicalAnalysisService {
             return analysisProjectionService.project(taskReservation,
                     projectionOriginObservationId,
                     intentValidation.intent, record, parsed.forecasts, projectionSourceDate,
-                    projectionSourcePrice, projectionDataSnapshotJson, projectionSession,
+                    projectionSourcePrice, projectionDataSnapshotJson, projectionDirectionPolicyVersion, projectionSession,
                     projectionBridgeTargetId, projectionConversationUrl);
         } catch (Exception e) {
             if (projectionPhase) {
@@ -1140,6 +1143,7 @@ public class StockWatchTechnicalAnalysisService {
         projection.put("schema", "stock-analysis-projection-v3");
         projection.put("responseContractVersion", RESPONSE_CONTRACT_VERSION);
         projection.put("promptPayloadVersion", PROMPT_PAYLOAD_VERSION);
+        projection.put("directionPolicyVersion", StockWatchPredictionService.CURRENT_DIRECTION_POLICY);
         projection.put("sessionId", session == null ? null : session.getId());
         projection.put("stockName", stockName);
         projection.put("sourceTradeDate", sourceTradeDate == null ? null : sourceTradeDate.toString());
@@ -1184,6 +1188,8 @@ public class StockWatchTechnicalAnalysisService {
                 ? projection.getIntValue("promptPayloadVersion")
                 : envelope.getIntValue("promptPayloadVersion");
         frozen.promptPayloadVersion = projectionPromptPayloadVersion;
+        frozen.directionPolicyVersion = text(projection.get("directionPolicyVersion"),
+                StockWatchPredictionService.LEGACY_DIRECTION_POLICY);
         frozen.responseContractVersion = projection.getIntValue("responseContractVersion");
         if (!SUPPORTED_RESPONSE_CONTRACTS.contains(frozen.responseContractVersion)) {
             throw new IllegalStateException("analysis_projection_response_contract_unsupported:"
@@ -1627,7 +1633,7 @@ public class StockWatchTechnicalAnalysisService {
                 "JSON字段固定为：stance(string), tone(string: green/blue/amber/red), confidence(number 0-1), title(string), conclusion(string), evidence(array string), missingData(array string), mainForceIntent(object), forecasts(array)。",
                 "每个forecast字段固定为：horizon(T1/T5/W1/M1), direction(UP/DOWN/SIDEWAYS), probability(0-1), targetLow, targetHigh, expectedReturnLow, expectedReturnHigh, invalidationPrice, rationale。",
                 forecastInstruction,
-                "direction定义：到期收益>=1%为UP，<=-1%为DOWN，其余为SIDEWAYS；targetLow不得大于targetHigh，价格与收益率必须和source price算术一致。",
+                StockWatchPredictionService.currentDirectionPolicyPrompt(),
                 "结论要短，优先说明当前周期技术状态、下一周期需要验证的价量条件、风险边界。",
                 "输入数据：",
                 payload.toJSONString()
@@ -4399,6 +4405,7 @@ public class StockWatchTechnicalAnalysisService {
 
     private static class FrozenProjection {
         private int promptPayloadVersion;
+        private String directionPolicyVersion;
         private int responseContractVersion;
         private Long sessionId;
         private String stockName;

@@ -33,6 +33,18 @@ public class StockWatchPredictionService {
 
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+    public static final String LEGACY_DIRECTION_POLICY = "LEGACY_1PCT";
+    public static final String CURRENT_DIRECTION_POLICY = "HORIZON_V2";
+    private static final Map<String, Double> CURRENT_SIDEWAYS_LIMITS;
+
+    static {
+        Map<String, Double> limits = new LinkedHashMap<>();
+        limits.put("T1", 1.5);
+        limits.put("T5", 3.0);
+        limits.put("W1", 3.0);
+        limits.put("M1", 5.0);
+        CURRENT_SIDEWAYS_LIMITS = Collections.unmodifiableMap(limits);
+    }
 
     private final StockWatchPredictionMapper predictionMapper;
     private final EastmoneyMarketDataService marketDataService;
@@ -50,7 +62,7 @@ public class StockWatchPredictionService {
                                                        JSONArray forecasts,
                                                        String inputSnapshotJson) {
         return persistPredictions(analysisId, symbol, market, stockName, forecastDate, sourcePrice,
-                forecasts, inputSnapshotJson, false);
+                forecasts, inputSnapshotJson, LEGACY_DIRECTION_POLICY, false);
     }
 
     public List<StockWatchPrediction> savePredictionsStrict(Long analysisId,
@@ -61,8 +73,21 @@ public class StockWatchPredictionService {
                                                              Double sourcePrice,
                                                              JSONArray forecasts,
                                                              String inputSnapshotJson) {
+        return savePredictionsStrict(analysisId, symbol, market, stockName, forecastDate, sourcePrice,
+                forecasts, inputSnapshotJson, LEGACY_DIRECTION_POLICY);
+    }
+
+    public List<StockWatchPrediction> savePredictionsStrict(Long analysisId,
+                                                             String symbol,
+                                                             String market,
+                                                             String stockName,
+                                                             LocalDate forecastDate,
+                                                             Double sourcePrice,
+                                                             JSONArray forecasts,
+                                                             String inputSnapshotJson,
+                                                             String directionPolicyVersion) {
         return persistPredictions(analysisId, symbol, market, stockName, forecastDate, sourcePrice,
-                forecasts, inputSnapshotJson, true);
+                forecasts, inputSnapshotJson, directionPolicyVersion, true);
     }
 
     public void validatePredictionsStrict(Double sourcePrice, JSONArray forecasts) {
@@ -97,8 +122,13 @@ public class StockWatchPredictionService {
                                                            Double sourcePrice,
                                                            JSONArray forecasts,
                                                            String inputSnapshotJson,
+                                                           String directionPolicyVersion,
                                                            boolean strict) {
         runtimeGate.assertReady();
+        if (!LEGACY_DIRECTION_POLICY.equals(directionPolicyVersion)
+                && !CURRENT_DIRECTION_POLICY.equals(directionPolicyVersion)) {
+            throw new IllegalArgumentException("prediction_direction_policy_invalid:" + directionPolicyVersion);
+        }
         if (strict) {
             validatePredictionsStrict(sourcePrice, forecasts);
         }
@@ -130,6 +160,7 @@ public class StockWatchPredictionService {
             prediction.setForecastDate(Date.valueOf(forecastDate));
             prediction.setSourcePrice(sourcePrice);
             prediction.setDirection(direction);
+            prediction.setDirectionPolicyVersion(directionPolicyVersion);
             prediction.setProbability(clamp(decimal(item.get("probability")), 0.0, 1.0));
             prediction.setTargetLow(targetLow);
             prediction.setTargetHigh(targetHigh);
@@ -160,6 +191,15 @@ public class StockWatchPredictionService {
         for (StockWatchPrediction prediction : records) rows.add(toPayload(prediction));
         payload.put("records", rows);
         return payload;
+    }
+
+    public static String currentDirectionPolicyPrompt() {
+        return "本轮direction定义覆盖会话历史中的旧口径：以预测horizon对应的到期收益率判定；"
+                + "T1震荡为±" + CURRENT_SIDEWAYS_LIMITS.get("T1") + "%以内，"
+                + "T5/W1震荡为±" + CURRENT_SIDEWAYS_LIMITS.get("T5") + "%以内，"
+                + "M1震荡为±" + CURRENT_SIDEWAYS_LIMITS.get("M1") + "%以内（均含边界）；"
+                + "高于对应正边界为UP，低于对应负边界为DOWN，其余为SIDEWAYS；"
+                + "targetLow不得大于targetHigh，价格与收益率必须和source price算术一致。";
     }
 
     @Scheduled(fixedDelayString = "${stock-watch.prediction.evaluation-interval-ms:1800000}",
@@ -235,7 +275,9 @@ public class StockWatchPredictionService {
         double actualLow = window.stream().map(bar -> decimal(bar.get("low"))).filter(value -> value != null)
                 .mapToDouble(Double::doubleValue).min().orElse(actualClose);
         double actualReturn = (actualClose / prediction.getSourcePrice() - 1) * 100;
-        String actualDirection = actualReturn >= 1 ? "UP" : (actualReturn <= -1 ? "DOWN" : "SIDEWAYS");
+        String policy = policyVersion(prediction);
+        double scoredReturn = CURRENT_DIRECTION_POLICY.equals(policy) ? round(actualReturn) : actualReturn;
+        String actualDirection = classifyDirection(scoredReturn, prediction.getHorizonCode(), policy);
         boolean directionHit = actualDirection.equals(prediction.getDirection());
         boolean rangeCloseHit = between(actualClose, prediction.getTargetLow(), prediction.getTargetHigh());
         boolean rangeTouchHit = prediction.getTargetLow() != null && prediction.getTargetHigh() != null
@@ -248,7 +290,7 @@ public class StockWatchPredictionService {
         double probability = prediction.getProbability() == null ? 0.5 : prediction.getProbability();
         double brier = Math.pow(probability - (directionHit ? 1 : 0), 2);
         LocalDate evaluatedDate = parseDate(finalBar.get("date"));
-        String note = "实际方向=" + actualDirection + "，预测方向=" + prediction.getDirection()
+        String note = "口径=" + policy + "，实际方向=" + actualDirection + "，预测方向=" + prediction.getDirection()
                 + "，区间收盘命中=" + rangeCloseHit + "，区间触达=" + rangeTouchHit;
 
         predictionMapper.updateEvaluation(prediction.getId(), "EVALUATED", Date.valueOf(evaluatedDate),
@@ -274,7 +316,12 @@ public class StockWatchPredictionService {
         int evaluated = 0;
         int directionHits = 0;
         int rangeHits = 0;
+        int currentPolicyScored = 0;
+        int currentPolicyHits = 0;
+        int strictScored = 0;
+        int strictHits = 0;
         double brierSum = 0;
+        Set<String> evaluatedPolicyVersions = new HashSet<>();
         Map<String, int[]> byHorizon = new LinkedHashMap<>();
         for (StockWatchPrediction record : records) {
             if (!"EVALUATED".equals(record.getStatus())) {
@@ -282,25 +329,51 @@ public class StockWatchPredictionService {
                 continue;
             }
             evaluated++;
+            evaluatedPolicyVersions.add(policyVersion(record));
             if (Boolean.TRUE.equals(record.getDirectionHit())) directionHits++;
             if (Boolean.TRUE.equals(record.getRangeCloseHit())) rangeHits++;
             if (record.getBrierScore() != null) brierSum += record.getBrierScore();
-            int[] stats = byHorizon.computeIfAbsent(record.getHorizonCode(), key -> new int[2]);
+            Boolean currentHit = reviewedDirectionHit(record, CURRENT_DIRECTION_POLICY);
+            Boolean strictHit = reviewedDirectionHit(record, LEGACY_DIRECTION_POLICY);
+            if (currentHit != null) {
+                currentPolicyScored++;
+                if (currentHit) currentPolicyHits++;
+            }
+            if (strictHit != null) {
+                strictScored++;
+                if (strictHit) strictHits++;
+            }
+            int[] stats = byHorizon.computeIfAbsent(record.getHorizonCode(), key -> new int[4]);
             stats[0]++;
             if (Boolean.TRUE.equals(record.getDirectionHit())) stats[1]++;
+            if (currentHit != null) {
+                stats[2]++;
+                if (currentHit) stats[3]++;
+            }
         }
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("total", records.size());
         result.put("pending", pending);
         result.put("evaluated", evaluated);
         result.put("directionHitRate", evaluated == 0 ? null : round(directionHits * 100.0 / evaluated));
+        result.put("currentPolicyVersion", CURRENT_DIRECTION_POLICY);
+        result.put("currentPolicyLimitsPct", CURRENT_SIDEWAYS_LIMITS);
+        result.put("currentPolicyScored", currentPolicyScored);
+        result.put("currentPolicyDirectionHitRate", currentPolicyScored == 0
+                ? null : round(currentPolicyHits * 100.0 / currentPolicyScored));
+        result.put("strictDirectionHitRate", strictScored == 0
+                ? null : round(strictHits * 100.0 / strictScored));
         result.put("rangeCloseHitRate", evaluated == 0 ? null : round(rangeHits * 100.0 / evaluated));
-        result.put("averageBrierScore", evaluated == 0 ? null : round(brierSum / evaluated));
+        result.put("brierPolicyMixed", evaluatedPolicyVersions.size() > 1);
+        result.put("averageBrierScore", evaluated == 0 || evaluatedPolicyVersions.size() > 1
+                ? null : round(brierSum / evaluated));
         Map<String, Object> horizonPayload = new LinkedHashMap<>();
         byHorizon.forEach((key, value) -> {
             Map<String, Object> stats = new LinkedHashMap<>();
             stats.put("evaluated", value[0]);
             stats.put("directionHitRate", value[0] == 0 ? null : round(value[1] * 100.0 / value[0]));
+            stats.put("currentPolicyDirectionHitRate", value[2] == 0
+                    ? null : round(value[3] * 100.0 / value[2]));
             horizonPayload.put(key, stats);
         });
         result.put("byHorizon", horizonPayload);
@@ -317,6 +390,7 @@ public class StockWatchPredictionService {
         row.put("tradingDays", prediction.getHorizonTradingDays());
         row.put("sourcePrice", prediction.getSourcePrice());
         row.put("direction", prediction.getDirection());
+        row.put("directionPolicyVersion", policyVersion(prediction));
         row.put("probability", prediction.getProbability());
         row.put("targetLow", prediction.getTargetLow());
         row.put("targetHigh", prediction.getTargetHigh());
@@ -330,6 +404,8 @@ public class StockWatchPredictionService {
         row.put("actualClose", prediction.getActualClose());
         row.put("actualReturnPct", prediction.getActualReturnPct());
         row.put("directionHit", prediction.getDirectionHit());
+        row.put("currentPolicyDirectionHit", reviewedDirectionHit(prediction, CURRENT_DIRECTION_POLICY));
+        row.put("strictDirectionHit", reviewedDirectionHit(prediction, LEGACY_DIRECTION_POLICY));
         row.put("rangeCloseHit", prediction.getRangeCloseHit());
         row.put("rangeTouchHit", prediction.getRangeTouchHit());
         row.put("invalidated", prediction.getInvalidated());
@@ -337,6 +413,31 @@ public class StockWatchPredictionService {
         row.put("brierScore", prediction.getBrierScore());
         row.put("evaluationNote", prediction.getEvaluationNote());
         return row;
+    }
+
+    private String policyVersion(StockWatchPrediction prediction) {
+        return CURRENT_DIRECTION_POLICY.equals(prediction.getDirectionPolicyVersion())
+                ? CURRENT_DIRECTION_POLICY : LEGACY_DIRECTION_POLICY;
+    }
+
+    private Boolean reviewedDirectionHit(StockWatchPrediction prediction, String policy) {
+        if (!"EVALUATED".equals(prediction.getStatus())) return null;
+        Double actualReturn = prediction.getActualReturnPct();
+        if (actualReturn == null && prediction.getActualClose() != null
+                && prediction.getSourcePrice() != null && prediction.getSourcePrice() > 0) {
+            actualReturn = round((prediction.getActualClose() / prediction.getSourcePrice() - 1) * 100);
+        }
+        if (actualReturn == null || !Double.isFinite(actualReturn)) return null;
+        return classifyDirection(actualReturn, prediction.getHorizonCode(), policy)
+                .equals(prediction.getDirection());
+    }
+
+    private String classifyDirection(double actualReturn, String horizon, String policy) {
+        if (LEGACY_DIRECTION_POLICY.equals(policy)) {
+            return actualReturn >= 1.0 ? "UP" : (actualReturn <= -1.0 ? "DOWN" : "SIDEWAYS");
+        }
+        double limit = CURRENT_SIDEWAYS_LIMITS.getOrDefault(horizon, 1.0);
+        return actualReturn > limit ? "UP" : (actualReturn < -limit ? "DOWN" : "SIDEWAYS");
     }
 
     private boolean isInvalidated(StockWatchPrediction prediction, double actualLow, double actualHigh) {

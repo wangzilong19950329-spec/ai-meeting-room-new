@@ -39,6 +39,24 @@ public class StockWatchAnalysisProjectionService {
                                                 StockWatchTechnicalSession session,
                                                 String bridgeTargetId,
                                                 String conversationUrl) {
+        return project(reservation, originObservationId, validatedIntent, record, forecasts,
+                forecastDate, sourcePrice, inputSnapshotJson,
+                StockWatchPredictionService.LEGACY_DIRECTION_POLICY, session, bridgeTargetId, conversationUrl);
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public StockWatchTechnicalAnalysis project(Reservation reservation,
+                                                Long originObservationId,
+                                                Map<String, Object> validatedIntent,
+                                                StockWatchTechnicalAnalysis record,
+                                                JSONArray forecasts,
+                                                LocalDate forecastDate,
+                                                Double sourcePrice,
+                                                String inputSnapshotJson,
+                                                String directionPolicyVersion,
+                                                StockWatchTechnicalSession session,
+                                                String bridgeTargetId,
+                                                String conversationUrl) {
         runtimeGate.assertReady();
         if (record == null || session == null || reservation == null) {
             throw new IllegalArgumentException("analysis_projection_input_required");
@@ -52,7 +70,8 @@ public class StockWatchAnalysisProjectionService {
             throw new IllegalStateException("analysis_projection_insert_failed");
         }
         predictionService.savePredictionsStrict(record.getId(), record.getSymbol(), record.getMarket(),
-                record.getStockName(), forecastDate, sourcePrice, forecasts, inputSnapshotJson);
+                record.getStockName(), forecastDate, sourcePrice, forecasts, inputSnapshotJson,
+                directionPolicyVersion);
 
         int used = session.getContextChars() == null ? 0 : session.getContextChars();
         int delta = record.getContextCharsDelta() == null ? 0 : record.getContextCharsDelta();

@@ -262,7 +262,7 @@
             <div>
               <p class="section-label">prediction audit</p>
               <h3>预测复盘</h3>
-              <small>预测生成时冻结输入快照；到达对应交易日后自动验真，不用后见数据改写历史。</small>
+              <small>预测和原始验真保持冻结；现行口径复核仅重算方向展示，不改历史概率与 Brier。</small>
             </div>
             <button class="plain-button" type="button" :disabled="predictionLoading" @click="loadPredictionHistory">
               {{ predictionLoading ? '刷新中' : '刷新复盘' }}
@@ -279,9 +279,10 @@
               <small>点击查看验真结果 · {{ predictionSummary.pending || 0 }} 条等待到期</small>
             </button>
             <article class="prediction-stat-card">
-              <span>方向命中率</span>
-              <strong>{{ formatMetricPercent(predictionSummary.directionHitRate) }}</strong>
-              <small>涨 / 跌 / 震荡按 ±1% 统一口径</small>
+              <span>现行口径方向复核</span>
+              <strong>{{ formatMetricPercent(predictionSummary.currentPolicyDirectionHitRate) }}</strong>
+              <small>{{ predictionPolicyCaption }}</small>
+              <small>旧 ±1% 对照 {{ formatMetricPercent(predictionSummary.strictDirectionHitRate) }} · {{ predictionSummary.currentPolicyScored || 0 }} 条可复核</small>
             </article>
             <article class="prediction-stat-card">
               <span>区间收盘命中</span>
@@ -291,7 +292,7 @@
             <article class="prediction-stat-card">
               <span>Brier 分数</span>
               <strong>{{ formatPredictionNumber(predictionSummary.averageBrierScore, 3) }}</strong>
-              <small>越低越好，同时衡量概率校准</small>
+              <small>{{ predictionSummary.brierPolicyMixed ? '生成口径混合，不展示跨口径均值' : '原始生成口径；越低越好' }}</small>
             </article>
           </div>
           <p v-if="predictionError" class="analysis-inline-error">{{ predictionError }}</p>
@@ -332,7 +333,7 @@
                   <span :class="['prediction-direction', predictionDirectionTone(prediction.direction)]">
                     {{ prediction.horizon }} · {{ predictionDirectionLabel(prediction.direction) }}
                   </span>
-                  <span :class="['prediction-status', prediction.status === 'EVALUATED' ? (prediction.directionHit ? 'hit' : 'miss') : 'pending']">
+                  <span :class="['prediction-status', prediction.status === 'EVALUATED' && prediction.currentPolicyDirectionHit != null ? (prediction.currentPolicyDirectionHit ? 'hit' : 'miss') : 'pending']">
                     {{ predictionStatusLabel(prediction) }}
                   </span>
                 </div>
@@ -343,7 +344,10 @@
                   {{ prediction.evaluatedTradeDate }} 收盘 {{ prediction.actualClose }}，实际收益 {{ formatSignedPercent(prediction.actualReturnPct) }}
                   <template v-if="prediction.evaluatedAt"> · 验真时间 {{ prediction.evaluatedAt }}</template>
                 </small>
-                <small v-else>等待第 {{ prediction.tradingDays }} 个后续交易日</small>
+                <small v-if="prediction.status === 'EVALUATED' && prediction.directionHit != null && prediction.currentPolicyDirectionHit != null && prediction.currentPolicyDirectionHit !== prediction.directionHit">
+                  原始验真{{ prediction.directionHit ? '命中' : '未中' }}（生成时口径）；上方为现行口径复核
+                </small>
+                <small v-if="prediction.status !== 'EVALUATED'">等待第 {{ prediction.tradingDays }} 个后续交易日</small>
               </article>
             </div>
             <article v-else class="prediction-empty">{{ predictionListEmptyText }}</article>
@@ -1585,7 +1589,12 @@ const selectedAnalysisSession = ref(defaultAnalysisSession(null))
 const predictionLoading = ref(false)
 const predictionError = ref('')
 const predictionRecords = ref([])
-const predictionSummary = ref({ evaluated: 0, pending: 0, directionHitRate: null, rangeCloseHitRate: null, averageBrierScore: null })
+const predictionSummary = ref({ evaluated: 0, pending: 0, directionHitRate: null, currentPolicyDirectionHitRate: null, strictDirectionHitRate: null, currentPolicyScored: 0, currentPolicyLimitsPct: null, rangeCloseHitRate: null, averageBrierScore: null, brierPolicyMixed: false })
+const predictionPolicyCaption = computed(() => {
+  const limits = predictionSummary.value.currentPolicyLimitsPct
+  if (!limits) return '按期限复核震荡范围'
+  return `T1 ±${limits.T1}% · T5/周 ±${limits.T5}% · 月 ±${limits.M1}%`
+})
 const predictionListMode = ref('all')
 const predictionListExpanded = ref(false)
 const showAddStockDialog = ref(false)
@@ -2607,8 +2616,13 @@ async function loadPredictionHistory() {
       evaluated: Number(payload.summary?.evaluated || 0),
       pending: Number(payload.summary?.pending || 0),
       directionHitRate: finiteOrNull(payload.summary?.directionHitRate),
+      currentPolicyDirectionHitRate: finiteOrNull(payload.summary?.currentPolicyDirectionHitRate),
+      strictDirectionHitRate: finiteOrNull(payload.summary?.strictDirectionHitRate),
+      currentPolicyScored: Number(payload.summary?.currentPolicyScored || 0),
+      currentPolicyLimitsPct: payload.summary?.currentPolicyLimitsPct || null,
       rangeCloseHitRate: finiteOrNull(payload.summary?.rangeCloseHitRate),
-      averageBrierScore: finiteOrNull(payload.summary?.averageBrierScore)
+      averageBrierScore: finiteOrNull(payload.summary?.averageBrierScore),
+      brierPolicyMixed: Boolean(payload.summary?.brierPolicyMixed)
     }
     predictionRecords.value = Array.isArray(payload.records) ? payload.records : []
   } catch (error) {
@@ -2657,7 +2671,8 @@ function predictionDirectionTone(direction) {
 
 function predictionStatusLabel(prediction) {
   if (prediction.status !== 'EVALUATED') return '待验真'
-  return prediction.directionHit ? '方向命中' : '方向未中'
+  if (prediction.currentPolicyDirectionHit == null) return '复核数据不足'
+  return prediction.currentPolicyDirectionHit ? '复核命中' : '复核未中'
 }
 
 function showEvaluatedPredictions() {
