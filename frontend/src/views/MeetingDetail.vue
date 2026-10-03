@@ -62,7 +62,7 @@
       <el-row :gutter="16">
 
         <!-- 左：聊天室主体（流程模板模式下隐藏讨论过程） -->
-        <el-col v-if="!isWorkflowTemplateMode" :xs="24" :md="17">
+        <el-col v-if="!isWorkflowTemplateMode" :xs="24" :md="24" :lg="17">
           <el-card shadow="never" class="chat-card">
             <template #header>
               <div class="chat-card-header">
@@ -410,8 +410,8 @@
           </el-card>
         </el-col>
 
-        <!-- 右侧：成员 + 贡献 + 总结（流程模板模式下全宽平铺） -->
-        <el-col :xs="24" :md="isWorkflowTemplateMode ? 24 : 7" :class="{ 'tiled-modules': isWorkflowTemplateMode }">
+        <!-- 右侧只保留讨论时需要随时参照的成员信息 -->
+        <el-col :xs="24" :md="24" :lg="isWorkflowTemplateMode ? 24 : 7" :class="{ 'tiled-modules': isWorkflowTemplateMode }">
           <el-card shadow="never" class="members-card">
             <template #header><span>👥 参与成员</span></template>
             <div v-for="(m, idx) in meeting.members" :key="idx" class="member-item">
@@ -432,8 +432,13 @@
               </div>
             </div>
           </el-card>
+        </el-col>
+      </el-row>
 
-          <el-card v-if="targetedThreads.length" shadow="never" style="margin-top:12px">
+      <!-- 讨论区下方使用整行宽度，避免长内容一直挤在右侧窄栏 -->
+      <div class="meeting-secondary">
+        <div v-if="targetedThreads.length || meeting.projectContext || meeting.inheritedContext" class="meeting-secondary-pair">
+          <el-card v-if="targetedThreads.length" shadow="never">
             <template #header><span>🎯 定向追问</span></template>
             <div class="targeted-thread-list">
               <div v-for="thread in targetedThreads" :key="thread.question.id" class="targeted-thread-item">
@@ -457,7 +462,7 @@
             </div>
           </el-card>
 
-          <el-card v-if="meeting.projectContext || meeting.inheritedContext" shadow="never" style="margin-top:12px">
+          <el-card v-if="meeting.projectContext || meeting.inheritedContext" shadow="never">
             <template #header><span>🗂 项目记忆</span></template>
             <div v-if="meeting.projectContext" class="memory-section">
               <div class="memory-title">当前项目背景</div>
@@ -468,9 +473,11 @@
               <div class="summary-text pre-wrap">{{ meeting.inheritedContext }}</div>
             </div>
           </el-card>
+        </div>
 
-          <el-card v-if="workflowSummary" shadow="never" style="margin-top:12px">
+          <el-card v-if="workflowSummary" shadow="never" class="workflow-card">
             <template #header><span>🧭 会议流程</span></template>
+            <div class="workflow-layout">
             <div class="workflow-overview">
               <div class="workflow-line"><span>模板</span><b>{{ workflowSummary.templateName }}</b></div>
               <div class="workflow-line"><span>运行状态</span><el-tag size="small" effect="plain">{{ workflowSummary.runStatusName }}</el-tag></div>
@@ -518,6 +525,7 @@
                 </el-button>
               </div>
             </div>
+            <div class="workflow-visual">
             <template v-if="workflowNodes.length && hasWorkflowCanvas">
               <div class="workflow-canvas-head">
                 <span>流程图</span>
@@ -644,6 +652,8 @@
                   <br>当前节点已阻塞。你可以先重试自动执行；如果仍不稳定，也可以人工接管并直接补交该节点产出。
                 </template>
               </div>
+            </div>
+            </div>
             </div>
           </el-card>
 
@@ -875,7 +885,7 @@
             </template>
           </el-drawer>
 
-          <el-card v-if="trackingSummary" shadow="never" style="margin-top:12px">
+          <el-card v-if="trackingSummary" shadow="never">
             <template #header><span>📌 追踪项</span></template>
             <div class="tracking-summary-row">
               <el-tag size="small">总数 {{ trackingSummary.totalCount || 0 }}</el-tag>
@@ -1082,7 +1092,8 @@
             <el-empty v-else description="暂无追踪项" :image-size="64" />
           </el-card>
 
-          <el-card v-if="contributions.length" shadow="never" class="contrib-card" style="margin-top:12px">
+        <div v-if="contributions.length || meeting.summary" class="meeting-secondary-pair">
+          <el-card v-if="contributions.length" shadow="never" class="contrib-card">
             <template #header><span>📊 贡献度</span></template>
             <div v-for="c in contributions" :key="c.memberId" class="contrib-item">
               <div class="contrib-name">{{ c.memberName }}</div>
@@ -1091,12 +1102,13 @@
             </div>
           </el-card>
 
-          <el-card v-if="meeting.summary" shadow="never" style="margin-top:12px">
+          <el-card v-if="meeting.summary" shadow="never">
             <template #header><span>📋 会议总结</span></template>
             <div class="summary-text">{{ meeting.summary }}</div>
           </el-card>
+        </div>
 
-          <el-card v-if="decisionArtifact" shadow="never" style="margin-top:12px">
+          <el-card v-if="decisionArtifact" shadow="never">
             <template #header><span>🧾 决策卡片</span></template>
             <div class="artifact-section">
               <div class="memory-title">议题概述</div>
@@ -1142,7 +1154,7 @@
             </div>
           </el-card>
 
-          <el-card v-if="meeting.conclusionHistory?.length" shadow="never" style="margin-top:12px">
+          <el-card v-if="meeting.conclusionHistory?.length" shadow="never">
             <template #header><span>🕰 结论版本链</span></template>
             <div class="conclusion-history-list">
               <div
@@ -1229,8 +1241,7 @@
               </div>
             </div>
           </el-card>
-        </el-col>
-      </el-row>
+      </div>
     </template>
 
     <el-result v-else-if="!loading" icon="error" title="会议不存在">
@@ -1914,6 +1925,18 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 <style scoped>
 .meeting-detail { display: flex; flex-direction: column; gap: 14px; }
 .header-card, .chat-card, .members-card, .contrib-card { border-radius: 12px; }
+.meeting-secondary { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.meeting-secondary-pair {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 420px), 1fr));
+  gap: 16px;
+  align-items: start;
+}
+.workflow-layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 24px; align-items: start; }
+.workflow-visual { min-width: 0; container-type: inline-size; }
+@media (max-width: 1200px) {
+  .workflow-layout { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+}
 
 /* 头部 */
 .meeting-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
@@ -2263,6 +2286,12 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .workflow-node.is-active .workflow-node-card {
   border-color: #f59e0b;
   box-shadow: 0 12px 28px rgba(245, 158, 11, 0.18);
+}
+@container (min-width: 960px) {
+  .workflow-map { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: stretch; }
+  .workflow-node { grid-template-columns: 18px minmax(0, 1fr); }
+  .workflow-node-rail { display: none; }
+  .workflow-node-card { height: 100%; }
 }
 .workflow-node-head,
 .workflow-drawer-meta {
