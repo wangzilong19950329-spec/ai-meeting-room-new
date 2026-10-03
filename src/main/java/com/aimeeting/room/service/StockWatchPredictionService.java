@@ -320,6 +320,8 @@ public class StockWatchPredictionService {
         int currentPolicyHits = 0;
         int strictScored = 0;
         int strictHits = 0;
+        int directionalForecastScored = 0;
+        int directionalDivergenceCount = 0;
         double brierSum = 0;
         Set<String> evaluatedPolicyVersions = new HashSet<>();
         Map<String, int[]> byHorizon = new LinkedHashMap<>();
@@ -343,6 +345,11 @@ public class StockWatchPredictionService {
                 strictScored++;
                 if (strictHit) strictHits++;
             }
+            Boolean diverged = directionDiverged(record);
+            if (diverged != null) {
+                directionalForecastScored++;
+                if (diverged) directionalDivergenceCount++;
+            }
             int[] stats = byHorizon.computeIfAbsent(record.getHorizonCode(), key -> new int[4]);
             stats[0]++;
             if (Boolean.TRUE.equals(record.getDirectionHit())) stats[1]++;
@@ -363,6 +370,14 @@ public class StockWatchPredictionService {
                 ? null : round(currentPolicyHits * 100.0 / currentPolicyScored));
         result.put("strictDirectionHitRate", strictScored == 0
                 ? null : round(strictHits * 100.0 / strictScored));
+        result.put("directionalDivergenceBasis", "RETURN_SIGN");
+        result.put("directionalForecastScored", directionalForecastScored);
+        result.put("directionalDivergenceCount", directionalDivergenceCount);
+        result.put("directionalDivergenceRate", directionalForecastScored == 0
+                ? null : round(directionalDivergenceCount * 100.0 / directionalForecastScored));
+        result.put("directionalNonDivergenceHitRate", directionalForecastScored == 0
+                ? null : round((directionalForecastScored - directionalDivergenceCount) * 100.0
+                / directionalForecastScored));
         result.put("rangeCloseHitRate", evaluated == 0 ? null : round(rangeHits * 100.0 / evaluated));
         result.put("brierPolicyMixed", evaluatedPolicyVersions.size() > 1);
         result.put("averageBrierScore", evaluated == 0 || evaluatedPolicyVersions.size() > 1
@@ -403,8 +418,10 @@ public class StockWatchPredictionService {
         row.put("evaluatedAt", formatDateTime(prediction.getEvaluatedAt()));
         row.put("actualClose", prediction.getActualClose());
         row.put("actualReturnPct", prediction.getActualReturnPct());
+        row.put("directionalReviewReturnPct", directionalReviewReturnPct(prediction));
         row.put("directionHit", prediction.getDirectionHit());
         row.put("currentPolicyDirectionHit", reviewedDirectionHit(prediction, CURRENT_DIRECTION_POLICY));
+        row.put("directionDiverged", directionDiverged(prediction));
         row.put("strictDirectionHit", reviewedDirectionHit(prediction, LEGACY_DIRECTION_POLICY));
         row.put("rangeCloseHit", prediction.getRangeCloseHit());
         row.put("rangeTouchHit", prediction.getRangeTouchHit());
@@ -421,15 +438,41 @@ public class StockWatchPredictionService {
     }
 
     private Boolean reviewedDirectionHit(StockWatchPrediction prediction, String policy) {
+        String actualDirection = reviewedActualDirection(prediction, policy);
+        return actualDirection == null ? null : actualDirection.equals(prediction.getDirection());
+    }
+
+    private Boolean directionDiverged(StockWatchPrediction prediction) {
+        String predicted = prediction.getDirection();
+        if (!"UP".equals(predicted) && !"DOWN".equals(predicted)) return null;
+        Double actualReturn = directionalReviewReturnPct(prediction);
+        if (actualReturn == null) return null;
+        return "UP".equals(predicted) ? actualReturn < 0 : actualReturn > 0;
+    }
+
+    private Double directionalReviewReturnPct(StockWatchPrediction prediction) {
+        if (!"EVALUATED".equals(prediction.getStatus())) return null;
+        Double actualReturn = prediction.getActualReturnPct();
+        if (actualReturn != null && Double.isFinite(actualReturn)) return actualReturn;
+        Double actualClose = prediction.getActualClose();
+        Double sourcePrice = prediction.getSourcePrice();
+        if (actualClose == null || !Double.isFinite(actualClose)
+                || sourcePrice == null || !Double.isFinite(sourcePrice) || sourcePrice <= 0) return null;
+        double derivedReturn = (actualClose / sourcePrice - 1) * 100;
+        return Double.isFinite(derivedReturn) ? derivedReturn : null;
+    }
+
+    private String reviewedActualDirection(StockWatchPrediction prediction, String policy) {
         if (!"EVALUATED".equals(prediction.getStatus())) return null;
         Double actualReturn = prediction.getActualReturnPct();
         if (actualReturn == null && prediction.getActualClose() != null
-                && prediction.getSourcePrice() != null && prediction.getSourcePrice() > 0) {
+                && Double.isFinite(prediction.getActualClose())
+                && prediction.getSourcePrice() != null && Double.isFinite(prediction.getSourcePrice())
+                && prediction.getSourcePrice() > 0) {
             actualReturn = round((prediction.getActualClose() / prediction.getSourcePrice() - 1) * 100);
         }
         if (actualReturn == null || !Double.isFinite(actualReturn)) return null;
-        return classifyDirection(actualReturn, prediction.getHorizonCode(), policy)
-                .equals(prediction.getDirection());
+        return classifyDirection(actualReturn, prediction.getHorizonCode(), policy);
     }
 
     private String classifyDirection(double actualReturn, String horizon, String policy) {

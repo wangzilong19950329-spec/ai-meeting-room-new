@@ -256,6 +256,98 @@ class StockWatchPredictionServiceTest {
     }
 
     @Test
+    void directionalDivergenceReviewUsesReturnSignEvenInsideSidewaysBand() {
+        StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
+        StockWatchPredictionService service = new StockWatchPredictionService(
+                mapper, mock(EastmoneyMarketDataService.class), mock(StockWatchV6RuntimeGate.class));
+        StockWatchPrediction upSideways = evaluatedPrediction(1L, "T5", "UP", -2.0, false, 0.49);
+        StockWatchPrediction downSideways = evaluatedPrediction(2L, "T5", "DOWN", 2.0, false, 0.49);
+        StockWatchPrediction upDiverged = evaluatedPrediction(3L, "T5", "UP", -3.1, false, 0.49);
+        StockWatchPrediction downDiverged = evaluatedPrediction(4L, "T5", "DOWN", 3.1, false, 0.49);
+        StockWatchPrediction upConfirmed = evaluatedPrediction(5L, "T5", "UP", 3.1, true, 0.09);
+        StockWatchPrediction downConfirmed = evaluatedPrediction(6L, "T5", "DOWN", -3.1, true, 0.09);
+        when(mapper.selectRecent("300750", "sz", 200)).thenReturn(Arrays.asList(
+                upSideways, downSideways, upDiverged, downDiverged, upConfirmed, downConfirmed));
+
+        Map<String, Object> history = service.history("300750", "sz", 200);
+        Map<String, Object> summary = (Map<String, Object>) history.get("summary");
+        List<Map<String, Object>> rows = (List<Map<String, Object>>) history.get("records");
+
+        assertEquals(6, summary.get("directionalForecastScored"));
+        assertEquals("RETURN_SIGN", summary.get("directionalDivergenceBasis"));
+        assertEquals(4, summary.get("directionalDivergenceCount"));
+        assertEquals(66.666667, (Double) summary.get("directionalDivergenceRate"), 0.000001);
+        assertEquals(33.333333, (Double) summary.get("directionalNonDivergenceHitRate"), 0.000001);
+        assertEquals(true, rows.get(0).get("directionDiverged"));
+        assertEquals(true, rows.get(1).get("directionDiverged"));
+        assertEquals(true, rows.get(2).get("directionDiverged"));
+        assertEquals(true, rows.get(3).get("directionDiverged"));
+        assertEquals(false, rows.get(4).get("directionDiverged"));
+        assertEquals(false, rows.get(5).get("directionDiverged"));
+        assertEquals(false, rows.get(0).get("currentPolicyDirectionHit"));
+        assertEquals(false, rows.get(0).get("directionHit"));
+        assertEquals(0.49, rows.get(0).get("brierScore"));
+    }
+
+    @Test
+    void directionalDivergenceUsesDisplayedReturnSignAndExcludesUnscorableRecords() {
+        StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
+        StockWatchPredictionService service = new StockWatchPredictionService(
+                mapper, mock(EastmoneyMarketDataService.class), mock(StockWatchV6RuntimeGate.class));
+        StockWatchPrediction upBoundary = evaluatedPrediction(1L, "T5", "UP", -3.0, false, 0.25);
+        StockWatchPrediction downBoundary = evaluatedPrediction(2L, "T5", "DOWN", 3.0, false, 0.25);
+        StockWatchPrediction fallback = evaluatedPrediction(3L, "T5", "UP", null, false, 0.25);
+        fallback.setSourcePrice(100.0);
+        fallback.setActualClose(96.0);
+        StockWatchPrediction upFlat = evaluatedPrediction(4L, "T5", "UP", 0.0, false, 0.25);
+        StockWatchPrediction downFlat = evaluatedPrediction(5L, "T5", "DOWN", 0.0, false, 0.25);
+        StockWatchPrediction roundedZero = evaluatedPrediction(6L, "T5", "UP", 0.0, false, 0.25);
+        roundedZero.setSourcePrice(100000.0);
+        roundedZero.setActualClose(99999.9999);
+        StockWatchPrediction sidewaysForecast = evaluatedPrediction(7L, "T5", "SIDEWAYS", 5.0, false, 0.25);
+        StockWatchPrediction pending = evaluatedPrediction(8L, "T5", "UP", -5.0, false, 0.25);
+        pending.setStatus("PENDING");
+        StockWatchPrediction missing = evaluatedPrediction(9L, "T5", "DOWN", null, false, 0.25);
+        when(mapper.selectRecent("300750", "sz", 200)).thenReturn(Arrays.asList(
+                upBoundary, downBoundary, fallback, upFlat, downFlat, roundedZero,
+                sidewaysForecast, pending, missing));
+
+        Map<String, Object> history = service.history("300750", "sz", 200);
+        Map<String, Object> summary = (Map<String, Object>) history.get("summary");
+        List<Map<String, Object>> rows = (List<Map<String, Object>>) history.get("records");
+
+        assertEquals(6, summary.get("directionalForecastScored"));
+        assertEquals(3, summary.get("directionalDivergenceCount"));
+        assertEquals(true, rows.get(0).get("directionDiverged"));
+        assertEquals(true, rows.get(1).get("directionDiverged"));
+        assertEquals(true, rows.get(2).get("directionDiverged"));
+        assertEquals(-4.0, (Double) rows.get(2).get("directionalReviewReturnPct"), 0.000001);
+        assertEquals(false, rows.get(3).get("directionDiverged"));
+        assertEquals(false, rows.get(4).get("directionDiverged"));
+        assertEquals(false, rows.get(5).get("directionDiverged"));
+        assertEquals(0.0, rows.get(5).get("directionalReviewReturnPct"));
+        assertNull(rows.get(6).get("directionDiverged"));
+        assertNull(rows.get(7).get("directionDiverged"));
+        assertNull(rows.get(8).get("directionDiverged"));
+    }
+
+    @Test
+    void directionalDivergenceWithoutDirectionalOutcomesHasNoRate() {
+        StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
+        StockWatchPredictionService service = new StockWatchPredictionService(
+                mapper, mock(EastmoneyMarketDataService.class), mock(StockWatchV6RuntimeGate.class));
+        when(mapper.selectRecent("300750", "sz", 200)).thenReturn(Collections.singletonList(
+                evaluatedPrediction(1L, "T5", "SIDEWAYS", 2.0, true, 0.16)));
+
+        Map<String, Object> summary = (Map<String, Object>) service.history("300750", "sz", 200).get("summary");
+
+        assertEquals(0, summary.get("directionalForecastScored"));
+        assertEquals(0, summary.get("directionalDivergenceCount"));
+        assertNull(summary.get("directionalDivergenceRate"));
+        assertNull(summary.get("directionalNonDivergenceHitRate"));
+    }
+
+    @Test
     void mixedGenerationPoliciesDoNotProduceMisleadingAggregateBrier() {
         StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
         StockWatchPredictionService service = new StockWatchPredictionService(

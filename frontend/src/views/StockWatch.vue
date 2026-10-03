@@ -284,6 +284,22 @@
               <small>{{ predictionPolicyCaption }}</small>
               <small>旧 ±1% 对照 {{ formatMetricPercent(predictionSummary.strictDirectionHitRate) }} · {{ predictionSummary.currentPolicyScored || 0 }} 条可复核</small>
             </article>
+            <button
+              :class="['prediction-stat-card', 'clickable', { active: predictionListMode === 'diverged' }]"
+              type="button"
+              :aria-pressed="predictionListMode === 'diverged'"
+              :disabled="!hasReturnSignDivergence"
+              @click="showDivergedPredictions"
+            >
+              <span>方向背离率 · 收益正负</span>
+              <strong>{{ hasReturnSignDivergence ? formatMetricPercent(predictionSummary.directionalDivergenceRate) : '--' }}</strong>
+              <template v-if="hasReturnSignDivergence">
+                <small>看涨且收益&lt;0 / 看跌且收益&gt;0 才背离；0 不背离</small>
+                <small>不背离命中 {{ formatMetricPercent(predictionSummary.directionalNonDivergenceHitRate) }} · {{ predictionSummary.directionalDivergenceCount }} / {{ predictionSummary.directionalForecastScored }} 条背离，点击查看</small>
+                <small>仅看涨/看跌已验真 · 最近 {{ predictionRecords.length }} 条预测</small>
+              </template>
+              <small v-else>等待收益正负口径接口</small>
+            </button>
             <article class="prediction-stat-card">
               <span>区间收盘命中</span>
               <strong>{{ formatMetricPercent(predictionSummary.rangeCloseHitRate) }}</strong>
@@ -334,18 +350,22 @@
                     {{ prediction.horizon }} · {{ predictionDirectionLabel(prediction.direction) }}
                   </span>
                   <span :class="['prediction-status', prediction.status === 'EVALUATED' && prediction.currentPolicyDirectionHit != null ? (prediction.currentPolicyDirectionHit ? 'hit' : 'miss') : 'pending']">
-                    {{ predictionStatusLabel(prediction) }}
+                    {{ predictionListMode === 'diverged' ? '方向背离' : predictionStatusLabel(prediction) }}
                   </span>
                 </div>
                 <strong>{{ prediction.targetLow }} – {{ prediction.targetHigh }}</strong>
                 <p>起点 {{ prediction.sourcePrice }} · 概率 {{ formatMetricPercent((prediction.probability || 0) * 100) }} · 失效线 {{ prediction.invalidationPrice || '--' }}</p>
                 <small>生成时间 {{ prediction.generatedAt || `${prediction.forecastDate} --:--` }}</small>
                 <small v-if="prediction.status === 'EVALUATED'">
-                  {{ prediction.evaluatedTradeDate }} 收盘 {{ prediction.actualClose }}，实际收益 {{ formatSignedPercent(prediction.actualReturnPct) }}
+                  {{ prediction.evaluatedTradeDate }} 收盘 {{ prediction.actualClose }}，实际收益 {{ formatSignedPercent(finiteOrNull(prediction.actualReturnPct) ?? prediction.directionalReviewReturnPct) }}
+                  <template v-if="finiteOrNull(prediction.actualReturnPct) == null && prediction.directionalReviewReturnPct != null">（据收盘价计算）</template>
                   <template v-if="prediction.evaluatedAt"> · 验真时间 {{ prediction.evaluatedAt }}</template>
                 </small>
                 <small v-if="prediction.status === 'EVALUATED' && prediction.directionHit != null && prediction.currentPolicyDirectionHit != null && prediction.currentPolicyDirectionHit !== prediction.directionHit">
                   原始验真{{ prediction.directionHit ? '命中' : '未中' }}（生成时口径）；上方为现行口径复核
+                </small>
+                <small v-if="prediction.directionDiverged != null">
+                  收益正负口径：{{ prediction.directionDiverged ? '方向背离' : '不背离（命中）' }}
                 </small>
                 <small v-if="prediction.status !== 'EVALUATED'">等待第 {{ prediction.tradingDays }} 个后续交易日</small>
               </article>
@@ -1589,7 +1609,11 @@ const selectedAnalysisSession = ref(defaultAnalysisSession(null))
 const predictionLoading = ref(false)
 const predictionError = ref('')
 const predictionRecords = ref([])
-const predictionSummary = ref({ evaluated: 0, pending: 0, directionHitRate: null, currentPolicyDirectionHitRate: null, strictDirectionHitRate: null, currentPolicyScored: 0, currentPolicyLimitsPct: null, rangeCloseHitRate: null, averageBrierScore: null, brierPolicyMixed: false })
+function emptyPredictionSummary() {
+  return { evaluated: 0, pending: 0, directionHitRate: null, currentPolicyDirectionHitRate: null, strictDirectionHitRate: null, currentPolicyScored: 0, currentPolicyLimitsPct: null, directionalDivergenceBasis: null, directionalForecastScored: 0, directionalDivergenceCount: 0, directionalDivergenceRate: null, directionalNonDivergenceHitRate: null, rangeCloseHitRate: null, averageBrierScore: null, brierPolicyMixed: false }
+}
+const predictionSummary = ref(emptyPredictionSummary())
+const hasReturnSignDivergence = computed(() => predictionSummary.value.directionalDivergenceBasis === 'RETURN_SIGN')
 const predictionPolicyCaption = computed(() => {
   const limits = predictionSummary.value.currentPolicyLimitsPct
   if (!limits) return '按期限复核震荡范围'
@@ -1854,6 +1878,9 @@ const filteredPredictionRecords = computed(() => {
   if (predictionListMode.value === 'evaluated') {
     return predictionRecords.value.filter((prediction) => prediction.status === 'EVALUATED')
   }
+  if (predictionListMode.value === 'diverged') {
+    return predictionRecords.value.filter((prediction) => prediction.directionDiverged === true)
+  }
   return predictionRecords.value
 })
 const hasPredictionOverflow = computed(() => filteredPredictionRecords.value.length > PREDICTION_COLLAPSED_LIMIT)
@@ -1864,14 +1891,16 @@ const visiblePredictionRecords = computed(() => {
 const hiddenPredictionCount = computed(() => (
   Math.max(filteredPredictionRecords.value.length - visiblePredictionRecords.value.length, 0)
 ))
-const predictionListTitle = computed(() => (
-  predictionListMode.value === 'evaluated' ? '验真结果列表' : '最近预测列表'
-))
-const predictionListEmptyText = computed(() => (
-  predictionListMode.value === 'evaluated'
-    ? '暂无已验真的预测结果。'
-    : '暂无预测记录。'
-))
+const predictionListTitle = computed(() => {
+  if (predictionListMode.value === 'evaluated') return '验真结果列表'
+  if (predictionListMode.value === 'diverged') return '方向背离样本'
+  return '最近预测列表'
+})
+const predictionListEmptyText = computed(() => {
+  if (predictionListMode.value === 'evaluated') return '暂无已验真的预测结果。'
+  if (predictionListMode.value === 'diverged') return '本次加载的预测中暂无方向背离样本。'
+  return '暂无预测记录。'
+})
 const selectedAiRules = computed(() => aiRules.value.filter((rule) => rule.symbol === selectedStock.value.symbol))
 const selectedFcCards = computed(() => fcCards.value.filter((card) => card.symbol === selectedStock.value.symbol))
 const selectedFcCard = computed(() => (
@@ -2620,6 +2649,11 @@ async function loadPredictionHistory() {
       strictDirectionHitRate: finiteOrNull(payload.summary?.strictDirectionHitRate),
       currentPolicyScored: Number(payload.summary?.currentPolicyScored || 0),
       currentPolicyLimitsPct: payload.summary?.currentPolicyLimitsPct || null,
+      directionalDivergenceBasis: payload.summary?.directionalDivergenceBasis || null,
+      directionalForecastScored: Number(payload.summary?.directionalForecastScored || 0),
+      directionalDivergenceCount: Number(payload.summary?.directionalDivergenceCount || 0),
+      directionalDivergenceRate: finiteOrNull(payload.summary?.directionalDivergenceRate),
+      directionalNonDivergenceHitRate: finiteOrNull(payload.summary?.directionalNonDivergenceHitRate),
       rangeCloseHitRate: finiteOrNull(payload.summary?.rangeCloseHitRate),
       averageBrierScore: finiteOrNull(payload.summary?.averageBrierScore),
       brierPolicyMixed: Boolean(payload.summary?.brierPolicyMixed)
@@ -2628,6 +2662,7 @@ async function loadPredictionHistory() {
   } catch (error) {
     predictionError.value = resolveErrorMessage(error, '预测复盘加载失败')
     predictionRecords.value = []
+    predictionSummary.value = emptyPredictionSummary()
   } finally {
     predictionLoading.value = false
   }
@@ -2652,6 +2687,7 @@ function formatPredictionNumber(value, digits = 2) {
 }
 
 function formatSignedPercent(value) {
+  if (value === null || value === undefined || value === '') return '--'
   const number = Number(value)
   if (!Number.isFinite(number)) return '--'
   return `${number > 0 ? '+' : ''}${number.toFixed(2)}%`
@@ -2677,6 +2713,12 @@ function predictionStatusLabel(prediction) {
 
 function showEvaluatedPredictions() {
   predictionListMode.value = 'evaluated'
+  predictionListExpanded.value = false
+}
+
+function showDivergedPredictions() {
+  if (!hasReturnSignDivergence.value) return
+  predictionListMode.value = 'diverged'
   predictionListExpanded.value = false
 }
 
@@ -5747,7 +5789,7 @@ svg {
 
 .prediction-stat-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 10px;
   margin-top: 14px;
 }
