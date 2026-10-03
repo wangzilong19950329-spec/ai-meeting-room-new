@@ -54,7 +54,7 @@
         SELECT * FROM stock_watch_prediction WHERE analysis_id = #{analysisId} ORDER BY horizon_trading_days ASC, id ASC
     </select>
 
-    <select id="selectRecent" resultMap="BaseResultMap">
+    <sql id="visiblePredictionHistory">
         SELECT p.* FROM stock_watch_prediction p
         JOIN stock_watch_technical_analysis a ON a.id = p.analysis_id
         LEFT JOIN stock_watch_analysis_observation_identity i ON i.canonical_task_id = a.analysis_task_id
@@ -63,6 +63,18 @@
         WHERE p.symbol = #{symbol} AND p.market = #{market}
           AND (i.analysis_scope = 'TECHNICAL_RUNTIME'
                OR (a.analysis_task_id IS NULL AND a.id &lt;= ms.legacy_analysis_cutoff_id))
+    </sql>
+
+    <select id="selectRecent" resultMap="BaseResultMap">
+        <include refid="visiblePredictionHistory"/>
+        ORDER BY p.forecast_date DESC, p.id DESC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectRecentBefore" resultMap="BaseResultMap">
+        <include refid="visiblePredictionHistory"/>
+          AND (p.forecast_date &lt; #{beforeDate}
+               OR (p.forecast_date = #{beforeDate} AND p.id &lt; #{beforeId}))
         ORDER BY p.forecast_date DESC, p.id DESC
         LIMIT #{limit}
     </select>

@@ -183,6 +183,16 @@ public class StockWatchPredictionService {
 
     public Map<String, Object> history(String symbol, String market, int limit) {
         List<StockWatchPrediction> records = predictionMapper.selectRecent(symbol, market, Math.max(10, Math.min(limit, 500)));
+        return historyPayload(symbol, market, records);
+    }
+
+    public Map<String, Object> historyBefore(String symbol, String market, LocalDate beforeDate, Long beforeId, int limit) {
+        List<StockWatchPrediction> records = predictionMapper.selectRecentBefore(symbol, market,
+                Date.valueOf(beforeDate), beforeId, Math.max(10, Math.min(limit, 500)));
+        return historyPayload(symbol, market, records);
+    }
+
+    private Map<String, Object> historyPayload(String symbol, String market, List<StockWatchPrediction> records) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("symbol", symbol);
         payload.put("market", market);

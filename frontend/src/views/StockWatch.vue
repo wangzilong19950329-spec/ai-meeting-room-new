@@ -311,6 +311,9 @@
               <small>{{ predictionSummary.brierPolicyMixed ? '生成口径混合，不展示跨口径均值' : '原始生成口径；越低越好' }}</small>
             </article>
           </div>
+          <small v-if="predictionRecords.length > predictionSummary.total" class="prediction-summary-scope">
+            上方统计按最近 {{ predictionSummary.total }} 条计算；下方列表已加载 {{ predictionRecords.length }} 条历史预测。
+          </small>
           <p v-if="predictionError" class="analysis-inline-error">{{ predictionError }}</p>
           <template v-if="predictionRecords.length">
             <div class="prediction-list-head">
@@ -1589,6 +1592,7 @@ import IntradayBarChart from '@/modules/stock-watch/components/IntradayBarChart.
 import BarUnavailableState from '@/modules/stock-watch/components/BarUnavailableState.vue'
 import MetricCard from '@/modules/stock-watch/components/MetricCard.vue'
 import { loadDemoState } from '@/modules/stock-watch/runtime/demoMode'
+import { loadAllPredictionPages, selectVisiblePredictionGroups } from '@/modules/stock-watch/runtime/predictionHistory.mjs'
 import { useStockWatchRuntimeStatus } from '@/modules/stock-watch/composables/useStockWatchRuntimeStatus'
 
 const CUSTOM_WATCHLIST_KEY = 'stock-watch.custom-watchlist.v1'
@@ -1663,8 +1667,9 @@ const selectedAnalysisSession = ref(defaultAnalysisSession(null))
 const predictionLoading = ref(false)
 const predictionError = ref('')
 const predictionRecords = ref([])
+let predictionHistoryLoadId = 0
 function emptyPredictionSummary() {
-  return { evaluated: 0, pending: 0, directionHitRate: null, currentPolicyDirectionHitRate: null, strictDirectionHitRate: null, currentPolicyScored: 0, currentPolicyLimitsPct: null, directionalDivergenceBasis: null, directionalForecastScored: 0, directionalDivergenceCount: 0, directionalDivergenceRate: null, directionalNonDivergenceHitRate: null, rangeCloseHitRate: null, averageBrierScore: null, brierPolicyMixed: false }
+  return { total: 0, evaluated: 0, pending: 0, directionHitRate: null, currentPolicyDirectionHitRate: null, strictDirectionHitRate: null, currentPolicyScored: 0, currentPolicyLimitsPct: null, directionalDivergenceBasis: null, directionalForecastScored: 0, directionalDivergenceCount: 0, directionalDivergenceRate: null, directionalNonDivergenceHitRate: null, rangeCloseHitRate: null, averageBrierScore: null, brierPolicyMixed: false }
 }
 const predictionSummary = ref(emptyPredictionSummary())
 const hasReturnSignDivergence = computed(() => predictionSummary.value.directionalDivergenceBasis === 'RETURN_SIGN')
@@ -1966,9 +1971,9 @@ const predictionGroups = computed(() => {
   })
   return [...groups.values()].sort((left, right) => right.date.localeCompare(left.date))
 })
-const hasPredictionOverflow = computed(() => predictionGroups.value.length > PREDICTION_COLLAPSED_LIMIT)
-const visiblePredictionGroups = computed(() => (
-  predictionListExpanded.value ? predictionGroups.value : predictionGroups.value.slice(0, PREDICTION_COLLAPSED_LIMIT)
+const hasPredictionOverflow = computed(() => !predictionGroupByDay.value && predictionGroups.value.length > PREDICTION_COLLAPSED_LIMIT)
+const visiblePredictionGroups = computed(() => selectVisiblePredictionGroups(
+  predictionGroups.value, predictionGroupByDay.value, predictionListExpanded.value, PREDICTION_COLLAPSED_LIMIT
 ))
 const visiblePredictionCount = computed(() => visiblePredictionGroups.value.reduce((count, group) => count + group.predictions.length, 0))
 const hiddenPredictionCount = computed(() => (
@@ -1982,7 +1987,7 @@ watch([predictionDirectionFilter, predictionHorizonFilter], () => {
 const predictionListTitle = computed(() => {
   if (predictionListMode.value === 'evaluated') return '验真结果列表'
   if (predictionListMode.value === 'diverged') return '方向背离样本'
-  return '最近预测列表'
+  return '预测历史列表'
 })
 const predictionListEmptyText = computed(() => {
   if (predictionDirectionFilter.value !== 'all') return '当前筛选条件下暂无预测记录。'
@@ -2721,16 +2726,21 @@ async function runTechnicalAnalysisNow() {
 
 async function loadPredictionHistory() {
   const stock = selectedStock.value
-  if (!stock?.symbol || predictionLoading.value) return
+  if (!stock?.symbol) return
+  const loadId = ++predictionHistoryLoadId
   predictionLoading.value = true
   predictionError.value = ''
   try {
-    const response = await stockWatchHttp.get('/stock-watch/technical-analysis/predictions', {
-      params: { symbol: stock.symbol, market: stock.market, limit: 200 },
-      suppressErrorMessage: true
-    })
-    const payload = response?.data || {}
+    const payload = await loadAllPredictionPages(async (params) => {
+      const response = await stockWatchHttp.get('/stock-watch/technical-analysis/predictions', {
+        params: { symbol: stock.symbol, market: stock.market, ...params },
+        suppressErrorMessage: true
+      })
+      return response?.data || {}
+    }, 200)
+    if (loadId !== predictionHistoryLoadId) return
     predictionSummary.value = {
+      total: Number(payload.summary?.total || 0),
       evaluated: Number(payload.summary?.evaluated || 0),
       pending: Number(payload.summary?.pending || 0),
       directionHitRate: finiteOrNull(payload.summary?.directionHitRate),
@@ -2749,11 +2759,12 @@ async function loadPredictionHistory() {
     }
     predictionRecords.value = Array.isArray(payload.records) ? payload.records : []
   } catch (error) {
+    if (loadId !== predictionHistoryLoadId) return
     predictionError.value = resolveErrorMessage(error, '预测复盘加载失败')
     predictionRecords.value = []
     predictionSummary.value = emptyPredictionSummary()
   } finally {
-    predictionLoading.value = false
+    if (loadId === predictionHistoryLoadId) predictionLoading.value = false
   }
 }
 
@@ -5946,6 +5957,13 @@ svg {
   margin: 5px 0;
   color: #0f172a;
   font-size: 24px;
+}
+
+.prediction-summary-scope {
+  display: block;
+  margin-top: 10px;
+  color: #667085;
+  font-size: 11px;
 }
 
 .prediction-list-head {

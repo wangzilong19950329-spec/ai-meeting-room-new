@@ -63,6 +63,20 @@ class StockWatchV6ReaderVisibilitySmokeTest {
         List<Long> visiblePredictions = predictionMapper.selectRecent("009996", "sz", 10)
                 .stream().map(StockWatchPrediction::getId).collect(Collectors.toList());
         assertEquals(java.util.Arrays.asList(991003L, 991001L), visiblePredictions);
+        List<Long> sameDayContinuation = predictionMapper.selectRecentBefore("009996", "sz",
+                        Date.valueOf("2026-07-16"), 991003L, 10)
+                .stream().map(StockWatchPrediction::getId).collect(Collectors.toList());
+        assertEquals(java.util.Collections.singletonList(991001L), sameDayContinuation);
+
+        insertAnalysis(989999, null, "09:15");
+        jdbc.update("INSERT INTO stock_watch_prediction(id,analysis_id,symbol,market,horizon_code,horizon_trading_days,"
+                        + "forecast_date,source_price,direction,status) "
+                        + "VALUES(991004,989999,'009996','sz','T1',1,?,100,'UP','PENDING')",
+                Date.valueOf("2026-07-15"));
+        List<Long> previousDayContinuation = predictionMapper.selectRecentBefore("009996", "sz",
+                        Date.valueOf("2026-07-16"), 991001L, 10)
+                .stream().map(StockWatchPrediction::getId).collect(Collectors.toList());
+        assertEquals(java.util.Collections.singletonList(991004L), previousDayContinuation);
     }
 
     private void insertAnalysis(long id, Long taskId, String slot) {

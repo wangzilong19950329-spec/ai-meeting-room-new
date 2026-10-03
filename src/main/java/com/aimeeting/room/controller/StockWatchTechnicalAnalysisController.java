@@ -74,8 +74,18 @@ public class StockWatchTechnicalAnalysisController {
     @GetMapping("/predictions")
     public ApiResponse<Map<String, Object>> predictions(@RequestParam("symbol") String symbol,
                                                         @RequestParam(value = "market", required = false) String market,
-                                                        @RequestParam(value = "limit", defaultValue = "200") int limit) {
+                                                        @RequestParam(value = "limit", defaultValue = "200") int limit,
+                                                        @RequestParam(value = "beforeDate", required = false)
+                                                        @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate beforeDate,
+                                                        @RequestParam(value = "beforeId", required = false) Long beforeId) {
         StockSymbol normalized = StockSymbol.parse(symbol, market);
+        if ((beforeDate == null) != (beforeId == null) || (beforeId != null && beforeId <= 0)) {
+            return ApiResponse.fail(400, "beforeDate和beforeId必须同时提供，且beforeId为正数");
+        }
+        if (beforeDate != null) {
+            return ApiResponse.ok(predictionService.historyBefore(
+                    normalized.getSymbol(), normalized.getMarket(), beforeDate, beforeId, limit));
+        }
         return ApiResponse.ok(predictionService.history(normalized.getSymbol(), normalized.getMarket(), limit));
     }
 

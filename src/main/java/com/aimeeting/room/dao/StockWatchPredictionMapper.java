@@ -17,6 +17,12 @@ public interface StockWatchPredictionMapper {
                                             @Param("market") String market,
                                             @Param("limit") int limit);
 
+    List<StockWatchPrediction> selectRecentBefore(@Param("symbol") String symbol,
+                                                  @Param("market") String market,
+                                                  @Param("beforeDate") Date beforeDate,
+                                                  @Param("beforeId") Long beforeId,
+                                                  @Param("limit") int limit);
+
     List<StockWatchPrediction> selectPending(@Param("limit") int limit);
 
     int updateEvaluation(@Param("id") Long id,
