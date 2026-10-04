@@ -7,7 +7,10 @@ import com.aimeeting.room.service.StockWatchAnalysisSchedulerOwnershipService;
 import com.aimeeting.room.service.StockWatchPredictionService;
 import com.aimeeting.room.service.StockWatchTechnicalAnalysisService;
 import org.junit.jupiter.api.Test;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 
+import java.time.LocalDate;
 import java.util.Collections;
 import java.util.Map;
 
@@ -20,8 +23,35 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 class StockWatchTechnicalAnalysisControllerTest {
+
+    @Test
+    void predictionHistoryCursorBindsThroughHttpAndRejectsIncompleteCursor() throws Exception {
+        StockWatchPredictionService predictions = mock(StockWatchPredictionService.class);
+        StockWatchTechnicalAnalysisController controller = new StockWatchTechnicalAnalysisController(
+                mock(StockWatchTechnicalAnalysisService.class), predictions,
+                mock(StockWatchAnalysisSchedulerOwnershipService.class),
+                mock(StockWatchAnalysisScheduler.class));
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(controller).build();
+        when(predictions.historyBefore("300750", "sz", LocalDate.of(2026, 7, 28), 123L, 200))
+                .thenReturn(Map.of("records", Collections.singletonList(Map.of("id", 122L))));
+
+        mvc.perform(get("/api/stock-watch/technical-analysis/predictions")
+                        .param("symbol", "300750").param("market", "sz").param("limit", "200")
+                        .param("beforeDate", "2026-07-28").param("beforeId", "123"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.records[0].id").value(122));
+        verify(predictions).historyBefore("300750", "sz", LocalDate.of(2026, 7, 28), 123L, 200);
+
+        mvc.perform(get("/api/stock-watch/technical-analysis/predictions")
+                        .param("symbol", "300750").param("market", "sz").param("beforeDate", "2026-07-28"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.code").value(400));
+    }
 
     @Test
     void reuseOnlyMissReturnsStructuredApplicationConflict() {
