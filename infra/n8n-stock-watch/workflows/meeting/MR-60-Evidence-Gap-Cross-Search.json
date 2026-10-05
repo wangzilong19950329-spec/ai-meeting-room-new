@@ -1,0 +1,1060 @@
+{
+  "id": "MR60EvidenceGapCrossSearch",
+  "name": "MR-60 Evidence Gap Cross-Search",
+  "active": false,
+  "nodes": [
+    {
+      "id": "MeetingEvidenceInput",
+      "name": "Meeting Evidence Input",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "NormalizeGap",
+      "name": "Normalize Gap",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nreturn [{ json: normalizeRequest($input.first().json) }];"
+      }
+    },
+    {
+      "id": "PrepareSearch1",
+      "name": "Prepare Search 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nreturn [{ json: prepareSearch($input.first().json) }];"
+      }
+    },
+    {
+      "id": "SearchBudget1",
+      "name": "Search Budget 1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        700,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "SearchBudget1",
+              "leftValue": "={{ $json.canSearch }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "CallSearch1",
+      "name": "Call Search 1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        900,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.bridgeEndpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.searchQuery, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}",
+        "options": {
+          "timeout": "={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}",
+          "neverError": true,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SWDeepSeekFacadeHeaderAuth",
+          "name": "SW DeepSeek Facade Header"
+        }
+      }
+    },
+    {
+      "id": "PrepareReview1",
+      "name": "Prepare Review 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nconst prior = $('Prepare Search 1').first().json;\nreturn [{ json: prepareReview(parseSearch(prior, $input.first().json)) }];"
+      }
+    },
+    {
+      "id": "ReviewGate1",
+      "name": "Review Gate 1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ReviewGate1",
+              "leftValue": "={{ $json.canReview }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "CallReview1",
+      "name": "Call Review 1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        1500,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.bridgeEndpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.reviewQuery, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}",
+        "options": {
+          "timeout": "={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}",
+          "neverError": true,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SWDeepSeekFacadeHeaderAuth",
+          "name": "SW DeepSeek Facade Header"
+        }
+      }
+    },
+    {
+      "id": "ApplyReview1",
+      "name": "Apply Review 1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nconst prior = $('Prepare Review 1').first().json;\nreturn [{ json: applyReview(prior, $input.first().json) }];"
+      }
+    },
+    {
+      "id": "RetryGap1",
+      "name": "Retry Gap 1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "RetryGap1",
+              "leftValue": "={{ $json.status === 'PENDING' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "PrepareSearch2",
+      "name": "Prepare Search 2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2040,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nreturn [{ json: prepareSearch($input.first().json) }];"
+      }
+    },
+    {
+      "id": "SearchBudget2",
+      "name": "Search Budget 2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "SearchBudget2",
+              "leftValue": "={{ $json.canSearch }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "CallSearch2",
+      "name": "Call Search 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        2440,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.bridgeEndpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.searchQuery, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}",
+        "options": {
+          "timeout": "={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}",
+          "neverError": true,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SWDeepSeekFacadeHeaderAuth",
+          "name": "SW DeepSeek Facade Header"
+        }
+      }
+    },
+    {
+      "id": "PrepareReview2",
+      "name": "Prepare Review 2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nconst prior = $('Prepare Search 2').first().json;\nreturn [{ json: prepareReview(parseSearch(prior, $input.first().json)) }];"
+      }
+    },
+    {
+      "id": "ReviewGate2",
+      "name": "Review Gate 2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ReviewGate2",
+              "leftValue": "={{ $json.canReview }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "CallReview2",
+      "name": "Call Review 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        3040,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.bridgeEndpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.reviewQuery, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}",
+        "options": {
+          "timeout": "={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}",
+          "neverError": true,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SWDeepSeekFacadeHeaderAuth",
+          "name": "SW DeepSeek Facade Header"
+        }
+      }
+    },
+    {
+      "id": "ApplyReview2",
+      "name": "Apply Review 2",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3240,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nconst prior = $('Prepare Review 2').first().json;\nreturn [{ json: applyReview(prior, $input.first().json) }];"
+      }
+    },
+    {
+      "id": "RetryGap2",
+      "name": "Retry Gap 2",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3440,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "RetryGap2",
+              "leftValue": "={{ $json.status === 'PENDING' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "PrepareSearch3",
+      "name": "Prepare Search 3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3580,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nreturn [{ json: prepareSearch($input.first().json) }];"
+      }
+    },
+    {
+      "id": "SearchBudget3",
+      "name": "Search Budget 3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3780,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "SearchBudget3",
+              "leftValue": "={{ $json.canSearch }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "CallSearch3",
+      "name": "Call Search 3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        3980,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.bridgeEndpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.searchQuery, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}",
+        "options": {
+          "timeout": "={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}",
+          "neverError": true,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SWDeepSeekFacadeHeaderAuth",
+          "name": "SW DeepSeek Facade Header"
+        }
+      }
+    },
+    {
+      "id": "PrepareReview3",
+      "name": "Prepare Review 3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4180,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nconst prior = $('Prepare Search 3').first().json;\nreturn [{ json: prepareReview(parseSearch(prior, $input.first().json)) }];"
+      }
+    },
+    {
+      "id": "ReviewGate3",
+      "name": "Review Gate 3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4380,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ReviewGate3",
+              "leftValue": "={{ $json.canReview }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "CallReview3",
+      "name": "Call Review 3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.3,
+      "position": [
+        4580,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.bridgeEndpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $json.reviewQuery, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}",
+        "options": {
+          "timeout": "={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}",
+          "neverError": true,
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SWDeepSeekFacadeHeaderAuth",
+          "name": "SW DeepSeek Facade Header"
+        }
+      }
+    },
+    {
+      "id": "ApplyReview3",
+      "name": "Apply Review 3",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4780,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nconst prior = $('Prepare Review 3').first().json;\nreturn [{ json: applyReview(prior, $input.first().json) }];"
+      }
+    },
+    {
+      "id": "RetryGap3",
+      "name": "Retry Gap 3",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4980,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "RetryGap3",
+              "leftValue": "={{ $json.status === 'PENDING' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "FinalEvidencePacket",
+      "name": "Final Evidence Packet",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5200,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.\nconst MAX_DURATION_MS = 12 * 60 * 1000;\nconst TRUSTED_ENDPOINTS = new Set([\n  'http://deepseek-facade:8793/search',\n  'http://host.docker.internal:8794/search' // Local fixture only.\n]);\n\nfunction text(value, max = 1000) {\n  return typeof value === 'string' ? value.trim().slice(0, max) : '';\n}\n\nfunction normalizeRequest(input, now = Date.now()) {\n  if (!input || typeof input !== 'object') throw new Error('EVIDENCE_INPUT_REQUIRED');\n  const requestId = text(input.requestId, 128);\n  const symbol = text(input.symbol, 32);\n  const gap = input.gap || {};\n  const gapId = text(gap.id, 128);\n  const question = text(gap.question, 1500);\n  if (!requestId || !/^[A-Za-z0-9._:-]+$/.test(requestId)) throw new Error('INVALID_REQUEST_ID');\n  if (!/^[0-9]{6}\\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');\n  if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');\n  const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';\n  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {\n    throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');\n  }\n  return {\n    schemaVersion: 'meeting.evidence-gap.v1', requestId, symbol,\n    gap: { id: gapId, question }, bridgeEndpoint: endpoint,\n    startedAt: new Date(now).toISOString(), deadlineAt: now + MAX_DURATION_MS,\n    status: 'PENDING', attempts: 0, searchCalls: 0, reviewCalls: 0,\n    feedback: '', candidate: null, evidence: null, auditTrail: []\n  };\n}\n\nfunction remainingMs(state, now = Date.now()) {\n  return Math.max(0, Number(state.deadlineAt) - now);\n}\n\nfunction prepareSearch(state, now = Date.now()) {\n  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 1000) {\n    return { ...state, status: 'UNVERIFIED', reason: 'SEARCH_BUDGET_EXHAUSTED', canSearch: false };\n  }\n  const query = [\n    '请实际使用智能搜索，只调查下列一个缺失字段。不要预测股价，不要使用先前对话内容。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    state.feedback ? `上次审核反馈（只返工这个缺口）：${state.feedback}` : '',\n    '只返回 JSON 对象：{\"status\":\"FOUND|UNKNOWN\",\"claim\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'FOUND 时每个字段必须来自搜索结果；框架协议、签约、交付、营收等状态不得混同。找不到可靠资料时 status=UNKNOWN 且 claim=null。链接必须是搜索结果中的网址。'\n  ].filter(Boolean).join('\\n');\n  return { ...state, canSearch: true, searchQuery: query };\n}\n\nfunction responseBody(transport) {\n  const statusCode = Number(transport && (transport.statusCode || transport.status));\n  const body = transport && transport.body !== undefined ? transport.body : transport;\n  if (statusCode && statusCode !== 200) throw new Error('BRIDGE_HTTP_' + statusCode);\n  if (!body || body.ok !== true || !body.result) throw new Error('BRIDGE_RESPONSE_INVALID');\n  const result = body.result;\n  if (result.contentStatus !== 'success' || result.jsonComplete !== true ||\n      !['completion_stream', 'new_assistant_block'].includes(result.answerSource) ||\n      result.modeState?.searchEnabled !== true || result.isolatedSession !== true ||\n      result.submittedTurnMatched === false || result.conversationRestored === true ||\n      !(Number(result.searchCount) > 0) || !text(result.answerText)) {\n    throw new Error('BRIDGE_SEARCH_PROOF_MISSING');\n  }\n  let answer;\n  try { answer = JSON.parse(result.answerText.trim()); }\n  catch (_) { throw new Error('BRIDGE_JSON_INVALID'); }\n  if (!answer || typeof answer !== 'object' || Array.isArray(answer)) throw new Error('BRIDGE_JSON_INVALID');\n  return { answer, result };\n}\n\nfunction normalizeClaim(claim) {\n  if (!claim || typeof claim !== 'object') throw new Error('CLAIM_MISSING');\n  const fields = ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification'];\n  const normalized = {};\n  for (const field of fields) normalized[field] = text(claim[field], 500);\n  if (!normalized.subject || !normalized.eventDate || !normalized.metric ||\n      !normalized.value || !normalized.qualification) {\n    throw new Error('CLAIM_FIELDS_MISSING');\n  }\n  const urls = Array.isArray(claim.sourceUrls) ? claim.sourceUrls : [];\n  normalized.sourceUrls = urls.map(url => text(url, 1000)).filter(url => /^https?:\\/\\//i.test(url)).slice(0, 5);\n  if (!normalized.sourceUrls.length) throw new Error('CLAIM_SOURCE_MISSING');\n  return normalized;\n}\n\nfunction hasCapturedCitation(claim, result) {\n  const captured = new Set((Array.isArray(result.links) ? result.links : [])\n    .map(link => typeof link === 'string' ? link : link && link.href)\n    .map(url => text(url, 1000)).filter(Boolean));\n  return claim.sourceUrls.some(url => captured.has(url));\n}\n\nfunction parseSearch(state, transport) {\n  const attempts = state.attempts + 1;\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (answer.status !== 'FOUND' && answer.status !== 'UNKNOWN') throw new Error('SEARCH_SCHEMA_INVALID');\n    const candidate = answer.status === 'FOUND' ? normalizeClaim(answer.claim) : null;\n    if (candidate && !hasCapturedCitation(candidate, result)) throw new Error('CLAIM_CITATION_NOT_CAPTURED');\n    auditTrail.push({ attempt: attempts, phase: 'search', status: answer.status,\n      reason: text(answer.reason, 500), searchCount: result.searchCount,\n      links: candidate ? candidate.sourceUrls : [] });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1,\n      candidate, searchStatus: answer.status, auditTrail, canReview: true };\n  } catch (error) {\n    auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR', reason: error.message });\n    return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,\n      status: 'UNVERIFIED', reason: error.message, canReview: false };\n  }\n}\n\nfunction prepareReview(state, now = Date.now()) {\n  if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };\n  if (remainingMs(state, now) < 1000) {\n    return { ...state, canReview: false, status: 'UNVERIFIED',\n      reason: 'SEARCH_DEADLINE_EXCEEDED' };\n  }\n  const query = [\n    '请开启全新会话并实际使用智能搜索，独立核验这一条资料。主动找反证；不要只重复候选链接的摘要。不要预测股价。',\n    `股票：${state.symbol}；缺口：${state.gap.id}；问题：${state.gap.question}`,\n    `待核候选：${JSON.stringify(state.candidate)}`,\n    '只返回 JSON 对象：{\"verdict\":\"PASS|REJECT|UNKNOWN\",\"observed\":{\"subject\":\"\",\"eventDate\":\"\",\"metric\":\"\",\"value\":\"\",\"unit\":\"\",\"qualification\":\"\",\"sourceUrls\":[\"\"]},\"reason\":\"\"}。',\n    'PASS 仅在独立搜索结果支持候选的全部字段、数字、单位、时点和状态时使用；observed 填核实所得字段和链接。没有证据或无法判断用 UNKNOWN；发现不符用 REJECT，reason 精确指出差异。'\n  ].join('\\n');\n  return { ...state, canReview: true, reviewQuery: query };\n}\n\nfunction sameClaim(a, b) {\n  return ['subject', 'eventDate', 'metric', 'value', 'unit', 'qualification']\n    .every(field => a[field] === b[field]);\n}\n\nfunction applyReview(state, transport, now = Date.now()) {\n  const auditTrail = [...state.auditTrail];\n  try {\n    const { answer, result } = responseBody(transport);\n    if (!['PASS', 'REJECT', 'UNKNOWN'].includes(answer.verdict)) throw new Error('REVIEW_SCHEMA_INVALID');\n    let observed = null;\n    if (answer.verdict === 'PASS') observed = normalizeClaim(answer.observed);\n    if (observed && !hasCapturedCitation(observed, result)) throw new Error('REVIEW_CITATION_NOT_CAPTURED');\n    const pass = answer.verdict === 'PASS' && state.candidate &&\n      sameClaim(state.candidate, observed) && now <= Number(state.deadlineAt);\n    const reason = pass ? 'INDEPENDENT_SEARCH_MATCH' :\n      (now > Number(state.deadlineAt) ? 'SEARCH_DEADLINE_EXCEEDED' :\n        (answer.verdict === 'PASS' ? 'REVIEW_FIELDS_MISMATCH' : text(answer.reason, 500) || 'REVIEW_UNVERIFIED'));\n    auditTrail.push({ attempt: state.attempts, phase: 'review', verdict: pass ? 'PASS' : answer.verdict,\n      reason, searchCount: result.searchCount, links: observed ? observed.sourceUrls : [] });\n    if (pass) return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'VERIFIED', evidence: { ...state.candidate, source: 'DEEPSEEK_BRIDGE_CROSS_SEARCH',\n        candidateLinks: state.candidate.sourceUrls, reviewLinks: observed.sourceUrls }, reason };\n    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 1000;\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail, candidate: null,\n      status: canRetry ? 'PENDING' : 'UNVERIFIED', feedback: reason,\n      reason: canRetry ? '' : (now > Number(state.deadlineAt)\n        ? 'SEARCH_DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED') };\n  } catch (error) {\n    auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR', reason: error.message });\n    return { ...state, reviewCalls: state.reviewCalls + 1, auditTrail,\n      status: 'UNVERIFIED', candidate: null, reason: error.message };\n  }\n}\n\nfunction finalPacket(state) {\n  const verified = state.status === 'VERIFIED' && state.evidence;\n  return {\n    schemaVersion: state.schemaVersion, requestId: state.requestId, symbol: state.symbol,\n    gapId: state.gap.id, status: verified ? 'VERIFIED' : 'UNVERIFIED',\n    reasoningPacket: {\n      verifiedFacts: verified ? [{ gapId: state.gap.id, ...state.evidence }] : [],\n      limitations: verified ? [] : [`${state.gap.id}: ${state.reason || '未能交叉核验'}`]\n    },\n    audit: { attempts: state.attempts, searchCalls: state.searchCalls,\n      reviewCalls: state.reviewCalls, trail: state.auditTrail }\n  };\n}\n\nreturn [{ json: finalPacket($input.first().json) }];"
+      }
+    }
+  ],
+  "connections": {
+    "Meeting Evidence Input": {
+      "main": [
+        [
+          {
+            "node": "Normalize Gap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Gap": {
+      "main": [
+        [
+          {
+            "node": "Prepare Search 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Search 1": {
+      "main": [
+        [
+          {
+            "node": "Search Budget 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Budget 1": {
+      "main": [
+        [
+          {
+            "node": "Call Search 1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Search 1": {
+      "main": [
+        [
+          {
+            "node": "Prepare Review 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Review 1": {
+      "main": [
+        [
+          {
+            "node": "Review Gate 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Gate 1": {
+      "main": [
+        [
+          {
+            "node": "Call Review 1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Review 1": {
+      "main": [
+        [
+          {
+            "node": "Apply Review 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Review 1": {
+      "main": [
+        [
+          {
+            "node": "Retry Gap 1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Gap 1": {
+      "main": [
+        [
+          {
+            "node": "Prepare Search 2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Search 2": {
+      "main": [
+        [
+          {
+            "node": "Search Budget 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Budget 2": {
+      "main": [
+        [
+          {
+            "node": "Call Search 2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Search 2": {
+      "main": [
+        [
+          {
+            "node": "Prepare Review 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Review 2": {
+      "main": [
+        [
+          {
+            "node": "Review Gate 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Gate 2": {
+      "main": [
+        [
+          {
+            "node": "Call Review 2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Review 2": {
+      "main": [
+        [
+          {
+            "node": "Apply Review 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Review 2": {
+      "main": [
+        [
+          {
+            "node": "Retry Gap 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Gap 2": {
+      "main": [
+        [
+          {
+            "node": "Prepare Search 3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Search 3": {
+      "main": [
+        [
+          {
+            "node": "Search Budget 3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Budget 3": {
+      "main": [
+        [
+          {
+            "node": "Call Search 3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Search 3": {
+      "main": [
+        [
+          {
+            "node": "Prepare Review 3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Review 3": {
+      "main": [
+        [
+          {
+            "node": "Review Gate 3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Gate 3": {
+      "main": [
+        [
+          {
+            "node": "Call Review 3",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Review 3": {
+      "main": [
+        [
+          {
+            "node": "Apply Review 3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Review 3": {
+      "main": [
+        [
+          {
+            "node": "Retry Gap 3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry Gap 3": {
+      "main": [
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Final Evidence Packet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "mr60-evidence-gap-v1",
+  "triggerCount": 0,
+  "tags": []
+}
