@@ -36,7 +36,7 @@ function call(name, queryField, x, y) {
       sendBody: true, specifyBody: 'json',
       jsonBody: `={{ JSON.stringify({ query: $json.${queryField}, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'general.evidence-search', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 90000 }) }}`,
       options: {
-        timeout: '={{ Math.max(1000, Math.min($json.httpTimeoutMs, $json.deadlineAt - Date.now() - 1000)) }}',
+        timeout: '={{ $json.requestTimeoutMs }}',
         response: { response: { responseFormat: 'json', fullResponse: true, neverError: true } }
       }
     },

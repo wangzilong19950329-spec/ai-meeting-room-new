@@ -3,6 +3,7 @@
 const MAX_ATTEMPTS = 3;
 const MAX_DURATION_MS = 12 * 60 * 1000;
 const MAX_CLAIMS = 3;
+const MIN_PRODUCTION_HTTP_TIMEOUT_MS = 60 * 1000;
 const ENDPOINTS = new Set([
   'http://deepseek-facade:8793/search',
   'http://host.docker.internal:8794/search',
@@ -40,10 +41,19 @@ function remainingMs(state, now = Date.now()) {
   return Math.max(0, Number(state.deadlineAt) - now);
 }
 
+function nextHttpTimeoutMs(state, now = Date.now()) {
+  return Math.max(0, Math.min(state.httpTimeoutMs, remainingMs(state, now) - 1000));
+}
+
+function hasHttpWindow(state, now = Date.now()) {
+  return nextHttpTimeoutMs(state, now) >=
+    Math.min(MIN_PRODUCTION_HTTP_TIMEOUT_MS, state.httpTimeoutMs);
+}
+
 function prepareSearch(state, now = Date.now()) {
-  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || remainingMs(state, now) < 2000) {
+  if (state.status !== 'PENDING' || state.attempts >= MAX_ATTEMPTS || !hasHttpWindow(state, now)) {
     return { ...state, status: state.accepted.length ? 'PARTIAL' : 'UNVERIFIED',
-      reason: remainingMs(state, now) < 2000 ? 'DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED',
+      reason: !hasHttpWindow(state, now) ? 'DEADLINE_EXCEEDED' : 'SEARCH_BUDGET_EXHAUSTED',
       canSearch: false };
   }
   const target = state.retryIds.length
@@ -58,7 +68,8 @@ function prepareSearch(state, now = Date.now()) {
     '仅返回 JSON：{"status":"FOUND|UNKNOWN","claims":[{"id":"","statement":"","scope":"","period":"","value":"","unit":"","qualification":"","sourceUrls":[""]}],"reason":""}。',
     '链接须来自本次搜索；无证据填 UNKNOWN、claims=[]。范围、时间、数值及单位仅在相关时填写，不将局部样本外推为总体。'
   ].filter(Boolean).join('\n');
-  return { ...state, canSearch: true, retryReviewProof: false,
+  return { ...state, canSearch: true,
+    requestTimeoutMs: nextHttpTimeoutMs(state, now), retryReviewProof: false,
     retrySearchProof: false, searchQuery };
 }
 
@@ -155,7 +166,7 @@ function parseSearch(state, transport, now = Date.now()) {
     auditTrail.push({ attempt: attempts, phase: 'search', status: 'ERROR',
       reason: error.message, ...(error.proof ? { proof: error.proof } : {}) });
     const retryProof = ['BRIDGE_TURN_NOT_MATCHED', 'BRIDGE_SEARCH_NOT_OBSERVED'].includes(error.message) &&
-      attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 30000;
+      attempts < MAX_ATTEMPTS && hasHttpWindow(state, now);
     return { ...state, attempts, searchCalls: state.searchCalls + 1, auditTrail,
       candidate: [], canReview: false, retrySearchProof: retryProof,
       status: retryProof ? 'PENDING' : finalStatus(state), reason: error.message };
@@ -164,7 +175,7 @@ function parseSearch(state, transport, now = Date.now()) {
 
 function prepareReview(state, now = Date.now()) {
   if (!state.canReview || state.status !== 'PENDING') return { ...state, canReview: false };
-  if (remainingMs(state, now) < 2000) {
+  if (!hasHttpWindow(state, now)) {
     return { ...state, canReview: false, status: finalStatus(state), reason: 'DEADLINE_EXCEEDED' };
   }
   const reviewQuery = [
@@ -175,7 +186,8 @@ function prepareReview(state, now = Date.now()) {
     '仅返回 JSON：{"coverage":"COMPLETE|PARTIAL|UNKNOWN","coverageReason":"","verdicts":[{"id":"","verdict":"PASS|REJECT|UNKNOWN","observed":{"id":"","statement":"","scope":"","period":"","value":"","unit":"","qualification":"","sourceUrls":[""]},"reason":"","missingFields":[],"requestedSource":""}]}。',
     'PASS 时 observed 按候选字段原样填写，仅链接换成本次搜索捕获的来源；不符则 REJECT 并指出字段和所需来源，没证据用 UNKNOWN。'
   ].filter(Boolean).join('\n');
-  return { ...state, canReview: true, reviewQuery };
+  return { ...state, canReview: true,
+    requestTimeoutMs: nextHttpTimeoutMs(state, now), reviewQuery };
 }
 
 function sameClaim(a, b) {
@@ -226,7 +238,7 @@ function applyReview(state, transport, now = Date.now()) {
     if (!rejected.length) {
       const coverageReason = text(answer.coverageReason, 500) || 'QUESTION_NOT_FULLY_ANSWERED';
       const retryCoverage = coverage !== 'COMPLETE' && state.attempts < MAX_ATTEMPTS &&
-        remainingMs(state, now) >= 30000;
+        hasHttpWindow(state, now);
       return { ...state, accepted, candidate: [],
         reviewCalls: state.reviewCalls + 1, auditTrail, retryReviewProof: false,
         retryIds: [],
@@ -235,7 +247,7 @@ function applyReview(state, transport, now = Date.now()) {
           retryCoverage ? 'PENDING' : finalStatus({ accepted }),
         reason: coverage === 'COMPLETE' ? '' : coverageReason };
     }
-    const canRetry = state.attempts < MAX_ATTEMPTS && remainingMs(state, now) >= 2000;
+    const canRetry = state.attempts < MAX_ATTEMPTS && hasHttpWindow(state, now);
     return { ...state, accepted, candidate: [], reviewCalls: state.reviewCalls + 1,
       auditTrail, retryIds: rejected.map(item => item.id),
       retryReviewProof: false,
@@ -246,7 +258,7 @@ function applyReview(state, transport, now = Date.now()) {
     auditTrail.push({ attempt: state.attempts, phase: 'review', status: 'ERROR',
       reason: error.message, ...(error.proof ? { proof: error.proof } : {}) });
     const retryProof = ['BRIDGE_TURN_NOT_MATCHED', 'BRIDGE_SEARCH_NOT_OBSERVED'].includes(error.message) &&
-      state.reviewProofRetries < 1 && remainingMs(state, now) >= 30000;
+      state.reviewProofRetries < 1 && hasHttpWindow(state, now);
     if (retryProof) return { ...state, reviewCalls: state.reviewCalls + 1,
       reviewProofRetries: state.reviewProofRetries + 1, auditTrail,
       status: 'PENDING', reason: error.message, canReview: true,

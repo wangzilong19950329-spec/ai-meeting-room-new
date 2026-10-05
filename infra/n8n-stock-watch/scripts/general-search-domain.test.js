@@ -194,3 +194,25 @@ test('missing search proof retries only initial search within the search budget'
   assert.equal(state.searchCalls, 2);
   assert.equal(state.reviewCalls, 1);
 });
+
+test('production HTTP calls have at least one minute or stop before sending', () => {
+  const deadline = 12 * 60 * 1000;
+  const request = domain.normalizeRequest(input, 0);
+  assert.equal(domain.prepareSearch(request, 1).requestTimeoutMs, 300000);
+  const search = domain.prepareSearch(request, deadline - 61000);
+  assert.equal(search.canSearch, true);
+  assert.equal(search.requestTimeoutMs, 60000);
+  const skipped = domain.prepareSearch(request, deadline - 60000);
+  assert.equal(skipped.canSearch, false);
+  assert.equal(skipped.reason, 'DEADLINE_EXCEEDED');
+
+  const reviewState = { ...request, canReview: true, candidate: [claim] };
+  assert.equal(domain.prepareReview(reviewState, deadline - 61000).requestTimeoutMs, 60000);
+  const skippedReview = domain.prepareReview(reviewState, deadline - 60000);
+  assert.equal(skippedReview.canReview, false);
+  assert.equal(skippedReview.reason, 'DEADLINE_EXCEEDED');
+
+  const fixture = domain.normalizeRequest({ ...input, fixtureMode: true,
+    bridgeEndpoint: 'http://host.docker.internal:8794/search', httpTimeoutMs: 1000 }, 0);
+  assert.equal(domain.prepareSearch(fixture, 1).requestTimeoutMs, 1000);
+});

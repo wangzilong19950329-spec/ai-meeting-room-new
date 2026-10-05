@@ -13,6 +13,6 @@ test('every bridge call catches transport failures and preserves HTTP errors for
     assert.equal(call.onError, 'continueRegularOutput');
     assert.equal(call.parameters.options.response.response.neverError, true);
     assert.match(call.parameters.jsonBody, /queueTimeoutMs: 90000/);
-    assert.match(call.parameters.options.timeout, /deadlineAt/);
+    assert.equal(call.parameters.options.timeout, '={{ $json.requestTimeoutMs }}');
   }
 });
