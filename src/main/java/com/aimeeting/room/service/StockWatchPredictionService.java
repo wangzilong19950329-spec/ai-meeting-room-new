@@ -53,6 +53,9 @@ public class StockWatchPredictionService {
     @Value("${stock-watch.prediction.evaluation-batch-limit:200}")
     private int evaluationBatchLimit = 200;
 
+    @Value("${stock-watch.prediction.evaluation-enabled:true}")
+    private boolean evaluationEnabled = true;
+
     public List<StockWatchPrediction> savePredictions(Long analysisId,
                                                        String symbol,
                                                        String market,
@@ -215,6 +218,7 @@ public class StockWatchPredictionService {
     @Scheduled(fixedDelayString = "${stock-watch.prediction.evaluation-interval-ms:1800000}",
             initialDelayString = "${stock-watch.prediction.evaluation-initial-delay-ms:180000}")
     public void evaluatePending() {
+        if (!evaluationEnabled) return;
         runtimeGate.assertReady();
         int limit = effectiveEvaluationBatchLimit();
         List<StockWatchPrediction> pending = predictionMapper.selectPending(limit);

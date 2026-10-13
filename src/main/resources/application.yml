@@ -143,6 +143,8 @@ notification:
 
 # 股票盯盘后端定时器。页面关闭后仍可运行；机器睡眠后仍会暂停。
 stock-watch:
+  prediction:
+    evaluation-enabled: ${STOCK_WATCH_PREDICTION_EVALUATION_ENABLED:true}
   monitor:
     enabled: ${STOCK_WATCH_MONITOR_ENABLED:true}
     notify-enabled: ${STOCK_WATCH_NOTIFY_ENABLED:true}

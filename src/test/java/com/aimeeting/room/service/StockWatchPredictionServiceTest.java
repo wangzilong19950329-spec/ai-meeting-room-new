@@ -6,6 +6,7 @@ import com.aimeeting.room.dao.StockWatchPredictionMapper;
 import com.aimeeting.room.entity.StockWatchPrediction;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.sql.Date;
 import java.time.LocalDate;
@@ -29,11 +30,25 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class StockWatchPredictionServiceTest {
+
+    @Test
+    void disabledScheduledEvaluationDoesNotFetchOtherStockPrices() {
+        StockWatchPredictionMapper mapper = mock(StockWatchPredictionMapper.class);
+        EastmoneyMarketDataService marketData = mock(EastmoneyMarketDataService.class);
+        StockWatchV6RuntimeGate runtimeGate = mock(StockWatchV6RuntimeGate.class);
+        StockWatchPredictionService service = new StockWatchPredictionService(mapper, marketData, runtimeGate);
+        ReflectionTestUtils.setField(service, "evaluationEnabled", false);
+
+        service.evaluatePending();
+
+        verifyNoInteractions(mapper, marketData, runtimeGate);
+    }
 
     @Test
     void persistsOnlyValidStructuredForecasts() {
