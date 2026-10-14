@@ -343,9 +343,18 @@ public class StockWatchAnalysisTaskService {
     }
 
     public boolean shouldMarkUnknown(Throwable error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof StockWatchBridgeHttpException
+                    && ((StockWatchBridgeHttpException) current).isProviderOutcomeUnknown()) {
+                return true;
+            }
+            current = current.getCause();
+        }
         String value = error == null || error.getMessage() == null ? "" : error.getMessage().toLowerCase();
         return value.contains("timeout") || value.contains("timed out") || value.contains("unexpected end")
-                || value.contains("connection reset") || value.contains("bridge http 500") || value.contains("max_inflight");
+                || value.contains("connection reset") || value.contains("bridge http 500") || value.contains("max_inflight")
+                || value.contains("provider_outcome_unknown");
     }
 
     public boolean shouldMarkInvalid(Throwable error) {

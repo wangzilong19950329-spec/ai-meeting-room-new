@@ -1,6 +1,7 @@
 package com.aimeeting.room.service;
 
 import com.aimeeting.room.config.AiModelProperties;
+import com.aimeeting.room.config.MeetingReviewedSearchLedgerSchemaInitializer;
 import com.aimeeting.room.dao.AiMeetingMemberMapper;
 import com.aimeeting.room.dao.AiMeetingConclusionClusterMapper;
 import com.aimeeting.room.dao.AiMeetingOpinionMapper;
@@ -20,6 +21,7 @@ import com.aimeeting.room.entity.AiMeetingOpinion;
 import com.aimeeting.room.entity.AiMeetingRoom;
 import com.aimeeting.room.entity.AiMeetingVote;
 import com.aimeeting.room.entity.AiWorkflowTemplate;
+import com.aimeeting.room.entity.MeetingReviewedTurnSkip;
 import com.aimeeting.room.enums.MeetingStatusEnum;
 import com.aimeeting.room.enums.MemberRoleEnum;
 import com.aimeeting.room.enums.OpinionTypeEnum;
@@ -45,6 +47,15 @@ import java.util.stream.Collectors;
 @Service
 public class MeetingRoomService {
 
+    private static final String ENDED_TARGETED_ORIGINAL_STATUS = "endedTargetedOriginalStatus";
+
+    @Autowired private MeetingReviewedEvidenceService reviewedEvidenceService;
+    @Autowired private MeetingReviewedSearchLedgerService reviewedSearchLedgerService;
+    @Autowired private MeetingReviewedTurnSkipService reviewedTurnSkipService;
+    @Autowired private MeetingReviewedSearchProgressService reviewedSearchProgressService;
+    @Autowired private MeetingReviewedSearchLedgerSchemaInitializer reviewedSearchLedgerSchemaInitializer;
+    @Autowired private MeetingReviewedOpinionWriter reviewedOpinionWriter;
+    @Autowired private MeetingReviewedFinalizationWriter reviewedFinalizationWriter;
     @Autowired private AiMeetingRoomMapper roomMapper;
     @Autowired private AiMeetingMemberMapper memberMapper;
     @Autowired private AiMeetingConclusionClusterMapper clusterMapper;
@@ -150,25 +161,112 @@ public class MeetingRoomService {
                 && !MeetingStatusEnum.PAUSED.getCode().equals(room.getStatus()))
             throw new IllegalStateException("会议状态不允许启动: status=" + room.getStatus());
 
-        workflowService.ensureWorkflowForMeeting(room, null);
-        roomMapper.updateStatus(meetingId, MeetingStatusEnum.IN_PROGRESS.getCode());
-        if (workflowService.isDefaultRoundtableWorkflow(meetingId)) {
-            workflowService.activateMeetingWorkflow(meetingId);
-            meetingExecutor.submit(() -> runMeetingFlow(meetingId));
-        } else {
-            meetingExecutor.submit(() -> {
-                try {
-                    workflowService.activateMeetingWorkflow(meetingId);
-                } catch (Exception e) {
-                    log.error("Workflow activation error, meetingId={}", meetingId, e);
-                    AiMeetingRoom current = roomMapper.selectById(meetingId);
-                    if (current != null && isActiveStatus(current.getStatus())) {
-                        roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
-                    }
+        boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+        if (reviewed) reviewedSearchLedgerSchemaInitializer.requireReady();
+
+        if (MeetingStatusEnum.PAUSED.getCode().equals(room.getStatus())
+                && reviewed) {
+            // An ended meeting's targeted addendum must resume as one reply, not as a new voting round.
+            EndedTargetedFollowUp followUp = findEndedTargetedFollowUp(room);
+            if (followUp != null) {
+                if (followUp.answered) {
+                    claimReviewedStart(meetingId, room.getStatus(), epochOf(room), followUp.originalStatus);
+                    return;
                 }
-            });
+                long followUpEpoch = claimReviewedStart(meetingId, room.getStatus(), epochOf(room),
+                        MeetingStatusEnum.REOPENED.getCode());
+                try {
+                    meetingExecutor.submit(() -> retryEndedTargetedFollowUp(meetingId, followUp, followUpEpoch));
+                } catch (RuntimeException e) {
+                    pauseEndedTargetedFollowUp(meetingId, followUp.roundNumber,
+                            MeetingStatusEnum.REOPENED.getCode(), followUpEpoch, e);
+                    throw e;
+                }
+                log.info("Meeting {} resumes ended targeted follow-up for member {}", meetingId, followUp.memberId);
+                return;
+            }
+        }
+
+        Long runEpoch = null;
+        if (reviewed) {
+            runEpoch = claimReviewedStart(meetingId, room.getStatus(), epochOf(room),
+                    MeetingStatusEnum.IN_PROGRESS.getCode());
+        } else {
+            workflowService.ensureWorkflowForMeeting(room, null);
+            roomMapper.updateStatus(meetingId, MeetingStatusEnum.IN_PROGRESS.getCode());
+        }
+        try {
+            if (reviewed) {
+                workflowService.ensureWorkflowForMeeting(room, null);
+            }
+            if (workflowService.isDefaultRoundtableWorkflow(meetingId)) {
+                workflowService.activateMeetingWorkflow(meetingId);
+                Long capturedEpoch = runEpoch;
+                meetingExecutor.submit(() -> runMeetingFlow(meetingId, capturedEpoch));
+            } else {
+                Long capturedEpoch = runEpoch;
+                meetingExecutor.submit(() -> {
+                    try {
+                        workflowService.activateMeetingWorkflow(meetingId);
+                    } catch (Exception e) {
+                        log.error("Workflow activation error, meetingId={}", meetingId, e);
+                        AiMeetingRoom current = roomMapper.selectById(meetingId);
+                        if (current != null && isActiveStatus(current.getStatus())) {
+                            if (reviewed) {
+                                if (isMeetingInProgress(meetingId, capturedEpoch)) {
+                                    roomMapper.updateStatusIfCurrentAndEpoch(meetingId, current.getStatus(),
+                                            capturedEpoch, MeetingStatusEnum.PAUSED.getCode());
+                                }
+                            } else {
+                                roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+                            }
+                        }
+                    }
+                });
+            }
+        } catch (RuntimeException e) {
+            if (reviewed) {
+                try {
+                    if (roomMapper.updateStatusIfCurrentAndEpoch(meetingId,
+                            MeetingStatusEnum.IN_PROGRESS.getCode(), runEpoch,
+                            MeetingStatusEnum.PAUSED.getCode()) == 1) {
+                        workflowService.markReviewedEvidenceBlocked(meetingId,
+                                "会议启动失败：" + e.getMessage());
+                    }
+                } catch (RuntimeException rollbackError) {
+                    e.addSuppressed(rollbackError);
+                }
+            }
+            throw e;
         }
         log.info("Meeting started async: id={}", meetingId);
+    }
+
+    private long claimReviewedStart(Long meetingId, int expectedStatus, long expectedEpoch, int nextStatus) {
+        if (roomMapper.claimReviewedRun(meetingId, expectedStatus, expectedEpoch, nextStatus) != 1) {
+            AiMeetingRoom current = roomMapper.selectById(meetingId);
+            throw new IllegalStateException("会议状态已变化，无法重复启动: status="
+                    + (current == null ? "missing" : current.getStatus()));
+        }
+        return expectedEpoch + 1;
+    }
+
+    /** Preparation commits before the caller separately starts the paused meeting. */
+    public MeetingReviewedTurnSkip prepareReviewedTurnRetry(Long meetingId, Long memberId,
+            Long skipId, Integer expectedRound, Long expectedEpoch) {
+        if (reviewedEvidenceService == null || !reviewedEvidenceService.isEnabled()) {
+            throw new IllegalStateException("REVIEWED_SEARCH_DISABLED");
+        }
+        reviewedSearchLedgerSchemaInitializer.requireReady();
+        AiMeetingMember member = memberMapper.selectById(memberId);
+        if (member == null || !Objects.equals(member.getMeetingId(), meetingId)) {
+            throw new IllegalArgumentException("REVIEWED_RETRY_MEMBER_MISMATCH");
+        }
+        return reviewedTurnSkipService.prepareRetry(meetingId, memberId, skipId, expectedRound, expectedEpoch);
+    }
+
+    private long epochOf(AiMeetingRoom room) {
+        return room.getRunEpoch() == null ? 0L : room.getRunEpoch();
     }
 
     public MeetingDetailVO getMeetingDetail(Long meetingId) {
@@ -213,7 +311,14 @@ public class MeetingRoomService {
         if (!isActiveStatus(room.getStatus())) {
             throw new IllegalStateException("只有进行中的会议才能暂停: status=" + room.getStatus());
         }
-        roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+        if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+            if (roomMapper.updateStatusIfCurrentAndEpoch(meetingId, room.getStatus(), epochOf(room),
+                    MeetingStatusEnum.PAUSED.getCode()) != 1) {
+                throw new IllegalStateException("会议状态已变化，无法暂停");
+            }
+        } else {
+            roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+        }
         log.info("Meeting {} paused", meetingId);
     }
 
@@ -224,26 +329,58 @@ public class MeetingRoomService {
         if (!isActiveStatus(room.getStatus()))
             throw new IllegalStateException("只有进行中的或重开中的会议才能终止: status=" + room.getStatus());
 
-        ConsensusResult forced = consensusService.forceConclude(meetingId);
-        if (forced.getConclusion() == null || forced.getConclusion().isBlank()) {
-            forced = buildTerminationFallbackResult(meetingId);
+        boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+        Long terminationEpoch = null;
+        if (reviewed) {
+            if (roomMapper.bumpEpochIfStatusAndEpoch(meetingId, room.getStatus(), epochOf(room)) != 1) {
+                throw new IllegalStateException("会议运行代次已变化，无法终止");
+            }
+            terminationEpoch = epochOf(room) + 1;
         }
-        finalizeMeeting(meetingId, forced);
+        try {
+            ConsensusResult forced = consensusService.forceConclude(meetingId);
+            if (forced.getConclusion() == null || forced.getConclusion().isBlank()) {
+                forced = reviewed ? buildTerminationFallbackResultStrict(meetingId)
+                        : buildTerminationFallbackResult(meetingId);
+            }
+            finalizeMeeting(meetingId, forced, terminationEpoch);
+        } catch (RuntimeException e) {
+            if (reviewed) {
+                roomMapper.updateStatusIfCurrentAndEpoch(meetingId, room.getStatus(), terminationEpoch,
+                        MeetingStatusEnum.PAUSED.getCode());
+            }
+            throw e;
+        }
     }
 
     /** 重启会议：清空讨论记录，重置为待启动状态 */
+    @Transactional
     public void restartMeeting(Long meetingId) {
-        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        // Hold the room row lock until child deletion and reset commit. A concurrent
+        // start must not claim PAUSED while this operation is clearing its data.
+        AiMeetingRoom room = roomMapper.selectByIdForUpdate(meetingId);
         if (room == null) throw new IllegalArgumentException("会议不存在: " + meetingId);
         Integer status = room.getStatus();
         // 允许从已结论/已验证/已取消状态重启
-        if (MeetingStatusEnum.IN_PROGRESS.getCode().equals(status))
+        if (isActiveStatus(status))
             throw new IllegalStateException("请先终止进行中的会议再重启");
 
         clusterMapper.deleteByMeetingId(meetingId);
         opinionMapper.deleteByMeetingId(meetingId);
         voteMapper.deleteByMeetingId(meetingId);
-        roomMapper.resetForRestart(meetingId);
+        if (reviewedSearchLedgerService != null && reviewedSearchLedgerSchemaInitializer.hasLedgerTables()) {
+            reviewedSearchLedgerService.deleteByMeetingId(meetingId);
+        }
+        if (reviewedTurnSkipService != null && reviewedSearchLedgerSchemaInitializer.hasTurnSkipTable()) {
+            reviewedTurnSkipService.deleteByMeetingId(meetingId);
+        }
+        if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+            if (roomMapper.resetForRestartIfCurrentAndEpoch(meetingId, status, epochOf(room)) != 1) {
+                throw new IllegalStateException("会议状态或运行代次已变化，无法重启");
+            }
+        } else if (roomMapper.resetForRestart(meetingId) != 1) {
+            throw new IllegalStateException("会议状态已变化，无法重启");
+        }
         log.info("Meeting {} reset for restart", meetingId);
     }
 
@@ -253,10 +390,18 @@ public class MeetingRoomService {
      */
     @Transactional
     public void deleteMeeting(Long meetingId) {
-        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        // Serialize deletion against a concurrent start claim on this room.
+        AiMeetingRoom room = roomMapper.selectByIdForUpdate(meetingId);
         if (room == null) throw new IllegalArgumentException("会议不存在: " + meetingId);
         if (isActiveStatus(room.getStatus())) {
-            roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+            if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+                if (roomMapper.updateStatusIfCurrentAndEpoch(meetingId, room.getStatus(), epochOf(room),
+                        MeetingStatusEnum.PAUSED.getCode()) != 1) {
+                    throw new IllegalStateException("会议运行代次已变化，无法删除");
+                }
+            } else {
+                roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+            }
             log.info("Meeting {} paused before deletion", meetingId);
         }
 
@@ -267,6 +412,12 @@ public class MeetingRoomService {
         clusterMapper.deleteByMeetingId(meetingId);
         voteMapper.deleteByMeetingId(meetingId);
         opinionMapper.deleteByMeetingId(meetingId);
+        if (reviewedSearchLedgerService != null && reviewedSearchLedgerSchemaInitializer.hasLedgerTables()) {
+            reviewedSearchLedgerService.deleteByMeetingId(meetingId);
+        }
+        if (reviewedTurnSkipService != null && reviewedSearchLedgerSchemaInitializer.hasTurnSkipTable()) {
+            reviewedTurnSkipService.deleteByMeetingId(meetingId);
+        }
         memberMapper.deleteByMeetingId(meetingId);
         roomMapper.deleteById(meetingId);
         log.info("Meeting {} and all related data deleted", meetingId);
@@ -326,7 +477,11 @@ public class MeetingRoomService {
         opinion.setContent(content);
         opinion.setEvidence(buildHumanOpinionMeta(targetMember));
         opinion.setOpinionType(resolveHumanOpinionType(asDirective, targetMember));
-        opinionMapper.insert(opinion);
+        if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+            reviewedOpinionWriter.insertHumanIfCurrent(opinion, epochOf(room), status);
+        } else {
+            opinionMapper.insert(opinion);
+        }
         log.info("Human intervention added to meeting {} directive={} targetMemberId={} content={}",
                 meetingId, asDirective, targetMember != null ? targetMember.getId() : null, content);
     }
@@ -388,64 +543,158 @@ public class MeetingRoomService {
 
     // ---- 内部流程 ----
 
-    private void runMeetingFlow(Long meetingId) {
+    private void runMeetingFlow(Long meetingId, Long expectedEpoch) {
         try {
             AiMeetingRoom room = roomMapper.selectById(meetingId);
             if (room == null) {
                 log.warn("Meeting {} disappeared before async flow started", meetingId);
                 return;
             }
+            boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+            if (reviewed && (expectedEpoch == null || !isMeetingInProgress(meetingId, expectedEpoch))) return;
             int startRound = room.getCurrentRound() > 0 ? room.getCurrentRound() + 1 : 1;
-            int endRound = startRound + room.getMaxRounds() - 1;
+            if (reviewed && room.getCurrentRound() > 0 && !hasRoundSummary(room, room.getCurrentRound())) {
+                // An interrupted search, vote, clustering or summary resumes the same round.
+                startRound = room.getCurrentRound();
+            }
+            if (reviewed && room.getCurrentRound() > 0 && hasRoundSummary(room, room.getCurrentRound())) {
+                // Old checkpoints may have a summary without enough reviewed speakers or ballots.
+                requireReviewedQuorum(meetingId, room.getCurrentRound(), false);
+                requireReviewedQuorum(meetingId, room.getCurrentRound(), true);
+                ConsensusResult previous = consensusService.checkConsensus(meetingId, room.getCurrentRound());
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
+                if (previous.isConsensusReached()) {
+                    finalizeMeeting(meetingId, previous, expectedEpoch);
+                    return;
+                }
+                if (room.getCurrentRound() >= room.getMaxRounds()) {
+                    if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
+                    finalizeMeeting(meetingId, consensusService.forceConclude(meetingId), expectedEpoch);
+                    return;
+                }
+            }
+            int endRound = reviewed ? room.getMaxRounds() : startRound + room.getMaxRounds() - 1;
 
             for (int round = startRound; round <= endRound; round++) {
-                if (!isMeetingInProgress(meetingId)) return;
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
 
                 log.info("Meeting {} round {} starting", meetingId, round);
-                roomMapper.updateCurrentRound(meetingId, round);
+                if (reviewed) {
+                    if (roomMapper.updateCurrentRoundIfEpoch(meetingId, expectedEpoch, round) != 1) return;
+                } else {
+                    roomMapper.updateCurrentRound(meetingId, round);
+                }
 
-                debateService.executeDebateRound(meetingId, round);
-                if (!isMeetingInProgress(meetingId)) return;
+                if (reviewed) {
+                    debateService.executeDebateRound(meetingId, round, expectedEpoch);
+                } else {
+                    debateService.executeDebateRound(meetingId, round);
+                }
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
 
-                consensusService.conductVoting(meetingId, round);
-                if (!isMeetingInProgress(meetingId)) return;
+                if (reviewed) requireReviewedQuorum(meetingId, round, false);
 
-                consensusService.clusterVotePositions(meetingId, round);
-                if (!isMeetingInProgress(meetingId)) return;
+                if (reviewed) {
+                    consensusService.conductVoting(meetingId, round, expectedEpoch);
+                } else {
+                    consensusService.conductVoting(meetingId, round);
+                }
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
+
+                if (reviewed) requireReviewedQuorum(meetingId, round, true);
+
+                if (reviewed) {
+                    consensusService.clusterVotePositions(meetingId, round, expectedEpoch);
+                } else {
+                    consensusService.clusterVotePositions(meetingId, round);
+                }
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
 
                 // 生成本轮摘要（用 deepseek-chat 快速调用，节约成本）
-                generateAndSaveRoundSummary(meetingId, round);
-                if (!isMeetingInProgress(meetingId)) return;
+                generateAndSaveRoundSummary(meetingId, round, expectedEpoch);
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
 
                 ConsensusResult result = consensusService.checkConsensus(meetingId, round);
+                if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
                 if (result.isConsensusReached()) {
-                    finalizeMeeting(meetingId, result);
+                    finalizeMeeting(meetingId, result, expectedEpoch);
                     return;
                 }
                 log.info("Meeting {} round {} no consensus yet", meetingId, round);
             }
 
             // 达到最大轮数，强制结论
+            if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
             log.info("Meeting {} max rounds reached, forcing conclusion", meetingId);
             ConsensusResult forced = consensusService.forceConclude(meetingId);
-            finalizeMeeting(meetingId, forced);
+            if (!isMeetingInProgress(meetingId, expectedEpoch)) return;
+            finalizeMeeting(meetingId, forced, expectedEpoch);
 
         } catch (Exception e) {
             log.error("Meeting flow error, meetingId={}", meetingId, e);
-            if (isMeetingInProgress(meetingId)) {
-                roomMapper.updateStatus(meetingId, MeetingStatusEnum.CANCELLED.getCode());
+            if (isMeetingInProgress(meetingId, expectedEpoch)) {
+                if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+                    AiMeetingRoom current = roomMapper.selectById(meetingId);
+                    if (current != null && roomMapper.updateStatusIfCurrentAndEpoch(
+                            meetingId, current.getStatus(), expectedEpoch,
+                            MeetingStatusEnum.PAUSED.getCode()) == 1) {
+                        workflowService.markReviewedEvidenceBlocked(meetingId,
+                                "会议模型或审核步骤失败：" + e.getMessage());
+                    }
+                } else {
+                    roomMapper.updateStatus(meetingId, MeetingStatusEnum.CANCELLED.getCode());
+                }
             }
         }
     }
 
-    private void generateAndSaveRoundSummary(Long meetingId, int round) {
+    /** A missing speaker may not stop peers, but a minority cannot decide for the room. */
+    private void requireReviewedQuorum(Long meetingId, int roundNumber, boolean afterVoting) {
+        int total = memberMapper.countByMeetingId(meetingId);
+        int required = total <= 1 ? 1 : total / 2 + 1;
+        Set<Long> eligible = consensusService.reviewedEligibleSpeakerIds(meetingId, roundNumber);
+        if (eligible.size() < required) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected(
+                    "本轮有效发言不足：需要 " + required + " 位，实际 " + eligible.size() + " 位");
+        }
+        if (afterVoting) {
+            long votes = voteMapper.selectByMeetingIdAndRound(meetingId, roundNumber).stream()
+                    .map(AiMeetingVote::getMemberId)
+                    .filter(eligible::contains)
+                    .distinct().count();
+            if (votes < required) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected(
+                        "本轮有效投票不足：需要 " + required + " 票，实际 " + votes + " 票");
+            }
+        }
+    }
+
+    private boolean hasRoundSummary(AiMeetingRoom room, int round) {
+        if (room == null || room.getRoundSummaries() == null) return false;
         try {
-            String meetingModelType = orchestrator.resolveOperationalMeetingModelType(meetingId);
-            String summaryText = orchestrator.callModel(meetingModelType,
-                    "你是会议记录员，请用一到两句话（100字以内）概括本轮讨论的核心分歧和主要共识，输出纯文本。",
-                    orchestrator.buildRoundSummaryPrompt(meetingId, round),
-                    220);
+            com.alibaba.fastjson.JSONArray summaries = com.alibaba.fastjson.JSON.parseArray(room.getRoundSummaries());
+            return summaries != null && summaries.stream().anyMatch(item -> item instanceof com.alibaba.fastjson.JSONObject
+                    && ((com.alibaba.fastjson.JSONObject) item).getIntValue("round") == round);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void generateAndSaveRoundSummary(Long meetingId, int round, Long expectedEpoch) {
+        try {
+            boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+            if (reviewed && hasRoundSummary(roomMapper.selectById(meetingId), round)) return;
+            String meetingModelType = reviewed ? orchestrator.resolveMeetingModelType(meetingId)
+                    : orchestrator.resolveOperationalMeetingModelType(meetingId);
+            String summaryText = reviewed
+                    ? orchestrator.callModelStrict(meetingModelType,
+                        "你是会议记录员，请用一到两句话（100字以内）概括本轮讨论的核心分歧和主要共识，输出纯文本。",
+                        orchestrator.buildRoundSummaryPrompt(meetingId, round), 220)
+                    : orchestrator.callModel(meetingModelType,
+                        "你是会议记录员，请用一到两句话（100字以内）概括本轮讨论的核心分歧和主要共识，输出纯文本。",
+                        orchestrator.buildRoundSummaryPrompt(meetingId, round), 220);
             if (summaryText == null || summaryText.isBlank()) return;
+            if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
 
             // 读取现有 roundSummaries JSON，追加本轮摘要
             AiMeetingRoom room = roomMapper.selectById(meetingId);
@@ -461,14 +710,20 @@ public class MeetingRoomService {
             entry.put("round", round);
             entry.put("summary", summaryText.trim());
             arr.add(entry);
-            roomMapper.updateRoundSummaries(meetingId, arr.toJSONString());
+            if (reviewed) {
+                if (roomMapper.updateRoundSummariesIfEpoch(meetingId, expectedEpoch,
+                        arr.toJSONString()) != 1) return;
+            } else {
+                roomMapper.updateRoundSummaries(meetingId, arr.toJSONString());
+            }
             log.info("Round {} summary saved for meeting {}", round, meetingId);
         } catch (Exception e) {
+            if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) throw e;
             log.warn("Failed to generate round summary for meeting {} round {}: {}", meetingId, round, e.getMessage());
         }
     }
 
-    private void finalizeMeeting(Long meetingId, ConsensusResult result) {
+    private void finalizeMeeting(Long meetingId, ConsensusResult result, Long expectedEpoch) {
         AiMeetingRoom existing = roomMapper.selectById(meetingId);
         if (existing == null) {
             log.warn("Skip finalizing missing meeting {}", meetingId);
@@ -481,8 +736,19 @@ public class MeetingRoomService {
         if (result == null) {
             result = new ConsensusResult();
         }
+        boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+        if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
+        if (reviewed && (result.getConclusion() == null || result.getConclusion().isBlank())) {
+            throw new IllegalStateException("meeting_conclusion_unavailable");
+        }
         if (result.getConclusion() == null || result.getConclusion().isBlank()) {
             result.setConclusion(buildFallbackConclusion(existing));
+        }
+        if (reviewed && hasLowConfidenceReviewedStatement(meetingId, existing.getCurrentRound())) {
+            String warning = "【本轮部分材料未经充分交叉核验；以下结论为条件性判断】\n";
+            if (!result.getConclusion().startsWith(warning)) {
+                result.setConclusion(warning + result.getConclusion());
+            }
         }
 
         Date concludedAt = new Date();
@@ -493,31 +759,51 @@ public class MeetingRoomService {
         concludedRoom.setStatus(MeetingStatusEnum.CONCLUDED.getCode());
 
         // 生成总结
-        String meetingModelType = orchestrator.resolveOperationalMeetingModelType(meetingId);
-        String summary = orchestrator.callModel(meetingModelType,
-                "你是专业会议记录员，请生成结构化会议总结。",
-                orchestrator.buildSummaryPrompt(meetingId));
+        String meetingModelType = reviewed ? orchestrator.resolveMeetingModelType(meetingId)
+                : orchestrator.resolveOperationalMeetingModelType(meetingId);
+        String reviewedAttendance = reviewed
+                ? buildReviewedFinalizationAttendance(meetingId, existing.getCurrentRound(), result)
+                : "";
+        String summary = reviewed
+                ? orchestrator.callModelStrict(meetingModelType,
+                    "你是专业会议记录员，请生成结构化会议总结。",
+                    orchestrator.buildSummaryPrompt(meetingId, result.getConclusion())
+                            + reviewedAttendance, null)
+                : orchestrator.callModel(meetingModelType,
+                    "你是专业会议记录员，请生成结构化会议总结。",
+                    orchestrator.buildSummaryPrompt(meetingId));
+        if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
         if (summary != null) {
-            roomMapper.updateSummary(meetingId, summary);
+            if (reviewed) {
+                if (roomMapper.updateSummaryIfEpoch(meetingId, expectedEpoch, summary) != 1) return;
+            } else {
+                roomMapper.updateSummary(meetingId, summary);
+            }
         }
-        String decisionArtifact = orchestrator.callModel(
-                meetingModelType,
-                "你是企业决策秘书。请将会议结果整理成严格 JSON 决策卡片，便于后续项目复用。不要输出 JSON 以外的任何文字。",
-                orchestrator.buildDecisionArtifactPrompt(meetingId)
-        );
-        String artifactJson = buildDecisionArtifactJson(meetingId, result.getConclusion(), summary, decisionArtifact);
+        String decisionArtifact = reviewed
+                ? orchestrator.callModelStrict(meetingModelType,
+                    "你是企业决策秘书。请将会议结果整理成严格 JSON 决策卡片，便于后续项目复用。不要输出 JSON 以外的任何文字。",
+                    orchestrator.buildDecisionArtifactPrompt(meetingId, result.getConclusion())
+                            + reviewedAttendance + "\n只输出 JSON，不要 Markdown，不要代码块。", null)
+                : orchestrator.callModel(meetingModelType,
+                    "你是企业决策秘书。请将会议结果整理成严格 JSON 决策卡片，便于后续项目复用。不要输出 JSON 以外的任何文字。",
+                    orchestrator.buildDecisionArtifactPrompt(meetingId));
+        if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
+        String artifactJson = reviewed
+                ? buildDecisionArtifactJsonStrict(meetingId, result.getConclusion(), summary, decisionArtifact)
+                : buildDecisionArtifactJson(meetingId, result.getConclusion(), summary, decisionArtifact);
 
         AiMeetingRoom conclusionContext = roomMapper.selectById(meetingId);
         if (conclusionContext == null) {
             log.warn("Meeting {} disappeared before conclusion persistence", meetingId);
             return;
         }
+        String expectedConclusionHistory = conclusionContext.getConclusionHistory();
         conclusionContext.setFinalConclusion(result.getConclusion());
         conclusionContext.setConclusionTime(concludedAt);
         conclusionContext.setStatus(MeetingStatusEnum.CONCLUDED.getCode());
 
-        roomMapper.updateDecisionArtifact(meetingId, artifactJson);
-        roomMapper.updateConclusionHistory(meetingId, appendConclusionHistoryEvent(
+        String conclusionHistory = appendConclusionHistoryEvent(
                 conclusionContext,
                 "CONCLUDED",
                 result.getConclusion(),
@@ -526,12 +812,18 @@ public class MeetingRoomService {
                         : "会议首次达成结论",
                 existing.getCurrentRound(),
                 concludedAt
-        ));
-        workflowService.markMeetingConcluded(
-                conclusionContext,
-                parseDecisionArtifact(artifactJson)
         );
-        roomMapper.updateConclusion(concludedRoom);
+        if (reviewed) {
+            reviewedFinalizationWriter.concludeIfCurrent(meetingId, expectedEpoch,
+                    existing.getStatus(), existing.getCurrentRound(), expectedConclusionHistory,
+                    artifactJson, conclusionHistory, result.getConclusion(), concludedAt);
+            workflowService.markMeetingConcluded(conclusionContext, parseDecisionArtifact(artifactJson));
+        } else {
+            roomMapper.updateDecisionArtifact(meetingId, artifactJson);
+            roomMapper.updateConclusionHistory(meetingId, conclusionHistory);
+            workflowService.markMeetingConcluded(conclusionContext, parseDecisionArtifact(artifactJson));
+            roomMapper.updateConclusion(concludedRoom);
+        }
         log.info("Meeting {} concluded: {}", meetingId, result.getConclusion());
 
         // 发送微信通知
@@ -540,7 +832,56 @@ public class MeetingRoomService {
                 concluded.getTitle(), result.getConclusion());
     }
 
-    private boolean isMeetingInProgress(Long meetingId) {
+    private String buildReviewedFinalizationAttendance(Long meetingId, int roundNumber,
+                                                        ConsensusResult result) {
+        List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
+        Map<Long, String> names = members.stream().collect(Collectors.toMap(
+                AiMeetingMember::getId, AiMeetingMember::getMemberName, (first, ignored) -> first));
+        Set<Long> absent = result.getAbsentMemberIds() != null
+                ? new HashSet<>(result.getAbsentMemberIds())
+                : new HashSet<>(names.keySet());
+        if (result.getAbsentMemberIds() == null) {
+            Set<Long> eligible = consensusService.reviewedEligibleSpeakerIds(meetingId, roundNumber);
+            voteMapper.selectByMeetingIdAndRound(meetingId, roundNumber).stream()
+                    .map(AiMeetingVote::getMemberId).filter(eligible::contains).forEach(absent::remove);
+        }
+        List<String> absentNames = members.stream().map(AiMeetingMember::getId)
+                .filter(absent::contains).map(names::get).collect(Collectors.toList());
+        List<MeetingReviewedTurnSkip> skipped = reviewedTurnSkipService.listSkippedByMeetingAndRound(
+                meetingId, roundNumber);
+        List<String> skippedNames = skipped.stream()
+                .map(skip -> names.getOrDefault(skip.getMemberId(), "议员" + skip.getMemberId())
+                        + "（" + skip.getReasonCode() + "）")
+                .collect(Collectors.toList());
+        return "\n【第" + roundNumber + "轮未投票席位】"
+                + (absentNames.isEmpty() ? "无" : String.join("、", absentNames))
+                + "\n【本轮资料或模型失败而跳过发言的席位】"
+                + (skippedNames.isEmpty() ? "无" : String.join("、", skippedNames))
+                + "\n上述未投票或跳过席位没有本轮有效立场，不得代写其观点或将其计入支持者、反对者。\n";
+    }
+
+    private boolean hasLowConfidenceReviewedStatement(Long meetingId, int roundNumber) {
+        Set<Long> eligible = consensusService.reviewedEligibleSpeakerIds(meetingId, roundNumber);
+        List<AiMeetingOpinion> opinions = opinionMapper.selectByMeetingIdAndRound(meetingId, roundNumber);
+        if (opinions == null) return false;
+        for (AiMeetingOpinion opinion : opinions) {
+            if (opinion == null || !eligible.contains(opinion.getMemberId())
+                    || !Objects.equals(opinion.getOpinionType(), OpinionTypeEnum.STATEMENT.getCode())
+                    || opinion.getEvidence() == null) continue;
+            try {
+                com.alibaba.fastjson.JSONObject evidence =
+                        com.alibaba.fastjson.JSON.parseObject(opinion.getEvidence());
+                if (evidence != null && "LOW_CONFIDENCE".equals(evidence.getString("reviewedSearchStatus"))) {
+                    return true;
+                }
+            } catch (RuntimeException ignored) {
+                // Malformed evidence never changes the finalization caveat.
+            }
+        }
+        return false;
+    }
+
+    private boolean isMeetingInProgress(Long meetingId, Long expectedEpoch) {
         AiMeetingRoom current = roomMapper.selectById(meetingId);
         if (current == null) {
             log.warn("Meeting {} disappeared during async flow", meetingId);
@@ -550,49 +891,199 @@ public class MeetingRoomService {
             log.info("Meeting {} no longer in progress, stop async flow at status={}", meetingId, current.getStatus());
             return false;
         }
+        if (expectedEpoch != null && epochOf(current) != expectedEpoch) {
+            log.info("Meeting {} worker epoch {} is stale; current epoch={}",
+                    meetingId, expectedEpoch, epochOf(current));
+            return false;
+        }
         return true;
     }
 
     private void reopenMeetingForFollowUp(AiMeetingRoom room, String content, boolean asDirective, Long targetMemberId) {
         int nextRound = room.getCurrentRound() > 0 ? room.getCurrentRound() + 1 : 1;
+        int originalStatus = room.getStatus();
         AiMeetingMember targetMember = resolveTargetMember(room.getId(), targetMemberId);
+        boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+        Long reopenedEpoch = reviewed
+                ? claimReviewedStart(room.getId(), originalStatus, epochOf(room),
+                        MeetingStatusEnum.REOPENED.getCode())
+                : null;
         AiMeetingOpinion opinion = new AiMeetingOpinion();
         opinion.setMeetingId(room.getId());
         opinion.setMemberId(0L);
         opinion.setRoundNumber(nextRound);
         opinion.setContent(content);
-        opinion.setEvidence(buildHumanOpinionMeta(targetMember));
+        String humanEvidence = buildHumanOpinionMeta(targetMember);
+        if (!asDirective && targetMember != null && reviewed) {
+            com.alibaba.fastjson.JSONObject meta = com.alibaba.fastjson.JSON.parseObject(humanEvidence);
+            meta.put(ENDED_TARGETED_ORIGINAL_STATUS, originalStatus);
+            humanEvidence = meta.toJSONString();
+        }
+        opinion.setEvidence(humanEvidence);
         opinion.setOpinionType(resolveHumanOpinionType(asDirective, targetMember));
-        opinionMapper.insert(opinion);
+        try {
+            opinionMapper.insert(opinion);
+        } catch (RuntimeException e) {
+            if (reviewed) {
+                roomMapper.updateStatusIfCurrentAndEpoch(room.getId(),
+                        MeetingStatusEnum.REOPENED.getCode(), reopenedEpoch,
+                        MeetingStatusEnum.PAUSED.getCode());
+            }
+            throw e;
+        }
 
         if (!asDirective && targetMember != null) {
-            roomMapper.updateCurrentRound(room.getId(), nextRound);
-            roomMapper.updateConclusionHistory(room.getId(), appendConclusionHistoryEvent(
+            if (reviewed) {
+                if (roomMapper.updateCurrentRoundIfEpoch(room.getId(), reopenedEpoch, nextRound) != 1) return;
+            } else {
+                roomMapper.updateCurrentRound(room.getId(), nextRound);
+            }
+            String history = appendConclusionHistoryEvent(
                     room,
                     "FOLLOW_UP_TARGETED",
                     null,
                     content,
                     nextRound,
                     new Date()
-            ));
-            debateService.generateSingleTargetReply(room.getId(), targetMember.getId(), nextRound);
+            );
+            if (reviewed) {
+                if (roomMapper.updateConclusionHistoryIfEpoch(room.getId(), reopenedEpoch, history) != 1) return;
+            } else {
+                roomMapper.updateConclusionHistory(room.getId(), history);
+            }
+            try {
+                if (reviewed) {
+                    debateService.generateSingleTargetReply(room.getId(), targetMember.getId(),
+                            nextRound, reopenedEpoch);
+                    roomMapper.updateStatusIfCurrentAndEpoch(room.getId(),
+                            MeetingStatusEnum.REOPENED.getCode(), reopenedEpoch, originalStatus);
+                } else {
+                    debateService.generateSingleTargetReply(room.getId(), targetMember.getId(), nextRound);
+                }
+            } catch (RuntimeException e) {
+                if (reviewed) {
+                    pauseEndedTargetedFollowUp(room.getId(), nextRound,
+                            MeetingStatusEnum.REOPENED.getCode(), reopenedEpoch, e);
+                }
+                throw e;
+            }
             log.info("Meeting {} handled targeted follow-up synchronously for member {}", room.getId(), targetMember.getId());
             return;
         }
 
-        roomMapper.updateStatus(room.getId(), MeetingStatusEnum.REOPENED.getCode());
-        roomMapper.updateCurrentRound(room.getId(), nextRound - 1);
-        roomMapper.updateConclusionHistory(room.getId(), appendConclusionHistoryEvent(
+        if (reviewed) {
+            if (roomMapper.updateCurrentRoundIfEpoch(room.getId(), reopenedEpoch, nextRound - 1) != 1) return;
+        } else {
+            roomMapper.updateStatus(room.getId(), MeetingStatusEnum.REOPENED.getCode());
+            roomMapper.updateCurrentRound(room.getId(), nextRound - 1);
+        }
+        String history = appendConclusionHistoryEvent(
                 room,
                 "REOPEN_HUMAN",
                 null,
                 content,
                 nextRound - 1,
                 new Date()
-        ));
+        );
+        if (reviewed) {
+            if (roomMapper.updateConclusionHistoryIfEpoch(room.getId(), reopenedEpoch, history) != 1) return;
+        } else {
+            roomMapper.updateConclusionHistory(room.getId(), history);
+        }
         workflowService.reopenMeetingWorkflow(room.getId());
-        meetingExecutor.submit(() -> runMeetingFlow(room.getId()));
+        meetingExecutor.submit(() -> runMeetingFlow(room.getId(), reopenedEpoch));
         log.info("Meeting {} reopened by human follow-up, directive={}, nextRound={}", room.getId(), asDirective, nextRound);
+    }
+
+    private void retryEndedTargetedFollowUp(Long meetingId, EndedTargetedFollowUp followUp,
+                                             long expectedEpoch) {
+        try {
+            AiMeetingRoom current = roomMapper.selectById(meetingId);
+            if (current == null || !MeetingStatusEnum.REOPENED.getCode().equals(current.getStatus())
+                    || epochOf(current) != expectedEpoch) return;
+            EndedTargetedFollowUp latest = findEndedTargetedFollowUp(current);
+            if (latest == null || !followUp.questionId.equals(latest.questionId)) {
+                throw new IllegalStateException("targeted_follow_up_identity_changed");
+            }
+            if (!latest.answered) {
+                debateService.generateSingleTargetReply(meetingId, followUp.memberId,
+                        followUp.roundNumber, expectedEpoch);
+            }
+            current = roomMapper.selectById(meetingId);
+            if (current != null && MeetingStatusEnum.REOPENED.getCode().equals(current.getStatus())
+                    && epochOf(current) == expectedEpoch) {
+                roomMapper.updateStatusIfCurrentAndEpoch(meetingId,
+                        MeetingStatusEnum.REOPENED.getCode(), expectedEpoch, followUp.originalStatus);
+            }
+        } catch (RuntimeException e) {
+            pauseEndedTargetedFollowUp(meetingId, followUp.roundNumber,
+                    MeetingStatusEnum.REOPENED.getCode(), expectedEpoch, e);
+            log.error("Meeting {} ended targeted follow-up retry failed", meetingId, e);
+        }
+    }
+
+    private void pauseEndedTargetedFollowUp(Long meetingId, int roundNumber,
+                                           int expectedStatus, long expectedEpoch, RuntimeException failure) {
+        if (roomMapper.updateStatusIfCurrentAndEpoch(meetingId, expectedStatus, expectedEpoch,
+                MeetingStatusEnum.PAUSED.getCode()) != 1) {
+            log.info("Meeting {} targeted follow-up failure arrived after status changed", meetingId);
+            return;
+        }
+        AiMeetingRoom current = roomMapper.selectById(meetingId);
+        if (current != null) {
+            String reason = "点名追问资料或发言失败：" + failure.getMessage();
+            roomMapper.updateConclusionHistoryIfEpoch(meetingId, expectedEpoch + 1,
+                    appendConclusionHistoryEvent(
+                    current, "FOLLOW_UP_TARGETED_BLOCKED", current.getFinalConclusion(),
+                    reason, roundNumber, new Date()));
+        }
+        log.warn("Meeting {} paused after targeted follow-up failure: {}", meetingId, failure.getMessage());
+    }
+
+    private EndedTargetedFollowUp findEndedTargetedFollowUp(AiMeetingRoom room) {
+        if (room == null || room.getId() == null || room.getCurrentRound() == null) return null;
+        List<AiMeetingOpinion> roundOpinions = opinionMapper.selectByMeetingIdAndRound(
+                room.getId(), room.getCurrentRound());
+        if (roundOpinions == null || roundOpinions.isEmpty()) return null;
+        for (int i = roundOpinions.size() - 1; i >= 0; i--) {
+            AiMeetingOpinion question = roundOpinions.get(i);
+            if (question == null || !OpinionTypeEnum.HUMAN_TARGETED.getCode().equals(question.getOpinionType())
+                    || question.getId() == null || question.getEvidence() == null) continue;
+            com.alibaba.fastjson.JSONObject meta;
+            try {
+                meta = com.alibaba.fastjson.JSON.parseObject(question.getEvidence());
+            } catch (Exception ignored) {
+                continue;
+            }
+            if (meta == null) continue;
+            Integer originalStatus = meta.getInteger(ENDED_TARGETED_ORIGINAL_STATUS);
+            Long memberId = meta.getLong("targetMemberId");
+            if (!isEndedStatus(originalStatus) || memberId == null) continue;
+            boolean answered = roundOpinions.stream().anyMatch(opinion -> opinion != null
+                    && question.getId().equals(opinion.getParentOpinionId())
+                    && memberId.equals(opinion.getMemberId())
+                    && OpinionTypeEnum.STATEMENT.getCode().equals(opinion.getOpinionType()));
+            return new EndedTargetedFollowUp(question.getId(), memberId,
+                    room.getCurrentRound(), originalStatus, answered);
+        }
+        return null;
+    }
+
+    private static final class EndedTargetedFollowUp {
+        private final Long questionId;
+        private final Long memberId;
+        private final int roundNumber;
+        private final int originalStatus;
+        private final boolean answered;
+
+        private EndedTargetedFollowUp(Long questionId, Long memberId, int roundNumber,
+                                      int originalStatus, boolean answered) {
+            this.questionId = questionId;
+            this.memberId = memberId;
+            this.roundNumber = roundNumber;
+            this.originalStatus = originalStatus;
+            this.answered = answered;
+        }
     }
 
     private ConsensusResult buildTerminationFallbackResult(Long meetingId) {
@@ -605,6 +1096,20 @@ public class MeetingRoomService {
             conclusion = "会议已终止，当前讨论尚未形成稳定共识。";
         }
 
+        ConsensusResult result = new ConsensusResult();
+        result.setConsensusReached(false);
+        result.setConclusion(conclusion.trim());
+        return result;
+    }
+
+    private ConsensusResult buildTerminationFallbackResultStrict(Long meetingId) {
+        String conclusion = orchestrator.callModelStrict(
+                orchestrator.resolveMeetingModelType(meetingId),
+                "你是会议主持人。请基于当前已记录的讨论给出一句话临时结论；若分歧明显请说明尚未形成共识。只输出一句中文结论。",
+                orchestrator.buildSummaryPrompt(meetingId), null);
+        if (conclusion == null || conclusion.isBlank()) {
+            throw new IllegalStateException("meeting_termination_conclusion_unavailable");
+        }
         ConsensusResult result = new ConsensusResult();
         result.setConsensusReached(false);
         result.setConclusion(conclusion.trim());
@@ -635,6 +1140,11 @@ public class MeetingRoomService {
         vo.setTracking(workflowService.buildTrackingSummary(room.getId()));
         enrichConclusionHistoryWithTracking(vo.getConclusionHistory(), vo.getTracking());
         vo.setMembers(members);
+
+        if (opinions != null && reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()
+                && reviewedSearchProgressService != null) {
+            reviewedSearchProgressService.fill(vo, room.getId(), members, opinions);
+        }
 
         if (opinions != null) {
             Map<Long, String> nameMap = members.stream()
@@ -890,6 +1400,40 @@ public class MeetingRoomService {
         }
     }
 
+    private String buildDecisionArtifactJsonStrict(Long meetingId, String finalConclusion,
+                                                   String summary, String rawArtifact) {
+        com.alibaba.fastjson.JSONObject parsed;
+        try {
+            String text = rawArtifact == null ? "" : rawArtifact.trim();
+            if (!text.startsWith("{") || !text.endsWith("}")) {
+                throw new IllegalArgumentException("not_json_object");
+            }
+            parsed = com.alibaba.fastjson.JSON.parseObject(text);
+            if (parsed == null) throw new IllegalArgumentException("not_json_object");
+            for (String key : List.of("topicOverview", "projectKey", "projectContext", "consensusPath",
+                    "finalDecision", "keyViewpoints", "majorDisputes", "decisionBasis",
+                    "openQuestions", "nextActions")) {
+                if (!parsed.containsKey(key)) throw new IllegalArgumentException("missing_" + key);
+            }
+            for (String key : List.of("keyViewpoints", "majorDisputes", "decisionBasis",
+                    "openQuestions", "nextActions")) {
+                com.alibaba.fastjson.JSONArray values = parsed.getJSONArray(key);
+                if (values == null || values.stream().anyMatch(value -> !(value instanceof String))) {
+                    throw new IllegalArgumentException("invalid_" + key);
+                }
+            }
+            if (parsed.getString("finalDecision") == null || parsed.getString("finalDecision").isBlank()) {
+                throw new IllegalArgumentException("finalDecision_blank");
+            }
+        } catch (RuntimeException invalid) {
+            throw new IllegalStateException("meeting_decision_artifact_invalid", invalid);
+        }
+        ensureDecisionArtifactDefaults(parsed, meetingId, finalConclusion, summary);
+        // The model may echo an older room conclusion; the voted result is authoritative.
+        parsed.put("finalDecision", finalConclusion);
+        return parsed.toJSONString();
+    }
+
     private void ensureDecisionArtifactDefaults(com.alibaba.fastjson.JSONObject artifact,
                                                 Long meetingId,
                                                 String finalConclusion,
@@ -978,17 +1522,31 @@ public class MeetingRoomService {
         }
 
         int nextRound = room.getCurrentRound() > 0 ? room.getCurrentRound() + 1 : 1;
+        boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+        Long resumedEpoch = reviewed
+                ? claimReviewedStart(room.getId(), room.getStatus(), epochOf(room),
+                        MeetingStatusEnum.REOPENED.getCode())
+                : null;
         Long directiveOpinionId = insertTrackingResumeDirective(room, trackingItemTitle, resumeReason, note, evidenceRef, nextRound);
-        roomMapper.updateStatus(room.getId(), MeetingStatusEnum.REOPENED.getCode());
-        roomMapper.updateCurrentRound(room.getId(), nextRound - 1);
-        roomMapper.updateConclusionHistory(room.getId(), appendConclusionHistoryEvent(
+        if (reviewed) {
+            if (roomMapper.updateCurrentRoundIfEpoch(room.getId(), resumedEpoch, nextRound - 1) != 1) return;
+        } else {
+            roomMapper.updateStatus(room.getId(), MeetingStatusEnum.REOPENED.getCode());
+            roomMapper.updateCurrentRound(room.getId(), nextRound - 1);
+        }
+        String history = appendConclusionHistoryEvent(
                 room,
                 "REOPEN_TRACKING",
                 null,
                 resumeReason,
                 nextRound - 1,
                 new Date()
-        ));
+        );
+        if (reviewed) {
+            if (roomMapper.updateConclusionHistoryIfEpoch(room.getId(), resumedEpoch, history) != 1) return;
+        } else {
+            roomMapper.updateConclusionHistory(room.getId(), history);
+        }
         workflowService.markWorkflowActiveDiscussion(room.getId(), resumeReason);
         workflowService.appendTrackingReopenUpdate(
                 trackingItemId,
@@ -997,7 +1555,7 @@ public class MeetingRoomService {
                 buildTrackingReopenAuditContent(trackingItemTitle, resumeReason, nextRound),
                 evidenceRef
         );
-        meetingExecutor.submit(() -> runMeetingFlow(room.getId()));
+        meetingExecutor.submit(() -> runMeetingFlow(room.getId(), resumedEpoch));
         log.info("Meeting {} resumed by tracking signal, trackingItemId={}", room.getId(), trackingItemId);
     }
 
@@ -1232,6 +1790,9 @@ public class MeetingRoomService {
     private String resolveConclusionEventLabel(String eventType) {
         if ("FOLLOW_UP_TARGETED".equalsIgnoreCase(eventType)) {
             return "定向追问";
+        }
+        if ("FOLLOW_UP_TARGETED_BLOCKED".equalsIgnoreCase(eventType)) {
+            return "定向追问暂停";
         }
         if ("REOPEN_HUMAN".equalsIgnoreCase(eventType)) {
             return "人工追问重开";

@@ -4,6 +4,7 @@ import com.aimeeting.room.common.ApiResponse;
 import com.aimeeting.room.dto.ContributionResult;
 import com.aimeeting.room.dto.MeetingCreateRequest;
 import com.aimeeting.room.dto.MeetingDetailVO;
+import com.aimeeting.room.dto.MeetingReviewedTurnRetryRequest;
 import com.aimeeting.room.dto.SkillFileVO;
 import com.aimeeting.room.dto.TrackingItemCreateRequest;
 import com.aimeeting.room.dto.TrackingItemUpdateRequest;
@@ -14,6 +15,7 @@ import com.aimeeting.room.dto.WorkflowTemplateRequest;
 import com.aimeeting.room.dto.WorkflowTemplateVO;
 import com.aimeeting.room.entity.AiMeetingScoreLog;
 import com.aimeeting.room.entity.AiWorkflowTemplate;
+import com.aimeeting.room.entity.MeetingReviewedTurnSkip;
 import com.aimeeting.room.service.MeetingRoomService;
 import com.aimeeting.room.service.MeetingScoreService;
 import com.aimeeting.room.service.SkillFileService;
@@ -84,6 +86,19 @@ public class MeetingController {
             return ApiResponse.ok();
         } catch (Exception e) {
             log.error("startMeeting error, id={}", id, e);
+            return ApiResponse.fail(e.getMessage());
+        }
+    }
+
+    /** 准备重试一个确定的本地校验失败；保持暂停，调用方随后单独启动会议。 */
+    @PostMapping("/meetings/{id}/reviewed-turns/{memberId}/prepare-retry")
+    public ApiResponse<MeetingReviewedTurnSkip> prepareReviewedTurnRetry(@PathVariable Long id,
+            @PathVariable Long memberId, @RequestBody @Validated MeetingReviewedTurnRetryRequest request) {
+        try {
+            return ApiResponse.ok(meetingRoomService.prepareReviewedTurnRetry(id, memberId,
+                    request.getSkipId(), request.getExpectedRound(), request.getExpectedEpoch()));
+        } catch (Exception e) {
+            log.warn("prepareReviewedTurnRetry rejected, meetingId={}, memberId={}: {}", id, memberId, e.getMessage());
             return ApiResponse.fail(e.getMessage());
         }
     }

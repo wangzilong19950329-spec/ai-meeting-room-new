@@ -368,6 +368,7 @@ public class StockWatchRiskPatternSummaryRenderer {
         String value = quality == null ? "" : quality.toUpperCase(Locale.ROOT);
         if ("FRESH".equals(value)) return "行情时间新鲜";
         if ("POST_CLOSE_VALID".equals(value)) return "收盘后行情可用";
+        if ("QUOTE_ALERT".equals(value)) return "报价异动锚点";
         if ("STALE_DATE".equals(value)) return "行情日期过期";
         if ("STALE_AGE".equals(value)) return "行情报价过旧";
         if ("OUTSIDE_REALTIME_SESSION".equals(value)) return "非实时交易时段";

@@ -78,4 +78,21 @@ class StockWatchAnalysisTaskServiceTest {
         verify(taskMapper, never()).insert(any());
         verify(identityMapper, never()).bindCanonical(anyLong(), anyLong(), anyLong(), anyString());
     }
+
+    @Test
+    void structuredBridgeUnknownOutcomeIsMarkedUnknown() {
+        StockWatchAnalysisTaskService service = new StockWatchAnalysisTaskService(
+                mock(StockWatchAnalysisTaskMapper.class),
+                mock(StockWatchAnalysisObservationIdentityMapper.class),
+                mock(StockWatchV6RuntimeGate.class));
+        StockWatchBridgeHttpException error = StockWatchBridgeHttpException.fromResponse(
+                "bridge",
+                504,
+                "{\"ok\":false,\"error\":\"provider_outcome_unknown\","
+                        + "\"providerOutcomeUnknown\":true,\"retrySafe\":false}");
+
+        assertTrue(service.shouldMarkUnknown(error));
+        assertEquals("provider_outcome_unknown", error.getErrorCode());
+        assertFalse(error.getRetrySafe());
+    }
 }

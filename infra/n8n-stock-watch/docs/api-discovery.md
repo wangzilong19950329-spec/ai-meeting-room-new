@@ -1,6 +1,7 @@
 # API Discovery
 
-Phase0 discovery status: completed for Phase1 local POC.
+Phase0 discovery is complete; Phase3 adds a narrow n8n-facing adapter rather
+than exposing the existing user-session API to workflow credentials.
 
 ## Git Baseline
 
@@ -14,32 +15,33 @@ Phase0 discovery status: completed for Phase1 local POC.
 
 ## Current Java API Matrix
 
-| Endpoint | Current code path | Auth | Phase1 use |
+| Endpoint | Current code path | Auth | Phase3 use |
 | --- | --- | --- | --- |
-| `GET /api/stock-watch/quotes?symbols=...` | `StockWatchController#getQuotes` calls `StockQuoteService#fetchQuotes` | `X-Token` header or `token` request parameter required | Not called in Phase1 |
-| `GET /api/stock-watch/intraday-bars?symbol=...&market=...` | `StockWatchController#getIntradayBars` calls `StockQuoteService#fetchIntradayBars` | `X-Token` header or `token` request parameter required | Not called in Phase1 |
-| `GET /api/stock-watch/runtime-status` | `StockWatchController#runtimeStatus` | `X-Token` header or `token` request parameter required | Not called in Phase1 |
+| `GET /api/stock-watch/quotes?symbols=...` | `StockWatchController#getQuotes` | user `X-Token` or query token | Not used by n8n |
+| `GET /api/stock-watch/intraday-bars?symbol=...&market=...` | `StockWatchController#getIntradayBars` | user `X-Token` or query token | Used internally by the adapter service |
+| `GET /api/stock-watch/n8n/quotes?symbols=...` | `StockWatchN8nController` calls `StockWatchN8nFacadeService` | dedicated `X-N8N-Token` | SW-10 source |
 
-Auth evidence:
+Adapter auth evidence:
 
-- `WebMvcConfig` applies `AuthInterceptor` to `/api/**`.
-- Only `/api/auth/login` and `/api/auth/register` are excluded.
-- `AuthInterceptor` reads `X-Token`, then `token`, and returns HTTP 401 when no valid token maps to a user.
+- `WebMvcConfig` excludes `/api/stock-watch/n8n/**` from user-session auth.
+- `StockWatchN8nController` applies its own default-disabled, constant-time token check.
+- Missing and incorrect adapter tokens return HTTP 401; disabled mode returns HTTP 503.
 
 ## Field Semantics
 
-| Field | Current Java mapping | Phase1 status |
+| Field | Current Java mapping | Phase3 status |
 | --- | --- | --- |
 | price | Eastmoney `f2` to `price` | Known as current quote price in existing code |
 | changePercent | Eastmoney `f3` to `changePercent` | Existing code maps it; Phase1 recomputes fixture percentage from price and previous close |
-| volume | Eastmoney `f5` to `volume`; trends `parts[5]` to intraday `volume` | Existing mapping only; not used for exact liquidity claim |
-| amount | Eastmoney `f6` to `amount`; trends `parts[6]` to intraday `amount` | `UNKNOWN_SEMANTICS`; not used for VWAP or money-flow claims |
+| volume | Eastmoney `f5` to `volume` | Empirical A-share lot conversion; raw and normalized values retained |
+| amount | Eastmoney `f6` to `amount` | Empirical CNY contract; not authoritative enough for VWAP |
 | open/high/low/previousClose | Eastmoney `f17/f15/f16/f18` | Used in fixture quality checks only |
 | mainInflow and related buckets | Eastmoney `f62/f66/f69/f72/f75/f78/f81/f84/f87/f184` | `UNKNOWN_SEMANTICS`; not used for intent or actor claims |
-| timestamp | Eastmoney `f124` | Existing code maps it to timestamp/update time; Phase1 uses fixture timestamps |
+| quoteTime | latest one-minute bar `asOfTime` | Used for freshness and bar boundaries |
+| providerUpdateTime | Eastmoney `f124` | Reported separately; not treated as the market observation time |
 
-Phase1 decision:
+Phase3 decision:
 
-- The workflow runs from fixtures only.
-- `amount` and `main_inflow` remain `UNKNOWN_SEMANTICS`.
-- Java bridge integration is deferred to a later gate.
+- Java transport and authentication are enabled only through the adapter Gate.
+- Stale weekend data is returned with `quality.status=STALE` and rejected by SW-10.
+- `amount`, volume conversion, and money-flow actor claims are not used to create VWAP or actor intent.

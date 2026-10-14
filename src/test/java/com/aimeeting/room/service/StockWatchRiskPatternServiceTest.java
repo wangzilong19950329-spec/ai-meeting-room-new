@@ -13,6 +13,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 class StockWatchRiskPatternServiceTest {
 
@@ -84,6 +85,25 @@ class StockWatchRiskPatternServiceTest {
 
         assertEquals("triggered", pattern(result, "R04").get("status"));
         assertEquals(2, pattern(result, "R04").get("windowMatchCount"));
+    }
+
+    @Test
+    void derivesPointInTimePositionFeaturesFromCurrentQuoteAndCompletedBarsOnly() {
+        ZonedDateTime quoteAt = ZonedDateTime.of(2026, 7, 16, 10, 0, 0, 0, CHINA);
+        List<Map<String, Object>> bars = baseline(20, 100.0);
+        Map<String, Object> current = quote(quoteAt, 110.0, 108.0, 112.0, 107.0, 99.0, 2.1);
+
+        StockWatchRiskPatternService.RiskPatternResult result = service.analyze(
+                "002979", "sz", current, bars, quoteAt.plusMinutes(1));
+
+        Map<?, ?> derived = (Map<?, ?>) result.getObservations().get("derived");
+        Map<?, ?> research = result.getPriceFailureResearchFeatures();
+        assertEquals((110.0 / 99.0 - 1.0) * 100.0, (Double) research.get("return5Pct"), 0.000001);
+        assertEquals((19 * 99.0 + 110.0) / 20.0, (Double) research.get("ma20"), 0.000001);
+        assertNotNull(research.get("closePosition20dPct"));
+        assertNotNull(research.get("volatility20Pct"));
+        assertFalse(derived.containsKey("return5Pct"));
+        assertFalse(derived.containsKey("priceVsMa20Pct"));
     }
 
     private Map<String, Object> pattern(StockWatchRiskPatternService.RiskPatternResult result, String id) {

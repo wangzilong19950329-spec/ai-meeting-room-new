@@ -12,6 +12,8 @@ public class ConsensusResult {
     private BigDecimal agreementRatio;
     private List<Long> agreeingMemberIds;
     private List<Long> dissentingMemberIds;
+    /** Members without a valid ballot in this round; neither agreement nor dissent. */
+    private List<Long> absentMemberIds;
 
     public static ConsensusResult reached(String conclusion, BigDecimal ratio,
                                           List<Long> agreeingIds, List<Long> dissentingIds) {

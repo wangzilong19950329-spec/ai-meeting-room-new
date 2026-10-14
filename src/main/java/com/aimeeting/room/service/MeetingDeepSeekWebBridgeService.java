@@ -9,6 +9,7 @@ import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -23,6 +24,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -43,6 +45,8 @@ public class MeetingDeepSeekWebBridgeService {
     }
 
     private static final MediaType JSON_TYPE = MediaType.get("application/json; charset=utf-8");
+    private static final String BROKER_CAPABILITY = "general.analysis";
+    private static final int BROKER_PRIORITY = 0;
     private static final List<String> LEGACY_NON_DEEPSEEK_PREFIXES = Arrays.asList(
             "gpt-", "o1", "o3", "qwen-", "claude-", "ernie-"
     );
@@ -102,6 +106,15 @@ public class MeetingDeepSeekWebBridgeService {
     }
 
     public ChatResult chat(String modelType, String systemPrompt, String userPrompt, Integer maxTokens) {
+        return chat(modelType, systemPrompt, userPrompt, maxTokens, true);
+    }
+
+    public ChatResult chatWithoutSearch(String modelType, String systemPrompt, String userPrompt, Integer maxTokens) {
+        return chat(modelType, systemPrompt, userPrompt, maxTokens, false);
+    }
+
+    private ChatResult chat(String modelType, String systemPrompt, String userPrompt, Integer maxTokens,
+                            boolean enableSearch) {
         RouteDecision decision = routeDecision(modelType);
         if (decision == RouteDecision.FAIL_CLOSED) {
             return failClosedResult(modelType);
@@ -114,14 +127,30 @@ public class MeetingDeepSeekWebBridgeService {
         AiModelProperties.DeepSeekWebBridgeConfig cfg = config();
         String query = buildQuery(systemPrompt, userPrompt, maxTokens);
         boolean expectedJson = shouldExpectJson(systemPrompt, userPrompt);
-        boolean searchExecutor = isSearchExecutorCall(resolveEntryForRouting(modelType), systemPrompt, userPrompt);
+        boolean searchExecutor = enableSearch
+                && isSearchExecutorCall(resolveEntryForRouting(modelType), systemPrompt, userPrompt);
         String mode = normalizeMode(searchExecutor ? cfg.getSearchMode() : cfg.getMode(), searchExecutor ? "fast" : "expert");
 
         JSONObject body = new JSONObject();
         body.put("query", query);
+        body.put("capability", BROKER_CAPABILITY);
+        body.put("purpose", searchExecutor ? "meeting.web-search.v1" : "meeting.model-generation.v1");
+        body.put("priority", BROKER_PRIORITY);
         body.put("expectedJson", expectedJson);
         body.put("mode", mode);
+        body.put("forceNewSession", true);
+        body.put("isolatedSession", true);
         body.put("closeTargetAfter", false);
+        if (!enableSearch) {
+            body.put("enableSearch", false);
+        }
+        String submissionKey = "meeting-web-v1:" + UUID.randomUUID();
+        body.put("submissionKey", submissionKey);
+        body.put("requestDigest", enableSearch
+                ? StockWatchBridgeRequestIdentity.digest(
+                    query, BROKER_CAPABILITY, "", mode, expectedJson, true, true, false, "")
+                : StockWatchBridgeRequestIdentity.digestWithoutSearch(
+                    query, BROKER_CAPABILITY, "", mode, expectedJson, true, true, false, ""));
 
         if (cfg.isSerialized()) {
             bridgeLock.lock();
@@ -144,68 +173,185 @@ public class MeetingDeepSeekWebBridgeService {
                 .connectTimeout(Math.max(5, cfg.getConnectTimeoutSeconds()), TimeUnit.SECONDS)
                 .readTimeout(Math.max(30, cfg.getReadTimeoutSeconds()), TimeUnit.SECONDS)
                 .callTimeout(Math.max(40, cfg.getReadTimeoutSeconds() + 10L), TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false)
                 .build();
-        Request request = new Request.Builder()
+        Request.Builder requestBuilder = new Request.Builder()
                 .url(cfg.getBridgeUrl())
                 .header("Content-Type", "application/json")
-                .post(RequestBody.create(body.toJSONString(), JSON_TYPE))
-                .build();
+                .post(RequestBody.create(body.toJSONString(), JSON_TYPE));
+        if (StringUtils.hasText(cfg.getApiKey())) {
+            requestBuilder.header("Authorization", "Bearer " + cfg.getApiKey().trim());
+        }
+        Request request = requestBuilder.build();
         long startedAt = System.currentTimeMillis();
         try (Response response = client.newCall(request).execute()) {
             String responseBody = response.body() == null ? "" : response.body().string();
             if (!response.isSuccessful()) {
-                String note = "会议 DeepSeek 网页 bridge HTTP " + response.code() + ": " + truncate(responseBody, 300);
-                log.warn(note);
-                return failure("bridge_http_" + response.code(), "bridge_http_" + response.code(), note);
+                log.warn("会议 DeepSeek 网页 bridge HTTP {}: {}", response.code(), truncate(responseBody, 300));
+                return failureFromPayload(response.code(), parseObject(responseBody));
             }
             JSONObject payload = JSON.parseObject(responseBody);
             if (payload == null || !payload.getBooleanValue("ok")) {
-                String note = "会议 DeepSeek 网页 bridge 返回无效结果：" + truncate(responseBody, 300);
-                log.warn(note);
-                return failure("invalid_payload", "invalid_payload", note);
+                log.warn("会议 DeepSeek 网页 bridge 返回无效结果：{}", truncate(responseBody, 300));
+                return failure("invalid_payload", "invalid_payload",
+                        "会议 DeepSeek 网页 bridge 返回无效结果。", true, false);
             }
-            JSONObject result = payload.getJSONObject("result");
-            if (result == null) {
-                return failure("missing_result", "missing_result", "会议 DeepSeek 网页 bridge 未返回 result。");
-            }
-            String contentStatus = firstNonBlank(result.getString("contentStatus"), "success");
-            String contentNote = firstNonBlank(result.getString("contentNote"), "已通过 DeepSeek 网页 bridge 返回会议模型结果。");
-            String completionReason = result.getString("completionReason");
-            if ("incomplete".equalsIgnoreCase(contentStatus)) {
-                String note = "会议 DeepSeek 网页 bridge 回答未完整生成，completionReason="
-                        + firstNonBlank(completionReason, "unknown");
-                log.warn(note);
-                return failure(contentStatus, "incomplete", note);
-            }
-            String answerText = result.getString("answerText");
-            if (!StringUtils.hasText(answerText)) {
-                String note = "会议 DeepSeek 网页 bridge 未返回正文，contentStatus="
-                        + contentStatus + "，completionReason=" + firstNonBlank(completionReason, "unknown");
-                log.warn(note);
-                return failure(contentStatus, "empty_answer", note);
-            }
-
-            String queryLabel = buildQueryLabel(userPrompt);
-            List<WebSearchService.SearchResult> searchResults = parseSearchResults(result, answerText, queryLabel);
-            List<String> searchQueries = searchResults.isEmpty()
-                    ? Collections.emptyList()
-                    : Collections.singletonList(queryLabel);
-            long elapsed = System.currentTimeMillis() - startedAt;
-            String modelNote = contentNote + " elapsedMs=" + elapsed;
-            return new ChatResult(
-                    answerText,
-                    searchQueries,
-                    searchResults,
-                    "deepseek_web_bridge",
-                    contentStatus,
-                    contentNote,
-                    "success",
-                    modelNote
-            );
+            return parseBridgeResult(payload.getJSONObject("result"), userPrompt, startedAt,
+                    !Boolean.FALSE.equals(body.getBoolean("enableSearch")));
         } catch (Exception e) {
-            String note = "会议 DeepSeek 网页 bridge 调用异常：" + e.getMessage();
+            log.warn("会议 DeepSeek 网页 bridge 调用异常：{}", e.getMessage());
+            BridgeLedgerLookup lookup = lookupBridgeLedger(cfg, body);
+            if (lookup.result != null) {
+                return parseBridgeResult(lookup.result, userPrompt, startedAt,
+                        !Boolean.FALSE.equals(body.getBoolean("enableSearch")));
+            }
+            boolean definitelyPreSubmit = "NOT_FOUND".equals(lookup.status)
+                    || "FAILED_PRE_SUBMIT".equals(lookup.status)
+                    || ("UNREACHABLE".equals(lookup.status) && isDefinitelyPreSubmitTransport(e));
+            if (definitelyPreSubmit) {
+                return failure("bridge_error", "bridge_pre_submit_failed",
+                        "会议 DeepSeek 网页 bridge 暂时不可用，且本次请求未提交。", false, true);
+            }
+            return failure("provider_outcome_unknown", "provider_outcome_unknown",
+                    "会议 DeepSeek 网页 bridge 返回状态不确定；为避免重复提交，本次不会自动重试。",
+                    true, false);
+        }
+    }
+
+    private ChatResult parseBridgeResult(JSONObject result, String userPrompt, long startedAt,
+                                         boolean enableSearch) {
+        if (result == null) {
+            return failure("missing_result", "missing_result",
+                    "会议 DeepSeek 网页 bridge 未返回 result。", true, false);
+        }
+        if (!enableSearch) {
+            JSONObject modeState = result.getJSONObject("modeState");
+            if (modeState == null || !Boolean.TRUE.equals(modeState.getBoolean("modeVerified"))
+                    || !Boolean.FALSE.equals(modeState.getBoolean("searchEnabled"))) {
+                return failure("search_mode_unverified", "search_mode_unverified",
+                        "会议模型推理未能证明联网搜索已关闭。", false, false);
+            }
+        }
+        String contentStatus = firstNonBlank(result.getString("contentStatus"), "success");
+        String contentNote = firstNonBlank(result.getString("contentNote"), "已通过 DeepSeek 网页 bridge 返回会议模型结果。");
+        String completionReason = result.getString("completionReason");
+        if (!enableSearch && (!"success".equalsIgnoreCase(contentStatus)
+                || !StringUtils.hasText(completionReason)
+                || !completionReason.startsWith("complete"))) {
+            return failure("inference_incomplete", "inference_incomplete",
+                    "会议模型推理结果未完整生成。", false, false);
+        }
+        if ("incomplete".equalsIgnoreCase(contentStatus)) {
+            String note = "会议 DeepSeek 网页 bridge 回答未完整生成，completionReason="
+                    + firstNonBlank(completionReason, "unknown");
             log.warn(note);
-            return failure("bridge_error", "bridge_error", note);
+            return failure(contentStatus, "incomplete", note, false, false);
+        }
+        String answerText = result.getString("answerText");
+        if (!StringUtils.hasText(answerText)) {
+            String note = "会议 DeepSeek 网页 bridge 未返回正文，contentStatus="
+                    + contentStatus + "，completionReason=" + firstNonBlank(completionReason, "unknown");
+            log.warn(note);
+            return failure(contentStatus, "empty_answer", note, false, false);
+        }
+
+        String queryLabel = buildQueryLabel(userPrompt);
+        List<WebSearchService.SearchResult> searchResults = enableSearch
+                ? parseSearchResults(result, answerText, queryLabel)
+                : Collections.emptyList();
+        List<String> searchQueries = searchResults.isEmpty()
+                ? Collections.emptyList()
+                : Collections.singletonList(queryLabel);
+        long elapsed = System.currentTimeMillis() - startedAt;
+        String modelNote = contentNote + " elapsedMs=" + elapsed;
+        return new ChatResult(
+                answerText,
+                searchQueries,
+                searchResults,
+                "deepseek_web_bridge",
+                contentStatus,
+                contentNote,
+                "success",
+                modelNote
+        );
+    }
+
+    private ChatResult failureFromPayload(int statusCode, JSONObject payload) {
+        String ledgerStatus = normalize(payload == null ? null : payload.getString("ledgerStatus")).toUpperCase(Locale.ROOT);
+        boolean providerOutcomeUnknown = payload != null
+                && Boolean.TRUE.equals(payload.getBoolean("providerOutcomeUnknown"));
+        if ("UNKNOWN".equals(ledgerStatus) || "IN_FLIGHT".equals(ledgerStatus)) {
+            providerOutcomeUnknown = true;
+        }
+        Boolean retrySafe = payload != null && payload.containsKey("retrySafe")
+                ? payload.getBoolean("retrySafe")
+                : null;
+        if (providerOutcomeUnknown || retrySafe == null) {
+            retrySafe = false;
+        }
+        String errorCode = firstNonBlank(payload == null ? null : payload.getString("error"),
+                "bridge_http_" + statusCode);
+        String note = providerOutcomeUnknown
+                ? "会议 DeepSeek 网页 bridge 返回状态不确定；为避免重复提交，本次不会自动重试。"
+                : "会议 DeepSeek 网页 bridge 请求失败，HTTP " + statusCode + "。";
+        return failure("bridge_http_" + statusCode, errorCode, note, providerOutcomeUnknown, retrySafe);
+    }
+
+    private BridgeLedgerLookup lookupBridgeLedger(AiModelProperties.DeepSeekWebBridgeConfig cfg, JSONObject body) {
+        HttpUrl base = HttpUrl.parse(cfg.getBridgeUrl());
+        if (base == null) {
+            return BridgeLedgerLookup.status("UNAVAILABLE");
+        }
+        HttpUrl statusUrl = base.newBuilder()
+                .encodedPath("/request-status")
+                .query(null)
+                .addQueryParameter("submissionKey", body.getString("submissionKey"))
+                .addQueryParameter("requestDigest", body.getString("requestDigest"))
+                .build();
+        OkHttpClient statusClient = new OkHttpClient.Builder()
+                .connectTimeout(Math.max(5, cfg.getConnectTimeoutSeconds()), TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(false)
+                .build();
+        Request.Builder requestBuilder = new Request.Builder().url(statusUrl).get();
+        if (StringUtils.hasText(cfg.getApiKey())) {
+            requestBuilder.header("Authorization", "Bearer " + cfg.getApiKey().trim());
+        }
+        try (Response response = statusClient.newCall(requestBuilder.build()).execute()) {
+            String responseBody = response.body() == null ? "" : response.body().string();
+            if (response.code() == 404) {
+                return BridgeLedgerLookup.status("NOT_FOUND");
+            }
+            JSONObject payload = parseObject(responseBody);
+            String ledgerStatus = normalize(payload == null ? null : payload.getString("ledgerStatus"))
+                    .toUpperCase(Locale.ROOT);
+            if (response.isSuccessful() && payload != null && payload.getBooleanValue("ok")
+                    && "SUCCESS".equals(ledgerStatus) && payload.getJSONObject("result") != null) {
+                return BridgeLedgerLookup.success(payload.getJSONObject("result"));
+            }
+            return BridgeLedgerLookup.status(StringUtils.hasText(ledgerStatus) ? ledgerStatus : "UNAVAILABLE");
+        } catch (Exception statusError) {
+            log.warn("会议 DeepSeek 网页 bridge ledger 查询异常：{}", statusError.getMessage());
+            return BridgeLedgerLookup.status("UNREACHABLE");
+        }
+    }
+
+    private boolean isDefinitelyPreSubmitTransport(Exception error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof java.net.ConnectException || current instanceof java.net.UnknownHostException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
+
+    private JSONObject parseObject(String raw) {
+        try {
+            return JSON.parseObject(raw);
+        } catch (Exception ignored) {
+            return null;
         }
     }
 
@@ -245,6 +391,14 @@ public class MeetingDeepSeekWebBridgeService {
     }
 
     private ChatResult failure(String searchStatus, String modelStatus, String note) {
+        return failure(searchStatus, modelStatus, note, false, null);
+    }
+
+    private ChatResult failure(String searchStatus,
+                               String modelStatus,
+                               String note,
+                               boolean providerOutcomeUnknown,
+                               Boolean retrySafe) {
         return new ChatResult(
                 null,
                 Collections.emptyList(),
@@ -253,8 +407,28 @@ public class MeetingDeepSeekWebBridgeService {
                 searchStatus,
                 note,
                 modelStatus,
-                note
+                note,
+                providerOutcomeUnknown,
+                retrySafe
         );
+    }
+
+    private static final class BridgeLedgerLookup {
+        private final String status;
+        private final JSONObject result;
+
+        private BridgeLedgerLookup(String status, JSONObject result) {
+            this.status = status;
+            this.result = result;
+        }
+
+        private static BridgeLedgerLookup status(String status) {
+            return new BridgeLedgerLookup(status, null);
+        }
+
+        private static BridgeLedgerLookup success(JSONObject result) {
+            return new BridgeLedgerLookup("SUCCESS", result);
+        }
     }
 
     private String buildQuery(String systemPrompt, String userPrompt, Integer maxTokens) {

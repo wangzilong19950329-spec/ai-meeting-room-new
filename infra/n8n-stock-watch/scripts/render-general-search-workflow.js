@@ -34,9 +34,9 @@ function call(name, queryField, x, y) {
       method: 'POST', url: '={{ $json.bridgeEndpoint }}',
       authentication: 'genericCredentialType', genericAuthType: 'httpHeaderAuth',
       sendBody: true, specifyBody: 'json',
-      jsonBody: `={{ JSON.stringify({ query: $json.${queryField}, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'general.evidence-search', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 90000 }) }}`,
+      jsonBody: `={{ JSON.stringify({ query: $json.${queryField}, mode: 'expert', expectedJson: true, requireSearchEvidence: true, capability: 'general.analysis', purpose: 'general.evidence-search', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 90000 }) }}`,
       options: {
-        timeout: '={{ $json.requestTimeoutMs }}',
+        timeout: '={{ Math.max(1000, Math.min($json.httpTimeoutMs, $json.deadlineAt - Date.now() - 1000)) }}',
         response: { response: { responseFormat: 'json', fullResponse: true, neverError: true } }
       }
     },
@@ -55,10 +55,23 @@ function buildWorkflow() {
     { id: 'GeneralSearchInput', name: 'General Search Input',
       type: 'n8n-nodes-base.executeWorkflowTrigger', typeVersion: 1.2,
       position: [0, 0], parameters: { inputSource: 'passthrough' } },
-    code('Normalize Request', 'return [{ json: normalizeRequest($input.first().json) }];', 220, 0)
+    { id: 'MeetingEvidenceWebhook', name: 'Meeting Evidence Webhook',
+      type: 'n8n-nodes-base.webhook', typeVersion: 2.1, position: [0, 240],
+      webhookId: 'meeting-evidence-v1',
+      parameters: { httpMethod: 'POST', path: 'meeting-evidence-v1',
+        authentication: 'headerAuth', responseMode: 'lastNode',
+        responseData: 'firstEntryJson', options: {} },
+      credentials: { httpHeaderAuth: { id: 'MeetingEvidenceWebhookHeaderAuth',
+        name: 'Meeting Evidence Webhook Header' } } },
+    code('Normalize Request', `const incoming = $input.first().json;
+const request = incoming.body && typeof incoming.body === 'object'
+  ? { requestId: incoming.body.requestId, question: incoming.body.question, asOf: incoming.body.asOf }
+  : incoming;
+return [{ json: normalizeRequest(request) }];`, 220, 0)
   ];
   const connections = {};
   connect(connections, 'General Search Input', 'Normalize Request');
+  connect(connections, 'Meeting Evidence Webhook', 'Normalize Request');
   let previous = 'Normalize Request';
   for (let attempt = 1; attempt <= 3; attempt++) {
     const x = 480 + (attempt - 1) * 1540;

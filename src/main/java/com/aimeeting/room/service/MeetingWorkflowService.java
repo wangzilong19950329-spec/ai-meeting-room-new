@@ -86,6 +86,11 @@ public class MeetingWorkflowService {
     private final AiSkillFileMapper skillFileMapper;
     private final MeetingOrchestratorService orchestrator;
     private final WebSearchService webSearch;
+    private final MeetingReviewedEvidenceService reviewedEvidenceService;
+
+    private boolean reviewedMode() {
+        return reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+    }
 
     private static final Pattern YEAR_PATTERN = Pattern.compile("(20\\d{2})");
 
@@ -1670,6 +1675,13 @@ public class MeetingWorkflowService {
         activateStage(meetingId, STAGE_TRACKING);
     }
 
+    public void markReviewedEvidenceBlocked(Long meetingId, String reason) {
+        AiWorkflowRun run = workflowRunMapper.selectByMeetingId(meetingId);
+        if (run != null && DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+            workflowRunMapper.updateStatus(run.getId(), WorkflowRunStatusEnum.ACTIVE.getCode(), reason);
+        }
+    }
+
     public void markWorkflowActiveDiscussion(Long meetingId, String blockedReason) {
         AiWorkflowRun run = workflowRunMapper.selectByMeetingId(meetingId);
         if (run == null) {
@@ -2423,6 +2435,9 @@ public class MeetingWorkflowService {
             searchTraces.add(searchTrace);
             if (isRequiredWorkflowSearchFailure(stageTemplate, searchTrace)) {
                 requiredSearchFailures.add(buildWorkflowRequiredSearchFailureReason(member, searchTrace));
+                if (reviewedMode()) {
+                    return AutoStageExecutionResult.blocked(requiredSearchFailures.get(0), searchTraces);
+                }
                 continue;
             }
             String webFullResearchContent = extractWorkflowWebFullResearchContent(searchTrace);
@@ -2446,7 +2461,17 @@ public class MeetingWorkflowService {
             String userPrompt = buildAutomatedStageUserPrompt(room, stageRun, stageTemplate, member, skillFileContext, searchTrace);
             // maxTokens=4000：deliverable 契约要求 5 段输出（结论/依据/不确定性/下一步/appendix），
             // 2500 tokens 在带 appendix 的完整报告下仍会断在最后一两段，导致 reviewer 一直抱怨"内容截断"。
-            String content = sanitizeWorkflowModelResponse(orchestrator.callModel(member.getModelType(), systemPrompt, userPrompt, 4000));
+            String content;
+            try {
+                content = sanitizeWorkflowModelResponse(reviewedMode()
+                        ? orchestrator.callModelStrict(member.getModelType(), systemPrompt, userPrompt, 4000)
+                        : orchestrator.callModel(member.getModelType(), systemPrompt, userPrompt, 4000));
+            } catch (RuntimeException e) {
+                if (reviewedMode()) {
+                    return AutoStageExecutionResult.blocked("所选议员模型未能完成独立推理：" + e.getMessage(), searchTraces);
+                }
+                throw e;
+            }
             if (StringUtils.hasText(content)) {
                 sourceActorRefs.add(member.getMemberName());
                 outputs.add(candidates.size() == 1 ? content.trim() : "【" + member.getMemberName() + "】\n" + content.trim());
@@ -2462,7 +2487,15 @@ public class MeetingWorkflowService {
         if (outputs.size() == 1) {
             return AutoStageExecutionResult.success(outputs.get(0), false, sourceActorRefs, searchTraces);
         }
-        String merged = mergeAutomatedStageOutputs(room, stageTemplate, candidates, outputs, skillFileContext);
+        String merged;
+        try {
+            merged = mergeAutomatedStageOutputs(room, stageTemplate, candidates, outputs, skillFileContext);
+        } catch (RuntimeException e) {
+            if (reviewedMode()) {
+                return AutoStageExecutionResult.blocked("流程汇总模型失败：" + e.getMessage(), searchTraces);
+            }
+            throw e;
+        }
         boolean mergedOutput = StringUtils.hasText(merged);
         return AutoStageExecutionResult.success(
                 mergedOutput ? sanitizeWorkflowModelResponse(merged) : String.join("\n\n", outputs),
@@ -2482,18 +2515,27 @@ public class MeetingWorkflowService {
         int approvedCount = 0;
         int rejectedCount = 0;
         for (AiMeetingMember member : candidates) {
-            String reviewRaw = orchestrator.callModel(
-                    member.getModelType(),
-                    buildAutomatedReviewSystemPrompt(member),
-                    buildAutomatedReviewUserPrompt(room, stageRun, stageTemplate, member, skillFileContext),
-                    1500
-            );
+            String reviewRaw;
+            try {
+                reviewRaw = reviewedMode()
+                        ? orchestrator.callModelStrict(member.getModelType(),
+                            buildAutomatedReviewSystemPrompt(member),
+                            buildAutomatedReviewUserPrompt(room, stageRun, stageTemplate, member, skillFileContext), 1500)
+                        : orchestrator.callModel(member.getModelType(),
+                            buildAutomatedReviewSystemPrompt(member),
+                            buildAutomatedReviewUserPrompt(room, stageRun, stageTemplate, member, skillFileContext), 1500);
+            } catch (RuntimeException e) {
+                if (reviewedMode()) return null;
+                throw e;
+            }
             if (!StringUtils.hasText(reviewRaw)) {
+                if (reviewedMode()) return null;
                 log.warn("Automated review returned empty for stageRun={} member={}", stageRun.getId(), member.getMemberName());
                 continue;
             }
             com.alibaba.fastjson.JSONObject parsed = parseReviewDecision(reviewRaw);
             if (parsed == null) {
+                if (reviewedMode()) return null;
                 log.warn("Automated review unparseable for stageRun={} member={} raw='{}'", stageRun.getId(), member.getMemberName(),
                         reviewRaw.length() > 300 ? reviewRaw.substring(0, 300) + "…" : reviewRaw);
                 continue;
@@ -2501,6 +2543,7 @@ public class MeetingWorkflowService {
             Boolean approved = parsed.getBoolean("approved");
             String comment = parsed.getString("comment");
             if (approved == null || !StringUtils.hasText(comment)) {
+                if (reviewedMode()) return null;
                 log.warn("Automated review missing approved/comment for stageRun={} member={} parsed={}",
                         stageRun.getId(), member.getMemberName(), parsed);
                 continue;
@@ -2514,6 +2557,7 @@ public class MeetingWorkflowService {
             }
         }
         if (comments.isEmpty()) {
+            if (reviewedMode()) return null;
             // 所有审核成员都未返回有效 JSON → 不再让 stage 死锁 BLOCKED，
             // 转为软性 REJECT 让流程进入下一轮 analysis；stagnation 检测器或 maxReviewAttempts 会自然兜底。
             log.warn("All automated reviewers returned no valid decision on stageRun={}, falling back to soft REJECT", stageRun.getId());
@@ -2555,7 +2599,9 @@ public class MeetingWorkflowService {
         prompt.append("请合并相同观点、保留分歧点，输出一份统一结果，至少包含：\n");
         prompt.append("1. 综合结论\n2. 关键依据\n3. 保留分歧\n4. 下一步建议\n");
         String modelType = candidates.get(0).getModelType();
-        return orchestrator.callModel(modelType, "你是一个严格的流程结果汇总器。", prompt.toString(), 2200);
+        return reviewedMode()
+                ? orchestrator.callModelStrict(modelType, "你是一个严格的流程结果汇总器。", prompt.toString(), 2200)
+                : orchestrator.callModel(modelType, "你是一个严格的流程结果汇总器。", prompt.toString(), 2200);
     }
 
     private String buildAutomatedReviewSystemPrompt(AiMeetingMember member) {
@@ -2760,6 +2806,9 @@ public class MeetingWorkflowService {
         String strategy = resolveSearchStrategy(stageTemplate);
         long executedAt = System.currentTimeMillis();
         WorkflowSearchContract contract = buildWorkflowSearchContract(room, stageTemplate, member, strategy);
+        if (reviewedMode()) {
+            return executeReviewedWorkflowStageSearch(room, stageTemplate, member, strategy, contract, executedAt);
+        }
         String webParityGapNote = resolveWorkflowWebParityGapNote(contract);
         if ("OFF".equalsIgnoreCase(strategy)) {
             return new WorkflowStageSearchTrace(strategy, false, contract, null, new ArrayList<>(), new ArrayList<>(), null, null, executedAt,
@@ -2795,6 +2844,10 @@ public class MeetingWorkflowService {
                 appendAgentPlanDiagnostics(builtInTrace.meta, agentPlan);
                 aggregatedQueries.addAll(builtInTrace.queries);
                 aggregatedResults.addAll(builtInTrace.results);
+                if (builtInTrace.meta != null
+                        && "provider_outcome_unknown".equalsIgnoreCase(builtInTrace.meta.status)) {
+                    return builtInTrace;
+                }
                 if (isWorkflowSearchSatisfied(strategy, contract, builtInTrace.results)) {
                     return builtInTrace;
                 }
@@ -2878,6 +2931,45 @@ public class MeetingWorkflowService {
                 deduped
         );
         return new WorkflowStageSearchTrace(strategy, true, contract, agentPlan, dedupeOrderedStrings(aggregatedQueries), deduped, meta, digest, executedAt, meta.note);
+    }
+
+    private WorkflowStageSearchTrace executeReviewedWorkflowStageSearch(AiMeetingRoom room,
+                                                                        AiWorkflowStageTemplate stageTemplate,
+                                                                        AiMeetingMember member,
+                                                                        String strategy,
+                                                                        WorkflowSearchContract contract,
+                                                                        long executedAt) {
+        if ("OFF".equalsIgnoreCase(strategy)) {
+            return new WorkflowStageSearchTrace(strategy, false, contract, null, new ArrayList<>(),
+                    new ArrayList<>(), null, null, executedAt, "当前节点关闭外部搜索。");
+        }
+        String question = "会议主题：" + firstNonBlank(room != null ? room.getTitle() : null, "")
+                + "；当前节点：" + firstNonBlank(stageTemplate.getStageName(), "")
+                + "；议员：" + firstNonBlank(member.getMemberName(), "")
+                + "。请搜索与该节点交付直接相关的最多三条公开事实。"
+                + (contract.requiredFields.isEmpty() ? "" : "重点字段：" + String.join("、", contract.requiredFields) + "。")
+                + (contract.sourceRequirements.isEmpty() ? "" : "关注来源："
+                    + contract.sourceRequirements.stream().map(source -> source.label).collect(Collectors.joining("、")) + "。")
+                + "不要把推测写成事实。";
+        WebSearchService.SearchMeta meta = new WebSearchService.SearchMeta();
+        meta.provider = "n8n-deepseek-reviewed";
+        meta.queryCount = 1;
+        try {
+            MeetingReviewedEvidenceService.ReviewedEvidence packet = reviewedEvidenceService.search(question);
+            List<WebSearchService.SearchResult> results = packet.results;
+            String coverageGap = contract.strict ? validateWorkflowRequiredSearchCoverage(contract, results) : null;
+            meta.status = StringUtils.hasText(coverageGap) ? "missing_required_search" : "success";
+            meta.note = StringUtils.hasText(coverageGap) ? coverageGap
+                    : "通过 n8n 双隔离会话搜索审核；未单独读取链接原文。";
+            meta.providerResultCount = results.size();
+            return new WorkflowStageSearchTrace(strategy, true, contract, null,
+                    Collections.singletonList(question), results, meta, null, executedAt, meta.note);
+        } catch (RuntimeException e) {
+            meta.status = "unverified";
+            meta.note = "n8n 搜索审核未通过：" + e.getMessage();
+            return new WorkflowStageSearchTrace(strategy, true, contract, null,
+                    Collections.singletonList(question), new ArrayList<>(), meta, null, executedAt, meta.note);
+        }
     }
 
     private boolean shouldPreferWorkflowBuiltInSearch(String strategy, WorkflowSearchContract contract) {
@@ -3134,6 +3226,24 @@ public class MeetingWorkflowService {
                 + "必须尽量命中用户明确指定的网站和字段，优先返回可核验的原始来源。";
         String userPrompt = buildWorkflowBuiltInSearchPrompt(room, stageRun, stageTemplate, member, contract, agentPlan);
         ChatResult chatResult = orchestrator.callModelEx(searchModelType, systemPrompt, userPrompt);
+        if (chatResult != null && chatResult.blocksAutomaticRetry()) {
+            WebSearchService.SearchMeta meta = new WebSearchService.SearchMeta();
+            meta.provider = "deepseek_builtin_search";
+            meta.status = "provider_outcome_unknown";
+            meta.note = "DeepSeek 内置搜索返回状态不确定；为避免重复提交，本轮不会继续自动补搜。";
+            return new WorkflowStageSearchTrace(
+                    resolveSearchStrategy(stageTemplate),
+                    true,
+                    contract,
+                    agentPlan,
+                    new ArrayList<>(),
+                    new ArrayList<>(),
+                    meta,
+                    null,
+                    executedAt,
+                    meta.note
+            );
+        }
         if (chatResult == null || !chatResult.hasSearchEvidence()) {
             log.warn("Workflow built-in search returned no evidence stageKey={} member={} searchStatus={} modelStatus={}",
                     stageTemplate.getStageKey(), member.getMemberName(),
@@ -3665,6 +3775,11 @@ public class MeetingWorkflowService {
     }
 
     private boolean isRequiredWorkflowSearchFailure(AiWorkflowStageTemplate stageTemplate, WorkflowStageSearchTrace trace) {
+        if (reviewedMode()) {
+            return trace != null && !"OFF".equalsIgnoreCase(trace.strategy)
+                    && (trace.meta == null || !"success".equalsIgnoreCase(trace.meta.status)
+                        || trace.results.isEmpty());
+        }
         return trace != null
                 && "REQUIRED".equalsIgnoreCase(resolveSearchStrategy(stageTemplate))
                 && trace.contract != null

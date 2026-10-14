@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.MeetingReviewedTurnSkipMapper">
+    <resultMap id="SkipMap" type="com.aimeeting.room.entity.MeetingReviewedTurnSkip">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="round_number" property="roundNumber"/>
+        <result column="member_id" property="memberId"/>
+        <result column="target_question_id" property="targetQuestionId"/>
+        <result column="reason_code" property="reasonCode"/>
+        <result column="run_epoch" property="runEpoch"/>
+        <result column="as_of" property="asOf"/>
+        <result column="context_opinion_id" property="contextOpinionId"/>
+        <result column="plan_id" property="planId"/>
+        <result column="gap_id" property="gapId"/>
+        <result column="active_turn" property="activeTurn"/>
+        <result column="retry_prepared_at" property="retryPreparedAt"/>
+        <result column="retry_prepared_epoch" property="retryPreparedEpoch"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <select id="findById" resultMap="SkipMap">
+        SELECT * FROM ai_meeting_reviewed_turn_skip WHERE id = #{id}
+    </select>
+
+    <select id="findByTurn" resultMap="SkipMap">
+        SELECT * FROM ai_meeting_reviewed_turn_skip
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
+          AND member_id = #{memberId} AND target_question_id = #{targetQuestionId}
+          AND active_turn = 1
+    </select>
+
+    <select id="listByMeetingAndRound" resultMap="SkipMap">
+        SELECT * FROM ai_meeting_reviewed_turn_skip
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
+          AND active_turn = 1
+        ORDER BY id
+    </select>
+
+    <select id="listByMeetingId" resultMap="SkipMap">
+        SELECT * FROM ai_meeting_reviewed_turn_skip WHERE meeting_id = #{meetingId} AND active_turn = 1
+        ORDER BY round_number, id
+    </select>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_reviewed_turn_skip
+        (meeting_id, round_number, member_id, target_question_id, reason_code,
+         run_epoch, as_of, context_opinion_id, plan_id, gap_id)
+        VALUES (#{meetingId}, #{roundNumber}, #{memberId}, #{targetQuestionId}, #{reasonCode},
+                #{runEpoch}, #{asOf}, #{contextOpinionId}, #{planId}, #{gapId})
+    </insert>
+
+    <update id="prepareRetry">
+        UPDATE ai_meeting_reviewed_turn_skip
+        SET active_turn = NULL, retry_prepared_at = CURRENT_TIMESTAMP,
+            retry_prepared_epoch = #{expectedEpoch}
+        WHERE id = #{id} AND active_turn = 1 AND retry_prepared_at IS NULL
+    </update>
+
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_reviewed_turn_skip WHERE meeting_id = #{meetingId}
+    </delete>
+</mapper>

@@ -32,6 +32,25 @@ public class MeetingDetailVO {
     private List<AiMeetingMember> members;
     private List<OpinionVO> opinions;
     private List<VoteVO> votes;
+    private List<ReviewedSearchProgressVO> reviewedSearchProgress = new ArrayList<>();
+    private List<ReviewedGapProgressVO> reviewedGapProgress = new ArrayList<>();
+
+    @Data
+    public static class ReviewedSearchProgressVO {
+        private Integer roundNumber;
+        private Long memberId;
+        private String memberName;
+        private String asOf;
+        private List<String> needQuestions = new ArrayList<>();
+        private String planStatus;
+        private String skipReasonCode;
+    }
+
+    @Data
+    public static class ReviewedGapProgressVO {
+        private Integer roundNumber;
+        private Map<String, Integer> statusCounts;
+    }
 
     @Data
     public static class DecisionArtifactVO {

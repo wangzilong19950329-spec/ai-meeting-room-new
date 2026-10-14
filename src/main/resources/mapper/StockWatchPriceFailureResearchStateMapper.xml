@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchPriceFailureResearchStateMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchPriceFailureResearchState">
+        <id column="rule_version" property="ruleVersion"/>
+        <result column="rule_spec_hash" property="ruleSpecHash"/>
+        <result column="rule_spec_json" property="ruleSpecJson"/>
+        <result column="bootstrap_observation_id" property="bootstrapObservationId"/>
+        <result column="last_observation_id" property="lastObservationId"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="started_at" property="startedAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <select id="selectByRuleVersion" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_price_failure_state WHERE rule_version = #{ruleVersion}
+    </select>
+
+    <insert id="insert">
+        INSERT INTO stock_watch_price_failure_state
+        (rule_version, rule_spec_hash, rule_spec_json, bootstrap_observation_id,
+         last_observation_id, row_version, started_at)
+        VALUES
+        (#{ruleVersion}, #{ruleSpecHash}, #{ruleSpecJson}, #{bootstrapObservationId},
+         #{lastObservationId}, #{rowVersion}, #{startedAt})
+    </insert>
+
+    <update id="updateCursor">
+        UPDATE stock_watch_price_failure_state
+        SET last_observation_id = #{lastObservationId},
+            row_version = row_version + 1,
+            gmt_modify = CURRENT_TIMESTAMP
+        WHERE rule_version = #{ruleVersion}
+          AND row_version = #{rowVersion}
+    </update>
+</mapper>

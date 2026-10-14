@@ -22,6 +22,10 @@ fi
 
 BACKEND_PORT="${AI_MEETING_BACKEND_PORT:-${BACKEND_PORT:-8127}}"
 BRIDGE_PORT="${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT:-8791}"
+BRIDGE_CURL_AUTH_ARGS=()
+if [[ -n "${DEEPSEEK_OPENAI_FACADE_API_KEY:-}" ]]; then
+  BRIDGE_CURL_AUTH_ARGS=(-H "Authorization: Bearer ${DEEPSEEK_OPENAI_FACADE_API_KEY}")
+fi
 
 if [[ "$ACTION" == "migrate" || "$ACTION" == "bootstrap" ]]; then
   if lsof -nP -iTCP:"$BACKEND_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -38,7 +42,7 @@ if [[ "$ACTION" == "migrate" || "$ACTION" == "bootstrap" ]]; then
     fi
     echo "migration quiescence: $launch_label remains loaded but is disabled and backend port is idle" >&2
   fi
-  health="$(curl -fsS --max-time 5 "http://127.0.0.1:${BRIDGE_PORT}/health")"
+  health="$(curl -fsS --max-time 5 "${BRIDGE_CURL_AUTH_ARGS[@]}" "http://127.0.0.1:${BRIDGE_PORT}/health")"
   printf '%s' "$health" | python3 -c '
 import json, sys
 payload = json.load(sys.stdin)

@@ -56,6 +56,9 @@
             <span>最终结论</span>
           </div>
           <MarkdownView :content="meeting.finalConclusion" class="final-conclusion-body" />
+          <div v-if="reviewedFinalRoundHasLowConfidence" class="evidence-note final-evidence-warning">
+            本轮有议员使用未完全核验的资料发言。请结合发言中的资料限制阅读结论；证据评分是规则分，并非事实为真的概率。
+          </div>
         </div>
       </el-card>
 
@@ -81,13 +84,43 @@
               </div>
             </template>
 
+            <div v-if="reviewedPlanProgress.length || reviewedRoundGapProgress.length" class="reviewed-search-progress" aria-label="资料搜索与审核进度">
+              <div class="reviewed-progress-title">🔎 资料搜索与审核进度</div>
+              <div v-for="(plan, index) in reviewedPlanProgress" :key="`${plan.roundNumber}-${plan.memberId}-${index}`" class="reviewed-progress-plan">
+                <div class="reviewed-progress-plan-head">
+                  <span>第 {{ plan.roundNumber }} 轮 · {{ plan.memberName || '议员' }}</span>
+                  <el-tag size="small" :type="reviewedPlanStatusType(plan.planStatus)" effect="plain">{{ reviewedPlanStatusLabel(plan.planStatus) }}</el-tag>
+                  <span v-if="plan.asOf" class="reviewed-progress-date">截至 {{ plan.asOf }}</span>
+                </div>
+                <div v-if="plan.needQuestions?.length" class="reviewed-progress-needs">
+                  <span class="reviewed-progress-label">本席资料需求：</span>
+                  <span v-for="(question, questionIndex) in plan.needQuestions" :key="questionIndex" class="reviewed-progress-question">{{ question }}</span>
+                </div>
+                <div v-else-if="plan.planStatus === 'SKIPPED'" class="reviewed-progress-empty">本席未生成可核验发言</div>
+                <div v-else class="reviewed-progress-empty">本席资料计划没有新增问题</div>
+                <div v-if="plan.planStatus === 'SKIPPED'" class="reviewed-progress-empty">
+                  {{ reviewedSkipReason(plan.skipReasonCode) }}；其他议员继续讨论，本席不参与本轮投票
+                </div>
+              </div>
+              <div v-for="round in reviewedRoundGapProgress" :key="`gap-${round.roundNumber}`" class="reviewed-progress-gaps">
+                <span class="reviewed-progress-label">第 {{ round.roundNumber }} 轮共用审核缺口：</span>
+                <span v-if="!reviewedTotalGapCount(round)" class="reviewed-progress-empty">当前没有待搜索的资料缺口</span>
+                <el-tag v-if="reviewedGapCount(round, 'PENDING')" size="small" type="info" effect="plain">待搜索 {{ reviewedGapCount(round, 'PENDING') }}</el-tag>
+                <el-tag v-if="reviewedGapCount(round, 'IN_FLIGHT')" size="small" type="warning" effect="plain">搜索审核中 {{ reviewedGapCount(round, 'IN_FLIGHT') }}</el-tag>
+                <el-tag v-if="reviewedGapCount(round, 'CROSS_CHECKED')" size="small" type="success" effect="plain">审核通过 {{ reviewedGapCount(round, 'CROSS_CHECKED') }}</el-tag>
+                <el-tag v-if="reviewedGapCount(round, 'LOW_CONFIDENCE')" size="small" type="warning" effect="plain">低置信资料 {{ reviewedGapCount(round, 'LOW_CONFIDENCE') }}</el-tag>
+                <el-tag v-if="reviewedGapCount(round, 'UNKNOWN')" size="small" type="danger" effect="plain">结果待确认 {{ reviewedGapCount(round, 'UNKNOWN') }}</el-tag>
+                <el-tag v-if="reviewedGapCount(round, 'REJECTED')" size="small" type="danger" effect="plain">审核未通过 {{ reviewedGapCount(round, 'REJECTED') }}</el-tag>
+              </div>
+            </div>
+
             <!-- 聊天消息区 -->
             <div class="chat-body" ref="chatRef">
 
               <!-- 等待开始 -->
               <div v-if="[1, 6].includes(meeting.status) && !filteredOpinions.length" class="thinking-placeholder">
                 <div class="dots"><span></span><span></span><span></span></div>
-                <p>AI 成员正在思考，即将发言…</p>
+                <p>AI 成员正在准备资料或发言…</p>
               </div>
 
               <template v-if="filteredOpinions.length">
@@ -134,6 +167,9 @@
                           <el-tag v-if="op.responseToTargetedQuestion" size="small" type="success" effect="plain" style="margin-left:4px">
                             回应追问
                           </el-tag>
+                          <el-tag v-if="isLowConfidenceEvidence(op.evidence)" size="small" type="warning" effect="plain" style="margin-left:4px">
+                            资料未完全核验
+                          </el-tag>
                         </div>
                         <div v-if="op.replyToLabel" class="chat-reply-label">{{ op.replyToLabel }}</div>
 
@@ -141,8 +177,66 @@
                         <div v-if="![3, 4, 5].includes(op.opinionType) && op.evidence && hasEvidence(op.evidence)" class="evidence-card">
                           <div class="evidence-header">
                             <span>🔍 {{ parsedEvidence(op.evidence).realResults?.length ? '联网搜索依据' : '引用论据' }}</span>
+                            <el-tag v-if="parsedEvidence(op.evidence).reviewedSearchStatus === 'CROSS_CHECKED'" size="small" type="success" effect="plain">n8n 双会话复核</el-tag>
+                            <el-tag v-else-if="isLowConfidenceEvidence(op.evidence)" size="small" type="warning" effect="plain">低置信资料</el-tag>
+                            <el-tag v-else-if="parsedEvidence(op.evidence).reviewedSearchStatus === 'STRUCTURED_ONLY'" size="small" type="primary" effect="plain">东方财富结构化数据</el-tag>
+                            <el-tag v-else-if="parsedEvidence(op.evidence).reviewedSearchStatus === 'NO_SEARCH_NEEDED'" size="small" type="info" effect="plain">本席未新增搜索</el-tag>
                           </div>
                           <div class="evidence-body">
+                            <div v-if="parsedEvidence(op.evidence).reviewedSearchStatus === 'CROSS_CHECKED'" class="evidence-note">
+                              候选事实已由两次隔离搜索交叉核对；引用链接的原文未单独读取。
+                            </div>
+                            <div v-if="isLowConfidenceEvidence(op.evidence)" class="evidence-note">
+                              本席资料未完全通过交叉核验；下方待核验线索只能用于条件分析，不能作为已确认事实。
+                              <template v-if="parsedEvidence(op.evidence).reviewedSearchConfidenceBasis === 'UNCALIBRATED_POLICY_SCORE' && parsedEvidence(op.evidence).reviewedSearchConfidenceScore != null">
+                                证据评分 {{ formatEvidenceScore(parsedEvidence(op.evidence).reviewedSearchConfidenceScore) }}（规则分，非事实概率）。
+                              </template>
+                            </div>
+                            <div v-for="(packet, packetIndex) in reviewedPackets(op.evidence)" :key="`review-packet-${packetIndex}`">
+                              <div v-if="isLowConfidencePacket(packet) && packet.question" class="evidence-note">
+                                待核验缺口：{{ packet.question }}
+                              </div>
+                              <div v-for="(claim, claimIndex) in provisionalClaims(packet)"
+                                   :key="`provisional-${packetIndex}-${claim.id || claimIndex}`"
+                                   class="evidence-item provisional-evidence-item">
+                                <span class="evidence-source">待核验线索</span>
+                                <div class="provisional-evidence-content">
+                                  <div>{{ claim.statement }}</div>
+                                  <div class="evidence-trace">
+                                    <span v-if="claim.limitation">限制：{{ claim.limitation }}</span>
+                                    <span v-if="claim.confidenceBasis === 'UNCALIBRATED_POLICY_SCORE' && claim.confidenceScore != null">证据评分 {{ formatEvidenceScore(claim.confidenceScore) }}（规则分，非事实概率）</span>
+                                  </div>
+                                  <div v-if="claim.sourceUrls?.length" class="evidence-trace">
+                                    初搜链接（未核验原文）：
+                                    <template v-for="(url, urlIndex) in claim.sourceUrls" :key="`provisional-link-${urlIndex}`">
+                                      <a v-if="safeEvidenceUrl(url)" :href="safeEvidenceUrl(url)" target="_blank" rel="noopener noreferrer" class="evidence-link">{{ url }}</a>
+                                      <span v-else>{{ url }}</span>
+                                    </template>
+                                  </div>
+                                </div>
+                              </div>
+                              <div v-if="isLowConfidencePacket(packet) && Array.isArray(packet.limitations) && packet.limitations.length" class="evidence-note">
+                                未解决的限制：{{ packet.limitations.join('；') }}
+                              </div>
+                            </div>
+                            <div v-if="parsedEvidence(op.evidence).reviewedSearchDecision?.unverifiedGaps?.length" class="evidence-note">
+                              本轮无法核验的缺口（未作为事实引用）：
+                              <span v-for="(gap, index) in parsedEvidence(op.evidence).reviewedSearchDecision.unverifiedGaps" :key="`unverified-gap-${index}`">
+                                {{ index ? '；' : '' }}{{ gap }}
+                              </span>
+                            </div>
+                            <div v-if="parsedEvidence(op.evidence).reviewedSearchDecision?.unsearchedGaps?.length" class="evidence-note">
+                              本轮未执行搜索的缺口：
+                              <span v-for="(gap, index) in parsedEvidence(op.evidence).reviewedSearchDecision.unsearchedGaps" :key="`unsearched-gap-${index}`">
+                                {{ index ? '；' : '' }}{{ gap }}
+                              </span>
+                            </div>
+                            <div v-if="parsedEvidence(op.evidence).reviewedSearchDecision?.needs?.length" class="evidence-note">
+                              本席资料需求：
+                              <span v-for="(need, index) in parsedEvidence(op.evidence).reviewedSearchDecision.needs" :key="need.id || index">
+                                {{ index ? '；' : '' }}{{ need.question }}
+                              </span>
+                            </div>
                             <div v-if="parsedEvidence(op.evidence).searchMeta?.note" class="evidence-note">
                               {{ parsedEvidence(op.evidence).searchMeta.note }}
                             </div>
@@ -211,6 +305,22 @@
                             </div>
                             <div v-if="parsedEvidence(op.evidence).searchMeta?.degradedReason" class="evidence-note evidence-note-danger">
                               降级原因：{{ parsedEvidence(op.evidence).searchMeta.degradedReason }}
+                            </div>
+                            <details v-if="parsedEvidence(op.evidence).unverifiedModelReply" class="unverified-model-reply">
+                              <summary>查看模型原始回复（未经事实核验，未作为正式发言）</summary>
+                              <div v-if="parsedEvidence(op.evidence).modelReplyRecovery" class="evidence-note">
+                                此回复按发言写入时间从 DeepSeek 请求记录恢复，尚未重新核验。
+                              </div>
+                              <div v-if="parsedEvidence(op.evidence).rejectedClaimAudit?.unsupportedNumericClaimCount" class="evidence-note evidence-note-danger">
+                                有 {{ parsedEvidence(op.evidence).rejectedClaimAudit.unsupportedNumericClaimCount }} 个数字未在本轮来源中定位到。
+                              </div>
+                              <div class="unverified-model-reply-content">{{ parsedEvidence(op.evidence).unverifiedModelReply }}</div>
+                            </details>
+                            <div v-if="parsedEvidence(op.evidence).modelReplyUnavailableReason" class="evidence-note evidence-note-danger">
+                              {{ parsedEvidence(op.evidence).modelReplyUnavailableReason }}
+                            </div>
+                            <div v-else-if="parsedEvidence(op.evidence).rejectedClaimAudit?.formatViolationCount" class="evidence-note evidence-note-danger">
+                              模型仅返回论据 JSON，没有生成可展示的发言正文。
                             </div>
                             <div v-if="parsedEvidence(op.evidence).searchMeta?.modelNote" class="evidence-note">
                               {{ parsedEvidence(op.evidence).searchMeta.modelNote }}
@@ -368,7 +478,7 @@
               <el-input
                 v-model="humanInput"
                 :placeholder="inputPlaceholder"
-                :disabled="sending"
+                :disabled="sending || reviewedCurrentRoundLocked"
                 @keydown.enter.exact.prevent="sendHumanMessage"
                 clearable
               >
@@ -398,7 +508,7 @@
                   <el-button
                     type="primary"
                     :loading="sending"
-                    :disabled="!humanInput.trim()"
+                    :disabled="!humanInput.trim() || reviewedCurrentRoundLocked"
                     @click="sendHumanMessage"
                     style="border-radius:0 6px 6px 0">
                     {{ sendButtonText }}
@@ -1324,7 +1434,14 @@ const statusType = (s) => ({0:'info',1:'warning',2:'primary',3:'success',4:'dang
 const formatTime = (t) => t ? dayjs(t).format('HH:mm:ss') : ''
 const formatDateTime = (t) => t ? dayjs(t).format('MM-DD HH:mm:ss') : ''
 const memberSpeechCount = (id) => meeting.value?.opinions?.filter(o => o.memberId === id).length ?? 0
+const reviewedCurrentRoundLocked = computed(() => {
+  const current = meeting.value
+  if (!current || ![1, 6].includes(current.status) || !(current.reviewedSearchProgress || []).length) return false
+  return (current.reviewedSearchProgress || []).some(plan => plan.roundNumber === current.currentRound
+    && ['SPOKEN', 'SKIPPED'].includes(plan.planStatus))
+})
 const inputPlaceholder = computed(() => {
+  if (reviewedCurrentRoundLocked.value) return '本轮已有议员发言或缺席，请在会议结束后发起下一轮追问'
   if (humanMode.value === 'directive') return '输入下一轮主持人指令，例如：只讨论成本和上线节奏，不再展开技术路线'
   if (targetMemberId.value) {
     const target = meeting.value?.members?.find(m => m.id === targetMemberId.value)
@@ -1338,6 +1455,7 @@ const sendButtonText = computed(() => {
   return [2, 3, 4].includes(meeting.value?.status) ? '继续追问' : '发送'
 })
 const inputHint = computed(() => {
+  if (reviewedCurrentRoundLocked.value) return '本轮已有发言或缺席记录；会后可开启下一轮追问'
   if (humanMode.value === 'directive') return '主持人模式会作为最高优先级指令注入下一轮讨论'
   if (targetMemberId.value) return '定向追问会优先注入指定议员的下一轮上下文，要求其直接回应'
   if ([2, 3, 4].includes(meeting.value?.status)) return '已结论会议继续追问后会自动进入“结论修订中”'
@@ -1346,9 +1464,33 @@ const inputHint = computed(() => {
 const targetableMembers = computed(() => meeting.value?.members || [])
 
 const rounds = computed(() => {
-  if (!meeting.value?.opinions) return []
-  return [...new Set(meeting.value.opinions.map(o => o.roundNumber))].sort((a, b) => a - b)
+  if (!meeting.value) return []
+  return [...new Set([
+    ...(meeting.value.opinions || []).map(o => o.roundNumber),
+    ...(meeting.value.reviewedSearchProgress || []).map(plan => plan.roundNumber),
+    ...(meeting.value.reviewedGapProgress || []).map(round => round.roundNumber)
+  ].filter(round => round != null))].sort((a, b) => a - b)
 })
+const reviewedPlanProgress = computed(() => (meeting.value?.reviewedSearchProgress || [])
+  .filter(plan => filterRound.value == null || plan.roundNumber === filterRound.value))
+const reviewedRoundGapProgress = computed(() => (meeting.value?.reviewedGapProgress || [])
+  .filter(round => filterRound.value == null || round.roundNumber === filterRound.value))
+const reviewedGapCount = (round, status) => Math.max(0, Number(round?.statusCounts?.[status]) || 0)
+const reviewedTotalGapCount = (round) => ['PENDING', 'IN_FLIGHT', 'CROSS_CHECKED', 'LOW_CONFIDENCE', 'UNKNOWN', 'REJECTED']
+  .reduce((total, status) => total + reviewedGapCount(round, status), 0)
+const reviewedPlanStatusLabel = (status) => ({
+  PLANNED: '资料计划已保存', SPOKEN: '已完成发言', SKIPPED: '本轮未发言'
+})[status] || '资料计划已保存'
+const reviewedPlanStatusType = (status) => ({
+  PLANNED: 'primary', SPOKEN: 'success', SKIPPED: 'warning'
+})[status] || 'primary'
+const reviewedSkipReason = (code) => ({
+  N8N_REVIEW_UNVERIFIED: '资料未通过交叉审核',
+  N8N_GAP_REJECTED: '此前资料审核未通过',
+  N8N_OUTCOME_UNKNOWN: '搜索结果暂时无法确认',
+  MODEL_SEARCH_CANNOT_BE_DISABLED: '议员模型无法关闭内置搜索',
+  ROUND_SEARCH_DEADLINE_EXCEEDED: '资料搜索超过本轮时限'
+})[code] || (code ? `资料或模型调用未完成（${code}）` : '资料或模型调用未完成')
 const filteredOpinions = computed(() => {
   if (!meeting.value?.opinions) return []
   return filterRound.value
@@ -1526,7 +1668,17 @@ function parsedEvidence(raw) {
 	      validation:  r.validation || null,
 	      factCatalog: r.factCatalog || null,
 	      claimAudit:  r.claimAudit || null,
-	      conflictValidation: r.conflictValidation || null
+	      rejectedClaimAudit: r.rejectedClaimAudit || null,
+	      unverifiedModelReply: r.unverifiedModelReply || null,
+	      modelReplyUnavailableReason: r.modelReplyUnavailableReason || null,
+	      modelReplyRecovery: r.modelReplyRecovery || null,
+	      conflictValidation: r.conflictValidation || null,
+	      reviewedSearchStatus: r.reviewedSearchStatus || null,
+	      reviewedSearchDecision: r.reviewedSearchDecision || null,
+	      reviewedSearchPackets: Array.isArray(r.reviewedSearchPackets) ? r.reviewedSearchPackets : null,
+	      reviewedSearchPacket: r.reviewedSearchPacket || null,
+	      reviewedSearchConfidenceScore: r.reviewedSearchConfidenceScore ?? null,
+	      reviewedSearchConfidenceBasis: r.reviewedSearchConfidenceBasis || null
 	    }
     evidenceCache.set(raw, result)
     return result
@@ -1535,6 +1687,48 @@ function parsedEvidence(raw) {
     return {}
   }
 }
+
+const lowConfidenceStatuses = new Set(['LOW_CONFIDENCE', 'PARTIAL', 'UNVERIFIED'])
+function isLowConfidenceEvidence(raw) {
+  return lowConfidenceStatuses.has(parsedEvidence(raw).reviewedSearchStatus)
+}
+
+function isLowConfidencePacket(packet) {
+  return packet && ['PARTIAL', 'UNVERIFIED'].includes(packet.status)
+}
+
+function provisionalClaims(packet) {
+  return isLowConfidencePacket(packet) && Array.isArray(packet.provisionalClaims)
+    ? packet.provisionalClaims.filter(claim => claim?.reviewVerdict === 'UNKNOWN')
+    : []
+}
+
+function reviewedPackets(raw) {
+  const evidence = parsedEvidence(raw)
+  if (evidence.reviewedSearchPackets?.length) return evidence.reviewedSearchPackets.filter(packet => packet && typeof packet === 'object')
+  return evidence.reviewedSearchPacket && typeof evidence.reviewedSearchPacket === 'object'
+    ? [evidence.reviewedSearchPacket] : []
+}
+
+function formatEvidenceScore(value) {
+  const score = Number(value)
+  return Number.isFinite(score) && score >= 0 && score <= 1 ? score.toFixed(2) + '/1' : '未提供'
+}
+
+function safeEvidenceUrl(value) {
+  try {
+    const url = new URL(value)
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : ''
+  } catch {
+    return ''
+  }
+}
+
+const reviewedFinalRoundHasLowConfidence = computed(() => {
+  if (!meeting.value?.finalConclusion) return false
+  return (meeting.value.opinions || []).some(op => op.roundNumber === meeting.value.currentRound
+    && op.opinionType === 0 && isLowConfidenceEvidence(op.evidence))
+})
 
 function isSyntheticEvidenceResult(item) {
   const source = String(item?.source || '').toLowerCase()
@@ -1556,7 +1750,10 @@ function hasEvidence(raw) {
     || !!ev.validation
     || !!ev.factCatalog
     || !!ev.claimAudit
+    || !!ev.unverifiedModelReply
+    || !!ev.modelReplyUnavailableReason
     || !!ev.conflictValidation
+    || !!ev.reviewedSearchStatus
 }
 
 function artifactList(value) {
@@ -1829,6 +2026,10 @@ async function handleVerify(valid) {
 
 async function sendHumanMessage() {
   if (!humanInput.value.trim() || sending.value) return
+  if (reviewedCurrentRoundLocked.value) {
+    ElMessage.warning('本轮已有议员发言或缺席，请在会议结束后发起下一轮追问')
+    return
+  }
   sending.value = true
   try {
     await meetingApi.sendHumanMessage(meetingId, humanInput.value.trim(), humanMode.value, targetMemberId.value)
@@ -1838,8 +2039,11 @@ async function sendHumanMessage() {
     await nextTick()
     scrollToBottom()
     if ([1, 6].includes(meeting.value?.status) && !pollTimer) startPolling()
-  } catch {
-    ElMessage.error('发送失败，请重试')
+  } catch (error) {
+    const message = error?.msg || error?.message || '发送失败，请重试'
+    ElMessage.error(message === 'MEETING_ROUND_ALREADY_ADVANCED_USE_FOLLOW_UP'
+      ? '本轮已有议员发言或缺席，请在会议结束后发起下一轮追问'
+      : message)
   } finally {
     sending.value = false
   }
@@ -1961,6 +2165,25 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 
 /* 聊天区 */
 .chat-card-header { display: flex; justify-content: space-between; align-items: center; font-weight: 600; }
+.reviewed-search-progress {
+  max-height: 230px;
+  overflow-y: auto;
+  margin: 0 2px 10px;
+  padding: 10px 12px;
+  border: 1px solid #dbeafe;
+  border-radius: 8px;
+  background: #f8faff;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.reviewed-progress-title { color: #2563eb; font-weight: 700; margin-bottom: 6px; }
+.reviewed-progress-plan { padding: 6px 0; border-top: 1px solid #e5edff; }
+.reviewed-progress-plan-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-weight: 600; color: #374151; }
+.reviewed-progress-date, .reviewed-progress-empty { color: #909399; font-weight: 400; }
+.reviewed-progress-needs { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; margin-top: 4px; }
+.reviewed-progress-label { color: #6b7280; }
+.reviewed-progress-question { color: #374151; background: #fff; border: 1px solid #e5edff; border-radius: 5px; padding: 2px 6px; overflow-wrap: anywhere; }
+.reviewed-progress-gaps { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; padding-top: 7px; border-top: 1px solid #e5edff; }
 .chat-body {
   height: 500px; overflow-y: auto; padding: 4px 2px;
   display: flex; flex-direction: column; gap: 2px;
@@ -2082,6 +2305,22 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
   background: #fef2f2;
   border-color: #fca5a5;
 }
+.unverified-model-reply {
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border: 1px solid #fca5a5;
+  border-radius: 8px;
+  background: #fff7f7;
+}
+.unverified-model-reply summary { cursor: pointer; color: #991b1b; font-weight: 600; }
+.unverified-model-reply-content {
+  margin-top: 8px;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
 .evidence-plan {
   margin-bottom: 6px;
   display: flex;
@@ -2097,6 +2336,13 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
   padding: 4px 6px; background: #fff; border-radius: 5px;
   border: 1px solid #e0e7ff;
 }
+.provisional-evidence-item {
+  margin-bottom: 6px;
+  border-color: #fcd34d;
+  background: #fffbeb;
+}
+.provisional-evidence-content { min-width: 0; overflow-wrap: anywhere; }
+.provisional-evidence-content .evidence-trace { margin-top: 4px; }
 .evidence-source {
   color: #6366f1; font-weight: 600; white-space: nowrap;
   font-size: 11px; padding: 1px 4px; background: #eef2ff;
@@ -2576,6 +2822,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 .final-conclusion-card { margin-top: 12px; border: 1px solid #c2e7b0; border-radius: 10px; background: #f6ffed; overflow: hidden; }
 .final-conclusion-head { display: flex; align-items: center; gap: 8px; padding: 10px 16px; font-weight: 700; color: #2f6b1f; background: #eaf7e1; border-bottom: 1px solid #d3edc3; }
 .final-conclusion-body { padding: 14px 16px; }
+.final-evidence-warning { margin: 0 16px 14px; }
 .memory-section + .memory-section,
 .artifact-section + .artifact-section { margin-top: 12px; }
 .memory-title { font-size: 12px; color: #909399; margin-bottom: 6px; font-weight: 600; }

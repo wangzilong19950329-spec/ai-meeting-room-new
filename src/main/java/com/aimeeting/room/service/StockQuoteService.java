@@ -108,6 +108,10 @@ public class StockQuoteService {
                                 return failedQuote(ref, "eastmoney_missing");
                             }
                             Map<String, Object> normalized = new LinkedHashMap<>(quote);
+                            normalized.put("providerSymbol", quote.get("symbol"));
+                            normalized.put("providerMarket", quote.get("market"));
+                            normalized.put("sourceEndpoint", quoteUrl);
+                            normalized.put("priceBasis", "UNADJUSTED");
                             normalized.put("market", ref.getMarket());
                             return normalized;
                         })

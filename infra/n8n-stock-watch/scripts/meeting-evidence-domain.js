@@ -4,7 +4,8 @@ const MAX_ATTEMPTS = 3; // Initial search plus at most two targeted searches.
 const MAX_DURATION_MS = 12 * 60 * 1000;
 const TRUSTED_ENDPOINTS = new Set([
   'http://deepseek-facade:8793/search',
-  'http://host.docker.internal:8794/search' // Local fixture only.
+  'http://host.docker.internal:8794/search', // Local fixture only.
+  'http://host.docker.internal:8795/search' // Local Edge bridge canary only.
 ]);
 
 function text(value, max = 1000) {
@@ -22,7 +23,9 @@ function normalizeRequest(input, now = Date.now()) {
   if (!/^[0-9]{6}\.(sz|sh)$/i.test(symbol)) throw new Error('INVALID_SYMBOL');
   if (!gapId || !/^[A-Za-z0-9._:-]+$/.test(gapId) || !question) throw new Error('INVALID_GAP');
   const endpoint = text(input.bridgeEndpoint, 200) || 'http://deepseek-facade:8793/search';
-  if (!TRUSTED_ENDPOINTS.has(endpoint) || (endpoint.includes('8794') && input.fixtureMode !== true)) {
+  if (!TRUSTED_ENDPOINTS.has(endpoint)
+    || (endpoint.includes('8794') && input.fixtureMode !== true)
+    || (endpoint.includes('8795') && input.edgeBridgeCanary !== true)) {
     throw new Error('UNTRUSTED_BRIDGE_ENDPOINT');
   }
   return {

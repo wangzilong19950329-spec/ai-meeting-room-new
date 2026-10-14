@@ -264,6 +264,8 @@ class StockWatchV17PersistenceSmokeTest {
         demand.setSymbol("009990");
         demand.setMarket("sz");
         demand.setStockName("邮件补充测试股");
+        demand.setCapability("TECHNICAL_PLUS_ANOMALY");
+        demand.setTriggerType("ANOMALY_DEFERRED");
         demand.setPeriodType("DAY");
         demand.setTargetFactObservationId(901L);
         demand.setTargetFactObservationKey(unique + "-fact");

@@ -32,6 +32,11 @@ const server = http.createServer((req, res) => {
     let body;
     try { body = JSON.parse(raw); } catch (_) { res.writeHead(400); res.end(); return; }
     const query = String(body.query || '');
+    if (query.includes('fixture_http_503')) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'login_required' }));
+      return;
+    }
     const review = query.startsWith('请开启全新会话');
     const failure = query.includes('fixture_reject');
     const key = `${failure ? 'reject' : 'pass'}:${review ? 'review' : 'search'}`;

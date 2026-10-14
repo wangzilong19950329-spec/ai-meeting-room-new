@@ -1,0 +1,90 @@
+{
+  "bySymbolDate": {},
+  "classification": "DESCRIPTIVE_ONLY",
+  "endpointNotice": "Verified unadjusted completed end <= target; gap <60s. No full path or drawdown. Overlapping windows are not independent.",
+  "evaluatedAt": "2026-10-05T16:33:42.336327+00:00",
+  "evaluationScope": "FROZEN_QUOTE_TO_TARGET",
+  "excludedNoM30RequestCount": 125,
+  "exportDate": "2026-08-14",
+  "informationCutoffStatus": "UNVERIFIED_WEB_SEARCH",
+  "integrityNotice": "Task request_digest must match envelope requestDigest; projectionDigest is SHA256 of the exact projectionJson UTF-8 string. Digest binding is not authentication or proof of model information cutoff.",
+  "protocol": "M30_MVP_V1",
+  "researchNotice": "Frozen quote (up to 120s old) to target description only. Neither exact starting price nor model information cutoff is verified. No formal future-30-minute predictive accuracy is established. Paired baselines are same-cohort descriptive statistics only.",
+  "rows": [],
+  "slotCoverage": {
+    "coverageRate": null,
+    "plannedSlotCount": null,
+    "status": "UNKNOWN",
+    "untriggeredSlotCount": null
+  },
+  "sourceSelection": "REAL_DB_READ_ONLY_TASK_DB_CREATE_DATE",
+  "sourceTaskCount": 125,
+  "strictAsOfDirectionAccuracy": null,
+  "strictAsOfDirectionAccuracyStatus": "NOT_ESTABLISHED",
+  "summary": {
+    "classification": "DESCRIPTIVE_ONLY",
+    "descriptiveEndpointCount": 0,
+    "evaluationScope": "FROZEN_QUOTE_TO_TARGET",
+    "forecastStatusCounts": {},
+    "frozenQuoteDirectionHitCount": 0,
+    "frozenQuoteDirectionHitRate": null,
+    "frozenQuoteIntervalCoverageRate": null,
+    "inputStatusCounts": {},
+    "intervalHits": 0,
+    "last30MissingOrFlatCount": 0,
+    "meanAbsoluteFrozenQuoteReturnPct": null,
+    "meanIntervalWidthPct": null,
+    "pairedBaselines": {
+      "alwaysDown": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "alwaysUp": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "classification": "DESCRIPTIVE_ONLY",
+      "count": 0,
+      "evaluationScope": "FROZEN_QUOTE_TO_TARGET",
+      "rawM30Direction": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "taskIds": []
+    },
+    "pairedLast30Trend": {
+      "alwaysDown": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "alwaysUp": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "classification": "DESCRIPTIVE_ONLY",
+      "count": 0,
+      "evaluationScope": "FROZEN_QUOTE_TO_TARGET",
+      "last30Trend": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "rawM30Direction": {
+        "frozenQuoteDirectionHitRate": null,
+        "hits": 0
+      },
+      "taskIds": []
+    },
+    "predictedCount": 0,
+    "predictedRate": null,
+    "recordingTimelyCount": 0,
+    "recordingTimelyRate": null,
+    "requestedTaskCount": 0,
+    "statusCounts": {},
+    "strictAsOfDirectionAccuracy": null,
+    "strictAsOfDirectionAccuracyStatus": "NOT_ESTABLISHED",
+    "taskStatusCounts": {}
+  },
+  "timingNotice": "Analysis gmt_create is a recording/projection proxy, NOT user delivery. Naive DB times assumed +08:00.",
+  "timingProvenance": "DB_INSERT_PROXY",
+  "unreadableEnvelopeTaskCount": 0
+}

@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.MeetingReviewedSearchLedgerMapper">
+    <resultMap id="PlanMap" type="com.aimeeting.room.entity.MeetingReviewedSearchPlan">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="round_number" property="roundNumber"/>
+        <result column="member_id" property="memberId"/>
+        <result column="target_question_id" property="targetQuestionId"/>
+        <result column="as_of" property="asOf"/>
+        <result column="context_opinion_id" property="contextOpinionId"/>
+        <result column="supersedes_plan_id" property="supersedesPlanId"/>
+        <result column="normalized_plan_json" property="normalizedPlanJson"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <resultMap id="GapMap" type="com.aimeeting.room.entity.MeetingReviewedSearchGap">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="round_number" property="roundNumber"/>
+        <result column="as_of" property="asOf"/>
+        <result column="question_hash" property="questionHash"/>
+        <result column="exact_question" property="exactQuestion"/>
+        <result column="request_id" property="requestId"/>
+        <result column="status" property="status"/>
+        <result column="packet_json" property="packetJson"/>
+        <result column="status_reason" property="statusReason"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <select id="findPlan" resultMap="PlanMap">
+        SELECT * FROM ai_meeting_reviewed_search_plan
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
+          AND member_id = #{memberId} AND target_question_id = #{targetQuestionId}
+        ORDER BY id DESC LIMIT 1
+    </select>
+
+    <select id="findPlanVersion" resultMap="PlanMap">
+        SELECT * FROM ai_meeting_reviewed_search_plan
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
+          AND member_id = #{memberId} AND target_question_id = #{targetQuestionId}
+          AND as_of = #{asOf} AND context_opinion_id = #{contextOpinionId}
+    </select>
+
+    <select id="listPlansByMeetingId" resultMap="PlanMap">
+        SELECT * FROM ai_meeting_reviewed_search_plan
+        WHERE meeting_id = #{meetingId}
+        ORDER BY round_number, gmt_create, id
+    </select>
+
+    <select id="listGapsByMeetingId" resultMap="GapMap">
+        SELECT * FROM ai_meeting_reviewed_search_gap
+        WHERE meeting_id = #{meetingId}
+        ORDER BY round_number, gmt_create, id
+    </select>
+
+    <insert id="insertPlan" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_reviewed_search_plan
+        (meeting_id, round_number, member_id, target_question_id, as_of,
+         context_opinion_id, supersedes_plan_id, normalized_plan_json)
+        VALUES (#{meetingId}, #{roundNumber}, #{memberId}, #{targetQuestionId}, #{asOf},
+                #{contextOpinionId}, #{supersedesPlanId}, #{normalizedPlanJson})
+    </insert>
+
+    <select id="findGap" resultMap="GapMap">
+        SELECT * FROM ai_meeting_reviewed_search_gap
+        WHERE meeting_id = #{meetingId} AND round_number = #{roundNumber}
+          AND as_of = #{asOf} AND question_hash = #{questionHash}
+    </select>
+
+    <select id="findGapById" resultMap="GapMap">
+        SELECT * FROM ai_meeting_reviewed_search_gap WHERE id = #{gapId}
+    </select>
+
+    <insert id="insertGap" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_reviewed_search_gap
+        (meeting_id, round_number, as_of, question_hash, exact_question, request_id, status)
+        VALUES (#{meetingId}, #{roundNumber}, #{asOf}, #{questionHash},
+                #{exactQuestion}, #{requestId}, #{status})
+    </insert>
+
+    <update id="claimPendingGap">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'IN_FLIGHT', gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status = 'PENDING'
+    </update>
+
+    <update id="releaseUnsubmittedGap">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'PENDING', gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status = 'IN_FLIGHT'
+    </update>
+
+    <update id="markCrossChecked">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'CROSS_CHECKED', packet_json = #{packetJson}, status_reason = NULL,
+            gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status = 'IN_FLIGHT'
+    </update>
+
+    <update id="markLowConfidence">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'LOW_CONFIDENCE', packet_json = #{packetJson}, status_reason = NULL,
+            gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status = 'IN_FLIGHT'
+    </update>
+
+    <update id="markUnknown">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'UNKNOWN', status_reason = #{reason}, gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status = 'IN_FLIGHT'
+    </update>
+
+    <update id="markRejected">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'REJECTED', status_reason = #{reason}, gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status = 'IN_FLIGHT'
+    </update>
+
+    <delete id="deletePlansByMeetingId">
+        DELETE FROM ai_meeting_reviewed_search_plan WHERE meeting_id = #{meetingId}
+    </delete>
+
+    <delete id="deleteGapsByMeetingId">
+        DELETE FROM ai_meeting_reviewed_search_gap WHERE meeting_id = #{meetingId}
+    </delete>
+</mapper>

@@ -11,6 +11,7 @@
         <result column="inherited_context" property="inheritedContext"/>
         <result column="creator_id" property="creatorId"/>
         <result column="status" property="status"/>
+        <result column="run_epoch" property="runEpoch"/>
         <result column="max_rounds" property="maxRounds"/>
         <result column="current_round" property="currentRound"/>
         <result column="final_conclusion" property="finalConclusion"/>
@@ -39,8 +40,36 @@
         SELECT * FROM ai_meeting_room WHERE id = #{id}
     </select>
 
+    <select id="selectByIdForUpdate" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_room WHERE id = #{id} FOR UPDATE
+    </select>
+
     <update id="updateStatus">
         UPDATE ai_meeting_room SET status = #{status}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateStatusIfCurrent">
+        UPDATE ai_meeting_room
+        SET status = #{status}, gmt_modify = NOW()
+        WHERE id = #{id} AND status = #{expectedStatus}
+    </update>
+
+    <update id="claimReviewedRun">
+        UPDATE ai_meeting_room
+        SET status = #{status}, run_epoch = run_epoch + 1, gmt_modify = NOW()
+        WHERE id = #{id} AND status = #{expectedStatus} AND run_epoch = #{expectedEpoch}
+    </update>
+
+    <update id="updateStatusIfCurrentAndEpoch">
+        UPDATE ai_meeting_room
+        SET status = #{status}, run_epoch = run_epoch + 1, gmt_modify = NOW()
+        WHERE id = #{id} AND status = #{expectedStatus} AND run_epoch = #{expectedEpoch}
+    </update>
+
+    <update id="bumpEpochIfStatusAndEpoch">
+        UPDATE ai_meeting_room
+        SET run_epoch = run_epoch + 1, gmt_modify = NOW()
+        WHERE id = #{id} AND status = #{expectedStatus} AND run_epoch = #{expectedEpoch}
     </update>
 
     <update id="updateConclusion" parameterType="com.aimeeting.room.entity.AiMeetingRoom">
@@ -52,24 +81,59 @@
         WHERE id = #{id}
     </update>
 
+    <update id="updateConclusionIfEpoch">
+        UPDATE ai_meeting_room
+        SET final_conclusion = #{finalConclusion},
+            conclusion_time = #{conclusionTime},
+            status = #{status},
+            run_epoch = run_epoch + 1,
+            gmt_modify = NOW()
+        WHERE id = #{id} AND run_epoch = #{expectedEpoch} AND status IN (1, 6)
+    </update>
+
     <update id="updateCurrentRound">
         UPDATE ai_meeting_room SET current_round = #{currentRound}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateCurrentRoundIfEpoch">
+        UPDATE ai_meeting_room SET current_round = #{currentRound}, gmt_modify = NOW()
+        WHERE id = #{id} AND run_epoch = #{expectedEpoch} AND status IN (1, 6)
     </update>
 
     <update id="updateSummary">
         UPDATE ai_meeting_room SET summary = #{summary}, gmt_modify = NOW() WHERE id = #{id}
     </update>
 
+    <update id="updateSummaryIfEpoch">
+        UPDATE ai_meeting_room SET summary = #{summary}, gmt_modify = NOW()
+        WHERE id = #{id} AND run_epoch = #{expectedEpoch} AND status IN (1, 6)
+    </update>
+
     <update id="updateDecisionArtifact">
         UPDATE ai_meeting_room SET decision_artifact = #{decisionArtifact}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateDecisionArtifactIfEpoch">
+        UPDATE ai_meeting_room SET decision_artifact = #{decisionArtifact}, gmt_modify = NOW()
+        WHERE id = #{id} AND run_epoch = #{expectedEpoch} AND status IN (1, 6)
     </update>
 
     <update id="updateRoundSummaries">
         UPDATE ai_meeting_room SET round_summaries = #{roundSummaries}, gmt_modify = NOW() WHERE id = #{id}
     </update>
 
+    <update id="updateRoundSummariesIfEpoch">
+        UPDATE ai_meeting_room SET round_summaries = #{roundSummaries}, gmt_modify = NOW()
+        WHERE id = #{id} AND run_epoch = #{expectedEpoch} AND status IN (1, 6)
+    </update>
+
     <update id="updateConclusionHistory">
         UPDATE ai_meeting_room SET conclusion_history = #{conclusionHistory}, gmt_modify = NOW() WHERE id = #{id}
+    </update>
+
+    <update id="updateConclusionHistoryIfEpoch">
+        UPDATE ai_meeting_room SET conclusion_history = #{conclusionHistory}, gmt_modify = NOW()
+        WHERE id = #{id} AND run_epoch = #{expectedEpoch}
     </update>
 
     <update id="resetForRestart">
@@ -78,6 +142,15 @@
             conclusion_time = NULL, summary = NULL, decision_artifact = NULL, conclusion_history = NULL,
             round_summaries = NULL, inherited_context = inherited_context, gmt_modify = NOW()
         WHERE id = #{id}
+    </update>
+
+    <update id="resetForRestartIfCurrentAndEpoch">
+        UPDATE ai_meeting_room
+        SET status = 0, current_round = 0, final_conclusion = NULL,
+            run_epoch = run_epoch + 1,
+            conclusion_time = NULL, summary = NULL, decision_artifact = NULL, conclusion_history = NULL,
+            round_summaries = NULL, inherited_context = inherited_context, gmt_modify = NOW()
+        WHERE id = #{id} AND status = #{expectedStatus} AND run_epoch = #{expectedEpoch}
     </update>
 
     <select id="selectByCreatorId" resultMap="BaseResultMap">

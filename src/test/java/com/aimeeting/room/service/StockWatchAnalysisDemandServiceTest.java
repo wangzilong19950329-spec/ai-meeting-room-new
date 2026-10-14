@@ -100,6 +100,28 @@ class StockWatchAnalysisDemandServiceTest {
     }
 
     @Test
+    void createScheduledKeepsImmediateAnomalyAsActiveAnalysis() {
+        StockWatchItem item = item("300750", "sz", "INTERVAL", 10, 7L);
+        ZonedDateTime now = ZonedDateTime.of(2026, 8, 7, 11, 20, 0, 0,
+                StockWatchAnalysisSchedulePlanner.CHINA_ZONE);
+        StockWatchAnalysisSchedulePlanner.DueDecision decision = planner.currentDayDecision(item, now);
+        StockWatchAnalysisDemand immediate = anomalyDemand("PENDING");
+        immediate.setDemandKey("immediate-anomaly-key");
+        immediate.setTriggerType("ANOMALY_IMMEDIATE");
+        immediate.setSourcePolicyVersion(7L);
+        when(policyService.allowsAutomaticDemand(item, "INTERVAL")).thenReturn(true);
+        when(demandMapper.selectByDemandKey(anyString())).thenReturn(null);
+        when(demandMapper.selectActiveByCoalesceKey(anyString())).thenReturn(immediate);
+
+        StockWatchAnalysisDemandService.DemandCreationResult result = service.createScheduled(item, decision);
+
+        assertFalse(result.isCreated());
+        assertSame(immediate, result.getDemand());
+        verify(demandMapper, never()).markSupersededIfUnsubmitted(any(), anyString(), any(Date.class));
+        verify(demandMapper, never()).insert(any());
+    }
+
+    @Test
     void createScheduledReusesActiveDemandWhenUniqueActiveCoalesceWinsRace() {
         StockWatchItem item = item("002979", "sz", "DAILY_CLOSE", null, 7L);
         ZonedDateTime now = ZonedDateTime.of(2026, 7, 17, 15, 20, 0, 0,
@@ -117,6 +139,47 @@ class StockWatchAnalysisDemandServiceTest {
 
         assertFalse(result.isCreated());
         assertSame(racedActive, result.getDemand());
+    }
+
+    @Test
+    void createAnomalyUsesColumnSafeRunSlotForQuoteAlertFactKey() {
+        StockWatchItem item = item("002463", "sz", "INTERVAL", 30, 7L);
+        ZonedDateTime now = ZonedDateTime.of(2026, 8, 7, 11, 8, 0, 0,
+                StockWatchAnalysisSchedulePlanner.CHINA_ZONE);
+        String observationKey = "91e002ab40416d60f14b483af927835b4b68b0ef6f5805cf0eb82b3cbc1a08db";
+        when(policyService.allowsAutomaticDemand(item, "ANOMALY_IMMEDIATE")).thenReturn(true);
+        when(demandMapper.selectByDemandKey(anyString())).thenReturn(null);
+        when(demandMapper.selectActiveByCoalesceKey(anyString())).thenReturn(null);
+
+        StockWatchAnalysisDemandService.DemandCreationResult result = service.createAnomalyDetailed(
+                item,
+                909L,
+                observationKey,
+                now.toInstant().toEpochMilli(),
+                List.of("AI_RULE_TRIGGERED"),
+                Collections.singletonMap("eventId", "ai_watch_002463_sz_045ae0bd_2026-08-07"),
+                now);
+
+        assertTrue(result.isCreated());
+        ArgumentCaptor<StockWatchAnalysisDemand> captor = ArgumentCaptor.forClass(StockWatchAnalysisDemand.class);
+        verify(demandMapper).insert(captor.capture());
+        StockWatchAnalysisDemand demand = captor.getValue();
+        assertEquals("ANOMALY_IMMEDIATE:" + observationKey, demand.getScheduleSlotKey());
+        assertTrue(demand.getRunSlot().startsWith("al:"));
+        assertTrue(demand.getRunSlot().length() <= 16);
+        assertEquals(909L, demand.getTargetFactObservationId());
+        assertEquals(observationKey, demand.getTargetFactObservationKey());
+    }
+
+    @Test
+    void anomalyObservationKeyMatchesDemandRunSlot() {
+        StockWatchAnalysisDemand demand = anomalyDemand("PENDING");
+        demand.setTargetFactObservationKey("91e002ab40416d60f14b483af927835b4b68b0ef6f5805cf0eb82b3cbc1a08db");
+        demand.setRunSlot("al:86aefc6f1ea8d");
+
+        String key = service.observationKey(demand);
+
+        assertEquals("DAY:2026-07-17:al:86aefc6f1ea8d", key);
     }
 
     @Test

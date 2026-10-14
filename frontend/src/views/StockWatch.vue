@@ -467,6 +467,7 @@
               </div>
               <strong>{{ record.title }}</strong>
               <p>{{ record.conclusion }}</p>
+              <M30ForecastLine :forecast="record.intradayForecast" />
               <div v-if="record.mainForceIntent" class="analysis-main-force">
                 <div>
                   <strong>{{ record.mainForceIntent.provenanceLabel }}</strong>
@@ -1591,6 +1592,7 @@ import { createHttp } from '@/api/http'
 import IntradayBarChart from '@/modules/stock-watch/components/IntradayBarChart.vue'
 import BarUnavailableState from '@/modules/stock-watch/components/BarUnavailableState.vue'
 import MetricCard from '@/modules/stock-watch/components/MetricCard.vue'
+import M30ForecastLine from '@/modules/stock-watch/components/M30ForecastLine.vue'
 import { loadDemoState } from '@/modules/stock-watch/runtime/demoMode'
 import { loadAllPredictionPages, selectVisiblePredictionGroups } from '@/modules/stock-watch/runtime/predictionHistory.mjs'
 import { useStockWatchRuntimeStatus } from '@/modules/stock-watch/composables/useStockWatchRuntimeStatus'
@@ -3281,6 +3283,7 @@ function normalizeAnalysisRecord(record) {
     confidence: formatConfidence(record?.confidence),
     title: record?.title || '技术面分析结论',
     conclusion: record?.conclusion || record?.rawResponse || '本轮未返回可展示结论。',
+    intradayForecast: record?.intradayForecast || null,
     evidence: normalizeEvidence(record?.evidence),
     missingData: normalizeEvidence(record?.missingData),
     mainForceIntent: normalizeMainForceIntent(record?.mainForceIntent, record?.mainForceIntentStatus, record?.evidenceQuality),

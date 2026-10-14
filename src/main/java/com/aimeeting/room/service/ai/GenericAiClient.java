@@ -68,6 +68,31 @@ public class GenericAiClient implements AiModelClient {
         return chatWithEvidence(modelType, systemPrompt, userPrompt, null);
     }
 
+    /** Strict meeting inference never invokes a client path with built-in search or model fallback. */
+    public ChatResult chatWithEvidenceStrict(String modelType, String systemPrompt, String userPrompt,
+                                              Integer maxTokens) {
+        ModelEntry entry = registry.getByModelId(modelType);
+        if (entry == null || !entry.isEnabled()) {
+            return new ChatResult(null, null, null,
+                    "unavailable", "missing_model", "所选模型不可用。",
+                    "missing_model", "所选模型不可用。");
+        }
+        if (supportsExperimentalDeepSeekSearch(entry)) {
+            return new ChatResult(null, null, null,
+                    "unavailable", "unseparable_builtin_search", "所选模型内置搜索无法与推理分离。",
+                    "unseparable_builtin_search", "所选模型内置搜索无法与推理分离。");
+        }
+        if ("claude".equalsIgnoreCase(entry.getApiFormat())) {
+            String content = callClaude(entry, systemPrompt, userPrompt, maxTokens);
+            return new ChatResult(content, null, null,
+                    "model_only", "no_builtin_search", "本次未启用内置联网搜索。",
+                    content != null && !content.isBlank() ? "success" : "api_call_failed",
+                    content != null && !content.isBlank() ? "所选模型已返回正文。" : "所选模型未返回正文。");
+        }
+        return callOpenAiWithEvidence(entry, entry.getModelId(), systemPrompt, userPrompt, maxTokens,
+                "model_only", "no_builtin_search", "本次未启用内置联网搜索。");
+    }
+
     public ChatResult chatWithEvidence(String modelType, String systemPrompt, String userPrompt, Integer maxTokens) {
         ModelEntry entry = registry.getByModelId(modelType);
         if (entry == null || !entry.isEnabled()) {

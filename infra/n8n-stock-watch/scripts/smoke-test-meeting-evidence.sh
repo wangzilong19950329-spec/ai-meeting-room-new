@@ -34,7 +34,8 @@ curl -fsS http://127.0.0.1:8794/health >/dev/null
 node > "$ROOT_DIR/runtime/workflows/MR-60-Fixture-Runner.json" <<'NODE'
 const inputCode = `return [
   { json: { requestId: 'fixture-pass', symbol: '300750.sz', gap: { id: 'fixture_pass', question: '储能项目规模和状态？' }, fixtureMode: true, bridgeEndpoint: 'http://host.docker.internal:8794/search' } },
-  { json: { requestId: 'fixture-reject', symbol: '300750.sz', gap: { id: 'fixture_reject', question: '储能项目规模和状态？' }, fixtureMode: true, bridgeEndpoint: 'http://host.docker.internal:8794/search' } }
+  { json: { requestId: 'fixture-reject', symbol: '300750.sz', gap: { id: 'fixture_reject', question: '储能项目规模和状态？' }, fixtureMode: true, bridgeEndpoint: 'http://host.docker.internal:8794/search' } },
+  { json: { requestId: 'fixture-http-503', symbol: '300750.sz', gap: { id: 'fixture_http_503', question: '模拟提供者登录失效？' }, fixtureMode: true, bridgeEndpoint: 'http://host.docker.internal:8794/search' } }
 ];`;
 const workflow = {
   id: 'MR60FixtureRunner', name: 'MR-60 Fixture Runner', active: false,
@@ -76,7 +77,8 @@ const items = execution.data.resultData.runData['Call MR-60'][0].data.main[0];
 const packets = new Map(items.map(item => [item.json.requestId, item.json]));
 const pass = packets.get('fixture-pass');
 const reject = packets.get('fixture-reject');
-if (!pass || !reject) throw new Error('MISSING_FIXTURE_OUTPUTS');
+const http503 = packets.get('fixture-http-503');
+if (!pass || !reject || !http503) throw new Error('MISSING_FIXTURE_OUTPUTS');
 if (pass.status !== 'VERIFIED' || pass.reasoningPacket.verifiedFacts[0]?.value !== '12' ||
     pass.audit.attempts !== 2 || pass.audit.reviewCalls !== 2) {
   throw new Error('CORRECTED_CLAIM_NOT_VERIFIED');
@@ -85,7 +87,12 @@ if (reject.status !== 'UNVERIFIED' || reject.reasoningPacket.verifiedFacts.lengt
     reject.audit.attempts !== 3 || reject.audit.reviewCalls !== 3) {
   throw new Error('BOUNDED_REJECTION_NOT_ENFORCED');
 }
-console.log('n8n MR-60 fixture smoke passed: verified and bounded-unverified outputs observed');
+if (http503.status !== 'UNVERIFIED' || http503.reasoningPacket.verifiedFacts.length !== 0 ||
+    http503.audit.attempts !== 1 || http503.audit.reviewCalls !== 0 ||
+    !http503.reasoningPacket.limitations.includes('fixture_http_503: BRIDGE_HTTP_503')) {
+  throw new Error('HTTP_503_DID_NOT_FAIL_CLOSED');
+}
+console.log('n8n MR-60 fixture smoke passed: verified, bounded-unverified, and HTTP 503 fail-closed outputs observed');
 NODE
 
 compose run --rm n8n-import unpublish:workflow --id=MR60EvidenceGapCrossSearch >/dev/null

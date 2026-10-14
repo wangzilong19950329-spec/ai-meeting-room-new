@@ -19,7 +19,7 @@ if compose exec -T n8n n8n audit --help >/dev/null 2>&1; then
       printf '%s\n' "$unexpected" >&2
       exit 30
     fi
-    echo "n8n audit findings match the Phase1 allowlist"
+    echo "n8n audit findings match the current local allowlist"
   else
     echo "[warning] jq unavailable or audit output is not JSON; allowlist gate skipped"
   fi

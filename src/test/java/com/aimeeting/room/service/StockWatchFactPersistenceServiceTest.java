@@ -1,5 +1,7 @@
 package com.aimeeting.room.service;
 
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
 import com.aimeeting.room.dao.StockWatchFactHeadMapper;
 import com.aimeeting.room.dao.StockWatchFactObservationMapper;
 import com.aimeeting.room.dao.StockWatchIntentTestMapper;
@@ -27,12 +29,15 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -69,6 +74,14 @@ class StockWatchFactPersistenceServiceTest {
 
         assertEquals("CREATED", receipt.get("status"));
         assertEquals(1, receipt.get("createdTestCount"));
+        ArgumentCaptor<StockWatchFactObservation> observationCaptor =
+                ArgumentCaptor.forClass(StockWatchFactObservation.class);
+        verify(observationMapper).insert(observationCaptor.capture());
+        JSONObject snapshot = JSON.parseObject(observationCaptor.getValue().getFactSnapshotJson());
+        assertNotNull(snapshot.getJSONObject("priceFailureResearchFeatures"));
+        assertEquals(12.0, snapshot.getJSONObject("priceFailureResearchFeatures").getDouble("return5Pct"));
+        assertFalse(snapshot.getJSONObject("riskPatternObservations")
+                .getJSONObject("derived").containsKey("return5Pct"));
         InOrder order = inOrder(intentTestMapper);
         order.verify(intentTestMapper).selectActiveForUpdate("002979", "sz", 11L);
         order.verify(intentTestMapper).insert(any());
@@ -87,6 +100,97 @@ class StockWatchFactPersistenceServiceTest {
         assertEquals("DUPLICATE", receipt.get("status"));
         verify(headMapper, never()).selectForUpdate(anyString(), anyString());
         verify(intentTestMapper, never()).selectActiveForUpdate(anyString(), anyString(), anyLong());
+    }
+
+    @Test
+    void quoteAlertObservationUsesStrictQuoteTimestampAndDoesNotCreateIntentTests() {
+        StockWatchFactHead head = head();
+        when(headMapper.selectForUpdate("002979", "sz")).thenReturn(head);
+        when(observationMapper.insert(any())).thenAnswer(invocation -> {
+            ((StockWatchFactObservation) invocation.getArgument(0)).setId(21L);
+            return 1;
+        });
+        when(headMapper.updateLatest(anyLong(), anyLong(), anyLong(), anyLong(), anyLong(),
+                anyString(), anyString(), anyString())).thenReturn(1);
+
+        Map<String, Object> receipt = service.observeQuoteAlert(
+                "002979", "sz", "雷赛智能", quote(), now()).toMap();
+
+        assertEquals("CREATED", receipt.get("status"));
+        assertEquals("QUOTE_ALERT", receipt.get("sourceTimeQuality"));
+        assertEquals("2026-07-16", receipt.get("sourceDate"));
+        assertEquals(0, receipt.get("createdTestCount"));
+        ArgumentCaptor<StockWatchFactObservation> observationCaptor =
+                ArgumentCaptor.forClass(StockWatchFactObservation.class);
+        verify(observationMapper).insert(observationCaptor.capture());
+        StockWatchFactObservation observation = observationCaptor.getValue();
+        assertEquals(StockWatchFactPersistenceService.QUOTE_ALERT_SOURCE_TIME_QUALITY,
+                observation.getSourceTimeQuality());
+        JSONObject snapshot = JSON.parseObject(observation.getFactSnapshotJson());
+        assertEquals(StockWatchFactPersistenceService.QUOTE_ALERT_FACT_SCHEMA, snapshot.getString("schema"));
+        assertNotNull(snapshot.getJSONObject("quote"));
+        assertNotNull(snapshot.getJSONObject("quoteAlertObservation"));
+        assertFalse(snapshot.containsKey("riskPatternObservations"));
+        verify(intentTestMapper, never()).selectActiveForUpdate(anyString(), anyString(), anyLong());
+        verify(intentTestMapper, never()).insert(any());
+    }
+
+    @Test
+    void quoteAlertObservationRejectsMissingQuoteTimestamp() {
+        Map<String, Object> quote = quote();
+        quote.remove("timestamp");
+
+        Map<String, Object> receipt = service.observeQuoteAlert(
+                "002979", "sz", "雷赛智能", quote, now()).toMap();
+
+        assertEquals("SKIPPED", receipt.get("status"));
+        assertEquals("quote_alert_timestamp_missing", receipt.get("reason"));
+        verify(observationMapper, never()).insert(any());
+        verify(headMapper, never()).selectForUpdate(anyString(), anyString());
+    }
+
+    @Test
+    void quoteAlertObservationIdentityIgnoresSamplingTime() {
+        StockWatchFactHead firstHead = head();
+        StockWatchFactHead secondHead = head();
+        secondHead.setArrivalVersion(1L);
+        secondHead.setRowVersion(1L);
+        when(headMapper.selectForUpdate("002979", "sz")).thenReturn(firstHead, secondHead);
+        when(observationMapper.insert(any())).thenAnswer(invocation -> {
+            ((StockWatchFactObservation) invocation.getArgument(0)).setId(21L);
+            return 1;
+        });
+        when(headMapper.updateLatest(anyLong(), anyLong(), anyLong(), anyLong(), anyLong(),
+                anyString(), anyString(), anyString())).thenReturn(1);
+
+        ZonedDateTime sampledAt = now();
+        service.observeQuoteAlert("002979", "sz", "雷赛智能", quote(), sampledAt);
+        service.observeQuoteAlert("002979", "sz", "雷赛智能", quote(), sampledAt.plusMinutes(3));
+
+        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
+        verify(observationMapper, times(2)).selectByObservationKey(keyCaptor.capture());
+        assertEquals(keyCaptor.getAllValues().get(0), keyCaptor.getAllValues().get(1));
+    }
+
+    @Test
+    void researchFeaturesDoNotChangeCanonicalObservationIdentity() {
+        StockWatchFactHead head = head();
+        when(headMapper.selectForUpdate("002979", "sz")).thenReturn(head);
+        when(observationMapper.insert(any())).thenAnswer(invocation -> {
+            ((StockWatchFactObservation) invocation.getArgument(0)).setId(11L);
+            return 1;
+        });
+        when(headMapper.updateLatest(anyLong(), anyLong(), anyLong(), anyLong(), anyLong(),
+                anyString(), anyString(), anyString())).thenReturn(1);
+        when(intentTestMapper.selectActiveForUpdate(anyString(), anyString(), anyLong()))
+                .thenReturn(Collections.emptyList());
+
+        service.observe("002979", "sz", "雷赛智能", quote(), riskWithResearchReturn5(8.0), now());
+        service.observe("002979", "sz", "雷赛智能", quote(), riskWithResearchReturn5(18.0), now());
+
+        ArgumentCaptor<String> keyCaptor = ArgumentCaptor.forClass(String.class);
+        verify(observationMapper, times(2)).selectByObservationKey(keyCaptor.capture());
+        assertEquals(keyCaptor.getAllValues().get(0), keyCaptor.getAllValues().get(1));
     }
 
     @Test
@@ -199,7 +303,17 @@ class StockWatchFactPersistenceServiceTest {
         observations.put("sourceQuality", sourceQuality);
         observations.put("derived", derived);
         observations.put("patterns", Collections.singletonList(pattern));
-        return new RiskPatternResult(observations, Collections.emptyMap(), now(), true);
+        Map<String, Object> research = new LinkedHashMap<>();
+        research.put("return5Pct", 12.0);
+        return new RiskPatternResult(observations, Collections.emptyMap(), now(), true, research);
+    }
+
+    private RiskPatternResult riskWithResearchReturn5(double return5) {
+        RiskPatternResult baseline = triggeredRisk();
+        Map<String, Object> research = new LinkedHashMap<>(baseline.getPriceFailureResearchFeatures());
+        research.put("return5Pct", return5);
+        return new RiskPatternResult(baseline.getObservations(), baseline.getGuidance(),
+                baseline.getQuoteObservedAt(), baseline.isActive(), research);
     }
 
     private Map<String, Object> quote() {

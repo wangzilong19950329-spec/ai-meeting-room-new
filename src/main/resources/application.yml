@@ -104,6 +104,7 @@ ai:
       enabled: false
       mode: fast
       bridge-url: http://127.0.0.1:8789/search
+      api-key: ${DEEPSEEK_OPENAI_FACADE_API_KEY:}
       node-command: node
       script-path: scripts/deepseek-web-search.js
       timeout-seconds: 150
@@ -121,11 +122,12 @@ ai:
     deepseek-web-bridge:
       enabled: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_ENABLED:false}
       bridge-url: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_URL:${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}}
+      api-key: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_API_KEY:${DEEPSEEK_OPENAI_FACADE_API_KEY:}}
       connect-timeout-seconds: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_CONNECT_TIMEOUT_SECONDS:10}
       read-timeout-seconds: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_READ_TIMEOUT_SECONDS:480}
       mode: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_MODE:expert}
       search-mode: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_SEARCH_MODE:fast}
-      serialized: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_SERIALIZED:true}
+      serialized: ${AI_MEETING_DEEPSEEK_WEB_BRIDGE_SERIALIZED:false}
   tracking:
     refresh:
       enabled: ${AI_TRACKING_REFRESH_ENABLED:true}
@@ -172,6 +174,8 @@ stock-watch:
     trading-hours-only: ${STOCK_WATCH_TECH_TRADING_HOURS_ONLY:true}
     scan-interval-ms: ${STOCK_WATCH_TECH_SCAN_INTERVAL_MS:1800000}
     initial-delay-ms: ${STOCK_WATCH_TECH_INITIAL_DELAY_MS:90000}
+    m30-enabled: ${STOCK_WATCH_M30_ENABLED:false}
+    m30-symbols: ${STOCK_WATCH_M30_SYMBOLS:}
     symbols: ${STOCK_WATCH_TECH_SYMBOLS:${STOCK_WATCH_SYMBOLS:688017.sh,300760.sz,002594.sz}}
     context-limit-chars: ${STOCK_WATCH_TECH_CONTEXT_LIMIT_CHARS:500000}
     context-rotate-ratio: ${STOCK_WATCH_TECH_CONTEXT_ROTATE_RATIO:1.0}
@@ -189,3 +193,11 @@ stock-watch:
     scan-interval-ms: ${STOCK_WATCH_DELIVERY_SCAN_INTERVAL_MS:300000}
     initial-delay-ms: ${STOCK_WATCH_DELIVERY_INITIAL_DELAY_MS:45000}
     batch-limit: ${STOCK_WATCH_DELIVERY_BATCH_LIMIT:100}
+  # 仅写离线前瞻研究账本；不进入 DeepSeek、通知、界面或交易动作。
+  price-failure-research:
+    enabled: ${STOCK_WATCH_PRICE_FAILURE_RESEARCH_ENABLED:true}
+    scan-interval-ms: ${STOCK_WATCH_PRICE_FAILURE_RESEARCH_SCAN_INTERVAL_MS:60000}
+    initial-delay-ms: ${STOCK_WATCH_PRICE_FAILURE_RESEARCH_INITIAL_DELAY_MS:120000}
+    batch-limit: ${STOCK_WATCH_PRICE_FAILURE_RESEARCH_BATCH_LIMIT:500}
+    reconcile-limit: ${STOCK_WATCH_PRICE_FAILURE_RESEARCH_RECONCILE_LIMIT:200}
+    outcome-observation-limit: ${STOCK_WATCH_PRICE_FAILURE_RESEARCH_OUTCOME_OBSERVATION_LIMIT:1000}

@@ -13,12 +13,14 @@ CREATE TABLE `ai_meeting_room` (
     `inherited_context` TEXT                                COMMENT '从同项目历史会议继承的上下文',
     `creator_id`       BIGINT       NOT NULL                COMMENT '创建者ID',
     `status`           TINYINT      NOT NULL DEFAULT 0      COMMENT '0-已创建 1-进行中 2-已达成结论 3-验证有效 4-验证无效 5-已取消',
+    `run_epoch`        BIGINT       NOT NULL DEFAULT 0      COMMENT '审核会议异步任务代次',
     `max_rounds`       INT          NOT NULL DEFAULT 10     COMMENT '最大辩论轮数',
     `current_round`    INT          NOT NULL DEFAULT 0      COMMENT '当前轮次',
     `final_conclusion` TEXT                                 COMMENT '最终结论',
     `conclusion_time`  DATETIME                             COMMENT '达成结论时间',
     `summary`          TEXT                                 COMMENT 'AI生成的会议总结',
     `decision_artifact` TEXT                                COMMENT '结构化决策卡片JSON',
+    `round_summaries` MEDIUMTEXT                             COMMENT '逐轮摘要JSON',
     `conclusion_history` TEXT                               COMMENT '结论版本历史JSON',
     `gmt_create`       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `gmt_modify`       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -225,6 +227,61 @@ CREATE TABLE `ai_meeting_opinion` (
     KEY `idx_meeting_round` (`meeting_id`, `round_number`),
     KEY `idx_parent` (`parent_opinion_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会议发言记录';
+
+-- 每位议员每轮的资料需求计划；target_question_id=0 表示普通发言。
+CREATE TABLE IF NOT EXISTS `ai_meeting_reviewed_search_plan` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `meeting_id` BIGINT NOT NULL,
+    `round_number` INT NOT NULL,
+    `member_id` BIGINT NOT NULL,
+    `target_question_id` BIGINT NOT NULL DEFAULT 0,
+    `as_of` VARCHAR(10) NOT NULL,
+    `context_opinion_id` BIGINT NOT NULL DEFAULT 0,
+    `supersedes_plan_id` BIGINT NULL,
+    `normalized_plan_json` MEDIUMTEXT NOT NULL,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_reviewed_plan_turn` (`meeting_id`, `round_number`, `member_id`,
+        `target_question_id`, `as_of`, `context_opinion_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='审核搜索议员资料计划';
+
+-- 同轮同日相同原文问题只允许一次自动提交；IN_FLIGHT 不因超时自动重试。
+CREATE TABLE IF NOT EXISTS `ai_meeting_reviewed_search_gap` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `meeting_id` BIGINT NOT NULL,
+    `round_number` INT NOT NULL,
+    `as_of` VARCHAR(10) NOT NULL,
+    `question_hash` CHAR(64) NOT NULL,
+    `exact_question` MEDIUMTEXT NOT NULL,
+    `request_id` VARCHAR(96) NOT NULL,
+    `status` VARCHAR(24) NOT NULL DEFAULT 'PENDING',
+    `packet_json` MEDIUMTEXT,
+    `status_reason` VARCHAR(128),
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_reviewed_gap_identity` (`meeting_id`, `round_number`, `as_of`, `question_hash`),
+    UNIQUE KEY `uk_reviewed_gap_request` (`request_id`),
+    KEY `idx_reviewed_gap_meeting_status` (`meeting_id`, `status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='审核搜索缺口单次提交账本';
+
+-- 议员局部搜索或推理失败后的本轮弃权；不伪造发言或投票。
+CREATE TABLE IF NOT EXISTS `ai_meeting_reviewed_turn_skip` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `meeting_id` BIGINT NOT NULL,
+    `round_number` INT NOT NULL,
+    `member_id` BIGINT NOT NULL,
+    `target_question_id` BIGINT NOT NULL DEFAULT 0,
+    `reason_code` VARCHAR(128) NOT NULL,
+    `run_epoch` BIGINT NULL,
+    `as_of` VARCHAR(10) NOT NULL,
+    `context_opinion_id` BIGINT NOT NULL DEFAULT 0,
+    `plan_id` BIGINT NULL,
+    `gap_id` BIGINT NULL,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_reviewed_skip_turn` (`meeting_id`, `round_number`, `member_id`, `target_question_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='审核会议议员本轮弃权账本';
 
 -- 投票记录
 CREATE TABLE `ai_meeting_vote` (
@@ -751,3 +808,98 @@ CREATE TABLE IF NOT EXISTS `stock_watch_fc_card` (
     KEY `idx_sw_fc_card_symbol_status` (`symbol`, `market`, `activation_status`),
     KEY `idx_sw_fc_card_enabled` (`enabled`, `symbol`, `market`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='股票盯盘单股FC论点证伪卡';
+
+-- 高位价格失效离线前瞻研究账本。不得连接模型结论、通知或交易动作。
+CREATE TABLE IF NOT EXISTS `stock_watch_price_failure_state` (
+    `rule_version` VARCHAR(96) NOT NULL,
+    `rule_spec_hash` VARCHAR(64) NOT NULL,
+    `rule_spec_json` MEDIUMTEXT NOT NULL,
+    `bootstrap_observation_id` BIGINT NOT NULL,
+    `last_observation_id` BIGINT NOT NULL,
+    `row_version` BIGINT NOT NULL DEFAULT 0,
+    `started_at` DATETIME NOT NULL,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`rule_version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='价格失效前瞻研究规则及游标';
+
+CREATE TABLE IF NOT EXISTS `stock_watch_price_failure_assessment` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `rule_version` VARCHAR(96) NOT NULL,
+    `rule_spec_hash` VARCHAR(64) NOT NULL,
+    `observation_id` BIGINT NOT NULL,
+    `symbol` VARCHAR(16) NOT NULL,
+    `market` VARCHAR(8) NOT NULL,
+    `stock_name` VARCHAR(128),
+    `source_date` VARCHAR(16) NOT NULL,
+    `source_time_epoch_ms` BIGINT NOT NULL,
+    `available_time_epoch_ms` BIGINT NOT NULL,
+    `evaluated_at` DATETIME NOT NULL,
+    `eligible` TINYINT NOT NULL,
+    `high_position` TINYINT NOT NULL,
+    `active_turnover` TINYINT NOT NULL,
+    `current_not_collapsed` TINYINT NOT NULL,
+    `price_shape_triggered` TINYINT NOT NULL,
+    `flow_data_complete` TINYINT NOT NULL,
+    `strong_outflow` TINYINT NOT NULL,
+    `shape_code` VARCHAR(64) NOT NULL,
+    `stratum` VARCHAR(64) NOT NULL,
+    `signal_price` DECIMAL(18,6),
+    `feature_snapshot_json` MEDIUMTEXT NOT NULL,
+    `exclusion_reason` VARCHAR(128),
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_pf_assessment_observation` (`rule_version`,`observation_id`),
+    KEY `idx_sw_pf_assessment_control` (`rule_version`,`market`,`source_date`,`source_time_epoch_ms`),
+    KEY `idx_sw_pf_assessment_shape` (`rule_version`,`price_shape_triggered`,`source_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='每条新事实的冻结价格失效评估';
+
+CREATE TABLE IF NOT EXISTS `stock_watch_price_failure_ledger` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `sample_key` VARCHAR(64) NOT NULL,
+    `signal_day_key` VARCHAR(192),
+    `rule_version` VARCHAR(96) NOT NULL,
+    `rule_spec_hash` VARCHAR(64) NOT NULL,
+    `sample_role` VARCHAR(16) NOT NULL,
+    `matched_signal_id` BIGINT,
+    `origin_assessment_id` BIGINT NOT NULL,
+    `origin_observation_id` BIGINT NOT NULL,
+    `symbol` VARCHAR(16) NOT NULL,
+    `market` VARCHAR(8) NOT NULL,
+    `stock_name` VARCHAR(128),
+    `stratum` VARCHAR(64) NOT NULL,
+    `source_date` VARCHAR(16) NOT NULL,
+    `source_time_epoch_ms` BIGINT NOT NULL,
+    `available_time_epoch_ms` BIGINT NOT NULL,
+    `available_at` DATETIME NOT NULL,
+    `signal_price` DECIMAL(18,6),
+    `feature_snapshot_json` MEDIUMTEXT NOT NULL,
+    `match_score` DECIMAL(18,8),
+    `controls_finalized` TINYINT(1) NOT NULL DEFAULT 0,
+    `status` VARCHAR(32) NOT NULL,
+    `entry_observation_id` BIGINT,
+    `entry_source_time_epoch_ms` BIGINT,
+    `entry_source_date` VARCHAR(16),
+    `entry_price` DECIMAL(18,6),
+    `t1_trade_date` VARCHAR(16),
+    `t1_open` DECIMAL(18,6),
+    `t1_high` DECIMAL(18,6),
+    `t1_low` DECIMAL(18,6),
+    `t1_close` DECIMAL(18,6),
+    `t1_max_drawdown_pct` DECIMAL(12,6),
+    `t1_close_return_pct` DECIMAL(12,6),
+    `t1_gap_pct` DECIMAL(12,6),
+    `t1_max_upside_pct` DECIMAL(12,6),
+    `t1_drawdown_5_hit` TINYINT,
+    `data_quality_reason` VARCHAR(128),
+    `row_version` BIGINT NOT NULL DEFAULT 0,
+    `matured_at` DATETIME,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `gmt_modify` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_sw_pf_ledger_sample` (`sample_key`),
+    UNIQUE KEY `uk_sw_pf_ledger_signal_day` (`signal_day_key`),
+    KEY `idx_sw_pf_ledger_pending` (`rule_version`,`status`),
+    KEY `idx_sw_pf_ledger_controls` (`matched_signal_id`,`sample_role`),
+    KEY `idx_sw_pf_ledger_control_reconcile` (`rule_version`,`sample_role`,`controls_finalized`,`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='价格失效信号、匹配对照及T+1结果';

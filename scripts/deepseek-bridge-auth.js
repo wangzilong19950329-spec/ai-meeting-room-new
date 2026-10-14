@@ -7,7 +7,7 @@ function normalizeHost(host) {
 }
 
 function shouldRequireSharedBridgeAuth(host, apiKey = process.env.DEEPSEEK_OPENAI_FACADE_API_KEY) {
-  return Boolean(apiKey) && !LOOPBACK_HOSTS.has(normalizeHost(host));
+  return Boolean(apiKey);
 }
 
 function getHeader(headers, name) {
@@ -25,6 +25,14 @@ function isBearerAuthorized(req, apiKey = process.env.DEEPSEEK_OPENAI_FACADE_API
   return getHeader(req && req.headers, 'authorization') === `Bearer ${apiKey}`;
 }
 
+function isSharedBridgeRequestAuthorized(
+  req,
+  host,
+  apiKey = process.env.DEEPSEEK_OPENAI_FACADE_API_KEY
+) {
+  return !shouldRequireSharedBridgeAuth(host, apiKey) || isBearerAuthorized(req, apiKey);
+}
+
 function sharedBridgeAuthHeaders(host, apiKey = process.env.DEEPSEEK_OPENAI_FACADE_API_KEY) {
   if (!shouldRequireSharedBridgeAuth(host, apiKey)) {
     return {};
@@ -38,6 +46,7 @@ module.exports = {
   LOOPBACK_HOSTS,
   getHeader,
   isBearerAuthorized,
+  isSharedBridgeRequestAuthorized,
   sharedBridgeAuthHeaders,
   shouldRequireSharedBridgeAuth
 };

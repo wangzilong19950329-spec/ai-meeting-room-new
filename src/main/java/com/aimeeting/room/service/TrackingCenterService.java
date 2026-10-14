@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class TrackingCenterService {
 
     private static final ZoneId DEFAULT_ZONE = ZoneId.systemDefault();
+    private static final ZoneId RECENCY_ZONE = ZoneId.of("Asia/Shanghai");
 
     private final AiMeetingTrackingItemMapper trackingItemMapper;
     private final AiMeetingTrackingUpdateMapper trackingUpdateMapper;
@@ -181,27 +182,39 @@ public class TrackingCenterService {
     private void refreshItemInternal(AiMeetingTrackingItem item, String updateType) {
         Date now = new Date();
         String query = firstNonBlank(trimToNull(item.getWatchQuery()), item.getTitle());
+        LocalDate latest = Instant.ofEpochMilli(now.getTime()).atZone(RECENCY_ZONE).toLocalDate();
+        LocalDate earliest = latest.minusMonths(3);
         webSearchService.beginSession();
-        List<WebSearchService.SearchResult> results = webSearchService.search(query, 4);
-        WebSearchService.SearchMeta meta = webSearchService.consumeSessionMeta();
-        WebSearchService.ResearchDigest digest = webSearchService.buildResearchDigest(
+        List<WebSearchService.SearchResult> results = webSearchService.searchRecent(query, 4, earliest, latest);
+        WebSearchService.ResearchDigest digest = results.isEmpty() ? null : webSearchService.buildResearchDigest(
                 item.getTitle(),
                 "tracking_followup",
                 inferTargetYear(item.getTitle()),
                 Collections.singletonList(query),
                 results
         );
+        WebSearchService.SearchMeta meta = webSearchService.consumeSessionMeta();
 
-        String summary = buildRefreshSummary(item, digest, results);
-        String fingerprint = buildFingerprint(summary, results);
-        String severity = resolveChangeSeverity(item.getLastCheckFingerprint(), fingerprint, item.getLastCheckNote(), summary);
-        String status = results.isEmpty() ? "no_result" : "success";
-        String note = buildRefreshNote(query, summary, digest, meta, severity, results, updateType);
+        boolean searchUnavailable = results.isEmpty() && meta != null && StringUtils.hasText(meta.status)
+                && !"empty".equalsIgnoreCase(meta.status);
+        String summary = searchUnavailable ? "近三个月搜索暂不可用，本次不更新追踪结论。"
+                : buildRefreshSummary(item, digest, results);
+        String fingerprint = results.isEmpty() ? item.getLastCheckFingerprint() : buildFingerprint(summary, results);
+        String severity;
+        if (results.isEmpty()) {
+            severity = "NONE";
+        } else if ("success".equalsIgnoreCase(item.getLastCheckStatus())) {
+            severity = resolveChangeSeverity(item.getLastCheckFingerprint(), fingerprint, item.getLastCheckNote(), summary);
+        } else {
+            severity = fingerprint.equals(item.getLastCheckFingerprint()) ? "NONE" : "MINOR";
+        }
+        String status = searchUnavailable ? "error" : results.isEmpty() ? "no_result" : "success";
+        String note = buildRefreshNote(query, earliest, latest, summary, digest, meta, severity, results, updateType);
         String evidenceRef = buildEvidenceRef(results);
 
         trackingItemMapper.updateRefreshState(
                 item.getId(),
-                computeNextCheckAt(item, now),
+                searchUnavailable ? computeRetryCheckAt(item, now) : computeNextCheckAt(item, now),
                 now,
                 status,
                 note,
@@ -417,7 +430,7 @@ public class TrackingCenterService {
             return digest.summary.trim();
         }
         if (results == null || results.isEmpty()) {
-            return "本次未检索到可用于更新该追踪项的新结果。";
+            return "近三个月内未检索到可核实发布日期的新结果，本次不判定为关键变化。";
         }
         StringBuilder sb = new StringBuilder();
         sb.append("围绕“").append(item.getTitle()).append("”检索到 ").append(results.size()).append(" 条结果。");
@@ -437,6 +450,8 @@ public class TrackingCenterService {
     }
 
     private String buildRefreshNote(String query,
+                                    LocalDate earliest,
+                                    LocalDate latest,
                                     String summary,
                                     WebSearchService.ResearchDigest digest,
                                     WebSearchService.SearchMeta meta,
@@ -446,9 +461,13 @@ public class TrackingCenterService {
         StringBuilder sb = new StringBuilder();
         sb.append(updateType != null && updateType.startsWith("MANUAL") ? "手动刷新查询：" : "自动刷新查询：")
                 .append(query).append("。");
+        sb.append("查询时间：").append(earliest).append(" 至 ").append(latest).append("。");
         sb.append("变化等级：").append(severity).append("。");
         if (meta != null && StringUtils.hasText(meta.provider)) {
             sb.append("搜索源：").append(meta.provider).append("。");
+        }
+        if (results.isEmpty() && meta != null && StringUtils.hasText(meta.note)) {
+            sb.append("搜索说明：").append(meta.note.trim()).append("。");
         }
         if (digest != null && StringUtils.hasText(digest.verificationLevel)) {
             sb.append("交叉验证：").append(digest.verificationLevel).append("。");

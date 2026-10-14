@@ -47,12 +47,14 @@ public class StockWatchRiskPatternService {
         if (!isMainlandMarket(normalizedMarket)) {
             eligibilityMissing.add("market_not_supported_for_l0:" + normalizedMarket);
             addSkippedPatterns(patterns, "market_not_supported_for_l0");
-            return finish(observations, guidance, eligibilityMissing, patterns, Collections.emptyMap(), null, 0);
+            return finish(observations, guidance, eligibilityMissing, patterns, Collections.emptyMap(),
+                    Collections.emptyMap(), null, 0);
         }
         if (quote == null || !bool(quote.get("ok"), true)) {
             eligibilityMissing.add("canonical_quote_unavailable");
             addSkippedPatterns(patterns, "canonical_quote_unavailable");
-            return finish(observations, guidance, eligibilityMissing, patterns, Collections.emptyMap(), null, 0);
+            return finish(observations, guidance, eligibilityMissing, patterns, Collections.emptyMap(),
+                    Collections.emptyMap(), null, 0);
         }
 
         ZonedDateTime quoteObservedAt = parseQuoteTime(quote.get("timestamp"));
@@ -88,12 +90,15 @@ public class StockWatchRiskPatternService {
         }
 
         Map<String, Object> derived = derive(quote, completedBars, marketPhase);
+        Map<String, Object> priceFailureResearchFeatures = priceFailureResearchFeatures(
+                quote, completedBars, derived);
         boolean commonEligible = eligibilityMissing.isEmpty();
         patterns.add(r01(derived, commonEligible, completedBars.size()));
         patterns.add(r02(derived, commonEligible, completedBars.size()));
         patterns.add(r03(derived, commonEligible));
         patterns.add(r04(quote, completedBars, derived, commonEligible));
-        return finish(observations, guidance, eligibilityMissing, patterns, derived, quoteObservedAt, completedBars.size());
+        return finish(observations, guidance, eligibilityMissing, patterns, derived,
+                priceFailureResearchFeatures, quoteObservedAt, completedBars.size());
     }
 
     private RiskPatternResult finish(Map<String, Object> observations,
@@ -101,6 +106,7 @@ public class StockWatchRiskPatternService {
                                      List<String> missing,
                                      List<Map<String, Object>> patterns,
                                      Map<String, Object> derived,
+                                     Map<String, Object> priceFailureResearchFeatures,
                                      ZonedDateTime quoteObservedAt,
                                      int completedBarCount) {
         boolean active = patterns.stream().anyMatch(this::activePattern);
@@ -110,7 +116,8 @@ public class StockWatchRiskPatternService {
         observations.put("derived", derived);
         observations.put("patterns", patterns);
         observations.put("completedBaselineBarCount", completedBarCount);
-        return new RiskPatternResult(observations, guidance, quoteObservedAt, active);
+        return new RiskPatternResult(observations, guidance, quoteObservedAt, active,
+                priceFailureResearchFeatures);
     }
 
     private Map<String, Object> derive(Map<String, Object> quote,
@@ -163,6 +170,35 @@ public class StockWatchRiskPatternService {
         derived.put("turnoverPercentile20EligibleForTrigger", "POST_CLOSE".equals(marketPhase));
         derived.put("mainInflow", number(quote.get("mainInflow")));
         return derived;
+    }
+
+    private Map<String, Object> priceFailureResearchFeatures(Map<String, Object> quote,
+                                                             List<Map<String, Object>> completedBars,
+                                                             Map<String, Object> derived) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        Double close = number(quote.get("price"));
+        Double high = number(quote.get("high"));
+        Double low = number(quote.get("low"));
+        Double ma20 = movingAverageWithCurrent(close, completedBars, BASELINE_BARS);
+        Double high20 = rangeExtremeWithCurrent(high, completedBars, "high", BASELINE_BARS, true);
+        Double low20 = rangeExtremeWithCurrent(low, completedBars, "low", BASELINE_BARS, false);
+        Double position20 = high20 == null || low20 == null || close == null || high20 <= low20
+                ? null : Math.max(0.0, Math.min(100.0, (close - low20) * 100.0 / (high20 - low20)));
+        result.put("schema", "stock-watch-price-failure-features-v1");
+        result.put("dailyReturnPct", number(derived.get("dailyReturnPct")));
+        result.put("previousDayReturnPct", previousDayReturn(completedBars));
+        result.put("return5Pct", returnFromCurrent(close, completedBars, 5));
+        result.put("return20Pct", returnFromCurrent(close, completedBars, 20));
+        result.put("ma20", ma20);
+        result.put("priceVsMa20Pct", pct(close, ma20));
+        result.put("high20", high20);
+        result.put("low20", low20);
+        result.put("closePosition20dPct", position20);
+        result.put("volatility20Pct", volatilityWithCurrent(close, completedBars, BASELINE_BARS));
+        result.put("gapOpenPct", number(derived.get("gapOpenPct")));
+        result.put("intradayFromOpenPct", number(derived.get("intradayFromOpenPct")));
+        result.put("closeLocationValue", number(derived.get("closeLocationValue")));
+        return result;
     }
 
     private Map<String, Object> r01(Map<String, Object> d, boolean commonEligible, int completedBars) {
@@ -394,6 +430,80 @@ public class StockWatchRiskPatternService {
         return count == 0 ? null : total / count;
     }
 
+    private Double previousDayReturn(List<Map<String, Object>> completedBars) {
+        if (completedBars == null || completedBars.isEmpty()) return null;
+        Map<String, Object> latest = completedBars.get(completedBars.size() - 1);
+        Double reported = number(latest.get("changePct"));
+        if (reported != null) return reported;
+        if (completedBars.size() < 2) return null;
+        Double close = number(latest.get("close"));
+        Double previousClose = number(completedBars.get(completedBars.size() - 2).get("close"));
+        return pct(close, previousClose);
+    }
+
+    private Double returnFromCurrent(Double currentClose,
+                                     List<Map<String, Object>> completedBars,
+                                     int periods) {
+        if (currentClose == null || completedBars == null || completedBars.size() < periods) return null;
+        Double base = number(completedBars.get(completedBars.size() - periods).get("close"));
+        return pct(currentClose, base);
+    }
+
+    private Double movingAverageWithCurrent(Double currentClose,
+                                            List<Map<String, Object>> completedBars,
+                                            int periods) {
+        if (currentClose == null || completedBars == null || completedBars.size() < periods - 1) return null;
+        double total = currentClose;
+        int start = completedBars.size() - (periods - 1);
+        for (int i = start; i < completedBars.size(); i++) {
+            Double close = number(completedBars.get(i).get("close"));
+            if (close == null) return null;
+            total += close;
+        }
+        return total / periods;
+    }
+
+    private Double rangeExtremeWithCurrent(Double current,
+                                           List<Map<String, Object>> completedBars,
+                                           String key,
+                                           int periods,
+                                           boolean maximum) {
+        if (current == null || completedBars == null || completedBars.size() < periods - 1) return null;
+        double result = current;
+        int start = completedBars.size() - (periods - 1);
+        for (int i = start; i < completedBars.size(); i++) {
+            Double value = number(completedBars.get(i).get(key));
+            if (value == null) return null;
+            result = maximum ? Math.max(result, value) : Math.min(result, value);
+        }
+        return result;
+    }
+
+    private Double volatilityWithCurrent(Double currentClose,
+                                         List<Map<String, Object>> completedBars,
+                                         int periods) {
+        if (currentClose == null || completedBars == null || completedBars.size() < periods) return null;
+        List<Double> closes = new ArrayList<>();
+        int start = completedBars.size() - periods;
+        for (int i = start; i < completedBars.size(); i++) {
+            Double close = number(completedBars.get(i).get("close"));
+            if (close == null || close <= 0) return null;
+            closes.add(close);
+        }
+        closes.add(currentClose);
+        double total = 0.0;
+        List<Double> returns = new ArrayList<>();
+        for (int i = 1; i < closes.size(); i++) {
+            double value = (closes.get(i) / closes.get(i - 1) - 1.0) * 100.0;
+            returns.add(value);
+            total += value;
+        }
+        double mean = total / returns.size();
+        double variance = 0.0;
+        for (Double value : returns) variance += Math.pow(value - mean, 2);
+        return Math.sqrt(variance / returns.size());
+    }
+
     private Double pct(Double value, Double base) {
         return value == null || base == null || base <= 0 ? null : (value / base - 1.0) * 100.0;
     }
@@ -464,15 +574,26 @@ public class StockWatchRiskPatternService {
         private final Map<String, Object> guidance;
         private final ZonedDateTime quoteObservedAt;
         private final boolean active;
+        private final Map<String, Object> priceFailureResearchFeatures;
 
         RiskPatternResult(Map<String, Object> observations,
                           Map<String, Object> guidance,
                           ZonedDateTime quoteObservedAt,
                           boolean active) {
+            this(observations, guidance, quoteObservedAt, active, Collections.emptyMap());
+        }
+
+        RiskPatternResult(Map<String, Object> observations,
+                          Map<String, Object> guidance,
+                          ZonedDateTime quoteObservedAt,
+                          boolean active,
+                          Map<String, Object> priceFailureResearchFeatures) {
             this.observations = observations;
             this.guidance = guidance;
             this.quoteObservedAt = quoteObservedAt;
             this.active = active;
+            this.priceFailureResearchFeatures = priceFailureResearchFeatures == null
+                    ? Collections.emptyMap() : priceFailureResearchFeatures;
         }
 
         public Map<String, Object> getObservations() {
@@ -489,6 +610,10 @@ public class StockWatchRiskPatternService {
 
         public boolean isActive() {
             return active;
+        }
+
+        public Map<String, Object> getPriceFailureResearchFeatures() {
+            return priceFailureResearchFeatures;
         }
 
         public boolean isAvailable() {

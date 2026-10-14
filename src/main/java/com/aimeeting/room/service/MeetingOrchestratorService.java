@@ -115,7 +115,7 @@ public class MeetingOrchestratorService {
     public String callModel(String modelType, String systemPrompt, String userPrompt) {
         ChatResult bridgeResult = routeMeetingDeepSeekBridge(modelType, systemPrompt, userPrompt, null);
         if (bridgeResult != null) {
-            return bridgeResult.content;
+            return bridgeContent(bridgeResult);
         }
         return aiModelRouter.chat(modelType, systemPrompt, userPrompt);
     }
@@ -123,7 +123,7 @@ public class MeetingOrchestratorService {
     public String callModel(String modelType, String systemPrompt, String userPrompt, Integer maxTokens) {
         ChatResult bridgeResult = routeMeetingDeepSeekBridge(modelType, systemPrompt, userPrompt, maxTokens);
         if (bridgeResult != null) {
-            return bridgeResult.content;
+            return bridgeContent(bridgeResult);
         }
         return aiModelRouter.chat(modelType, systemPrompt, userPrompt, maxTokens);
     }
@@ -134,6 +134,39 @@ public class MeetingOrchestratorService {
             return bridgeResult;
         }
         return aiModelRouter.chatEx(modelType, systemPrompt, userPrompt);
+    }
+
+    public ChatResult callModelExStrict(String modelType, String systemPrompt, String userPrompt) {
+        return callModelExStrict(modelType, systemPrompt, userPrompt, null);
+    }
+
+    public ChatResult callModelExStrict(String modelType, String systemPrompt, String userPrompt,
+                                        Integer maxTokens) {
+        ModelEntry selected = modelType == null ? null : modelRegistryStore.getByModelId(modelType);
+        if (selected == null || !selected.isEnabled()) return new ChatResult(null);
+        if (meetingDeepSeekWebBridgeService != null) {
+            MeetingDeepSeekWebBridgeService.RouteDecision decision =
+                    meetingDeepSeekWebBridgeService.routeDecision(modelType);
+            if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.BRIDGE) {
+                return meetingDeepSeekWebBridgeService.chatWithoutSearch(
+                        modelType, systemPrompt, userPrompt, maxTokens);
+            }
+            if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.FAIL_CLOSED) {
+                return meetingDeepSeekWebBridgeService.failClosedResult(modelType);
+            }
+        }
+        return aiModelRouter.chatExStrict(modelType, systemPrompt, userPrompt, maxTokens);
+    }
+
+    public String callModelStrict(String modelType, String systemPrompt, String userPrompt,
+                                  Integer maxTokens) {
+        ChatResult result = callModelExStrict(modelType, systemPrompt, userPrompt, maxTokens);
+        if (result == null || result.content == null || result.content.isBlank()
+                || result.hasSearchEvidence()
+                || (result.modelStatus != null && !"success".equalsIgnoreCase(result.modelStatus))) {
+            throw new IllegalStateException("meeting_selected_model_unavailable");
+        }
+        return result.content;
     }
 
     private ChatResult routeMeetingDeepSeekBridge(String modelType,
@@ -152,6 +185,13 @@ public class MeetingOrchestratorService {
             return meetingDeepSeekWebBridgeService.failClosedResult(modelType);
         }
         return null;
+    }
+
+    private String bridgeContent(ChatResult bridgeResult) {
+        if (bridgeResult.blocksAutomaticRetry() && (bridgeResult.content == null || bridgeResult.content.isBlank())) {
+            throw new IllegalStateException("meeting_provider_outcome_not_retriable");
+        }
+        return bridgeResult.content;
     }
 
     public String buildDebateContext(Long meetingId, Long memberId, int roundNumber) {
@@ -389,6 +429,32 @@ public class MeetingOrchestratorService {
     }
 
     public String buildSearchDecisionPrompt(Long meetingId, Long memberId, int roundNumber) {
+        StringBuilder sb = buildSearchDecisionContext(meetingId, memberId, roundNumber);
+        sb.append("若需要，返回：{\"need\":true,\"intent\":\"forecast_outlook\",\"freshnessDays\":30,\"targetYear\":2026,\"sourceFocus\":[\"eastmoney.com\",\"cninfo.com.cn\"],\"q\":[\"搜索词1\",\"搜索词2\"],\"eastmoneySymbol\":\"300750\",\"eastmoneyMarket\":\"sz\",\"eastmoneyFields\":[\"quote\",\"dailyKline\",\"technicalIndicators\",\"valuation\",\"financials\",\"latestNews\",\"shareholderCounts\"]}\n");
+        sb.append("若不需要，返回：{\"need\":false}\n");
+        sb.append("只返回JSON，不要其他内容。");
+        return sb.toString();
+    }
+
+    public String buildReviewedEvidenceNeedsPrompt(Long meetingId, Long memberId, int roundNumber) {
+        StringBuilder sb = buildSearchDecisionContext(meetingId, memberId, roundNumber);
+        sb.append("本轮只规划资料需求，不要自行搜索或给出事实答案。每个需求必须是一个可以单独核验的具体问题，最多三个。\n");
+        sb.append("对于A股行情、K线、技术指标、估值、财报、公告等可由东方财富结构化接口获取的资料，在该需求的 eastmoneyFields 中列出字段；只需外部搜索的需求填空数组。\n");
+        sb.append("eastmoneyFields 只允许：quote、stockDetail、dailyKline、technicalIndicators、valuation、financials、announcements、latestNews、shareholderCounts、marketBenchmark、minuteTrends5d、intradayFundFlow。MA20/MACD/RSI 等单项归入 technicalIndicators；成交量/换手率归入 dailyKline 或 quote。MA120、融资余额、跨20日主力资金汇总等接口未提供的项目必须标记 webSearch:true，不能编造字段名。\n");
+        sb.append("对具体数值需求，增加 requiredFieldPaths 数组，明确需要交付的字段，不能只填分组名。只允许 section.field 或 section[].field，例如 financials[].netProfit、valuation.pePercentile1y、technicalIndicators.rsi14；section 必须属于本项 eastmoneyFields。最多8项，不使用索引、通配符或表达式。系统会逐项核对实际响应和最终交付资料，字段缺失会转为待搜索缺口。\n");
+        sb.append("technicalIndicators 常用实际字段：ma5、ma10、ma20、ma60、macdDif、macdDea、macdHistogram、rsi14、atr14、bollMiddle、bollUpper、bollLower、historicalVolatility20Pct、return5Pct、return20Pct、support20、resistance20、obv、priceVsMa20Pct。MACD需求填写 macdDif、macdDea、macdHistogram 三个路径；没有单一的 macd 字段。只申请本轮问题需要的指标，不要把全部字段塞入计划。\n");
+        sb.append("quote 常用实际字段：price、previousClose、open、high、low、changeAmount、changePercent、volume、amount、turnover、volumeRatio、mainInflow、mainInflowRatio。换手率路径为 quote.turnover，不是 quote.turnoverRate。\n");
+        sb.append("financials 当前提供 revenue、netProfit、netProfitExNonRecurring、grossMarginPct、netMarginPct、cashToRevenuePct 等；cashToRevenuePct 是经营现金流营收比，不能替代经营活动现金流量净额 netOperatingCashFlow。valuation 仅提供 pePercentile1y/pbPercentile1y，不能替代五年分位。公告和新闻接口主要提供标题目录（新闻摘要可能截断），具体公告内容、风险与数字需 webSearch:true 并写明 webQuestion。明确要求已收盘数据时，盘中日K及由它计算的指标不能算满足。\n");
+        sb.append("每个需求还要给出 webSearch 布尔值：东方财富字段足以回答时为 false；还需要公开网页资料时为 true。没有 eastmoneyFields 的需求必须为 true。若一个需求同时要结构化字段和网页事实，必须单列 webQuestion，明确网页独有的一个待核验问题。\n");
+        sb.append("若某项资料属于另一只股票，在该 needs 项内写 eastmoneySymbol 和 eastmoneyMarket；不要把会议主股票的数据用于对手股票。每个问题尽量只问一个事实或指标。\n");
+        sb.append("不要在一个 question 中罗列多个数字、指标或事件。每项 needs 最多填写一个 eastmoneyFields 字段，或一个独立的网页问题；整份计划优先选最关键的三个原子缺口，避免把十几个指标塞进三项需求。\n");
+        sb.append("每个需求的 sourceFocus 只能填写按重要性排序的 0 到 3 个来源域名，不要填写完整 URL、描述或超过三个域名。这里是优先搜索站点提示，不代表只有这些站点才可用于交叉核验。\n");
+        sb.append("返回：{\"need\":true,\"eastmoneySymbol\":\"300750\",\"eastmoneyMarket\":\"sz\",\"needs\":[{\"id\":\"price\",\"question\":\"宁德时代最近一个交易日的收盘价是多少？\",\"eastmoneyFields\":[\"quote\"],\"requiredFieldPaths\":[\"quote.price\"],\"webSearch\":false,\"sourceFocus\":[]},{\"id\":\"industry\",\"question\":\"最近的储能行业需求数据是什么？\",\"eastmoneyFields\":[],\"webSearch\":true,\"sourceFocus\":[\"gov.cn\"]}]}\n");
+        sb.append("如果本轮只表达不新增事实的逻辑意见，可返回：{\"need\":false,\"needs\":[]}。只返回JSON，不要其他内容。");
+        return sb.toString();
+    }
+
+    private StringBuilder buildSearchDecisionContext(Long meetingId, Long memberId, int roundNumber) {
         AiMeetingRoom room = roomMapper.selectById(meetingId);
         AiMeetingMember member = memberMapper.selectById(memberId);
         List<AiMeetingOpinion> allOpinions = opinionMapper.selectByMeetingId(meetingId);
@@ -439,10 +505,7 @@ public class MeetingOrchestratorService {
         sb.append("当你确定某个事实只该从特定站点取证（如交易所/统计局/公司公告/指定财经媒体，例如 eastmoney.com、stats.gov.cn），就把该域名放进 sourceFocus，系统会定向只检索这些站点；也可直接在查询词里写 site:域名。不确定来源时 sourceFocus 留空即可。\n");
         sb.append("如果议题是A股个股，你还可以要求系统调用东方财富结构化数据。可选 eastmoneyFields：quote（实时行情/资金流）、stockDetail（估值与市值）、dailyKline（日K）、technicalIndicators（均线/MACD/RSI/波动）、valuation（估值分位）、financials（财报）、announcements（公告）、latestNews（个股新闻）、shareholderCounts（股东户数）、marketBenchmark（相对指数强弱）。\n");
         sb.append("使用东方财富时请尽量给出股票代码和市场，例如宁德时代为 300750.sz；如果不确定代码，可以只返回网络搜索计划。\n");
-        sb.append("若需要，返回：{\"need\":true,\"intent\":\"forecast_outlook\",\"freshnessDays\":30,\"targetYear\":2026,\"sourceFocus\":[\"eastmoney.com\",\"cninfo.com.cn\"],\"q\":[\"搜索词1\",\"搜索词2\"],\"eastmoneySymbol\":\"300750\",\"eastmoneyMarket\":\"sz\",\"eastmoneyFields\":[\"quote\",\"dailyKline\",\"technicalIndicators\",\"valuation\",\"financials\",\"latestNews\",\"shareholderCounts\"]}\n");
-        sb.append("若不需要，返回：{\"need\":false}\n");
-        sb.append("只返回JSON，不要其他内容。");
-        return sb.toString();
+        return sb;
     }
 
     public String buildVotePrompt(Long meetingId, Long memberId) {
@@ -513,6 +576,11 @@ public class MeetingOrchestratorService {
     }
 
     public String buildSummaryPrompt(Long meetingId) {
+        return buildSummaryPrompt(meetingId, null);
+    }
+
+    /** The reviewed finalization passes its voted conclusion before that value is committed to the room. */
+    public String buildSummaryPrompt(Long meetingId, String pendingConclusion) {
         AiMeetingRoom room = roomMapper.selectById(meetingId);
         List<AiMeetingOpinion> opinions = opinionMapper.selectByMeetingId(meetingId);
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
@@ -524,7 +592,9 @@ public class MeetingOrchestratorService {
         sb.append("【主题】").append(room.getTitle()).append("\n");
         appendProjectMemory(sb, room);
         sb.append("【参与成员】").append(members.stream().map(AiMeetingMember::getMemberName).collect(Collectors.joining("、"))).append("\n");
-        sb.append("【最终结论】").append(room.getFinalConclusion() != null ? room.getFinalConclusion() : "未达成").append("\n\n");
+        String conclusion = pendingConclusion != null && !pendingConclusion.isBlank()
+                ? pendingConclusion : room.getFinalConclusion();
+        sb.append("【最终结论】").append(conclusion != null ? conclusion : "未达成").append("\n\n");
         sb.append("【完整记录】\n");
         for (AiMeetingOpinion op : opinions) {
             sb.append(String.format("[第%d轮] %s: %s\n", op.getRoundNumber(), nameMap.getOrDefault(op.getMemberId(), "未知"), op.getContent()));
@@ -535,6 +605,11 @@ public class MeetingOrchestratorService {
     }
 
     public String buildDecisionArtifactPrompt(Long meetingId) {
+        return buildDecisionArtifactPrompt(meetingId, null);
+    }
+
+    /** The reviewed finalization passes its voted conclusion before that value is committed to the room. */
+    public String buildDecisionArtifactPrompt(Long meetingId, String pendingConclusion) {
         AiMeetingRoom room = roomMapper.selectById(meetingId);
         List<AiMeetingOpinion> opinions = opinionMapper.selectByMeetingId(meetingId);
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
@@ -548,7 +623,9 @@ public class MeetingOrchestratorService {
         sb.append("其中 keyViewpoints / majorDisputes / decisionBasis / openQuestions / nextActions 必须是字符串数组。\n\n");
         sb.append("【主题】").append(room.getTitle()).append("\n");
         appendProjectMemory(sb, room);
-        sb.append("【最终结论】").append(room.getFinalConclusion() != null ? room.getFinalConclusion() : "未达成").append("\n");
+        String conclusion = pendingConclusion != null && !pendingConclusion.isBlank()
+                ? pendingConclusion : room.getFinalConclusion();
+        sb.append("【最终结论】").append(conclusion != null ? conclusion : "未达成").append("\n");
         if (room.getSummary() != null && !room.getSummary().isBlank()) {
             sb.append("【会议总结】").append(room.getSummary()).append("\n");
         }

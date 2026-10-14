@@ -44,6 +44,46 @@ services:
       db-bootstrap:
         condition: service_completed_successfully
 
+  mailpit:
+    image: axllent/mailpit:v1.21
+    container_name: ai-meeting-room-sw-mailpit
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  deepseek-facade:
+    image: docker.n8n.io/n8nio/n8n:${N8N_VERSION}
+    container_name: ai-meeting-room-sw-deepseek-facade
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DEEPSEEK_BROKER_PROXY_HOST: 0.0.0.0
+      DEEPSEEK_BROKER_PROXY_PORT: 8793
+      DEEPSEEK_BROKER_UPSTREAM: http://host.docker.internal:8791
+      DEEPSEEK_OPENAI_FACADE_API_KEY: ${DEEPSEEK_FACADE_API_KEY}
+    entrypoint: ["node"]
+    command: ["/app/scripts/deepseek-bridge-proxy.js"]
+    ports:
+      - "127.0.0.1:${DEEPSEEK_FACADE_HOST_PORT:-8793}:8793"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../../scripts:/app/scripts:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e "fetch('http://127.0.0.1:8793/health',{headers:{Authorization:'Bearer '+process.env.DEEPSEEK_OPENAI_FACADE_API_KEY}}).then(async r=>{if(!r.ok)process.exit(1);const b=await r.json();const a=((b.broker||{}).accounts||[]);const ready=a.some(x=>x.routingEligible===true&&x.identityVerified===true&&x.circuitOpen!==true&&(x.capabilities||[]).includes('stock.technical-analysis'));process.exit(ready?0:1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
   n8n:
     image: docker.n8n.io/n8nio/n8n:${N8N_VERSION}
     container_name: ai-meeting-room-sw-n8n
@@ -90,6 +130,10 @@ services:
     depends_on:
       db-migrate:
         condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
+      deepseek-facade:
+        condition: service_healthy
 
   n8n-import:
     image: docker.n8n.io/n8nio/n8n:${N8N_VERSION}
@@ -121,6 +165,8 @@ services:
     depends_on:
       db-migrate:
         condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
 
 volumes:
   postgres_data:

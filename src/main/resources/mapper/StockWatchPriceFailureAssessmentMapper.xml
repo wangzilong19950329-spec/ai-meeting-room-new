@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchPriceFailureAssessmentMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchPriceFailureAssessment">
+        <id column="id" property="id"/>
+        <result column="rule_version" property="ruleVersion"/>
+        <result column="rule_spec_hash" property="ruleSpecHash"/>
+        <result column="observation_id" property="observationId"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="source_date" property="sourceDate"/>
+        <result column="source_time_epoch_ms" property="sourceTimeEpochMs"/>
+        <result column="available_time_epoch_ms" property="availableTimeEpochMs"/>
+        <result column="evaluated_at" property="evaluatedAt"/>
+        <result column="eligible" property="eligible"/>
+        <result column="high_position" property="highPosition"/>
+        <result column="active_turnover" property="activeTurnover"/>
+        <result column="current_not_collapsed" property="currentNotCollapsed"/>
+        <result column="price_shape_triggered" property="priceShapeTriggered"/>
+        <result column="flow_data_complete" property="flowDataComplete"/>
+        <result column="strong_outflow" property="strongOutflow"/>
+        <result column="shape_code" property="shapeCode"/>
+        <result column="stratum" property="stratum"/>
+        <result column="signal_price" property="signalPrice"/>
+        <result column="feature_snapshot_json" property="featureSnapshotJson"/>
+        <result column="exclusion_reason" property="exclusionReason"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_price_failure_assessment
+        (rule_version, rule_spec_hash, observation_id, symbol, market, stock_name,
+         source_date, source_time_epoch_ms, available_time_epoch_ms, evaluated_at,
+         eligible, high_position, active_turnover, current_not_collapsed,
+         price_shape_triggered, flow_data_complete, strong_outflow, shape_code,
+         stratum, signal_price, feature_snapshot_json, exclusion_reason)
+        VALUES
+        (#{ruleVersion}, #{ruleSpecHash}, #{observationId}, #{symbol}, #{market}, #{stockName},
+         #{sourceDate}, #{sourceTimeEpochMs}, #{availableTimeEpochMs}, #{evaluatedAt},
+         #{eligible}, #{highPosition}, #{activeTurnover}, #{currentNotCollapsed},
+         #{priceShapeTriggered}, #{flowDataComplete}, #{strongOutflow}, #{shapeCode},
+         #{stratum}, #{signalPrice}, #{featureSnapshotJson}, #{exclusionReason})
+    </insert>
+
+    <select id="selectByRuleObservation" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_price_failure_assessment
+        WHERE rule_version = #{ruleVersion} AND observation_id = #{observationId}
+    </select>
+
+    <select id="selectControlCandidates" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_price_failure_assessment
+        WHERE rule_version = #{ruleVersion}
+          AND market = #{market}
+          AND source_date = #{sourceDate}
+          AND source_time_epoch_ms &gt;= #{minimumSourceTimeEpochMs}
+          AND source_time_epoch_ms &lt;= #{maximumSourceTimeEpochMs}
+          AND available_time_epoch_ms &lt;= #{maximumAvailableTimeEpochMs}
+          AND eligible = TRUE
+          AND high_position = TRUE
+          AND active_turnover = TRUE
+          AND current_not_collapsed = TRUE
+          AND price_shape_triggered = FALSE
+        ORDER BY source_time_epoch_ms DESC, id ASC
+    </select>
+
+    <select id="countDistinctSourceDates" resultType="int">
+        SELECT COUNT(DISTINCT source_date)
+        FROM stock_watch_price_failure_assessment
+        WHERE rule_version = #{ruleVersion}
+          AND eligible = TRUE
+    </select>
+</mapper>

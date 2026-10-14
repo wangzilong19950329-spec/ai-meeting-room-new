@@ -92,3 +92,69 @@ test('does not mark incomplete or empty provider results successful', () => {
   });
   assert.equal(ledger.lookup('invalid', 'digest-c').status, 'INVALID');
 });
+
+test('does not persist budget-limited inference as a successful provider answer', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-ledger-'));
+  const file = path.join(directory, 'requests.json');
+  const ledger = new RequestLedger(file);
+  ledger.begin('budget-limited', 'digest-budget');
+  ledger.markSubmitting('budget-limited', 'digest-budget');
+  ledger.markSubmitted('budget-limited', 'digest-budget');
+  ledger.complete('budget-limited', 'digest-budget', {
+    answerText: '==REPLY==\n未完成的回答',
+    contentStatus: 'success',
+    completionReason: 'quick_budget_reached'
+  });
+  const reloaded = new RequestLedger(file);
+  assert.equal(reloaded.lookup('budget-limited', 'digest-budget').status, 'INVALID');
+  assert.equal(reloaded.lookup('budget-limited', 'digest-budget').entry.error,
+    'provider_response_incomplete');
+});
+
+test('invalidates older cached successes whose completion was only a budget signal', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-ledger-'));
+  const file = path.join(directory, 'requests.json');
+  fs.writeFileSync(file, JSON.stringify({
+    'older-budget': {
+      submissionKey: 'older-budget',
+      requestDigest: 'digest-old',
+      status: 'SUCCESS',
+      submitPhase: 'COMPLETED',
+      result: {
+        answerText: 'partial answer',
+        contentStatus: 'success',
+        completionReason: 'quick_budget_reached'
+      }
+    }
+  }));
+  const ledger = new RequestLedger(file);
+  const entry = ledger.lookup('older-budget', 'digest-old').entry;
+  assert.equal(entry.status, 'INVALID');
+  assert.equal(entry.error, 'provider_response_incomplete');
+  assert.equal(entry.result, undefined);
+  assert.equal(new RequestLedger(file).lookup('older-budget', 'digest-old').status, 'INVALID');
+});
+
+test('does not cache a response without verified search evidence as success', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-ledger-'));
+  const ledger = new RequestLedger(path.join(directory, 'requests.json'));
+  ledger.begin('missing-proof', 'digest-proof');
+  ledger.markSubmitting('missing-proof', 'digest-proof');
+  ledger.markSubmitted('missing-proof', 'digest-proof');
+  ledger.complete('missing-proof', 'digest-proof', {
+    answerText: 'A plausible answer with no current-turn citations',
+    contentStatus: 'search_evidence_missing',
+    completionReason: 'complete_json_network'
+  });
+  assert.equal(ledger.lookup('missing-proof', 'digest-proof').status, 'INVALID');
+});
+
+test('submission keys cannot collide with object prototype properties', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-ledger-'));
+  const file = path.join(directory, 'requests.json');
+  const ledger = new RequestLedger(file);
+  const claim = ledger.begin('__proto__', 'digest-prototype');
+  assert.equal(claim.created, true);
+  assert.equal(ledger.lookup('__proto__', 'digest-prototype').status, 'IN_FLIGHT');
+  assert.equal(Object.getPrototypeOf(ledger.entries), null);
+});

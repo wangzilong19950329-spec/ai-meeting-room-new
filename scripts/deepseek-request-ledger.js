@@ -1,6 +1,20 @@
 const fs = require('fs');
 const path = require('path');
 
+function completionIsUnproven(result) {
+  const contentStatus = String(result && result.contentStatus || '').trim().toLowerCase();
+  const completionReason = String(result && result.completionReason || '').trim().toLowerCase();
+  return contentStatus === 'incomplete' || [
+    'quick_budget_reached', 'signal_budget_reached',
+    'timeout_with_last_state', 'timeout_incomplete_json'
+  ].includes(completionReason);
+}
+
+function contentStatusIsUnverified(result) {
+  const contentStatus = String(result && result.contentStatus || '').trim().toLowerCase();
+  return !!contentStatus && contentStatus !== 'success' && contentStatus !== 'complete';
+}
+
 class RequestLedger {
   constructor(filePath, maxEntries = 500, maxTombstones = 100000) {
     this.filePath = filePath;
@@ -11,9 +25,11 @@ class RequestLedger {
   }
 
   load() {
-    if (!this.filePath || !fs.existsSync(this.filePath)) return {};
+    if (!this.filePath || !fs.existsSync(this.filePath)) return Object.create(null);
     const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? Object.assign(Object.create(null), parsed)
+      : Object.create(null);
   }
 
   recoverInterruptedRequests() {
@@ -22,6 +38,15 @@ class RequestLedger {
       if (entry && entry.status === 'IN_FLIGHT') {
         entry.status = 'UNKNOWN';
         entry.error = 'bridge_restarted_with_provider_outcome_unknown';
+        entry.updatedAt = new Date().toISOString();
+        changed = true;
+      } else if (entry && entry.status === 'SUCCESS'
+        && (completionIsUnproven(entry.result) || contentStatusIsUnverified(entry.result))) {
+        const incomplete = completionIsUnproven(entry.result);
+        entry.status = 'INVALID';
+        entry.submitPhase = 'INVALID';
+        entry.error = incomplete ? 'provider_response_incomplete' : 'provider_response_unverified';
+        delete entry.result;
         entry.updatedAt = new Date().toISOString();
         changed = true;
       }
@@ -91,11 +116,13 @@ class RequestLedger {
 
   complete(submissionKey, requestDigest, result) {
     const existing = this.requireMatching(submissionKey, requestDigest);
-    const contentStatus = String(result && result.contentStatus || '').trim().toLowerCase();
+    const completionUnproven = completionIsUnproven(result);
+    const contentUnverified = contentStatusIsUnverified(result);
     const answerText = String(result && result.answerText || '').trim();
-    if (contentStatus === 'incomplete' || !answerText) {
+    if (completionUnproven || contentUnverified || !answerText) {
       return this.markInvalid(submissionKey, requestDigest,
-        contentStatus === 'incomplete' ? 'provider_response_incomplete' : 'provider_response_empty');
+        completionUnproven ? 'provider_response_incomplete'
+          : contentUnverified ? 'provider_response_unverified' : 'provider_response_empty');
     }
     existing.status = 'SUCCESS';
     existing.submitPhase = 'COMPLETED';
@@ -168,7 +195,10 @@ class RequestLedger {
       retainedTombstones += 1;
       return retainedTombstones <= this.maxTombstones;
     });
-    this.entries = Object.fromEntries(retained.map((entry) => [entry.submissionKey, entry]));
+    this.entries = Object.assign(
+      Object.create(null),
+      Object.fromEntries(retained.map((entry) => [entry.submissionKey, entry]))
+    );
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
     const fileDescriptor = fs.openSync(temporaryPath, 'w');

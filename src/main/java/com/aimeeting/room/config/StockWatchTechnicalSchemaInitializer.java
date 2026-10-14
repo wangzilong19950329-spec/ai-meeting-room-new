@@ -326,6 +326,7 @@ public class StockWatchTechnicalSchemaInitializer {
             log.warn("failed to ensure stock-watch technical analysis schema: {}", e.getMessage());
         }
         ensureV17FactSchema();
+        ensurePriceFailureResearchSchema();
     }
 
     private void ensureV17FactSchema() {
@@ -386,6 +387,60 @@ public class StockWatchTechnicalSchemaInitializer {
                 + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
         safeAddColumn("stock_watch_analysis_task", "response_envelope_hash", "VARCHAR(64)");
         safeAddColumn("stock_watch_analysis_task", "response_envelope_json", "MEDIUMTEXT");
+    }
+
+    private void ensurePriceFailureResearchSchema() {
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_price_failure_state ("
+                + "rule_version VARCHAR(96) NOT NULL,rule_spec_hash VARCHAR(64) NOT NULL,"
+                + "rule_spec_json MEDIUMTEXT NOT NULL,bootstrap_observation_id BIGINT NOT NULL,"
+                + "last_observation_id BIGINT NOT NULL,row_version BIGINT NOT NULL DEFAULT 0,"
+                + "started_at DATETIME NOT NULL,gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                + "PRIMARY KEY (rule_version)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_price_failure_assessment ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,rule_version VARCHAR(96) NOT NULL,"
+                + "rule_spec_hash VARCHAR(64) NOT NULL,observation_id BIGINT NOT NULL,"
+                + "symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,stock_name VARCHAR(128),"
+                + "source_date VARCHAR(16) NOT NULL,source_time_epoch_ms BIGINT NOT NULL,"
+                + "available_time_epoch_ms BIGINT NOT NULL,evaluated_at DATETIME NOT NULL,"
+                + "eligible TINYINT NOT NULL,high_position TINYINT NOT NULL,active_turnover TINYINT NOT NULL,"
+                + "current_not_collapsed TINYINT NOT NULL,price_shape_triggered TINYINT NOT NULL,"
+                + "flow_data_complete TINYINT NOT NULL,strong_outflow TINYINT NOT NULL,"
+                + "shape_code VARCHAR(64) NOT NULL,stratum VARCHAR(64) NOT NULL,signal_price DECIMAL(18,6),"
+                + "feature_snapshot_json MEDIUMTEXT NOT NULL,exclusion_reason VARCHAR(128),"
+                + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY (id),"
+                + "UNIQUE KEY uk_sw_pf_assessment_observation (rule_version,observation_id),"
+                + "KEY idx_sw_pf_assessment_control (rule_version,market,source_date,source_time_epoch_ms),"
+                + "KEY idx_sw_pf_assessment_shape (rule_version,price_shape_triggered,source_date)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeExecute("CREATE TABLE IF NOT EXISTS stock_watch_price_failure_ledger ("
+                + "id BIGINT NOT NULL AUTO_INCREMENT,sample_key VARCHAR(64) NOT NULL,signal_day_key VARCHAR(192),"
+                + "rule_version VARCHAR(96) NOT NULL,rule_spec_hash VARCHAR(64) NOT NULL,"
+                + "sample_role VARCHAR(16) NOT NULL,matched_signal_id BIGINT,origin_assessment_id BIGINT NOT NULL,"
+                + "origin_observation_id BIGINT NOT NULL,symbol VARCHAR(16) NOT NULL,market VARCHAR(8) NOT NULL,"
+                + "stock_name VARCHAR(128),stratum VARCHAR(64) NOT NULL,source_date VARCHAR(16) NOT NULL,"
+                + "source_time_epoch_ms BIGINT NOT NULL,available_time_epoch_ms BIGINT NOT NULL,"
+                + "available_at DATETIME NOT NULL,signal_price DECIMAL(18,6),feature_snapshot_json MEDIUMTEXT NOT NULL,"
+                + "match_score DECIMAL(18,8),controls_finalized TINYINT NOT NULL DEFAULT 0,"
+                + "status VARCHAR(32) NOT NULL,entry_observation_id BIGINT,"
+                + "entry_source_time_epoch_ms BIGINT,entry_source_date VARCHAR(16),entry_price DECIMAL(18,6),"
+                + "t1_trade_date VARCHAR(16),t1_open DECIMAL(18,6),t1_high DECIMAL(18,6),"
+                + "t1_low DECIMAL(18,6),t1_close DECIMAL(18,6),t1_max_drawdown_pct DECIMAL(12,6),"
+                + "t1_close_return_pct DECIMAL(12,6),t1_gap_pct DECIMAL(12,6),"
+                + "t1_max_upside_pct DECIMAL(12,6),t1_drawdown_5_hit TINYINT,data_quality_reason VARCHAR(128),"
+                + "row_version BIGINT NOT NULL DEFAULT 0,matured_at DATETIME,"
+                + "gmt_create DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+                + "gmt_modify DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+                + "PRIMARY KEY (id),UNIQUE KEY uk_sw_pf_ledger_sample (sample_key),"
+                + "UNIQUE KEY uk_sw_pf_ledger_signal_day (signal_day_key),"
+                + "KEY idx_sw_pf_ledger_pending (rule_version,status),"
+                + "KEY idx_sw_pf_ledger_controls (matched_signal_id,sample_role),"
+                + "KEY idx_sw_pf_ledger_control_reconcile (rule_version,sample_role,controls_finalized,id)"
+                + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+        safeAddColumn("stock_watch_price_failure_ledger", "controls_finalized", "TINYINT NOT NULL DEFAULT 0");
+        safeExecute("CREATE INDEX idx_sw_pf_ledger_control_reconcile ON stock_watch_price_failure_ledger "
+                + "(rule_version,sample_role,controls_finalized,id)");
     }
 
     private void safeAddColumn(String table, String column, String definition) {

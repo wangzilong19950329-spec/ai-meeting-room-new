@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.StockWatchPriceFailureLedgerMapper">
+    <resultMap id="BaseResultMap" type="com.aimeeting.room.entity.StockWatchPriceFailureLedger">
+        <id column="id" property="id"/>
+        <result column="sample_key" property="sampleKey"/>
+        <result column="signal_day_key" property="signalDayKey"/>
+        <result column="rule_version" property="ruleVersion"/>
+        <result column="rule_spec_hash" property="ruleSpecHash"/>
+        <result column="sample_role" property="sampleRole"/>
+        <result column="matched_signal_id" property="matchedSignalId"/>
+        <result column="origin_assessment_id" property="originAssessmentId"/>
+        <result column="origin_observation_id" property="originObservationId"/>
+        <result column="symbol" property="symbol"/>
+        <result column="market" property="market"/>
+        <result column="stock_name" property="stockName"/>
+        <result column="stratum" property="stratum"/>
+        <result column="source_date" property="sourceDate"/>
+        <result column="source_time_epoch_ms" property="sourceTimeEpochMs"/>
+        <result column="available_time_epoch_ms" property="availableTimeEpochMs"/>
+        <result column="available_at" property="availableAt"/>
+        <result column="signal_price" property="signalPrice"/>
+        <result column="feature_snapshot_json" property="featureSnapshotJson"/>
+        <result column="match_score" property="matchScore"/>
+        <result column="controls_finalized" property="controlsFinalized"/>
+        <result column="status" property="status"/>
+        <result column="entry_observation_id" property="entryObservationId"/>
+        <result column="entry_source_time_epoch_ms" property="entrySourceTimeEpochMs"/>
+        <result column="entry_source_date" property="entrySourceDate"/>
+        <result column="entry_price" property="entryPrice"/>
+        <result column="t1_trade_date" property="t1TradeDate"/>
+        <result column="t1_open" property="t1Open"/>
+        <result column="t1_high" property="t1High"/>
+        <result column="t1_low" property="t1Low"/>
+        <result column="t1_close" property="t1Close"/>
+        <result column="t1_max_drawdown_pct" property="t1MaxDrawdownPct"/>
+        <result column="t1_close_return_pct" property="t1CloseReturnPct"/>
+        <result column="t1_gap_pct" property="t1GapPct"/>
+        <result column="t1_max_upside_pct" property="t1MaxUpsidePct"/>
+        <result column="t1_drawdown_5_hit" property="t1Drawdown5Hit"/>
+        <result column="data_quality_reason" property="dataQualityReason"/>
+        <result column="row_version" property="rowVersion"/>
+        <result column="matured_at" property="maturedAt"/>
+        <result column="gmt_create" property="gmtCreate"/>
+        <result column="gmt_modify" property="gmtModify"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO stock_watch_price_failure_ledger
+        (sample_key, signal_day_key, rule_version, rule_spec_hash, sample_role, matched_signal_id,
+         origin_assessment_id, origin_observation_id, symbol, market, stock_name,
+         stratum, source_date, source_time_epoch_ms, available_time_epoch_ms,
+         available_at, signal_price, feature_snapshot_json, match_score, controls_finalized, status, row_version)
+        VALUES
+        (#{sampleKey}, #{signalDayKey}, #{ruleVersion}, #{ruleSpecHash}, #{sampleRole}, #{matchedSignalId},
+         #{originAssessmentId}, #{originObservationId}, #{symbol}, #{market}, #{stockName},
+         #{stratum}, #{sourceDate}, #{sourceTimeEpochMs}, #{availableTimeEpochMs},
+         #{availableAt}, #{signalPrice}, #{featureSnapshotJson}, #{matchScore}, #{controlsFinalized},
+         #{status}, #{rowVersion})
+    </insert>
+
+    <select id="selectBySampleKey" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_price_failure_ledger WHERE sample_key = #{sampleKey}
+    </select>
+
+    <select id="selectSignalBySymbolDate" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_price_failure_ledger
+        WHERE rule_version = #{ruleVersion}
+          AND sample_role = 'SIGNAL'
+          AND symbol = #{symbol}
+          AND market = #{market}
+          AND source_date = #{sourceDate}
+        ORDER BY id ASC
+        LIMIT 1
+    </select>
+
+    <select id="selectSignalsNeedingControls" resultMap="BaseResultMap">
+        SELECT signal.*
+        FROM stock_watch_price_failure_ledger signal
+        WHERE signal.rule_version = #{ruleVersion}
+          AND signal.sample_role = 'SIGNAL'
+          AND signal.controls_finalized = FALSE
+        ORDER BY signal.id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectControlsBySignal" resultMap="BaseResultMap">
+        SELECT * FROM stock_watch_price_failure_ledger
+        WHERE matched_signal_id = #{matchedSignalId} AND sample_role = 'CONTROL'
+        ORDER BY match_score ASC, id ASC
+    </select>
+
+    <update id="markControlsFinalized">
+        UPDATE stock_watch_price_failure_ledger
+        SET controls_finalized = TRUE,
+            row_version = row_version + 1,
+            gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{id}
+          AND row_version = #{rowVersion}
+          AND sample_role = 'SIGNAL'
+          AND controls_finalized = FALSE
+    </update>
+
+    <select id="selectPending" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_price_failure_ledger
+        WHERE rule_version = #{ruleVersion}
+          AND status IN ('WAITING_ENTRY', 'WAITING_T1')
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
+
+    <update id="updateOutcome">
+        UPDATE stock_watch_price_failure_ledger
+        SET status = #{status},
+            entry_observation_id = #{entryObservationId},
+            entry_source_time_epoch_ms = #{entrySourceTimeEpochMs},
+            entry_source_date = #{entrySourceDate},
+            entry_price = #{entryPrice},
+            t1_trade_date = #{t1TradeDate},
+            t1_open = #{t1Open},
+            t1_high = #{t1High},
+            t1_low = #{t1Low},
+            t1_close = #{t1Close},
+            t1_max_drawdown_pct = #{t1MaxDrawdownPct},
+            t1_close_return_pct = #{t1CloseReturnPct},
+            t1_gap_pct = #{t1GapPct},
+            t1_max_upside_pct = #{t1MaxUpsidePct},
+            t1_drawdown_5_hit = #{t1Drawdown5Hit},
+            data_quality_reason = #{dataQualityReason},
+            matured_at = #{maturedAt},
+            row_version = row_version + 1,
+            gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{id} AND row_version = #{rowVersion}
+    </update>
+
+    <select id="countMatureSignals" resultType="int">
+        SELECT COUNT(*)
+        FROM stock_watch_price_failure_ledger
+        WHERE rule_version = #{ruleVersion}
+          AND sample_role = 'SIGNAL'
+          AND status = 'MATURE'
+    </select>
+</mapper>

@@ -22,7 +22,8 @@ export const meetingApi = {
   getContributions: (id) => http.get(`/meetings/${id}/contributions`),
   getMemberScores: (memberId) => http.get(`/members/${memberId}/scores`),
   sendHumanMessage: (id, content, mode = 'message', targetMemberId = null) =>
-    http.post(`/meetings/${id}/human-message`, { content, mode, targetMemberId }),
+    http.post(`/meetings/${id}/human-message`, { content, mode, targetMemberId },
+      { suppressErrorMessage: true }),
   getTrackingOverview: () => http.get('/tracking-items/overview'),
   createCustomTrackingItem: (data) => http.post('/tracking-items/custom', data),
   refreshTrackingItem: (id) => http.post(`/tracking-items/${id}/refresh`),

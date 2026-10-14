@@ -2,8 +2,11 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { normalizeSessionKey } = require('./deepseek-session-identity');
 
-const CHROME_BIN = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const BROWSER_BIN = process.env.DEEPSEEK_WEB_BROWSER_BIN
+  || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const IS_EDGE_BROWSER = path.basename(BROWSER_BIN) === 'Microsoft Edge';
 const DEBUG_PORT = Number(process.env.DEEPSEEK_WEB_DEBUG_PORT || 9333);
 const DEFAULT_PROFILE_ROOT = process.env.DEEPSEEK_WEB_PROFILE_ROOT
   || path.join(os.tmpdir(), 'deepseek-web-profile');
@@ -12,7 +15,8 @@ const DEFAULT_CHROME_LOG_PATH = process.env.DEEPSEEK_WEB_CHROME_LOG
 const DEFAULT_SESSION_STORE_PATH = process.env.DEEPSEEK_WEB_SESSION_STORE
   || path.join(os.homedir(), '.aimeeting-room', 'deepseek-web-sessions.json');
 const SESSION_STORE_META_KEY = '__meta';
-const SOURCE_CHROME_DIR = path.join(os.homedir(), 'Library/Application Support/Google/Chrome');
+const SOURCE_BROWSER_DIR = path.join(os.homedir(), 'Library/Application Support',
+  IS_EDGE_BROWSER ? 'Microsoft Edge' : 'Google/Chrome');
 const DEFAULT_ACCOUNT_KEY = normalizeAccountKey(process.env.DEEPSEEK_WEB_DEFAULT_ACCOUNT_KEY || 'default');
 const ACCOUNT_WORKERS = new Map();
 const WAIT_TIMEOUT_MS = Number(process.env.DEEPSEEK_WEB_WAIT_TIMEOUT_MS || 120000);
@@ -25,15 +29,39 @@ const POST_SUBMIT_SETTLE_MS = Number(process.env.DEEPSEEK_WEB_POST_SUBMIT_SETTLE
 const POLL_INTERVAL_MS = Number(process.env.DEEPSEEK_WEB_POLL_INTERVAL_MS || 3500);
 const HUMAN_JITTER_MS = Number(process.env.DEEPSEEK_WEB_HUMAN_JITTER_MS || 1200);
 
-async function sleep(ms) {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+function abortError(signal) {
+  const reason = signal && signal.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error(reason ? String(reason) : 'Operation aborted');
+  error.name = 'AbortError';
+  return error;
 }
 
-async function sleepWithJitter(baseMs, jitterMs = HUMAN_JITTER_MS) {
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) throw abortError(signal);
+}
+
+async function sleep(ms, signal) {
+  throwIfAborted(signal);
+  await new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function sleepWithJitter(baseMs, jitterMs = HUMAN_JITTER_MS, signal) {
   const safeBase = Math.max(0, Number(baseMs) || 0);
   const safeJitter = Math.max(0, Number(jitterMs) || 0);
   const extra = safeJitter > 0 ? Math.floor(Math.random() * (safeJitter + 1)) : 0;
-  await sleep(safeBase + extra);
+  await sleep(safeBase + extra, signal);
 }
 
 function normalizeAccountKey(accountKey) {
@@ -41,7 +69,7 @@ function normalizeAccountKey(accountKey) {
     .trim()
     .replace(/[^a-zA-Z0-9_.:-]/g, '_')
     .slice(0, 80);
-  return normalized || DEFAULT_ACCOUNT_KEY || 'default';
+  return normalized || 'default';
 }
 
 function accountEnvSuffix(accountKey) {
@@ -137,7 +165,7 @@ function resolveWorkerConfig(options = {}) {
     || (isDefault ? DEFAULT_CHROME_LOG_PATH : accountScopedPath('deepseek-web', accountKey, 'chrome.log'));
   const profileBootstrap = normalizeProfileBootstrap(
     accountEnvValue(accountKey, 'PROFILE_BOOTSTRAP') || process.env.DEEPSEEK_WEB_PROFILE_BOOTSTRAP,
-    isDefault ? 'copy' : 'empty'
+    isDefault && !IS_EDGE_BROWSER ? 'copy' : 'empty'
   );
   const debugPort = isDefault
     ? Number(accountEnvValue(accountKey, 'DEBUG_PORT') || DEBUG_PORT)
@@ -174,13 +202,6 @@ function getWorkerStates() {
     resolveWorkerConfig();
   }
   return Array.from(ACCOUNT_WORKERS.values()).map(workerPublicState);
-}
-
-function normalizeSessionKey(sessionKey) {
-  return String(sessionKey || '')
-    .trim()
-    .replace(/[^a-zA-Z0-9_.:-]/g, '_')
-    .slice(0, 120);
 }
 
 function loadSessionStore(worker = resolveWorkerConfig()) {
@@ -297,7 +318,7 @@ function ensureAutomationProfile(worker = resolveWorkerConfig()) {
       return;
     }
     for (const item of ['Local State', 'Default']) {
-      const src = path.join(SOURCE_CHROME_DIR, item);
+      const src = path.join(SOURCE_BROWSER_DIR, item);
       const dest = path.join(worker.profileRoot, item);
       if (!fs.existsSync(src)) continue;
       fs.cpSync(src, dest, {
@@ -348,10 +369,159 @@ async function listTargets(worker = resolveWorkerConfig()) {
 }
 
 async function closeTarget(targetId, worker = resolveWorkerConfig()) {
-  if (!targetId) return;
+  if (!targetId) return false;
   try {
-    await fetch(`http://127.0.0.1:${worker.debugPort}/json/close/${targetId}`, { method: 'PUT' });
-  } catch (_) {}
+    const response = await fetch(`http://127.0.0.1:${worker.debugPort}/json/close/${targetId}`, {
+      method: 'PUT',
+      signal: AbortSignal.timeout(3000)
+    });
+    return response.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function closeTargetAndVerify(targetId, worker = resolveWorkerConfig(), verificationTimeoutMs = 5000) {
+  if (!targetId) return true;
+  await closeTarget(targetId, worker);
+  const deadline = Date.now() + Math.max(1, Number(verificationTimeoutMs) || 5000);
+  while (Date.now() < deadline) {
+    try {
+      const targets = await fetchJson(`http://127.0.0.1:${worker.debugPort}/json/list`, {
+        signal: AbortSignal.timeout(1500)
+      });
+      if (!targets.some(item => item && item.id === targetId)) return true;
+    } catch (_) {}
+    await sleep(200);
+  }
+  return false;
+}
+
+async function closeAccountBrowserAndVerify(workerOrOptions = {}, options = {}) {
+  const worker = effectiveWorker(workerOrOptions);
+  const debuggerVersion = await getExistingDebuggerVersion(worker);
+  if (debuggerVersion) {
+    if (!worker.debuggerProfileVerified) {
+      await verifyDebuggerProfile(worker, debuggerVersion);
+    }
+    if (!debuggerVersion.webSocketDebuggerUrl) return false;
+    const client = new CdpClient(debuggerVersion.webSocketDebuggerUrl, {
+      WebSocketImpl: options.WebSocketImpl
+    });
+    try {
+      await client.open();
+      await Promise.race([
+        client.send('Browser.close').catch(() => undefined),
+        sleep(Math.max(1, Number(options.commandTimeoutMs) || 1500))
+      ]);
+    } catch (_) {
+      // Browser.close commonly tears down its own CDP socket before replying.
+    } finally {
+      client.close();
+    }
+  }
+
+  const deadline = Date.now() + Math.max(1, Number(options.verificationTimeoutMs) || 5000);
+  const requiredAbsentCount = Math.max(2, Number(options.requiredAbsentCount) || 3);
+  const pollIntervalMs = Math.max(1, Number(options.pollIntervalMs) || 200);
+  let absentCount = debuggerVersion ? 0 : 1;
+  if (absentCount >= requiredAbsentCount) return true;
+  while (Date.now() < deadline) {
+    if (!await getExistingDebuggerVersion(worker)) {
+      absentCount += 1;
+      if (absentCount >= requiredAbsentCount) return true;
+    } else {
+      absentCount = 0;
+    }
+    await sleep(pollIntervalMs);
+  }
+  return false;
+}
+
+function effectiveWorker(workerOrOptions = {}) {
+  if (workerOrOptions.accountKey && workerOrOptions.profileRoot && workerOrOptions.debugPort) {
+    return workerOrOptions;
+  }
+  return resolveWorkerConfig(workerOrOptions);
+}
+
+function quarantineMarkerPath(workerOrOptions = {}) {
+  const worker = effectiveWorker(workerOrOptions);
+  return path.join(worker.profileRoot, '.deepseek-bridge-quarantine.json');
+}
+
+function readAccountQuarantine(workerOrOptions = {}) {
+  const markerPath = quarantineMarkerPath(workerOrOptions);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function hasAccountQuarantine(workerOrOptions = {}) {
+  return fs.existsSync(quarantineMarkerPath(workerOrOptions));
+}
+
+function markAccountQuarantined(workerOrOptions = {}, details = {}) {
+  const worker = effectiveWorker(workerOrOptions);
+  fs.mkdirSync(worker.profileRoot, { recursive: true });
+  const markerPath = quarantineMarkerPath(worker);
+  const temporaryPath = `${markerPath}.${process.pid}.tmp`;
+  const payload = {
+    version: 1,
+    accountKey: worker.accountKey,
+    debugPort: worker.debugPort,
+    targetId: details.targetId || null,
+    requestId: details.requestId || null,
+    reason: details.reason || 'provider_outcome_unknown',
+    markedAt: new Date().toISOString()
+  };
+  fs.writeFileSync(temporaryPath, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  fs.renameSync(temporaryPath, markerPath);
+  return payload;
+}
+
+function clearAccountQuarantine(workerOrOptions = {}) {
+  fs.rmSync(quarantineMarkerPath(workerOrOptions), { force: true });
+}
+
+async function recoverAccountQuarantine(workerOrOptions = {}, options = {}) {
+  const worker = effectiveWorker(workerOrOptions);
+  const marker = readAccountQuarantine(worker);
+  if (!marker) return { recovered: false, closedTargetCount: 0 };
+  const targets = await listTargets(worker);
+  const staleTargets = targets.filter(item => item && (
+    marker.targetId
+      ? item.id === marker.targetId
+      : item.type === 'page' && String(item.url || '').includes('chat.deepseek.com')
+  ));
+  for (const target of staleTargets) {
+    const closed = await closeTargetAndVerify(
+      target.id,
+      worker,
+      options.verificationTimeoutMs
+    );
+    if (!closed) {
+      const error = new Error(`DeepSeek quarantined target cleanup could not be confirmed for account ${worker.accountKey}`);
+      error.code = 'account_quarantine_cleanup_unconfirmed';
+      throw error;
+    }
+  }
+  const remaining = await listTargets(worker);
+  const unsafeRemaining = remaining.some(item => item && (
+    marker.targetId
+      ? item.id === marker.targetId
+      : item.type === 'page' && String(item.url || '').includes('chat.deepseek.com')
+  ));
+  if (unsafeRemaining) {
+    const error = new Error(`DeepSeek quarantined target is still active for account ${worker.accountKey}`);
+    error.code = 'account_quarantine_cleanup_unconfirmed';
+    throw error;
+  }
+  clearAccountQuarantine(worker);
+  return { recovered: true, closedTargetCount: staleTargets.length };
 }
 
 async function waitForDebugger(worker = resolveWorkerConfig()) {
@@ -373,7 +543,7 @@ async function waitForDebugger(worker = resolveWorkerConfig()) {
 function launchChrome(worker = resolveWorkerConfig()) {
   fs.mkdirSync(path.dirname(worker.chromeLogPath), { recursive: true });
   const chromeLogFd = fs.openSync(worker.chromeLogPath, 'a');
-  return spawn(CHROME_BIN, [
+  return spawn(BROWSER_BIN, [
     `--remote-debugging-port=${worker.debugPort}`,
     '--remote-debugging-address=127.0.0.1',
     `--user-data-dir=${worker.profileRoot}`,
@@ -396,11 +566,16 @@ function launchChrome(worker = resolveWorkerConfig()) {
 }
 
 class CdpClient {
-  constructor(wsUrl) {
-    this.ws = new WebSocket(wsUrl);
+  constructor(wsUrl, options = {}) {
+    this.WebSocketImpl = options.WebSocketImpl || WebSocket;
+    this.signal = options.signal || null;
+    this.commandTimeoutMs = Math.max(1, Number(options.commandTimeoutMs) || 20000);
+    this.openTimeoutMs = Math.max(1, Number(options.openTimeoutMs) || 15000);
+    this.ws = new this.WebSocketImpl(wsUrl);
     this.id = 0;
     this.pending = new Map();
     this.eventListeners = new Map();
+    this.closedError = null;
     this.ws.addEventListener('message', (event) => {
       const data = JSON.parse(event.data.toString());
       if (data.id && this.pending.has(data.id)) {
@@ -417,21 +592,81 @@ class CdpClient {
         }
       }
     });
+    this.ws.addEventListener('close', () => {
+      this.failPending(this.closedError || new Error('CDP WebSocket closed'));
+    });
+    this.ws.addEventListener('error', (event) => {
+      this.failPending(event instanceof Error ? event : new Error('CDP WebSocket error'));
+    });
+    this.onAbort = () => {
+      this.closedError = abortError(this.signal);
+      this.failPending(this.closedError);
+      try {
+        this.ws.close();
+      } catch (_) {}
+    };
+    if (this.signal) {
+      if (this.signal.aborted) this.onAbort();
+      else this.signal.addEventListener('abort', this.onAbort, { once: true });
+    }
+  }
+
+  failPending(error) {
+    for (const { reject } of this.pending.values()) reject(error);
+    this.pending.clear();
   }
 
   async open() {
-    if (this.ws.readyState === WebSocket.OPEN) return;
+    throwIfAborted(this.signal);
+    if (this.ws.readyState === this.WebSocketImpl.OPEN) return;
     await new Promise((resolve, reject) => {
-      this.ws.addEventListener('open', resolve, { once: true });
-      this.ws.addEventListener('error', reject, { once: true });
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`CDP WebSocket open timed out after ${this.openTimeoutMs}ms`));
+      }, this.openTimeoutMs);
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.ws.removeEventListener('open', onOpen);
+        this.ws.removeEventListener('error', onError);
+        if (this.signal) this.signal.removeEventListener('abort', onAbort);
+      };
+      const onOpen = () => { cleanup(); resolve(); };
+      const onError = (event) => {
+        cleanup();
+        reject(event instanceof Error ? event : new Error('CDP WebSocket open failed'));
+      };
+      const onAbort = () => { cleanup(); reject(abortError(this.signal)); };
+      this.ws.addEventListener('open', onOpen, { once: true });
+      this.ws.addEventListener('error', onError, { once: true });
+      if (this.signal) this.signal.addEventListener('abort', onAbort, { once: true });
     });
   }
 
   async send(method, params = {}) {
+    throwIfAborted(this.signal);
+    if (this.closedError) throw this.closedError;
+    if (this.ws.readyState !== this.WebSocketImpl.OPEN) {
+      throw new Error('CDP WebSocket is not open');
+    }
     const id = ++this.id;
-    this.ws.send(JSON.stringify({ id, method, params }));
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        const error = new Error(`CDP command timed out: ${method} after ${this.commandTimeoutMs}ms`);
+        this.closedError = error;
+        this.failPending(error);
+        try { this.ws.close(); } catch (_) {}
+      }, this.commandTimeoutMs);
+      this.pending.set(id, {
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (error) => { clearTimeout(timer); reject(error); }
+      });
+      try {
+        this.ws.send(JSON.stringify({ id, method, params }));
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(error);
+      }
     });
   }
 
@@ -453,9 +688,125 @@ class CdpClient {
   }
 
   close() {
+    if (this.signal) this.signal.removeEventListener('abort', this.onAbort);
+    this.closedError = this.closedError || new Error('CDP client closed');
+    this.failPending(this.closedError);
     try {
       this.ws.close();
     } catch (_) {}
+  }
+}
+
+function validateAccountIdentityReceipt(receipt) {
+  const fingerprint = String(receipt && receipt.fingerprint || '').trim().toLowerCase();
+  if (Number(receipt && receipt.httpStatus) !== 200
+    || Number(receipt && receipt.code) !== 0
+    || !/^[a-f0-9]{64}$/.test(fingerprint)) {
+    const error = new Error('DeepSeek account identity could not be verified; login may be required');
+    error.code = 'login_required';
+    throw error;
+  }
+  return {
+    identityVerified: true,
+    identityFingerprint: fingerprint,
+    identityFingerprintShort: fingerprint.slice(0, 12)
+  };
+}
+
+async function readCurrentAccountIdentityOnce(target) {
+  const client = new CdpClient(target.webSocketDebuggerUrl);
+  try {
+    await client.open();
+    const receipt = await client.eval(`
+      (async () => {
+        let token = '';
+        try {
+          token = JSON.parse(localStorage.getItem('userToken') || '{}').value || '';
+        } catch (_) {}
+        if (!token) return { httpStatus: 0, code: -1, fingerprint: '' };
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 10000);
+        let response;
+        let payload;
+        try {
+          response = await fetch('/api/v0/users/current', {
+            credentials: 'include',
+            headers: { Authorization: 'Bearer ' + token },
+            signal: controller.signal
+          });
+          payload = await response.json().catch(() => null);
+        } finally {
+          clearTimeout(timer);
+        }
+        const accountId = payload && payload.data && payload.data.biz_data
+          ? payload.data.biz_data.id
+          : '';
+        if (!accountId) {
+          return {
+            httpStatus: response.status,
+            code: payload && payload.code,
+            fingerprint: ''
+          };
+        }
+        const digest = await crypto.subtle.digest(
+          'SHA-256',
+          new TextEncoder().encode('deepseek-account:' + accountId)
+        );
+        return {
+          httpStatus: response.status,
+          code: payload && payload.code,
+          fingerprint: Array.from(new Uint8Array(digest))
+            .map(value => value.toString(16).padStart(2, '0'))
+            .join('')
+        };
+      })()
+    `);
+    return validateAccountIdentityReceipt(receipt);
+  } finally {
+    client.close();
+  }
+}
+
+async function retryTransientIdentityRead(read) {
+  try {
+    return await read();
+  } catch (error) {
+    if (!/^CDP command timed out: Runtime\.evaluate\b/.test(String(error && error.message || ''))) {
+      throw error;
+    }
+    await sleep(500);
+    return read();
+  }
+}
+
+async function readCurrentAccountIdentity(target) {
+  return retryTransientIdentityRead(() => readCurrentAccountIdentityOnce(target));
+}
+
+async function replaceStalledAccountTarget(target, worker) {
+  const fresh = await fetchJson(`http://127.0.0.1:${worker.debugPort}/json/new?https://chat.deepseek.com/`, {
+    method: 'PUT'
+  });
+  if (!fresh || !fresh.id || !fresh.webSocketDebuggerUrl) {
+    throw new Error('Fresh DeepSeek account target could not be opened');
+  }
+  try {
+    await sleep(1000);
+    const identity = await readCurrentAccountIdentity(fresh);
+    if (!await closeTargetAndVerify(target.targetId, worker)) {
+      throw new Error('Stalled DeepSeek account target could not be closed');
+    }
+    saveSessionStore(bindSessionStoreToSharedTarget(loadSessionStore(worker), fresh.id), worker);
+    return {
+      targetId: fresh.id,
+      reused: false,
+      closedDuplicateTargets: target.closedDuplicateTargets + 1,
+      recoveredStalledTarget: true,
+      ...identity
+    };
+  } catch (error) {
+    await closeTargetAndVerify(fresh.id, worker);
+    throw error;
   }
 }
 
@@ -662,42 +1013,54 @@ async function ensureDebuggerAvailable(options = {}) {
 async function prepareSharedTarget(options = {}) {
   const worker = resolveWorkerConfig(options);
   await ensureDebuggerAvailable(worker);
+  await recoverAccountQuarantine(worker);
   const target = await openPageTarget({ ...options, prepareOnly: true, accountKey: worker.accountKey });
+  let identity;
+  try {
+    identity = await readCurrentAccountIdentity(target);
+  } catch (error) {
+    if (!/^CDP command timed out: Runtime\.evaluate\b/.test(String(error && error.message || ''))) {
+      throw error;
+    }
+    identity = await replaceStalledAccountTarget(target, worker);
+  }
   return {
     mode: 'single_worker',
     accountKey: worker.accountKey,
     debugPort: worker.debugPort,
     profileRoot: worker.profileRoot,
-    targetId: target.targetId,
-    reused: target.reused,
-    closedDuplicateTargets: target.closedDuplicateTargets
+    targetId: identity.targetId || target.targetId,
+    reused: identity.reused === false ? false : target.reused,
+    closedDuplicateTargets: identity.closedDuplicateTargets ?? target.closedDuplicateTargets,
+    recoveredStalledTarget: identity.recoveredStalledTarget === true,
+    ...identity
   };
 }
 
-async function resetConversationSurface(client) {
+async function resetConversationSurface(client, signal) {
   try {
     await client.send('Page.navigate', { url: 'https://chat.deepseek.com/' });
   } catch (_) {}
-  await sleepWithJitter(PAGE_RESET_SETTLE_MS);
+  await sleepWithJitter(PAGE_RESET_SETTLE_MS, HUMAN_JITTER_MS, signal);
 }
 
-async function restoreConversationSurface(client, url) {
+async function restoreConversationSurface(client, url, signal) {
   const currentUrl = await client.eval('location.href').catch(() => '');
   if (currentUrl === url) {
     return { restored: true, navigated: false, url };
   }
   await client.send('Page.navigate', { url });
-  await sleepWithJitter(PAGE_RESET_SETTLE_MS);
+  await sleepWithJitter(PAGE_RESET_SETTLE_MS, HUMAN_JITTER_MS, signal);
   return { restored: true, navigated: true, url };
 }
 
-async function tryStartFreshConversation(client) {
+async function tryStartFreshConversation(client, signal) {
   const js = `
     (() => {
-      const candidates = Array.from(document.querySelectorAll('button,[role="button"],a'))
+      const candidates = Array.from(document.querySelectorAll('button,[role="button"],a,[tabindex="0"]'))
         .filter(el => {
           const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
-          return text && /新对话|开启新对话|新建对话|New chat|new chat|New conversation/i.test(text);
+          return /^(开启新对话|新对话|新建对话|New chat|New conversation)$/i.test(text);
         });
       const target = candidates[0];
       if (!target) return { clicked: false };
@@ -711,7 +1074,7 @@ async function tryStartFreshConversation(client) {
   try {
     const result = await client.eval(js);
     if (result && result.clicked) {
-      await sleepWithJitter(PAGE_RESET_SETTLE_MS, 800);
+      await sleepWithJitter(PAGE_RESET_SETTLE_MS, 800, signal);
     }
     return result || { clicked: false };
   } catch (_) {
@@ -719,7 +1082,7 @@ async function tryStartFreshConversation(client) {
   }
 }
 
-async function waitForComposer(client) {
+async function waitForComposer(client, signal) {
   const deadline = Date.now() + 60000;
   const js = `
     (() => {
@@ -739,14 +1102,13 @@ async function waitForComposer(client) {
   while (Date.now() < deadline) {
     const state = await client.eval(js);
     if (state && state.ready) return state;
-    await sleep(1000);
+    await sleep(1000, signal);
   }
   throw new Error('DeepSeek composer textarea did not appear; login may be required');
 }
 
-// 默认 fast：经实测，DeepSeek 网页的 expert 模式不适合作为通用联网搜索入口，
-// 只有 fast（默认对话模式）更稳定拿到真实搜索结果与可点击 URL。
-// 需要专业/专家模式的调用方可以在单次请求里传 mode=expert，避免影响其它搜索链路。
+// Preserve the bridge's fast/expert request contract. On DeepSeek's unified UI,
+// fast uses search without deep thinking; expert enables both visible controls.
 function normalizeBridgeMode(raw) {
   const value = String(raw || '').trim().toLowerCase();
   return value === 'expert' || value === 'professional' ? 'expert' : 'fast';
@@ -754,12 +1116,13 @@ function normalizeBridgeMode(raw) {
 
 const DEFAULT_BRIDGE_MODE = normalizeBridgeMode(process.env.DEEPSEEK_WEB_MODE || 'fast');
 
-function buildToggleJs(mode) {
+function buildToggleJs(mode, enableSearch = true) {
   const wantExpert = mode === 'expert';
   return `
     (() => {
       const updates = [];
       const wantExpert = ${wantExpert ? 'true' : 'false'};
+      const wantSearch = ${enableSearch ? 'true' : 'false'};
       const textOf = (el) => ((el && (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title'))) || '').trim();
       const classOf = (el) => String((el && el.className) || '');
       const rectOf = (el) => {
@@ -875,6 +1238,40 @@ function buildToggleJs(mode) {
         if (headerMode.text === '识图模式') return 'vision';
         return '';
       };
+      const composer = document.querySelector('textarea');
+      const composerControls = composer && composer.parentElement && composer.parentElement.parentElement
+        && composer.parentElement.parentElement.parentElement
+        ? controls.filter(el => composer.parentElement.parentElement.parentElement.contains(el))
+        : [];
+      const toggle = (aliases) => composerControls.find(el =>
+        aliases.some(alias => textOf(el).replace(/\\s+/g, '') === alias)
+        && el.hasAttribute('aria-pressed')
+      );
+      const deepToggle = toggle(['深度思考']);
+      const searchToggle = toggle(['智能搜索', '联网搜索']);
+      const unifiedMode = isVisible(composer)
+        && deepToggle && searchToggle
+        && !modeFromText()
+        && !controls.some(el => el.hasAttribute('data-model-type'));
+      if (unifiedMode) {
+        const setToggle = (el, label, wanted) => {
+          const before = isSelected(el);
+          if (before !== wanted) el.click();
+          const after = isSelected(el);
+          updates.push({ label, found: true, changed: before !== wanted, pressedAfter: String(after) });
+          return after === wanted;
+        };
+        const deepReady = setToggle(deepToggle, '深度思考', wantExpert);
+        const searchReady = setToggle(searchToggle, '智能搜索', wantSearch);
+        updates.push({
+          label: '页面模式',
+          found: true,
+          mode: 'unified',
+          requestedMode: wantExpert ? 'expert' : 'fast',
+          modeVerified: deepReady && searchReady
+        });
+        return updates;
+      }
       const expert = findModeOption(['专家模式', '专业模式'], ['expert', 'professional']);
       const quick = findModeOption(['快速模式'], ['default', 'fast', 'quick']);
 
@@ -906,12 +1303,11 @@ function buildToggleJs(mode) {
         }
       }
 
-      // Only manipulate deep think / search toggles in expert mode. DeepSeek currently renders
-      // these controls as div.ds-toggle-button with aria-pressed, not always as real buttons.
-      if (wantExpert) {
+      // DeepSeek currently renders these controls as div.ds-toggle-button with aria-pressed.
+      {
         const targets = [
-          { label: '深度思考', aliases: ['深度思考'] },
-          { label: '智能搜索', aliases: ['智能搜索', '联网搜索'] }
+          { label: '深度思考', aliases: ['深度思考'], wanted: wantExpert },
+          { label: '智能搜索', aliases: ['智能搜索', '联网搜索'], wanted: wantSearch }
         ];
         for (const target of targets) {
           const button = controls.find((el) => target.aliases.some(alias => textOf(el).includes(alias)));
@@ -920,11 +1316,11 @@ function buildToggleJs(mode) {
             continue;
           }
           const pressed = isSelected(button);
-          if (!pressed) {
+          if (pressed !== target.wanted) {
             button.click();
           }
           const pressedAfter = isSelected(button);
-          updates.push({ label: target.label, found: true, changed: !pressed, pressedAfter: String(pressedAfter) });
+          updates.push({ label: target.label, found: true, changed: pressed !== target.wanted, pressedAfter: String(pressedAfter) });
         }
       }
       const detectedMode = modeFromText()
@@ -937,47 +1333,51 @@ function buildToggleJs(mode) {
         mode: detectedMode || 'unknown',
         requestedMode,
         modeVerified: detectedMode === requestedMode
+          && !!updates.find(item => item.label === '智能搜索' && item.found
+            && item.pressedAfter === String(wantSearch))
       });
       return updates;
     })()
   `;
 }
 
-async function ensureToggleModes(client, mode = DEFAULT_BRIDGE_MODE) {
+async function ensureToggleModes(client, mode = DEFAULT_BRIDGE_MODE, signal, enableSearch = true) {
   const bridgeMode = normalizeBridgeMode(mode);
-  const js = buildToggleJs(bridgeMode);
+  const js = buildToggleJs(bridgeMode, enableSearch);
   let lastResult = [];
   for (let i = 0; i < 12; i++) {
     const result = await client.eval(js);
     lastResult = Array.isArray(result) ? result : [];
+    const pageMode = lastResult.find(item => item.label === '页面模式');
+    if (pageMode && pageMode.mode === 'unified' && pageMode.modeVerified === true) break;
     if (bridgeMode === 'fast') {
       const quick = lastResult.find(item => item.label === '快速模式');
-      if (quick && quick.found && quick.selectedAfter) {
+      if (quick && quick.found && quick.selectedAfter && pageMode?.modeVerified === true) {
         break;
       }
     } else {
       const expert = lastResult.find(item => item.label === '专家模式');
       const deep = lastResult.find(item => item.label === '深度思考');
       const search = lastResult.find(item => item.label === '智能搜索');
-      const pageMode = lastResult.find(item => item.label === '页面模式');
       const expertReady = expert && expert.found && (expert.selectedAfter || expert.selected || pageMode?.mode === 'expert');
       const modeReady = pageMode && pageMode.modeVerified === true;
       const deepReady = deep && deep.found && String(deep.pressedAfter).toLowerCase() === 'true';
-      const searchReady = !search || !search.found || String(search.pressedAfter).toLowerCase() === 'true';
+      const searchReady = search && search.found
+        && (String(search.pressedAfter).toLowerCase() === 'true') === enableSearch;
       if (expertReady && modeReady && deepReady && searchReady) {
         break;
       }
     }
-    await sleepWithJitter(900, 500);
+    await sleepWithJitter(900, 500, signal);
   }
-  await sleepWithJitter(MODE_SETTLE_MS);
+  await sleepWithJitter(MODE_SETTLE_MS, HUMAN_JITTER_MS, signal);
   return lastResult;
 }
 
 async function submitQuery(client, query) {
   const escaped = JSON.stringify(query);
   return client.eval(`
-    (() => {
+    (async () => {
       const textarea = document.querySelector('textarea');
       if (!textarea) return { ok: false, reason: 'no_textarea' };
       textarea.focus();
@@ -1020,43 +1420,33 @@ async function submitQuery(client, query) {
           (btn.className || '').includes('_52c986b')
         ) || null;
       };
-      const sendButton = findSendButton();
-      if (sendButton) {
-        if ((sendButton.getAttribute('aria-disabled') || '').toLowerCase() === 'true' || sendButton.disabled) {
-          return {
-            ok: false,
-            reason: 'send_button_disabled',
-            valueLength: textarea.value.length,
-            buttonHtml: (sendButton.outerHTML || '').slice(0, 500)
-          };
-        }
-        sendButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
-        sendButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-        sendButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-        sendButton.click();
+      const isDisabled = (button) => button
+        && ((button.getAttribute('aria-disabled') || '').toLowerCase() === 'true'
+          || button.disabled || button.classList.contains('ds-button--disabled'));
+      let sendButton = null;
+      for (let attempt = 0; attempt < 15; attempt += 1) {
+        sendButton = findSendButton();
+        if (sendButton && !isDisabled(sendButton)) break;
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      if (!sendButton || isDisabled(sendButton) || textarea.value !== ${escaped}) {
         return {
-          ok: true,
-          method: 'button',
+          ok: false,
+          reason: !sendButton ? 'no_send_button' : 'send_button_disabled_or_composer_changed',
           valueLength: textarea.value.length,
-          buttonHtml: (sendButton.outerHTML || '').slice(0, 500)
+          buttonHtml: sendButton ? (sendButton.outerHTML || '').slice(0, 500) : null
         };
       }
-      textarea.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true
-      }));
-      textarea.dispatchEvent(new KeyboardEvent('keyup', {
-        key: 'Enter',
-        code: 'Enter',
-        keyCode: 13,
-        which: 13,
-        bubbles: true
-      }));
-      return { ok: true, method: 'enter', valueLength: textarea.value.length };
+      sendButton.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      sendButton.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      sendButton.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      sendButton.click();
+      return {
+        ok: true,
+        method: 'button',
+        valueLength: textarea.value.length,
+        buttonHtml: (sendButton.outerHTML || '').slice(0, 500)
+      };
     })()
   `);
 }
@@ -1192,6 +1582,8 @@ function diffSearchState(state, baseline = null) {
     links: (state.links || []).filter(item => item && item.href && !baselineLinks.has(item.href)),
     candidateTexts: changedCandidateTexts,
     assistantBlockCount: Math.max(0, Number(state.assistantBlockCount || 0) - Number(baseline.assistantBlockCount || 0)),
+    allAssistantBlockCount: Number(state.allAssistantBlockCount || 0),
+    submittedTurnMatched: false,
     generationActive: !!state.generationActive
   };
 }
@@ -1210,13 +1602,15 @@ function buildModeState(toggleUpdates, mode = DEFAULT_BRIDGE_MODE) {
   const quickExplicit = !!(quick && quick.found && (quick.selectedAfter === true || quick.selected === true));
   const deepThinkEnabled = isPressed(deep);
   const headerMode = pageMode && pageMode.found ? pageMode.mode : null;
-  const modeVerified = pageMode && pageMode.modeVerified === true
-    ? true
+  const modeVerified = pageMode
+    ? pageMode.modeVerified === true
     : (bridgeMode === 'expert' ? expertExplicit : quickExplicit);
   return {
     bridgeMode,
-    expertMode: bridgeMode === 'expert' && (expertExplicit || headerMode === 'expert'),
-    quickMode: quickExplicit || headerMode === 'fast',
+    expertMode: bridgeMode === 'expert' && (expertExplicit || headerMode === 'expert'
+      || (headerMode === 'unified' && modeVerified && deepThinkEnabled)),
+    quickMode: quickExplicit || headerMode === 'fast'
+      || (bridgeMode === 'fast' && headerMode === 'unified' && modeVerified && !deepThinkEnabled),
     headerMode,
     modeVerified,
     deepThinkEnabled,
@@ -1247,9 +1641,30 @@ function parseDeepSeekCompletionSse(body) {
   let activeFragmentType = '';
   let activePatchPath = '';
   let finished = false;
+  let responseFinished = false;
+  let fragmentOrdinal = 0;
+  let activeSearchFragment = '';
+  let activeOpenFragment = '';
+  const searchResults = new Map();
+  const openedPages = new Map();
+  const recordResults = (results) => {
+    if (activeFragmentType !== 'TOOL_SEARCH' || !activeSearchFragment || !Array.isArray(results)) return;
+    searchResults.set(activeSearchFragment, results.filter(item => item && typeof item.url === 'string'
+      && /^https?:\/\//i.test(item.url)));
+  };
   const appendFragment = (fragment) => {
     if (!fragment || typeof fragment !== 'object') return;
     activeFragmentType = String(fragment.type || '').toUpperCase();
+    fragmentOrdinal += 1;
+    activeSearchFragment = activeFragmentType === 'TOOL_SEARCH'
+      ? String(fragment.id || `fragment-${fragmentOrdinal}`) : '';
+    activeOpenFragment = activeFragmentType === 'TOOL_OPEN'
+      ? String(fragment.id || `fragment-${fragmentOrdinal}`) : '';
+    if (activeSearchFragment) recordResults(fragment.results);
+    if (activeOpenFragment && fragment.result
+      && typeof fragment.result.url === 'string' && /^https?:\/\//i.test(fragment.result.url)) {
+      openedPages.set(activeOpenFragment, fragment.result);
+    }
     if (activeFragmentType === 'RESPONSE' && typeof fragment.content === 'string') {
       answerText += fragment.content;
     }
@@ -1257,8 +1672,12 @@ function parseDeepSeekCompletionSse(body) {
   const inspectBatch = (items) => {
     for (const item of Array.isArray(items) ? items : []) {
       if (!item || typeof item !== 'object') continue;
+      if (item.p === 'fragments' && item.o === 'APPEND') {
+        for (const fragment of Array.isArray(item.v) ? item.v : [item.v]) appendFragment(fragment);
+      }
       if ((item.p === 'status' || item.p === 'quasi_status') && String(item.v || '').toUpperCase() === 'FINISHED') {
         finished = true;
+        responseFinished = true;
       }
     }
   };
@@ -1282,17 +1701,27 @@ function parseDeepSeekCompletionSse(body) {
     const response = payload && payload.v && payload.v.response;
     if (response && typeof response === 'object') {
       for (const fragment of response.fragments || []) appendFragment(fragment);
-      if (String(response.status || response.quasi_status || '').toUpperCase() === 'FINISHED') finished = true;
+      if (String(response.status || response.quasi_status || '').toUpperCase() === 'FINISHED') {
+        finished = true;
+        responseFinished = true;
+      }
     }
 
     if (payload && typeof payload.p === 'string') {
       activePatchPath = payload.p;
       if (payload.p === 'response/fragments') {
         for (const fragment of Array.isArray(payload.v) ? payload.v : [payload.v]) appendFragment(fragment);
+      } else if (/^response\/fragments\/(?:-1|\d+)\/results$/.test(payload.p)) {
+        recordResults(payload.v);
+      } else if (/^response\/fragments\/(?:-1|\d+)\/result$/.test(payload.p)
+        && activeFragmentType === 'TOOL_OPEN' && activeOpenFragment
+        && payload.v && typeof payload.v.url === 'string' && /^https?:\/\//i.test(payload.v.url)) {
+        openedPages.set(activeOpenFragment, payload.v);
       } else if (payload.p.endsWith('/content') && activeFragmentType === 'RESPONSE' && typeof payload.v === 'string') {
         answerText += payload.v;
       } else if (payload.p === 'response/status' && String(payload.v || '').toUpperCase() === 'FINISHED') {
         finished = true;
+        responseFinished = true;
       } else if (payload.p === 'response' && payload.o === 'BATCH') {
         inspectBatch(payload.v);
       }
@@ -1301,22 +1730,57 @@ function parseDeepSeekCompletionSse(body) {
     }
   }
 
-  return { answerText, finished };
+  const links = [];
+  const seen = new Set();
+  let searchCount = 0;
+  for (const results of searchResults.values()) {
+    searchCount += results.length;
+    for (const item of results) {
+      if (seen.has(item.url)) continue;
+      seen.add(item.url);
+      links.push({ href: item.url, text: String(item.title || '').slice(0, 300) });
+    }
+  }
+  for (const item of openedPages.values()) {
+    if (seen.has(item.url)) continue;
+    seen.add(item.url);
+    links.push({ href: item.url, text: String(item.title || '').slice(0, 300) });
+  }
+  return { answerText, finished, responseFinished, searchCount, searchToolCallCount: searchResults.size,
+    openedPageCount: openedPages.size, links };
 }
 
-function createDeepSeekCompletionCapture(client) {
+function createDeepSeekCompletionCapture(client, expectedQuery) {
   const trackedRequestIds = new Set();
+  const expectedTurnSignature = buildTurnSignature(expectedQuery);
   const state = {
     answerText: '',
     completed: false,
+    responseFinished: false,
     responseStatus: null,
-    error: ''
+    error: '',
+    requestMatched: false,
+    requestSearchEnabled: false,
+    searchCount: 0,
+    searchToolCallCount: 0,
+    openedPageCount: 0,
+    links: []
   };
 
+  client.on('Network.requestWillBeSent', (params) => {
+    const request = params && params.request;
+    if (!request || !String(request.url || '').includes('/api/v0/chat/completion')
+      || request.method !== 'POST') return;
+    let payload;
+    try { payload = JSON.parse(request.postData || ''); } catch (_) { return; }
+    if (!expectedTurnSignature || buildTurnSignature(payload.prompt) !== expectedTurnSignature) return;
+    trackedRequestIds.add(params.requestId);
+    state.requestMatched = true;
+    state.requestSearchEnabled = payload.search_enabled === true;
+  });
   client.on('Network.responseReceived', (params) => {
     const response = params && params.response;
-    if (!response || !String(response.url || '').includes('/api/v0/chat/completion')) return;
-    trackedRequestIds.add(params.requestId);
+    if (!response || !trackedRequestIds.has(params.requestId)) return;
     state.responseStatus = Number(response.status || 0);
     if (state.responseStatus >= 400) {
       state.error = `DeepSeek completion HTTP ${state.responseStatus}`;
@@ -1333,6 +1797,11 @@ function createDeepSeekCompletionCapture(client) {
       .then((result) => {
         const parsed = parseDeepSeekCompletionSse(result && result.body || '');
         state.answerText = parsed.answerText;
+        state.responseFinished = parsed.responseFinished;
+        state.searchCount = parsed.searchCount;
+        state.searchToolCallCount = parsed.searchToolCallCount;
+        state.openedPageCount = parsed.openedPageCount;
+        state.links = parsed.links;
         state.completed = true;
         if (!state.answerText && !state.error) {
           state.error = 'DeepSeek completion stream finished without response content';
@@ -1376,9 +1845,49 @@ function resolveNonJsonCompletionReason({
   return null;
 }
 
+function acceptsNonJsonCompletionReason(reason, enableSearch) {
+  return !!reason && (enableSearch !== false || reason === 'complete_network');
+}
+
+function hasCompletedNetworkAnswer(capture, enableSearch) {
+  return !!(capture && capture.completed && capture.answerText && capture.answerText.trim()
+    && (enableSearch !== false || (capture.requestMatched === true
+      && capture.responseFinished === true && !capture.error)));
+}
+
+function acceptsStableJsonCompletion(jsonComplete, generationActive, stableCount, enableSearch) {
+  return enableSearch !== false && jsonComplete && !generationActive && stableCount >= 2;
+}
+
+function resolveWaitTimeout(lastState, options = {}, startedAt = Date.now()) {
+  if (lastState && lastState.generationActive) {
+    const error = new Error('Timed out waiting for DeepSeek web answer while provider generation remained active');
+    error.code = 'provider_timeout';
+    error.providerOutcomeUnknown = true;
+    error.retrySafe = false;
+    throw error;
+  }
+  const answerCandidate = (lastState.candidateTexts || [])
+    .map(item => item && item.text || '')
+    .filter(Boolean)
+    .slice(-1)[0]
+    || lastState.bodyDelta
+    || lastState.bodyText
+    || '';
+  return {
+    ...lastState,
+    jsonComplete: hasCompleteJson(answerCandidate),
+    waitDurationMs: Date.now() - startedAt,
+    completionReason: options.expectedJson === true
+      ? 'timeout_incomplete_json'
+      : 'timeout_with_last_state'
+  };
+}
+
 async function waitForAnswer(client, baseline, options = {}) {
-  const deadline = Date.now() + WAIT_TIMEOUT_MS;
   const startedAt = Date.now();
+  let deadline = startedAt + WAIT_TIMEOUT_MS;
+  let proofWaitStartedAt = 0;
   let stableCount = 0;
   let lastDigest = '';
   let firstContentAt = 0;
@@ -1396,12 +1905,36 @@ async function waitForAnswer(client, baseline, options = {}) {
       baseline
     );
     const completionCapture = options.completionCapture;
-    const networkAnswerComplete = !!(
-      completionCapture
+    const networkAnswerComplete = hasCompletedNetworkAnswer(completionCapture, options.enableSearch);
+    const pageSearchEvidence = state.submittedTurnMatched === true
+      && Number(state.searchCount) > 0
+      && Array.isArray(state.links) && state.links.length > 0;
+    const networkSearchEvidence = !!(completionCapture
       && completionCapture.completed
-      && completionCapture.answerText
-      && completionCapture.answerText.trim()
-    );
+      && completionCapture.requestMatched === true
+      && completionCapture.requestSearchEnabled === true
+      && Number(completionCapture.searchCount) > 0
+      && Array.isArray(completionCapture.links) && completionCapture.links.length > 0);
+    if (options.requireSearchEvidence === true && networkSearchEvidence) {
+      const links = new Map((pageSearchEvidence ? state.links : []).map(item => [item.href, item]));
+      for (const item of completionCapture.links) links.set(item.href, item);
+      state = {
+        ...state,
+        submittedTurnMatched: true,
+        searchCount: Number(state.searchCount) > 0 ? state.searchCount : completionCapture.searchCount,
+        links: [...links.values()],
+        searchToolCallCount: completionCapture.searchToolCallCount,
+        openedPageCount: completionCapture.openedPageCount,
+        searchEvidenceSource: pageSearchEvidence ? 'page' : 'completion_tool_results'
+      };
+    } else if (pageSearchEvidence) {
+      state = { ...state, searchEvidenceSource: 'page' };
+    }
+    if (networkAnswerComplete && options.requireSearchEvidence === true && !proofWaitStartedAt) {
+      proofWaitStartedAt = Date.now();
+      deadline = Math.max(deadline, Math.min(startedAt + WAIT_TIMEOUT_MS + 30000,
+        proofWaitStartedAt + 30000));
+    }
     if (networkAnswerComplete) {
       const networkAnswer = completionCapture.answerText.trim();
       state = {
@@ -1434,6 +1967,10 @@ async function waitForAnswer(client, baseline, options = {}) {
     const answerCandidate = (state.candidateTexts || []).map(item => item && item.text || '').filter(Boolean).slice(-1)[0]
       || state.bodyDelta || state.bodyText || '';
     const jsonComplete = options.expectedJson === true && hasCompleteJson(answerCandidate);
+    const searchEvidenceObserved = state.submittedTurnMatched === true
+      && Number(state.searchCount) > 0
+      && Array.isArray(state.links) && state.links.length > 0;
+    const searchEvidenceRequired = options.requireSearchEvidence === true;
     const hasLinkOnlySignal = !hasTextSignal && hasEnoughLinks;
     if (hasTextSignal && !firstContentAt) {
       firstContentAt = Date.now();
@@ -1449,11 +1986,16 @@ async function waitForAnswer(client, baseline, options = {}) {
         && isFatalCompletionCaptureError(completionCapture.error)) {
         throw new Error(completionCapture.error);
       }
-      if (completionCapture && completionCapture.completed && jsonComplete && state.networkAnswerCaptured) {
+      if (networkAnswerComplete && jsonComplete && state.networkAnswerCaptured
+        && (!searchEvidenceRequired || searchEvidenceObserved)) {
         return finalize({ ...state, jsonComplete: true }, 'complete_json_network');
       }
-      if (jsonComplete && !state.generationActive && stableCount >= 2) return finalize({ ...state, jsonComplete: true }, 'complete_json_stable');
-      await sleepWithJitter(POLL_INTERVAL_MS, 800);
+      if (acceptsStableJsonCompletion(jsonComplete, state.generationActive, stableCount,
+        options.enableSearch)
+        && (!searchEvidenceRequired || searchEvidenceObserved)) {
+        return finalize({ ...state, jsonComplete: true }, 'complete_json_stable');
+      }
+      await sleepWithJitter(POLL_INTERVAL_MS, 800, options.signal);
       continue;
     }
     const nonJsonCompletionReason = resolveNonJsonCompletionReason({
@@ -1467,13 +2009,14 @@ async function waitForAnswer(client, baseline, options = {}) {
       quickDeadline,
       now: Date.now()
     });
-    if (nonJsonCompletionReason) return finalize(state, nonJsonCompletionReason);
-    await sleepWithJitter(POLL_INTERVAL_MS, 800);
+    // Model inference must wait for the completed response stream. A short pause in
+    // page rendering can otherwise trip the search-oriented quick-return budget.
+    if (acceptsNonJsonCompletionReason(nonJsonCompletionReason, options.enableSearch)) {
+      return finalize(state, nonJsonCompletionReason);
+    }
+    await sleepWithJitter(POLL_INTERVAL_MS, 800, options.signal);
   }
-  if (lastState) return finalize({ ...lastState, jsonComplete: hasCompleteJson(
-    (lastState.candidateTexts || []).map(item => item && item.text || '').filter(Boolean).slice(-1)[0]
-      || lastState.bodyDelta || lastState.bodyText || ''
-  ) }, options.expectedJson === true ? 'timeout_incomplete_json' : 'timeout_with_last_state');
+  if (lastState) return resolveWaitTimeout(lastState, options, startedAt);
   throw new Error('Timed out waiting for DeepSeek web answer');
 }
 
@@ -1507,6 +2050,9 @@ function normalizeResult(raw) {
   if (raw.networkAnswerCaptured) {
     contentNote = '网页消息区未稳定渲染，已从完成的 DeepSeek completion 流恢复回答。';
   }
+  if (raw.searchEvidenceSource === 'completion_tool_results') {
+    contentNote = '已从本轮匹配的 DeepSeek completion 搜索工具结果恢复网页链接。';
+  }
   if (!text && uniqueLinks.length === 0) {
     contentStatus = 'empty';
     contentNote = '未抓到新增回答内容或引用链接。';
@@ -1524,12 +2070,21 @@ function normalizeResult(raw) {
   if (raw.expectedJson && !raw.jsonComplete) {
     contentStatus = 'incomplete';
     contentNote = '结构化JSON尚未完整生成，当前内容不作为成功结果。';
-  } else if (raw.completionReason === 'timeout_with_last_state' && raw.generationActive) {
+  } else if (['quick_budget_reached', 'signal_budget_reached',
+    'timeout_with_last_state', 'timeout_incomplete_json'].includes(raw.completionReason)) {
     contentStatus = 'incomplete';
-    contentNote = 'DeepSeek 网页仍在生成时已达到等待上限，当前正文可能截断，不作为成功结果。';
+    contentNote = '尚未观察到回答完整结束，当前正文可能截断，不作为成功结果。';
+  }
+  if (contentStatus !== 'incomplete' && raw.requireSearchEvidence && (!raw.submittedTurnMatched
+    || !(Number(raw.searchCount) > 0) || uniqueLinks.length === 0)) {
+    contentStatus = 'search_evidence_missing';
+    contentNote = '回答已完成，但未抓到与本轮提问关联的搜索数量和引用链接。';
   }
   return {
     searchCount: raw.searchCount,
+    searchToolCallCount: Number(raw.searchToolCallCount || 0),
+    openedPageCount: Number(raw.openedPageCount || 0),
+    searchEvidenceSource: raw.searchEvidenceSource || null,
     answerText: text,
     links: uniqueLinks,
     providerTimingMs: raw.providerTimingMs || null,
@@ -1567,32 +2122,57 @@ async function searchQuery(query, options = {}) {
   }
   const worker = resolveWorkerConfig(options);
   const bridgeMode = normalizeBridgeMode(options.mode || options.webMode || DEFAULT_BRIDGE_MODE);
+  throwIfAborted(options.signal);
   await ensureDebuggerAvailable(worker);
+  await recoverAccountQuarantine(worker);
+  throwIfAborted(options.signal);
   const target = await openPageTarget({ ...options, accountKey: worker.accountKey });
-  const client = new CdpClient(target.webSocketDebuggerUrl);
+  const client = new CdpClient(target.webSocketDebuggerUrl, { signal: options.signal });
   let conversationSurface = null;
+  let providerOutcomeUnknown = false;
+  let quarantineMarkerPersisted = false;
+  const persistQuarantineMarker = () => {
+    try {
+      markAccountQuarantined(worker, {
+        targetId: target.targetId,
+        reason: 'provider_outcome_unknown'
+      });
+      quarantineMarkerPersisted = true;
+    } catch (error) {
+      console.error(JSON.stringify({
+        ok: false,
+        event: 'account_quarantine_marker_write_failed',
+        accountKey: worker.accountKey,
+        message: error && error.message ? error.message : String(error)
+      }));
+    }
+  };
+  if (options.signal) {
+    options.signal.addEventListener('abort', persistQuarantineMarker, { once: true });
+  }
   try {
     await client.open();
     await client.send('Page.enable');
     await client.send('Runtime.enable');
     await client.send('Network.enable');
-    const completionCapture = createDeepSeekCompletionCapture(client);
+    const completionCapture = createDeepSeekCompletionCapture(client, query.trim());
     if (target.resumeUrl) {
-      conversationSurface = await restoreConversationSurface(client, target.resumeUrl);
+      conversationSurface = await restoreConversationSurface(client, target.resumeUrl, options.signal);
     } else {
-      await resetConversationSurface(client);
-      const fresh = await tryStartFreshConversation(client);
+      await resetConversationSurface(client, options.signal);
+      const fresh = await tryStartFreshConversation(client, options.signal);
       conversationSurface = { restored: false, fresh };
     }
-    await waitForComposer(client);
-    const toggleUpdates = await ensureToggleModes(client, bridgeMode);
+    await waitForComposer(client, options.signal);
+    const toggleUpdates = await ensureToggleModes(client, bridgeMode, options.signal,
+      options.enableSearch !== false);
     const modeState = buildModeState(toggleUpdates, bridgeMode);
-    if (bridgeMode === 'expert' && !modeState.modeVerified) {
-      throw new Error(`DeepSeek expert mode was not verified before submit: ${JSON.stringify(modeState)}`);
+    if (!modeState.modeVerified || (options.enableSearch === false && modeState.searchEnabled)) {
+      throw new Error(`DeepSeek ${bridgeMode} mode was not verified before submit: ${JSON.stringify(modeState)}`);
     }
     const baseline = await captureSearchState(client);
     const searchStartedAt = Date.now();
-    await sleepWithJitter(PRE_SUBMIT_DELAY_MS);
+    await sleepWithJitter(PRE_SUBMIT_DELAY_MS, HUMAN_JITTER_MS, options.signal);
     if (typeof options.onSubmitting === 'function') {
       await options.onSubmitting({
         targetId: target.targetId || null,
@@ -1611,7 +2191,7 @@ async function searchQuery(query, options = {}) {
         turnSignature: buildTurnSignature(query.trim())
       });
     }
-    await sleepWithJitter(POST_SUBMIT_SETTLE_MS, 600);
+    await sleepWithJitter(POST_SUBMIT_SETTLE_MS, 600, options.signal);
     const raw = await waitForAnswer(client, baseline, {
       ...options,
       submittedTurnSignature: buildTurnSignature(query.trim()),
@@ -1642,12 +2222,33 @@ async function searchQuery(query, options = {}) {
       sessionKey: options.sessionKey || target.sessionKey || null,
       finalUrl: finalUrl || null,
       expectedJson: options.expectedJson === true,
+      requireSearchEvidence: options.requireSearchEvidence === true,
       targetReuseMode: 'single_worker',
       conversationRestored: !!(conversationSurface && conversationSurface.restored)
     });
+  } catch (error) {
+    providerOutcomeUnknown = error && error.providerOutcomeUnknown === true;
+    if (providerOutcomeUnknown && !quarantineMarkerPersisted) persistQuarantineMarker();
+    throw error;
   } finally {
+    if (options.signal) options.signal.removeEventListener('abort', persistQuarantineMarker);
     client.close();
-    if (options.closeTargetAfter && target && target.targetId && !target.sharedTarget) {
+    if (((options.signal && options.signal.aborted) || providerOutcomeUnknown)
+      && target && target.targetId) {
+      if (!quarantineMarkerPersisted) persistQuarantineMarker();
+      const closed = await closeTargetAndVerify(target.targetId, worker);
+      if (closed) {
+        clearAccountQuarantine(worker);
+      } else {
+        console.error(JSON.stringify({
+          ok: false,
+          event: 'aborted_target_close_unconfirmed',
+          accountKey: worker.accountKey,
+          targetId: target.targetId
+        }));
+        await new Promise(() => {});
+      }
+    } else if (options.closeTargetAfter && target && target.targetId && !target.sharedTarget) {
       await closeTarget(target.targetId, worker);
     }
   }
@@ -1657,6 +2258,9 @@ module.exports = {
   searchQuery,
   prepareSharedTarget,
   getWorkerStates,
+  markAccountQuarantined,
+  hasAccountQuarantine,
+  closeAccountBrowserAndVerify,
   DEBUG_PORT,
   WAIT_TIMEOUT_MS,
   CHROME_LOG_PATH: DEFAULT_CHROME_LOG_PATH,
@@ -1666,6 +2270,8 @@ module.exports = {
     getWorkerStates,
     isReusableConversationUrl,
     normalizeAccountKey,
+    validateAccountIdentityReceipt,
+    retryTransientIdentityRead,
     parseProfilePathFromChromeVersionText,
     resolveWorkerConfig,
     selectSharedTarget,
@@ -1674,10 +2280,26 @@ module.exports = {
     diffSearchState,
     hasCompleteJson,
     parseDeepSeekCompletionSse,
+    createDeepSeekCompletionCapture,
     resolveNonJsonCompletionReason,
+    acceptsNonJsonCompletionReason,
+    hasCompletedNetworkAnswer,
+    acceptsStableJsonCompletion,
     normalizeResult,
     normalizeBridgeMode,
+    buildToggleJs,
+    ensureToggleModes,
     buildModeState,
-    isFatalCompletionCaptureError
+    submitQuery,
+    captureSearchState,
+    isFatalCompletionCaptureError,
+    CdpClient,
+    closeTargetAndVerify,
+    closeAccountBrowserAndVerify,
+    resolveWaitTimeout,
+    waitForAnswer,
+    markAccountQuarantined,
+    hasAccountQuarantine,
+    recoverAccountQuarantine
   }
 };

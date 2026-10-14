@@ -33,6 +33,8 @@ public class StockWatchTechnicalAnalysis {
     private String dataSnapshotJson;
     private String rawResponse;
     private String promptHash;
+    private String taskRequestDigest;
+    private String taskRequestEnvelopeJson;
     private String provider;
     private String bridgeTargetId;
     private String conversationUrl;

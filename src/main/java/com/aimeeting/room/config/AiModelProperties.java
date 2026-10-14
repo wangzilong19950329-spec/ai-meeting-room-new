@@ -41,10 +41,11 @@ public class AiModelProperties {
     public static class DeepSeekWebBridgeConfig {
         private boolean enabled = false;
         private String bridgeUrl = "http://127.0.0.1:8789/search";
+        private String apiKey;
         private int connectTimeoutSeconds = 10;
         private int readTimeoutSeconds = 480;
         private String mode = "expert";
         private String searchMode = "fast";
-        private boolean serialized = true;
+        private boolean serialized = false;
     }
 }

@@ -4,10 +4,12 @@ import com.aimeeting.room.dao.StockWatchDeliveryConfigMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
 import com.aimeeting.room.entity.StockWatchAnalysisDemand;
 import com.aimeeting.room.entity.StockWatchDeliveryConfig;
+import com.aimeeting.room.entity.StockWatchFactObservation;
 import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
+import com.aimeeting.room.service.StockWatchAnalysisDemandService.DemandCreationResult;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -753,8 +755,9 @@ class StockWatchMonitorServiceTest {
         ReflectionTestUtils.setField(service, "analysisDemandService", demandService);
         ZonedDateTime now = ZonedDateTime.of(2026, 7, 17, 10, 31, 0, 0, CHINA_ZONE);
         when(policyService.currentItem("002979", "sz")).thenReturn(item);
-        when(demandService.createAnomaly(eq(item), eq(9001L), eq("fact-key-001"), eq(targetSourceTime),
-                anyList(), anyMap(), eq(now))).thenReturn(demand);
+        when(policyService.allowsAutomaticDemand(item, "ANOMALY_IMMEDIATE")).thenReturn(true);
+        when(demandService.createAnomalyDetailed(eq(item), eq(9001L), eq("fact-key-001"), eq(targetSourceTime),
+                anyList(), anyMap(), eq(now))).thenReturn(DemandCreationResult.created(demand));
 
         ReflectionTestUtils.invokeMethod(service, "queueUnifiedAnalysisDemand", rule, event, now);
 
@@ -762,11 +765,94 @@ class StockWatchMonitorServiceTest {
         assertEquals(909L, event.get("analysis_demand_id"));
         assertEquals("demand-key-909", event.get("analysis_demand_key"));
         ArgumentCaptor<List<String>> reasons = ArgumentCaptor.forClass(List.class);
-        verify(demandService).createAnomaly(eq(item), eq(9001L), eq("fact-key-001"), eq(targetSourceTime),
+        verify(demandService).createAnomalyDetailed(eq(item), eq(9001L), eq("fact-key-001"), eq(targetSourceTime),
                 reasons.capture(), anyMap(), eq(now));
         assertTrue(reasons.getValue().contains("AI_RULE_TRIGGERED"));
         assertTrue(reasons.getValue().contains("mainInflow=-7178万"));
         verify(alertDeliveryService, never()).createAndSend(any());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void quoteAnomalyRunCreatesQuoteAlertFactBeforeUnifiedDemand() {
+        AiWatchRule rule = notifyingRule("quote-alert-fact-rule");
+        rule.setNotify(false);
+        rule.setRequiredCapabilities(Collections.singletonList(StockWatchAiRuleService.CAPABILITY_QUOTE_ANOMALY_V1));
+        Map<String, Object> quote = quote("002979", "sz", "雷赛智能");
+        quote.put("timestamp", ZonedDateTime.now(CHINA_ZONE).toEpochSecond());
+        AiDecision decision = decision(true);
+        decision.setReason("结构化行情规则命中：量价异动");
+        StockWatchItem item = stockItem(rule);
+        StockWatchFactObservation observation = factObservation(9002L, "quote-alert-fact-key",
+                ((Number) quote.get("timestamp")).longValue() * 1000L,
+                StockWatchFactPersistenceService.QUOTE_ALERT_SOURCE_TIME_QUALITY);
+        StockWatchAnalysisDemand demand = new StockWatchAnalysisDemand();
+        demand.setId(910L);
+        demand.setDemandKey("demand-key-910");
+        demand.setTriggerType("ANOMALY_IMMEDIATE");
+        StockWatchAnalysisPolicyService policyService = org.mockito.Mockito.mock(StockWatchAnalysisPolicyService.class);
+        StockWatchAnalysisDemandService demandService = org.mockito.Mockito.mock(StockWatchAnalysisDemandService.class);
+        ReflectionTestUtils.setField(service, "analysisPolicyService", policyService);
+        ReflectionTestUtils.setField(service, "analysisDemandService", demandService);
+        when(aiRuleService.listEnabled()).thenReturn(Collections.singletonList(rule));
+        when(aiJudgeService.judgeDeterministic(rule, quote)).thenReturn(decision);
+        when(policyService.currentItem("002979", "sz")).thenReturn(item);
+        when(policyService.allowsAutomaticDemand(item, "ANOMALY_IMMEDIATE")).thenReturn(true);
+        when(factPersistenceService.observeQuoteAlert(eq("002979"), eq("sz"), eq("雷赛智能"), eq(quote),
+                any(ZonedDateTime.class))).thenReturn(
+                StockWatchFactPersistenceService.ObservationReceipt.created(observation, Collections.emptyList(), 0));
+        when(demandService.createAnomalyDetailed(eq(item), eq(9002L), eq("quote-alert-fact-key"),
+                eq(observation.getSourceTimeEpochMs()), anyList(), anyMap(), any(ZonedDateTime.class)))
+                .thenReturn(DemandCreationResult.created(demand));
+
+        Map<String, Object> request = new LinkedHashMap<>();
+        request.put("rules", Collections.emptyList());
+        request.put("quotes", Collections.singletonList(quote));
+        request.put("ignoreTradingHours", true);
+        request.put("notify", false);
+        Map<String, Object> result = service.runOnce(request, "test");
+        Map<String, Object> evaluation = (Map<String, Object>) ((List<?>) result.get("evaluations")).get(0);
+        Map<String, Object> event = (Map<String, Object>) evaluation.get("event");
+        Map<String, Object> receipt = (Map<String, Object>) evaluation.get("analysisFactObservation");
+
+        assertEquals("QUEUED", evaluation.get("analysisDemandStatus"));
+        assertEquals(910L, evaluation.get("analysisDemandId"));
+        assertEquals(1, result.get("analysisFactObservationCount"));
+        assertEquals("CREATED", receipt.get("status"));
+        assertEquals(StockWatchFactPersistenceService.QUOTE_ALERT_SOURCE_TIME_QUALITY,
+                receipt.get("sourceTimeQuality"));
+        assertEquals(9002L, event.get("target_fact_observation_id"));
+        assertEquals("quote-alert-fact-key", event.get("target_fact_observation_key"));
+        assertEquals(observation.getSourceTimeEpochMs(), event.get("target_source_time_epoch_ms"));
+    }
+
+    @Test
+    void quoteAnomalyPolicySkipDoesNotWriteQuoteAlertFact() {
+        AiWatchRule rule = notifyingRule("quote-alert-policy-skip");
+        rule.setRequiredCapabilities(Collections.singletonList(StockWatchAiRuleService.CAPABILITY_QUOTE_ANOMALY_V1));
+        Map<String, Object> event = aiEvent(rule, ZonedDateTime.of(2026, 7, 17, 10, 30, 0, 0, CHINA_ZONE)
+                .toInstant().toEpochMilli());
+        event.remove("target_fact_observation_id");
+        event.remove("target_fact_observation_key");
+        event.remove("target_source_time_epoch_ms");
+        event.put("triggered", true);
+        StockWatchItem item = stockItem(rule);
+        item.setAnomalyTriggerMode("ALERT_ONLY");
+        StockWatchAnalysisPolicyService policyService = org.mockito.Mockito.mock(StockWatchAnalysisPolicyService.class);
+        StockWatchAnalysisDemandService demandService = org.mockito.Mockito.mock(StockWatchAnalysisDemandService.class);
+        ReflectionTestUtils.setField(service, "analysisPolicyService", policyService);
+        ReflectionTestUtils.setField(service, "analysisDemandService", demandService);
+        when(policyService.currentItem("002979", "sz")).thenReturn(item);
+        when(policyService.allowsAutomaticDemand(item, "ANOMALY_IMMEDIATE")).thenReturn(false);
+
+        ReflectionTestUtils.invokeMethod(service, "queueUnifiedAnalysisDemand", rule, event,
+                ZonedDateTime.of(2026, 7, 17, 10, 31, 0, 0, CHINA_ZONE));
+
+        assertEquals("SKIPPED_BY_POLICY", event.get("analysis_demand_status"));
+        assertEquals("analysis_policy_disallowed:ANOMALY_IMMEDIATE", event.get("analysis_demand_reason"));
+        verify(factPersistenceService, never()).observeQuoteAlert(anyString(), anyString(), anyString(), anyMap(), any());
+        verify(demandService, never()).createAnomalyDetailed(any(), anyLong(), anyString(), anyLong(),
+                anyList(), anyMap(), any());
     }
 
     @Test
@@ -902,6 +988,22 @@ class StockWatchMonitorServiceTest {
         item.setMonthlyReviewEnabled(true);
         item.setAnalysisPolicyVersion(7L);
         return item;
+    }
+
+    private StockWatchFactObservation factObservation(Long id,
+                                                      String observationKey,
+                                                      long sourceTimeEpochMs,
+                                                      String sourceTimeQuality) {
+        StockWatchFactObservation observation = new StockWatchFactObservation();
+        observation.setId(id);
+        observation.setObservationKey(observationKey);
+        observation.setArrivalVersion(3L);
+        observation.setSourceTimeEpochMs(sourceTimeEpochMs);
+        observation.setSourceDate(ZonedDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(sourceTimeEpochMs), CHINA_ZONE).toLocalDate().toString());
+        observation.setSourceTimeQuality(sourceTimeQuality);
+        observation.setFactHash("fact-hash-" + id);
+        return observation;
     }
 
     private void writeState(String json) throws Exception {

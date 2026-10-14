@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS ai_meeting_room (
     inherited_context CLOB,
     creator_id BIGINT NOT NULL,
     status TINYINT DEFAULT 0 NOT NULL,
+    run_epoch BIGINT DEFAULT 0 NOT NULL,
     max_rounds INT DEFAULT 10 NOT NULL,
     current_round INT DEFAULT 0 NOT NULL,
     final_conclusion CLOB,
@@ -231,6 +232,58 @@ CREATE TABLE IF NOT EXISTS ai_meeting_opinion (
 
 CREATE INDEX IF NOT EXISTS idx_meeting_opinion_meeting_round ON ai_meeting_opinion(meeting_id, round_number);
 CREATE INDEX IF NOT EXISTS idx_meeting_opinion_parent ON ai_meeting_opinion(parent_opinion_id);
+
+CREATE TABLE IF NOT EXISTS ai_meeting_reviewed_search_plan (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    meeting_id BIGINT NOT NULL,
+    round_number INT NOT NULL,
+    member_id BIGINT NOT NULL,
+    target_question_id BIGINT NOT NULL DEFAULT 0,
+    as_of VARCHAR(10) NOT NULL,
+    context_opinion_id BIGINT NOT NULL DEFAULT 0,
+    supersedes_plan_id BIGINT,
+    normalized_plan_json CLOB NOT NULL,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_reviewed_plan_turn UNIQUE
+        (meeting_id, round_number, member_id, target_question_id, as_of, context_opinion_id)
+);
+
+CREATE TABLE IF NOT EXISTS ai_meeting_reviewed_search_gap (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    meeting_id BIGINT NOT NULL,
+    round_number INT NOT NULL,
+    as_of VARCHAR(10) NOT NULL,
+    question_hash CHAR(64) NOT NULL,
+    exact_question CLOB NOT NULL,
+    request_id VARCHAR(96) NOT NULL,
+    status VARCHAR(24) DEFAULT 'PENDING' NOT NULL,
+    packet_json CLOB,
+    status_reason VARCHAR(128),
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_reviewed_gap_identity UNIQUE (meeting_id, round_number, as_of, question_hash),
+    CONSTRAINT uk_reviewed_gap_request UNIQUE (request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_reviewed_gap_meeting_status ON ai_meeting_reviewed_search_gap(meeting_id, status);
+
+CREATE TABLE IF NOT EXISTS ai_meeting_reviewed_turn_skip (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    meeting_id BIGINT NOT NULL,
+    round_number INT NOT NULL,
+    member_id BIGINT NOT NULL,
+    target_question_id BIGINT NOT NULL DEFAULT 0,
+    reason_code VARCHAR(128) NOT NULL,
+    run_epoch BIGINT,
+    as_of VARCHAR(10) NOT NULL,
+    context_opinion_id BIGINT NOT NULL DEFAULT 0,
+    plan_id BIGINT,
+    gap_id BIGINT,
+    active_turn TINYINT DEFAULT 1,
+    retry_prepared_at TIMESTAMP,
+    retry_prepared_epoch BIGINT,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_reviewed_skip_turn UNIQUE (meeting_id, round_number, member_id, target_question_id, active_turn)
+);
 
 CREATE TABLE IF NOT EXISTS ai_meeting_vote (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -710,3 +763,92 @@ CREATE TABLE IF NOT EXISTS stock_watch_alert_delivery_obligation (
 );
 CREATE INDEX IF NOT EXISTS idx_sw_alert_initial_dispatch ON stock_watch_alert_delivery_obligation(initial_status, initial_next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_sw_alert_supplement_dispatch ON stock_watch_alert_delivery_obligation(supplement_status, supplement_next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS stock_watch_price_failure_state (
+    rule_version VARCHAR(96) PRIMARY KEY,
+    rule_spec_hash VARCHAR(64) NOT NULL,
+    rule_spec_json CLOB NOT NULL,
+    bootstrap_observation_id BIGINT NOT NULL,
+    last_observation_id BIGINT NOT NULL,
+    row_version BIGINT NOT NULL DEFAULT 0,
+    started_at TIMESTAMP NOT NULL,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS stock_watch_price_failure_assessment (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    rule_version VARCHAR(96) NOT NULL,
+    rule_spec_hash VARCHAR(64) NOT NULL,
+    observation_id BIGINT NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    stock_name VARCHAR(128),
+    source_date VARCHAR(16) NOT NULL,
+    source_time_epoch_ms BIGINT NOT NULL,
+    available_time_epoch_ms BIGINT NOT NULL,
+    evaluated_at TIMESTAMP NOT NULL,
+    eligible BOOLEAN NOT NULL,
+    high_position BOOLEAN NOT NULL,
+    active_turnover BOOLEAN NOT NULL,
+    current_not_collapsed BOOLEAN NOT NULL,
+    price_shape_triggered BOOLEAN NOT NULL,
+    flow_data_complete BOOLEAN NOT NULL,
+    strong_outflow BOOLEAN NOT NULL,
+    shape_code VARCHAR(64) NOT NULL,
+    stratum VARCHAR(64) NOT NULL,
+    signal_price DECIMAL(18,6),
+    feature_snapshot_json CLOB NOT NULL,
+    exclusion_reason VARCHAR(128),
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_sw_pf_assessment_observation UNIQUE (rule_version, observation_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sw_pf_assessment_control ON stock_watch_price_failure_assessment(rule_version, market, source_date, source_time_epoch_ms);
+CREATE INDEX IF NOT EXISTS idx_sw_pf_assessment_shape ON stock_watch_price_failure_assessment(rule_version, price_shape_triggered, source_date);
+
+CREATE TABLE IF NOT EXISTS stock_watch_price_failure_ledger (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    sample_key VARCHAR(64) NOT NULL UNIQUE,
+    signal_day_key VARCHAR(192) UNIQUE,
+    rule_version VARCHAR(96) NOT NULL,
+    rule_spec_hash VARCHAR(64) NOT NULL,
+    sample_role VARCHAR(16) NOT NULL,
+    matched_signal_id BIGINT,
+    origin_assessment_id BIGINT NOT NULL,
+    origin_observation_id BIGINT NOT NULL,
+    symbol VARCHAR(16) NOT NULL,
+    market VARCHAR(8) NOT NULL,
+    stock_name VARCHAR(128),
+    stratum VARCHAR(64) NOT NULL,
+    source_date VARCHAR(16) NOT NULL,
+    source_time_epoch_ms BIGINT NOT NULL,
+    available_time_epoch_ms BIGINT NOT NULL,
+    available_at TIMESTAMP NOT NULL,
+    signal_price DECIMAL(18,6),
+    feature_snapshot_json CLOB NOT NULL,
+    match_score DECIMAL(18,8),
+    controls_finalized BOOLEAN NOT NULL DEFAULT FALSE,
+    status VARCHAR(32) NOT NULL,
+    entry_observation_id BIGINT,
+    entry_source_time_epoch_ms BIGINT,
+    entry_source_date VARCHAR(16),
+    entry_price DECIMAL(18,6),
+    t1_trade_date VARCHAR(16),
+    t1_open DECIMAL(18,6),
+    t1_high DECIMAL(18,6),
+    t1_low DECIMAL(18,6),
+    t1_close DECIMAL(18,6),
+    t1_max_drawdown_pct DECIMAL(12,6),
+    t1_close_return_pct DECIMAL(12,6),
+    t1_gap_pct DECIMAL(12,6),
+    t1_max_upside_pct DECIMAL(12,6),
+    t1_drawdown_5_hit BOOLEAN,
+    data_quality_reason VARCHAR(128),
+    row_version BIGINT NOT NULL DEFAULT 0,
+    matured_at TIMESTAMP,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    gmt_modify TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sw_pf_ledger_pending ON stock_watch_price_failure_ledger(rule_version, status);
+CREATE INDEX IF NOT EXISTS idx_sw_pf_ledger_controls ON stock_watch_price_failure_ledger(matched_signal_id, sample_role);
+CREATE INDEX IF NOT EXISTS idx_sw_pf_ledger_control_reconcile ON stock_watch_price_failure_ledger(rule_version, sample_role, controls_finalized, id);

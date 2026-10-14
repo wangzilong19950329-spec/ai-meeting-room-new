@@ -66,6 +66,11 @@ test('numeric mismatch, missing search proof and fabricated citation fail closed
 test('endpoint is allowlisted and a failed provider response cannot enter reasoning packet', () => {
   assert.throws(() => domain.normalizeRequest({ ...request,
     bridgeEndpoint: 'http://127.0.0.1:9999/search' }), /UNTRUSTED/);
+  const edgeEndpoint = 'http://host.docker.internal:8795/search';
+  assert.throws(() => domain.normalizeRequest({ ...request,
+    bridgeEndpoint: edgeEndpoint }), /UNTRUSTED/);
+  assert.equal(domain.normalizeRequest({ ...request,
+    bridgeEndpoint: edgeEndpoint, edgeBridgeCanary: true }).bridgeEndpoint, edgeEndpoint);
   const state = domain.parseSearch(domain.normalizeRequest(request, 0),
     { statusCode: 504, body: { ok: false, providerOutcomeUnknown: true } });
   assert.equal(domain.finalPacket(state).reasoningPacket.verifiedFacts.length, 0);

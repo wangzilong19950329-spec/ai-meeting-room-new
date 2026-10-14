@@ -8,10 +8,12 @@ import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalSessionMapper;
 import com.aimeeting.room.entity.StockWatchAnalysisDemand;
 import com.aimeeting.room.entity.StockWatchAnalysisTask;
+import com.aimeeting.room.entity.StockWatchFactObservation;
 import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.entity.StockWatchTechnicalSession;
 import com.aimeeting.room.service.StockWatchAnalysisTaskService.Reservation;
+import okhttp3.Request;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -69,6 +71,65 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertEquals(true, ReflectionTestUtils.invokeMethod(service, "isTradingSession", at1530, "hk"));
         assertEquals(false, ReflectionTestUtils.invokeMethod(service, "isTradingSession", at1530, "sh"));
         assertEquals("15:30", ReflectionTestUtils.invokeMethod(service, "currentRunSlot", at1530, false, "hk"));
+    }
+
+    @Test
+    void structuredBridgeUnknownOutcomeIsAmbiguous() {
+        StockWatchBridgeHttpException error = StockWatchBridgeHttpException.fromResponse(
+                "bridge",
+                504,
+                "{\"ok\":false,\"error\":\"provider_outcome_unknown\","
+                        + "\"providerOutcomeUnknown\":true,\"retrySafe\":false}");
+
+        Boolean ambiguous = ReflectionTestUtils.invokeMethod(service, "isAmbiguousProviderOutcome", error);
+        assertTrue(Boolean.TRUE.equals(ambiguous));
+    }
+
+    @Test
+    void bridgeRequestsUseConfiguredBearerAuthentication() {
+        ReflectionTestUtils.setField(service, "bridgeApiKey", "technical-bridge-secret");
+
+        Request.Builder builder = ReflectionTestUtils.invokeMethod(
+                service, "authorizeBridgeRequest", new Request.Builder());
+        Request request = builder.url("http://127.0.0.1:8791/search").build();
+
+        assertEquals("Bearer technical-bridge-secret", request.header("Authorization"));
+    }
+
+    @Test
+    void publicStatusAndFailurePayloadHideBridgeTopologyAndRawDiagnostics() {
+        ReflectionTestUtils.setField(service, "bridgeUrl", "http://127.0.0.1:8791/search?accountKey=technical");
+        ReflectionTestUtils.setField(service, "lastRunStatus",
+                "error: connect 127.0.0.1:8791 accountKey=technical profileRoot=/private/profile debugPort=9333");
+        Map<String, Object> status = service.status();
+        assertFalse(status.containsKey("bridgeUrl"));
+        assertEquals("error", status.get("lastRunStatus"));
+
+        StockWatchTechnicalAnalysis record = new StockWatchTechnicalAnalysis();
+        record.setId(91L);
+        record.setAnalysisDate(java.sql.Date.valueOf("2026-08-07"));
+        record.setRunSlot("10:30");
+        record.setPeriodType("DAY");
+        record.setPeriodKey("2026-08-07");
+        record.setSourceRecordIds("[]");
+        record.setStatus("ERROR");
+        record.setProvider("deepseek_web_bridge");
+        record.setConfidence(0.0);
+        record.setEvidenceJson("[]");
+        record.setMissingDataJson("[]");
+        record.setConclusion("provider failed accountKey=technical profileRoot=/private/profile debugPort=9333");
+        record.setErrorMessage("connect 127.0.0.1:8791 accountKey=technical");
+        record.setMainForceIntentWarningsJson("[\"profileRoot=/private/profile debugPort=9333\"]");
+        record.setDataSnapshotJson("{}");
+        record.setRawResponse("internal response accountKey=technical");
+
+        Map<String, Object> payload = ReflectionTestUtils.invokeMethod(service, "toRecordPayload", record);
+        String serialized = JSON.toJSONString(payload);
+        assertFalse(serialized.contains("127.0.0.1"));
+        assertFalse(serialized.contains("accountKey"));
+        assertFalse(serialized.contains("profileRoot"));
+        assertFalse(serialized.contains("debugPort"));
+        assertTrue(serialized.contains("analysis_failed_details_server_only"));
     }
 
     @Test
@@ -136,6 +197,41 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertTrue(prompt.contains("\"triggerType\":\"ANOMALY_DEFERRED\""));
         assertTrue(prompt.contains("\"quote_anomaly\""));
         assertTrue(prompt.contains("\"mainInflow\":120000000"));
+    }
+
+    @Test
+    void targetFactSnapshotAcceptsQuoteAlertFactSchema() {
+        Map<String, Object> quote = new LinkedHashMap<>();
+        quote.put("symbol", "002979");
+        quote.put("market", "sz");
+        quote.put("price", 70.99);
+        quote.put("timestamp", 1_784_339_400L);
+        Map<String, Object> quality = new LinkedHashMap<>();
+        quality.put("freshnessStatus", StockWatchFactPersistenceService.QUOTE_ALERT_SOURCE_TIME_QUALITY);
+        quality.put("timestampSource", "quote.timestamp");
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("schema", StockWatchFactPersistenceService.QUOTE_ALERT_FACT_SCHEMA);
+        snapshot.put("quote", quote);
+        snapshot.put("quoteAlertObservation", quality);
+        StockWatchFactObservation fact = new StockWatchFactObservation();
+        fact.setId(9002L);
+        fact.setObservationKey("quote-alert-fact-key");
+        fact.setArrivalVersion(3L);
+        fact.setFactHash("fact-hash");
+        fact.setSourceDate("2026-07-17");
+        fact.setSourceTimeEpochMs(1_784_339_400_000L);
+        fact.setSourceTimeQuality(StockWatchFactPersistenceService.QUOTE_ALERT_SOURCE_TIME_QUALITY);
+        fact.setFactSnapshotJson(JSON.toJSONString(snapshot));
+        Map<String, Object> payload = new LinkedHashMap<>();
+
+        ReflectionTestUtils.invokeMethod(service, "applyTargetFactSnapshot", payload, fact);
+
+        assertEquals("70.99", String.valueOf(((Map<?, ?>) payload.get("quote")).get("price")));
+        assertTrue(((Map<?, ?>) payload.get("riskPatternObservations")).isEmpty());
+        assertEquals("quote.timestamp",
+                ((Map<?, ?>) payload.get("quoteAlertObservation")).get("timestampSource"));
+        assertEquals(StockWatchFactPersistenceService.QUOTE_ALERT_SOURCE_TIME_QUALITY,
+                ((Map<?, ?>) payload.get("targetFactObservation")).get("sourceTimeQuality"));
     }
 
     @Test
@@ -336,6 +432,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         record.setRawResponse("压低股价以利于建仓");
         record.setMainForceIntentJson("{damaged-main-force-json");
         record.setEvidenceSignalJson(JSON.toJSONString(evidenceSignals()));
+        record.setConversationUrl("https://chat.deepseek.com/a/chat/s/private-session");
+        record.setBridgeTargetId("private-target-id");
 
         Map<?, ?> payload = ReflectionTestUtils.invokeMethod(service, "toRecordPayload", record);
 
@@ -347,6 +445,9 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertEquals("SERVER_TECHNICAL_V1", payload.get("technicalEvidenceQuality"));
         assertEquals(1, payload.get("technicalRenderVersion"));
         assertTrue(((List<?>) payload.get("evidence")).stream().anyMatch(item -> item.toString().contains("MA20")));
+        assertFalse(payload.containsKey("conversationUrl"));
+        assertFalse(payload.containsKey("bridgeTargetId"));
+        assertFalse(payload.containsKey("modelTraceable"));
     }
 
     @Test
@@ -374,6 +475,8 @@ class StockWatchTechnicalAnalysisServiceTest {
         session.setGeneration(64);
         session.setContextLimitChars(80_000);
         session.setContextChars(100_000);
+        session.setConversationUrl("https://chat.deepseek.com/a/chat/s/private-session");
+        session.setBridgeTargetId("private-target-id");
 
         assertEquals(false, ReflectionTestUtils.invokeMethod(service, "shouldRotate", session));
         assertEquals(Integer.valueOf(500_000),
@@ -382,6 +485,9 @@ class StockWatchTechnicalAnalysisServiceTest {
         Map<?, ?> payload = ReflectionTestUtils.invokeMethod(service, "toSessionPayload", session, ref, "DAY");
         assertEquals(20, payload.get("contextUsage"));
         assertEquals("复用中", payload.get("status"));
+        assertFalse(payload.containsKey("url"));
+        assertFalse(payload.containsKey("bridgeTargetId"));
+        assertFalse(payload.containsKey("traceable"));
 
         session.setContextChars(500_000);
         assertEquals(true, ReflectionTestUtils.invokeMethod(service, "shouldRotate", session));
@@ -547,18 +653,23 @@ class StockWatchTechnicalAnalysisServiceTest {
                 mock(StockWatchV6RuntimeGate.class), mock(StockWatchBridgeAdmissionService.class));
         StockWatchTechnicalSession session = new StockWatchTechnicalSession();
         session.setId(81L);
-        String promptHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");
+        String promptContentHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");
+        String requestDigest = "bridge-request-digest-82";
+        String snapshotJson = "{\"quote\":{\"price\":58.51}}";
+        String snapshotDigest = ReflectionTestUtils.invokeMethod(localService, "sha256", snapshotJson);
+        String promptDeltaJson = "{\"schema\":\"stock-watch-prompt-delta-v1\",\"mode\":\"FULL\"}";
         String projectionJson = ReflectionTestUtils.invokeMethod(localService, "frozenProjectionJson",
                 session, "雷赛智能", LocalDate.of(2026, 7, 16), "10:30", "DAY", "2026-07-16",
                 "[701]", "{\"fundFlowEvidence\":{\"anchorMainInflowYuan\":1}}",
                 emptyExternalEvidenceCatalog().toJSONString(),
-                "{\"quote\":{\"price\":58.51}}", 91L, 58.51, promptHash, 1234, "[]",
-                emptyHistoryCatalog().toJSONString());
+                snapshotJson, 91L, 58.51, requestDigest, promptContentHash, 1234, "[]",
+                emptyHistoryCatalog().toJSONString(), "FULL", promptDeltaJson, snapshotDigest);
         JSONObject envelope = new JSONObject(true);
-        envelope.put("promptPayloadVersion", 2);
+        envelope.put("promptPayloadVersion", 3);
+        envelope.put("requestDigest", requestDigest);
         envelope.put("projectionJson", projectionJson);
         envelope.put("projectionDigest", ReflectionTestUtils.invokeMethod(localService, "sha256", projectionJson));
-        StockWatchAnalysisTask responseTask = task(82L, "RESPONSE_RECEIVED", promptHash);
+        StockWatchAnalysisTask responseTask = task(82L, "RESPONSE_RECEIVED", requestDigest);
         responseTask.setPeriodType("DAY");
         responseTask.setRequestEnvelopeJson(envelope.toJSONString());
         Reservation reservation = Reservation.existing(responseTask, "different-current-digest");
@@ -569,7 +680,9 @@ class StockWatchTechnicalAnalysisServiceTest {
         assertFalse(reservation.isRequestDigestMatch());
         assertEquals("雷赛智能", ReflectionTestUtils.getField(frozen, "stockName"));
         assertEquals("[701]", ReflectionTestUtils.getField(frozen, "sourceRecordIds"));
-        assertEquals(promptHash, ReflectionTestUtils.getField(frozen, "promptHash"));
+        assertEquals(requestDigest, ReflectionTestUtils.getField(frozen, "promptHash"));
+        assertEquals(requestDigest, ReflectionTestUtils.getField(frozen, "requestDigest"));
+        assertEquals(promptContentHash, ReflectionTestUtils.getField(frozen, "promptContentHash"));
         assertEquals(6, ReflectionTestUtils.getField(frozen, "responseContractVersion"));
 
         envelope.put("projectionDigest", "tampered");
@@ -665,6 +778,199 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
+    void promptMarketDataProjectionFallsBackToFullWithoutEligibleBaseline() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(44L);
+        Map<String, Object> current = promptDeltaMarketData(90, 112, "2026-07-28");
+        when(analysisMapper.selectLatestSuccessfulBySession(44L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-28"), "10:30"))
+                .thenReturn(null);
+
+        Object projection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-28", "10:30",
+                LocalDate.of(2026, 7, 28), session, false, JSON.toJSONString(current));
+
+        assertEquals("FULL", ReflectionTestUtils.getField(projection, "mode"));
+        JSONObject promptDelta = (JSONObject) ReflectionTestUtils.getField(projection, "promptDelta");
+        assertEquals("no_successful_baseline", promptDelta.getString("invalidationReason"));
+    }
+
+    @Test
+    void promptMarketDataProjectionRejectsLegacyBaselineWithoutV3Contract() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(45L);
+        Map<String, Object> current = promptDeltaMarketData(90, 112, "2026-07-28");
+        StockWatchTechnicalAnalysis baseline = promptBaselineRecord(localService, 45L,
+                promptDeltaMarketData(90, 110, "2026-07-28"), false);
+        when(analysisMapper.selectLatestSuccessfulBySession(45L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-28"), "10:30"))
+                .thenReturn(baseline);
+
+        Object projection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-28", "10:30",
+                LocalDate.of(2026, 7, 28), session, false, JSON.toJSONString(current));
+
+        assertEquals("FULL", ReflectionTestUtils.getField(projection, "mode"));
+        JSONObject promptDelta = (JSONObject) ReflectionTestUtils.getField(projection, "promptDelta");
+        assertEquals("baseline_contract_missing", promptDelta.getString("invalidationReason"));
+    }
+
+    @Test
+    void promptMarketDataProjectionUsesDeltaForEligibleSameSessionBaselineAcrossTradeDates() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(46L);
+        session.setConversationUrl(null);
+        Map<String, Object> baselineRaw = promptDeltaMarketData(90, 110, "2026-07-28");
+        Map<String, Object> current = promptDeltaMarketData(92, 112, "2026-07-29");
+        StockWatchTechnicalAnalysis baseline = promptBaselineRecord(localService, 46L, baselineRaw, true);
+        when(analysisMapper.selectLatestSuccessfulBySession(46L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-29"), "10:30"))
+                .thenReturn(baseline);
+
+        Object projection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-29", "10:30",
+                LocalDate.of(2026, 7, 29), session, false, JSON.toJSONString(current));
+
+        assertEquals("DELTA", ReflectionTestUtils.getField(projection, "mode"));
+        @SuppressWarnings("unchecked")
+        Map<String, Object> marketData = (Map<String, Object>) ReflectionTestUtils.getField(projection, "marketData");
+        JSONObject promptDelta = (JSONObject) ReflectionTestUtils.getField(projection, "promptDelta");
+        assertEquals("DELTA", promptDelta.getString("mode"));
+        assertEquals(901L, promptDelta.getJSONObject("baseline").getLongValue("analysisId"));
+        assertEquals("2026-07-28", promptDelta.getJSONObject("baseline").getString("sourceTradeDate"));
+        assertEquals(112d, ((Number) ((Map<?, ?>) marketData.get("anchorFacts")).get("priceYuan")).doubleValue(), 0.001d);
+        assertEquals("2026-07-29", ((Map<?, ?>) marketData.get("anchorFacts")).get("sourceTradeDate"));
+        assertEquals("HIGH", ((Map<?, ?>) marketData.get("valuation")).get("level"));
+        assertEquals(true, marketData.containsKey("dataQuality"));
+        assertTrue(((List<?>) marketData.get("dailyKline")).size() <= 3);
+        assertEquals("delta_changed_rows_plus_overlap",
+                promptDelta.getJSONObject("sections").getJSONObject("dailyKline").getString("mode"));
+        assertEquals("delta_for_deepseek_prompt",
+                ((Map<?, ?>) marketData.get("dataPacking")).get("mode"));
+    }
+
+    @Test
+    void eligibleDeltaProjectionShrinksSerializedPrompt() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(50L);
+        Map<String, Object> baselineRaw = promptDeltaMarketData(90, 110, "2026-07-28");
+        Map<String, Object> current = promptDeltaMarketData(92, 112, "2026-07-28");
+        StockWatchTechnicalAnalysis baseline = promptBaselineRecord(localService, 50L, baselineRaw, true);
+        when(analysisMapper.selectLatestSuccessfulBySession(50L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-28"), "10:30"))
+                .thenReturn(baseline);
+        when(analysisMapper.selectRecentBySymbol(
+                org.mockito.ArgumentMatchers.eq("002979"),
+                org.mockito.ArgumentMatchers.eq("sz"),
+                org.mockito.ArgumentMatchers.eq("DAY"),
+                org.mockito.ArgumentMatchers.eq(2))).thenReturn(Collections.emptyList());
+
+        Object fullProjection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-28", "10:30",
+                LocalDate.of(2026, 7, 28), session, true, JSON.toJSONString(current));
+        Object deltaProjection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-28", "10:30",
+                LocalDate.of(2026, 7, 28), session, false, JSON.toJSONString(current));
+
+        String fullPrompt = ReflectionTestUtils.invokeMethod(localService, "buildPrompt",
+                stockRef(localService, "002979", "sz"), "雷赛智能", fullProjection,
+                Collections.emptyMap(), emptyExternalEvidenceCatalog(), emptyHistoryCatalog(),
+                Collections.emptyList(), session, "scheduled", "DAY", periodWindow(localService),
+                Collections.<StockWatchTechnicalAnalysis>emptyList(), null);
+        String deltaPrompt = ReflectionTestUtils.invokeMethod(localService, "buildPrompt",
+                stockRef(localService, "002979", "sz"), "雷赛智能", deltaProjection,
+                Collections.emptyMap(), emptyExternalEvidenceCatalog(), emptyHistoryCatalog(),
+                Collections.emptyList(), session, "scheduled", "DAY", periodWindow(localService),
+                Collections.<StockWatchTechnicalAnalysis>emptyList(), null);
+
+        int fullChars = fullPrompt.length();
+        int deltaChars = deltaPrompt.length();
+        assertEquals("FULL", ReflectionTestUtils.getField(fullProjection, "mode"));
+        assertEquals("DELTA", ReflectionTestUtils.getField(deltaProjection, "mode"));
+        JSONObject auditPromptDelta = (JSONObject) ReflectionTestUtils.getField(deltaProjection, "promptDelta");
+        assertTrue(auditPromptDelta.getJSONObject("baseline").containsKey("requestDigest"));
+        JSONObject modelPromptDelta = promptPayload(deltaPrompt).getJSONObject("promptDelta");
+        assertFalse(modelPromptDelta.getJSONObject("baseline").containsKey("requestDigest"));
+        assertEquals(20, modelPromptDelta.getJSONObject("sections")
+                .getJSONObject("dailyKline").getIntValue("currentCount"));
+        assertTrue(modelPromptDelta.getJSONObject("sections")
+                .getJSONObject("dailyKline").getIntValue("includedCount") <= 2);
+        assertTrue(deltaChars <= fullChars * 0.90,
+                "deltaChars=" + deltaChars + " fullChars=" + fullChars);
+    }
+
+    @Test
+    void promptMarketDataProjectionFallsBackWhenBaselineTradeDateIsAfterCurrent() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(48L);
+        Map<String, Object> current = promptDeltaMarketData(90, 112, "2026-07-28");
+        StockWatchTechnicalAnalysis baseline = promptBaselineRecord(localService, 48L,
+                promptDeltaMarketData(90, 110, "2026-07-29"), true);
+        when(analysisMapper.selectLatestSuccessfulBySession(48L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-28"), "10:30"))
+                .thenReturn(baseline);
+
+        Object projection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-28", "10:30",
+                LocalDate.of(2026, 7, 28), session, false, JSON.toJSONString(current));
+
+        assertEquals("FULL", ReflectionTestUtils.getField(projection, "mode"));
+        JSONObject promptDelta = (JSONObject) ReflectionTestUtils.getField(projection, "promptDelta");
+        assertEquals("baseline_source_trade_date_after_current", promptDelta.getString("invalidationReason"));
+    }
+
+    @Test
+    void promptMarketDataProjectionFallsBackWhenBaselineSequenceRowsAreOutOfOrder() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(49L);
+        Map<String, Object> baselineRaw = promptDeltaMarketData(90, 110, "2026-07-28");
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> dailyKline = (List<Map<String, Object>>) baselineRaw.get("dailyKline");
+        Collections.swap(dailyKline, dailyKline.size() - 1, dailyKline.size() - 2);
+        Map<String, Object> current = promptDeltaMarketData(92, 112, "2026-07-29");
+        StockWatchTechnicalAnalysis baseline = promptBaselineRecord(localService, 49L, baselineRaw, true);
+        when(analysisMapper.selectLatestSuccessfulBySession(49L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-29"), "10:30"))
+                .thenReturn(baseline);
+
+        Object projection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-29", "10:30",
+                LocalDate.of(2026, 7, 29), session, false, JSON.toJSONString(current));
+
+        assertEquals("FULL", ReflectionTestUtils.getField(projection, "mode"));
+        JSONObject promptDelta = (JSONObject) ReflectionTestUtils.getField(projection, "promptDelta");
+        assertEquals("delta_projection_failed", promptDelta.getString("invalidationReason"));
+    }
+
+    @Test
+    void promptMarketDataProjectionFallsBackToFullWhenBaselineSnapshotIsMalformed() {
+        StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
+        StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
+        StockWatchTechnicalSession session = promptSession(47L);
+        Map<String, Object> current = promptDeltaMarketData(92, 112, "2026-07-28");
+        StockWatchTechnicalAnalysis baseline = promptBaselineRecord(localService, 47L,
+                promptDeltaMarketData(90, 110, "2026-07-28"), true);
+        baseline.setDataSnapshotJson("{broken");
+        when(analysisMapper.selectLatestSuccessfulBySession(47L, "002979", "sz", "DAY",
+                java.sql.Date.valueOf("2026-07-28"), "10:30"))
+                .thenReturn(baseline);
+
+        Object projection = ReflectionTestUtils.invokeMethod(localService, "buildPromptMarketDataProjection",
+                stockRef(localService, "002979", "sz"), current, "DAY", "2026-07-28", "10:30",
+                LocalDate.of(2026, 7, 28), session, false, JSON.toJSONString(current));
+
+        assertEquals("FULL", ReflectionTestUtils.getField(projection, "mode"));
+        JSONObject promptDelta = (JSONObject) ReflectionTestUtils.getField(projection, "promptDelta");
+        assertEquals("baseline_snapshot_invalid", promptDelta.getString("invalidationReason"));
+    }
+
+    @Test
     void promptPayloadVersionIsRecordedAndLegacyFrozenProjectionRemainsReadable() {
         StockWatchTechnicalAnalysisMapper analysisMapper = mock(StockWatchTechnicalAnalysisMapper.class);
         StockWatchTechnicalAnalysisService localService = serviceWithAnalysisMapper(analysisMapper);
@@ -679,37 +985,44 @@ class StockWatchTechnicalAnalysisServiceTest {
                 emptyExternalEvidenceCatalog(), emptyHistoryCatalog(), Collections.emptyList(),
                 session(), "manual_api", "DAY", periodWindow(localService),
                 Collections.<StockWatchTechnicalAnalysis>emptyList(), null);
-        assertEquals(2, promptPayload(prompt).getIntValue("promptPayloadVersion"));
+        assertEquals(3, promptPayload(prompt).getIntValue("promptPayloadVersion"));
 
         StockWatchTechnicalSession session = new StockWatchTechnicalSession();
         session.setId(81L);
-        String promptHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");
+        String promptContentHash = ReflectionTestUtils.invokeMethod(localService, "sha256", "original prompt");
+        String requestDigest = "bridge-request-digest-82";
+        String snapshotJson = "{\"quote\":{\"price\":58.51}}";
+        String snapshotDigest = ReflectionTestUtils.invokeMethod(localService, "sha256", snapshotJson);
+        String promptDeltaJson = "{\"schema\":\"stock-watch-prompt-delta-v1\",\"mode\":\"FULL\"}";
         String projectionJson = ReflectionTestUtils.invokeMethod(localService, "frozenProjectionJson",
                 session, "雷赛智能", LocalDate.of(2026, 7, 16), "10:30", "DAY", "2026-07-16",
                 "[701]", "{\"fundFlowEvidence\":{\"anchorMainInflowYuan\":1}}",
                 emptyExternalEvidenceCatalog().toJSONString(),
-                "{\"quote\":{\"price\":58.51}}", 91L, 58.51, promptHash, 1234, "[]",
-                emptyHistoryCatalog().toJSONString());
+                snapshotJson, 91L, 58.51, requestDigest, promptContentHash, 1234, "[]",
+                emptyHistoryCatalog().toJSONString(), "FULL", promptDeltaJson, snapshotDigest);
         JSONObject projection = JSON.parseObject(projectionJson);
-        assertEquals(2, projection.getIntValue("promptPayloadVersion"));
+        assertEquals(3, projection.getIntValue("promptPayloadVersion"));
+        assertEquals(requestDigest, projection.getString("requestDigest"));
+        assertEquals(promptContentHash, projection.getString("promptContentHash"));
         JSONObject envelope = new JSONObject(true);
-        envelope.put("promptPayloadVersion", 2);
+        envelope.put("promptPayloadVersion", 3);
+        envelope.put("requestDigest", requestDigest);
         envelope.put("projectionJson", projectionJson);
         envelope.put("projectionDigest", ReflectionTestUtils.invokeMethod(localService, "sha256", projectionJson));
-        StockWatchAnalysisTask responseTask = task(82L, "RESPONSE_RECEIVED", promptHash);
+        StockWatchAnalysisTask responseTask = task(82L, "RESPONSE_RECEIVED", requestDigest);
         responseTask.setPeriodType("DAY");
         responseTask.setRequestEnvelopeJson(envelope.toJSONString());
         Reservation reservation = Reservation.existing(responseTask, "different-current-digest");
 
         Object frozen = ReflectionTestUtils.invokeMethod(localService, "restoreFrozenProjection", reservation);
 
-        assertEquals(2, ReflectionTestUtils.getField(frozen, "promptPayloadVersion"));
+        assertEquals(3, ReflectionTestUtils.getField(frozen, "promptPayloadVersion"));
 
-        envelope.put("promptPayloadVersion", 3);
+        envelope.put("promptPayloadVersion", 4);
         responseTask.setRequestEnvelopeJson(envelope.toJSONString());
         Object envelopeOnlyMismatch = ReflectionTestUtils.invokeMethod(localService,
                 "restoreFrozenProjection", reservation);
-        assertEquals(2, ReflectionTestUtils.getField(envelopeOnlyMismatch, "promptPayloadVersion"));
+        assertEquals(3, ReflectionTestUtils.getField(envelopeOnlyMismatch, "promptPayloadVersion"));
 
         projection.remove("promptPayloadVersion");
         String legacyProjectionJson = projection.toJSONString();
@@ -1142,6 +1455,17 @@ class StockWatchTechnicalAnalysisServiceTest {
         return session;
     }
 
+    private StockWatchTechnicalSession promptSession(Long id) {
+        StockWatchTechnicalSession session = new StockWatchTechnicalSession();
+        session.setId(id);
+        session.setSessionKey("stock-watch-day-sz-002979-g3");
+        session.setGeneration(3);
+        session.setContextChars(12_000);
+        session.setContextLimitChars(500_000);
+        session.setConversationUrl("https://chat.deepseek.com/a/chat/s/session-" + id);
+        return session;
+    }
+
     private JSONObject promptPayload(String prompt) {
         String marker = "输入数据：";
         int index = prompt.indexOf(marker);
@@ -1190,6 +1514,98 @@ class StockWatchTechnicalAnalysisServiceTest {
         record.put("evidence", jsonArray("历史证据文本"));
         record.put("missingData", new JSONArray());
         record.put("narrowingEligible", false);
+        return record;
+    }
+
+    private Map<String, Object> promptDeltaMarketData(int startClose, int endClose, String sourceTradeDate) {
+        Map<String, Object> raw = new LinkedHashMap<>();
+        raw.put("symbol", "002979");
+        raw.put("market", "sz");
+        raw.put("periodType", "DAY");
+        raw.put("sourceTradeDate", sourceTradeDate);
+        raw.put("sourceTradeDateQuality", Map.of("selectedSourceTradeDate", sourceTradeDate, "fresh", true));
+        Map<String, Object> quote = new LinkedHashMap<>();
+        quote.put("name", "雷赛智能");
+        quote.put("price", (double) endClose);
+        quote.put("changePercent", 1.2d);
+        raw.put("quote", quote);
+        Map<String, Object> anchorFacts = new LinkedHashMap<>();
+        anchorFacts.put("sourceTradeDate", sourceTradeDate);
+        anchorFacts.put("priceYuan", (double) endClose);
+        anchorFacts.put("changePercent", 1.2d);
+        anchorFacts.put("mainInflowYuan", 88_000_000d);
+        raw.put("anchorFacts", anchorFacts);
+        raw.put("technicalIndicators", Map.of("ma5", endClose - 2d, "ma20", endClose - 8d));
+        raw.put("valuation", Map.of("level", "HIGH", "peTtm", 80.5d));
+        raw.put("marketBenchmark", Map.of("relativeStrength20Pct", 3.1d));
+        raw.put("riskPatternObservations", Collections.emptyMap());
+        raw.put("riskPatternGuidance", Collections.emptyMap());
+        raw.put("factObservationReceipt", Collections.emptyMap());
+        List<Map<String, Object>> dailyKline = new ArrayList<>();
+        LocalDate start = LocalDate.of(2026, 1, 1);
+        for (int close = startClose; close <= endClose; close++) {
+            Map<String, Object> bar = new LinkedHashMap<>();
+            bar.put("date", start.plusDays(close).toString());
+            bar.put("close", (double) close);
+            bar.put("high", close + 1d);
+            bar.put("low", close - 1d);
+            dailyKline.add(bar);
+        }
+        raw.put("dailyKline", dailyKline);
+        raw.put("minuteTrends5d", timeRows(sourceTradeDate, "10:", startClose, endClose));
+        raw.put("intradayFundFlow", timeRows(sourceTradeDate, "14:", startClose, endClose));
+        raw.put("financials", jsonArray(Map.of("reportDate", "2026-06-30", "profit", 1_000_000d)));
+        raw.put("announcements", jsonArray(Map.of("title", "baseline announcement", "date", "2026-07-28")));
+        raw.put("shareholderCounts", jsonArray(Map.of("date", "2026-06-30", "count", 20_000)));
+        Map<String, Object> dataQuality = new LinkedHashMap<>();
+        dataQuality.put("requiredMissing", new JSONArray());
+        dataQuality.put("optionalMissing", new JSONArray());
+        dataQuality.put("canPredict", true);
+        dataQuality.put("sourceStatus", Map.of("dailyKline", Map.of(
+                "ok", true, "count", dailyKline.size(), "selectedProvider", "eastmoney",
+                "sourceTradeDate", sourceTradeDate, "fresh", true)));
+        raw.put("dataQuality", dataQuality);
+        return raw;
+    }
+
+    private List<Map<String, Object>> timeRows(String sourceTradeDate, String hourPrefix, int start, int end) {
+        List<Map<String, Object>> rows = new ArrayList<>();
+        for (int value = start; value <= end; value++) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("time", sourceTradeDate + " " + hourPrefix + String.format("%02d", value % 60));
+            row.put("main", (double) value);
+            rows.add(row);
+        }
+        return rows;
+    }
+
+    private StockWatchTechnicalAnalysis promptBaselineRecord(StockWatchTechnicalAnalysisService target,
+                                                             Long sessionId,
+                                                             Map<String, Object> snapshot,
+                                                             boolean v3Contract) {
+        StockWatchTechnicalAnalysis record = new StockWatchTechnicalAnalysis();
+        record.setId(901L);
+        record.setAnalysisTaskId(902L);
+        record.setSessionId(sessionId);
+        record.setSymbol("002979");
+        record.setMarket("sz");
+        record.setPeriodType("DAY");
+        record.setPeriodKey("2026-07-28");
+        record.setAnalysisDate(java.sql.Date.valueOf("2026-07-28"));
+        record.setStatus("SUCCESS");
+        String snapshotJson = JSON.toJSONString(snapshot);
+        record.setDataSnapshotJson(snapshotJson);
+        record.setTaskRequestDigest("baseline-request-digest");
+        if (v3Contract) {
+            JSONObject envelope = new JSONObject(true);
+            envelope.put("schema", "stock-analysis-v3");
+            envelope.put("responseContractVersion", 6);
+            envelope.put("promptPayloadVersion", 3);
+            envelope.put("promptPayloadMode", "FULL");
+            envelope.put("requestDigest", "baseline-request-digest");
+            envelope.put("dataSnapshotDigest", ReflectionTestUtils.invokeMethod(target, "sha256", snapshotJson));
+            record.setTaskRequestEnvelopeJson(envelope.toJSONString());
+        }
         return record;
     }
 

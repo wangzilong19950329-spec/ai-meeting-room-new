@@ -34,4 +34,40 @@
     <select id="selectById" resultMap="BaseResultMap">
         SELECT * FROM stock_watch_fact_observation WHERE id = #{id}
     </select>
+
+    <select id="selectMaxId" resultType="java.lang.Long">
+        SELECT COALESCE(MAX(id), 0) FROM stock_watch_fact_observation
+    </select>
+
+    <select id="selectAfterId" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_fact_observation
+        WHERE id &gt; #{afterId}
+        ORDER BY id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectForOutcome" resultMap="BaseResultMap">
+        SELECT *
+        FROM stock_watch_fact_observation
+        WHERE symbol = #{symbol}
+          AND market = #{market}
+          AND source_time_epoch_ms &gt; #{afterSourceTimeEpochMs}
+          AND source_time_quality IN ('FRESH', 'POST_CLOSE_VALID')
+        ORDER BY source_time_epoch_ms ASC, id ASC
+        LIMIT #{limit}
+    </select>
+
+    <select id="selectNextObservedSourceDate" resultType="java.lang.String">
+        SELECT MIN(source_date)
+        FROM stock_watch_fact_observation
+        WHERE source_date &gt; #{sourceDate}
+          AND source_time_quality IN ('FRESH', 'POST_CLOSE_VALID')
+    </select>
+
+    <select id="selectMaxSourceDate" resultType="java.lang.String">
+        SELECT MAX(source_date)
+        FROM stock_watch_fact_observation
+        WHERE source_time_quality IN ('FRESH', 'POST_CLOSE_VALID')
+    </select>
 </mapper>

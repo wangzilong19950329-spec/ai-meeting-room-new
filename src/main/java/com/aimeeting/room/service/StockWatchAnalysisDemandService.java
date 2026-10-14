@@ -39,6 +39,8 @@ public class StockWatchAnalysisDemandService {
     private static final ZoneId CHINA_ZONE = ZoneId.of("Asia/Shanghai");
     private static final long NOT_BEFORE_MILLIS = 5L * 60L * 1000L;
     private static final long DEADLINE_MILLIS = 6L * 60L * 60L * 1000L;
+    private static final String ANOMALY_RUN_SLOT_PREFIX = "al:";
+    private static final int ANALYSIS_RUN_SLOT_MAX_LENGTH = 16;
 
     private final StockWatchAnalysisDemandMapper demandMapper;
     private final StockWatchAlertDeliveryObligationMapper obligationMapper;
@@ -124,7 +126,7 @@ public class StockWatchAnalysisDemandService {
         StockWatchAnalysisDemand active = demandMapper.selectActiveByCoalesceKey(coalesceKey);
         Long supersededId = null;
         if (active != null && !demandKey.equals(active.getDemandKey())) {
-            if (shouldReuseDeferredAnomalyForScheduled(active, policyVersion)) {
+            if (shouldReuseAnomalyForScheduled(active, policyVersion)) {
                 return DemandCreationResult.reused(active);
             }
             if (demandMapper.markSupersededIfUnsubmitted(active.getId(), "superseded_by_new_scheduled_slot",
@@ -178,6 +180,18 @@ public class StockWatchAnalysisDemandService {
         DemandCreationResult result = createAnomalyInternal(item, targetFactObservationId, targetFactObservationKey,
                 targetSourceTimeEpochMs, reasonCodes, triggerContext, now);
         return result.getDemand();
+    }
+
+    @Transactional
+    public DemandCreationResult createAnomalyDetailed(StockWatchItem item,
+                                                      Long targetFactObservationId,
+                                                      String targetFactObservationKey,
+                                                      Long targetSourceTimeEpochMs,
+                                                      List<String> reasonCodes,
+                                                      Map<String, Object> triggerContext,
+                                                      ZonedDateTime now) {
+        return createAnomalyInternal(item, targetFactObservationId, targetFactObservationKey,
+                targetSourceTimeEpochMs, reasonCodes, triggerContext, now);
     }
 
     private DemandCreationResult createAnomalyInternal(StockWatchItem item,
@@ -236,7 +250,7 @@ public class StockWatchAnalysisDemandService {
         demand.setCapability(StockWatchAnalysisPolicyService.CAPABILITY);
         demand.setTriggerType(triggerType);
         demand.setScheduleSlotKey(triggerType + ":" + targetFactObservationKey);
-        demand.setRunSlot("alert:" + targetFactObservationKey);
+        demand.setRunSlot(anomalyRunSlot(targetFactObservationKey));
         demand.setCoalesceKey(coalesceKey);
         demand.setActiveCoalesceKey(coalesceKey);
         demand.setSourcePolicyVersion(policyVersion);
@@ -413,7 +427,9 @@ public class StockWatchAnalysisDemandService {
         if (demand.getTargetSourceTimeEpochMs() != null && StringUtils.hasText(demand.getTargetFactObservationKey())) {
             LocalDate sourceDate = Instant.ofEpochMilli(demand.getTargetSourceTimeEpochMs())
                     .atZone(CHINA_ZONE).toLocalDate();
-            return periodType + ":" + sourceDate + ":alert:" + demand.getTargetFactObservationKey();
+            String runSlot = StringUtils.hasText(demand.getRunSlot())
+                    ? demand.getRunSlot() : "alert:" + demand.getTargetFactObservationKey();
+            return periodType + ":" + sourceDate + ":" + runSlot;
         }
         LocalDate tradeDate = demand.getTradeDate() == null
                 ? LocalDate.now(CHINA_ZONE)
@@ -456,10 +472,10 @@ public class StockWatchAnalysisDemandService {
         }
     }
 
-    private boolean shouldReuseDeferredAnomalyForScheduled(StockWatchAnalysisDemand active, long policyVersion) {
+    private boolean shouldReuseAnomalyForScheduled(StockWatchAnalysisDemand active, long policyVersion) {
         if (active == null) return false;
         String triggerType = text(active.getTriggerType()).toUpperCase(Locale.ROOT);
-        return "ANOMALY_DEFERRED".equals(triggerType)
+        return triggerType.startsWith("ANOMALY")
                 && value(active.getSourcePolicyVersion()) == policyVersion;
     }
 
@@ -471,6 +487,12 @@ public class StockWatchAnalysisDemandService {
         return sha256("stock-analysis-active-v1|" + text(market).toLowerCase(Locale.ROOT) + "|"
                 + text(symbol) + "|" + StockWatchAnalysisPolicyService.CAPABILITY + "|"
                 + text(periodType).toUpperCase(Locale.ROOT));
+    }
+
+    private String anomalyRunSlot(String targetFactObservationKey) {
+        String digest = sha256("stock-analysis-alert-run-slot-v1|" + text(targetFactObservationKey));
+        int suffixLength = ANALYSIS_RUN_SLOT_MAX_LENGTH - ANOMALY_RUN_SLOT_PREFIX.length();
+        return ANOMALY_RUN_SLOT_PREFIX + digest.substring(0, suffixLength);
     }
 
     private int priorityFor(String triggerType) {

@@ -21,15 +21,21 @@ STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT="${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT:-87
 STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT="${STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT:-9344}"
 STOCK_WATCH_DEEPSEEK_WEB_SEARCH_URL="${STOCK_WATCH_DEEPSEEK_WEB_SEARCH_URL:-http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}/search}"
 TECH_DEEPSEEK_WEB_BRIDGE_PORT="${TECH_DEEPSEEK_WEB_BRIDGE_PORT:-${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}}"
-TECH_DEEPSEEK_WEB_DEBUG_PORT="${TECH_DEEPSEEK_WEB_DEBUG_PORT:-${STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT}}"
+TECH_DEEPSEEK_WEB_DEBUG_PORT="${TECH_DEEPSEEK_WEB_DEBUG_PORT:-9333}"
 TECH_DEEPSEEK_WEB_SEARCH_URL="${TECH_DEEPSEEK_WEB_SEARCH_URL:-http://127.0.0.1:${TECH_DEEPSEEK_WEB_BRIDGE_PORT}/search}"
+DEEPSEEK_COMPATIBILITY_PROXY_PORT="${DEEPSEEK_COMPATIBILITY_PROXY_PORT:-8789}"
 STACK_WATCH_INTERVAL_SECONDS="${STACK_WATCH_INTERVAL_SECONDS:-30}"
 STACK_WAIT_TIMEOUT_SECONDS="${STACK_WAIT_TIMEOUT_SECONDS:-120}"
 
 BRIDGE_HEALTH_URL="http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}/health"
 TECH_BRIDGE_HEALTH_URL="http://127.0.0.1:${TECH_DEEPSEEK_WEB_BRIDGE_PORT}/health"
+COMPATIBILITY_PROXY_HEALTH_URL="http://127.0.0.1:${DEEPSEEK_COMPATIBILITY_PROXY_PORT}/health"
 BACKEND_BASE_URL="http://127.0.0.1:${BACKEND_PORT}"
 FRONTEND_BASE_URL="http://127.0.0.1:${FRONTEND_PORT}"
+BRIDGE_CURL_AUTH_ARGS=()
+if [[ -n "${DEEPSEEK_OPENAI_FACADE_API_KEY:-}" ]]; then
+  BRIDGE_CURL_AUTH_ARGS=(-H "Authorization: Bearer ${DEEPSEEK_OPENAI_FACADE_API_KEY}")
+fi
 
 export STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT
 export STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT
@@ -52,6 +58,7 @@ Usage: scripts/start-stock-watch-stack.sh [--watch]
 Starts the local stock-watch development stack:
   - Stock DeepSeek bridge: http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}/health
   - Tech DeepSeek bridge : http://127.0.0.1:${TECH_DEEPSEEK_WEB_BRIDGE_PORT}/health
+  - Compatibility proxy  : http://127.0.0.1:${DEEPSEEK_COMPATIBILITY_PROXY_PORT}/health
   - Spring Boot backend  : ${BACKEND_BASE_URL}
   - Vite frontend        : ${FRONTEND_BASE_URL}
 
@@ -64,6 +71,8 @@ Environment overrides:
   AI_MEETING_BACKEND_PORT, AI_MEETING_FRONTEND_PORT,
   STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT, STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT,
   TECH_DEEPSEEK_WEB_BRIDGE_PORT, TECH_DEEPSEEK_WEB_DEBUG_PORT,
+  DEEPSEEK_COMPATIBILITY_PROXY_PORT,
+  DEEPSEEK_OPENAI_FACADE_API_KEY,
   STOCK_WATCH_DEEPSEEK_WEB_PROFILE_ROOT, STOCK_WATCH_DEEPSEEK_WEB_SESSION_STORE,
   STOCK_WATCH_DEEPSEEK_WEB_CHROME_LOG, AI_MEETING_ENV_FILE, AI_MEETING_LOG_DIR,
   AI_MEETING_RUN_DIR, STACK_WATCH_INTERVAL_SECONDS, STACK_WAIT_TIMEOUT_SECONDS.
@@ -136,23 +145,44 @@ http_responds() {
 
 bridge_healthy() {
   local body
-  body="$(curl -fsS --max-time 2 "$BRIDGE_HEALTH_URL" 2>/dev/null)" || return 1
+  body="$(curl -fsS --max-time 2 "${BRIDGE_CURL_AUTH_ARGS[@]}" "$BRIDGE_HEALTH_URL" 2>/dev/null)" || return 1
   printf '%s' "$body" | python3 -c '
 import json
 import sys
 
-expected = int(sys.argv[1])
+expected = {int(sys.argv[1]), int(sys.argv[2])}
+required_capabilities = {"stock.technical-analysis", "stock.rule-evaluation"}
 try:
     payload = json.load(sys.stdin)
 except Exception:
     sys.exit(1)
-sys.exit(0 if payload.get("debugPort") == expected else 1)
-' "$STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT"
+worker_ports = {int(worker.get("debugPort")) for worker in payload.get("workers", []) if worker.get("debugPort")}
+available_capabilities = set()
+for account in payload.get("broker", {}).get("accounts", []):
+    if account.get("enabled") is not True:
+        continue
+    if account.get("routingEligible") is not True or account.get("identityVerified") is not True:
+        continue
+    if account.get("circuitOpen") is True:
+        continue
+    available_capabilities.update(account.get("capabilities") or [])
+ok = (
+    payload.get("mode") == "deepseek_account_broker"
+    and payload.get("startupPreparationComplete") is True
+    and expected.issubset(worker_ports)
+    and required_capabilities.issubset(available_capabilities)
+)
+sys.exit(0 if ok else 1)
+' "$STOCK_WATCH_DEEPSEEK_WEB_DEBUG_PORT" "$TECH_DEEPSEEK_WEB_DEBUG_PORT"
 }
 
 technical_bridge_healthy() {
+  if [[ "$TECH_DEEPSEEK_WEB_BRIDGE_PORT" == "$STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT" ]]; then
+    bridge_healthy
+    return
+  fi
   local body
-  body="$(curl -fsS --max-time 2 "$TECH_BRIDGE_HEALTH_URL" 2>/dev/null)" || return 1
+  body="$(curl -fsS --max-time 2 "${BRIDGE_CURL_AUTH_ARGS[@]}" "$TECH_BRIDGE_HEALTH_URL" 2>/dev/null)" || return 1
   printf '%s' "$body" | python3 -c '
 import json
 import sys
@@ -164,6 +194,12 @@ except Exception:
     sys.exit(1)
 sys.exit(0 if payload.get("debugPort") == expected else 1)
 ' "$TECH_DEEPSEEK_WEB_DEBUG_PORT"
+}
+
+compatibility_proxy_healthy() {
+  local headers
+  headers="$(curl -fsS --max-time 2 -D - -o /dev/null "${BRIDGE_CURL_AUTH_ARGS[@]}" "$COMPATIBILITY_PROXY_HEALTH_URL" 2>/dev/null)" || return 1
+  printf '%s' "$headers" | grep -qi '^x-deepseek-broker-proxy: true'
 }
 
 wait_until() {
@@ -211,6 +247,10 @@ start_bridge() {
 }
 
 start_technical_bridge() {
+  if [[ "$TECH_DEEPSEEK_WEB_BRIDGE_PORT" == "$STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT" ]]; then
+    log "Account broker on :${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT} owns the technical and monitor workers"
+    return 0
+  fi
   if technical_bridge_healthy; then
     log "Tech DeepSeek bridge already healthy on :${TECH_DEEPSEEK_WEB_BRIDGE_PORT} (Chrome debug :${TECH_DEEPSEEK_WEB_DEBUG_PORT})"
     return 0
@@ -227,6 +267,30 @@ start_technical_bridge() {
       DEEPSEEK_WEB_DEBUG_PORT="$TECH_DEEPSEEK_WEB_DEBUG_PORT" \
       nohup "$ROOT_DIR/scripts/start-deepseek-web-bridge-safe.sh" >>"${LOG_DIR}/deepseek-web-primary-bridge.log" 2>&1 &
     write_pid "deepseek-web-primary-bridge" "$!"
+  )
+}
+
+start_compatibility_proxy() {
+  if [[ "$DEEPSEEK_COMPATIBILITY_PROXY_PORT" == "$STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT" ]]; then
+    return 0
+  fi
+  if compatibility_proxy_healthy; then
+    log "DeepSeek compatibility proxy already healthy on :${DEEPSEEK_COMPATIBILITY_PROXY_PORT}"
+    return 0
+  fi
+  if port_listening "$DEEPSEEK_COMPATIBILITY_PROXY_PORT"; then
+    log "WARN: port ${DEEPSEEK_COMPATIBILITY_PROXY_PORT} is listening, but it is not the DeepSeek broker proxy"
+    return 1
+  fi
+
+  log "starting DeepSeek compatibility proxy on :${DEEPSEEK_COMPATIBILITY_PROXY_PORT} -> :${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}"
+  (
+    cd "$ROOT_DIR"
+    DEEPSEEK_WEB_BRIDGE_PORT="$DEEPSEEK_COMPATIBILITY_PROXY_PORT" \
+      DEEPSEEK_BROKER_PROXY_PORT="$DEEPSEEK_COMPATIBILITY_PROXY_PORT" \
+      DEEPSEEK_BROKER_UPSTREAM="http://127.0.0.1:${STOCK_WATCH_DEEPSEEK_WEB_BRIDGE_PORT}" \
+      nohup "$ROOT_DIR/scripts/start-deepseek-web-bridge-safe.sh" >>"${LOG_DIR}/deepseek-broker-proxy.log" 2>&1 &
+    write_pid "deepseek-broker-proxy" "$!"
   )
 }
 
@@ -272,11 +336,13 @@ start_frontend() {
 ensure_stack_once() {
   start_bridge || true
   start_technical_bridge || true
+  start_compatibility_proxy || true
   start_backend || true
   start_frontend || true
 
   wait_until "DeepSeek bridge" "bridge_healthy" "$STACK_WAIT_TIMEOUT_SECONDS" || true
   wait_until "Tech DeepSeek bridge" "technical_bridge_healthy" "$STACK_WAIT_TIMEOUT_SECONDS" || true
+  wait_until "DeepSeek compatibility proxy" "compatibility_proxy_healthy" "$STACK_WAIT_TIMEOUT_SECONDS" || true
   wait_until "backend" "http_responds '${BACKEND_BASE_URL}/api/auth/login'" "$STACK_WAIT_TIMEOUT_SECONDS" || true
   wait_until "frontend" "http_responds '${FRONTEND_BASE_URL}/'" "$STACK_WAIT_TIMEOUT_SECONDS" || true
 
@@ -285,6 +351,7 @@ ensure_stack_once() {
   log "  backend : ${BACKEND_BASE_URL}"
   log "  bridge  : ${BRIDGE_HEALTH_URL}"
   log "  tech    : ${TECH_BRIDGE_HEALTH_URL}"
+  log "  compat  : ${COMPATIBILITY_PROXY_HEALTH_URL}"
   log "  logs    : ${LOG_DIR}"
 }
 

@@ -7,17 +7,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 require_cmd docker
 
-if [ ! -f "$ENV_FILE" ]; then
-  umask 077
-  sed \
-    -e "s/replace-with-local-admin-password/$(random_hex 24)/" \
-    -e "s/replace-with-local-n8n-password/$(random_hex 24)/" \
-    -e "s/replace-with-local-stock-watch-password/$(random_hex 24)/" \
-    -e "s/replace-with-local-jwt-secret/$(random_hex 32)/" \
-    -e "s/replace-with-32-plus-random-characters/$(random_hex 32)/" \
-    "$ROOT_DIR/.env.example" > "$ENV_FILE"
-  echo "created local env: $ENV_FILE"
-fi
+ensure_local_env
 
 load_env
 port="${N8N_HOST_PORT:-5678}"
@@ -35,7 +25,9 @@ if command -v lsof >/dev/null 2>&1; then
 fi
 
 "$SCRIPT_DIR/render-phase1-workflow.js"
-compose up -d postgres db-bootstrap db-migrate n8n
+node "$SCRIPT_DIR/render-phase2-workflows.js"
+compose up -d postgres db-bootstrap db-migrate mailpit n8n
 compose ps
 
 echo "n8n local URL: http://127.0.0.1:${port}"
+echo "Mailpit local inbox: http://127.0.0.1:${MAILPIT_UI_PORT:-8025}"

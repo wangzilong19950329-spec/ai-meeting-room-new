@@ -82,4 +82,23 @@ public class AiModelRouter {
         }
         return new ChatResult(null);
     }
+
+    /** Reviewed meetings must use the selected model or fail without routing to another client. */
+    public ChatResult chatExStrict(String modelType, String systemPrompt, String userPrompt) {
+        return chatExStrict(modelType, systemPrompt, userPrompt, null);
+    }
+
+    public ChatResult chatExStrict(String modelType, String systemPrompt, String userPrompt,
+                                   Integer maxTokens) {
+        if (modelType == null || modelType.isBlank()) return new ChatResult(null);
+        for (AiModelClient client : clients) {
+            if (client.supports(modelType)) {
+                if (client instanceof GenericAiClient) {
+                    return ((GenericAiClient) client).chatWithEvidenceStrict(modelType, systemPrompt, userPrompt, maxTokens);
+                }
+                return new ChatResult(client.chat(modelType, systemPrompt, userPrompt));
+            }
+        }
+        return new ChatResult(null);
+    }
 }

@@ -1,0 +1,89 @@
+{
+  "id": "SW00ErrorHandler",
+  "name": "SW-00 Error Handler",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "ErrorTrigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "\nconst input = $input.first().json || {};\nconst error = input.execution && input.execution.error ? input.execution.error : (input.error || input);\nconst message = String(error.message || error.description || 'unknown workflow error');\nconst knownCodes = [\n  'QUOTE_HTTP_ERROR', 'QUOTE_EMPTY', 'QUOTE_STALE', 'QUOTE_INVALID', 'BAR_INCOMPLETE',\n  'DB_ERROR', 'MODEL_TIMEOUT', 'MODEL_EMPTY', 'MODEL_INVALID_JSON', 'INVALID_FACT_REF',\n  'CAPABILITY_VIOLATION', 'POLICY_VIOLATION', 'REPORT_ERROR', 'JOB_TIMEOUT',\n    'JOB_MAX_ATTEMPTS', 'MODEL_PROVIDER_OUTCOME_UNKNOWN', 'MODEL_RETRY_SAFETY_UNPROVEN'\n];\nconst errorCode = knownCodes.find((code) => message.includes(code)) || 'UNCLASSIFIED_WORKFLOW_ERROR';\nreturn [{ json: {\n  workflow_name: input.workflow && input.workflow.name ? input.workflow.name : 'unknown',\n  execution_id: input.execution && input.execution.id ? String(input.execution.id) : null,\n  error_code: errorCode,\n  error_message: message.slice(0, 2000),\n  retryable: ['QUOTE_HTTP_ERROR', 'MODEL_TIMEOUT', 'DB_ERROR', 'JOB_TIMEOUT'].includes(errorCode),\n  context: { lastNodeExecuted: input.execution && input.execution.lastNodeExecuted || null }\n} }];\n"
+      },
+      "id": "NormalizeError",
+      "name": "Normalize Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO sw_run_failure (\n  workflow_name, execution_id, error_code, error_message, retryable, context\n) VALUES (\n  ($1::jsonb)->>'workflow_name',\n  ($1::jsonb)->>'execution_id',\n  ($1::jsonb)->>'error_code',\n  ($1::jsonb)->>'error_message',\n  COALESCE((($1::jsonb)->>'retryable')::boolean, false),\n  COALESCE(($1::jsonb)->'context', '{}'::jsonb)\n) RETURNING id, error_code, created_at;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ JSON.stringify($json) }}"
+        }
+      },
+      "id": "PersistRunFailure",
+      "name": "Persist Run Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        500,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "SWPostgresLocal",
+          "name": "SW PostgreSQL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Normalize Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Error": {
+      "main": [
+        [
+          {
+            "node": "Persist Run Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "phase2-local-generated-SW00ErrorHandler",
+  "triggerCount": 0,
+  "tags": []
+}

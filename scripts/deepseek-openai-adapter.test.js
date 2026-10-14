@@ -9,9 +9,11 @@ const {
 } = require('./deepseek-openai-adapter');
 const {
   isBearerAuthorized,
+  isSharedBridgeRequestAuthorized,
   sharedBridgeAuthHeaders,
   shouldRequireSharedBridgeAuth
 } = require('./deepseek-bridge-auth');
+const { bridgeResultResponse } = require('./deepseek-bridge-result-response');
 
 function mockReq({ method = 'POST', url = '/v1/chat/completions', headers = {}, body = {} } = {}) {
   const req = new EventEmitter();
@@ -117,14 +119,16 @@ test('configured API key is required before serving /v1 routes', async () => {
   }
 });
 
-test('shared bridge auth is required only for non-loopback bridge hosts with an API key', () => {
-  assert.equal(shouldRequireSharedBridgeAuth('127.0.0.1', 'secret-key'), false);
-  assert.equal(shouldRequireSharedBridgeAuth('localhost', 'secret-key'), false);
-  assert.equal(shouldRequireSharedBridgeAuth('::1', 'secret-key'), false);
+test('shared bridge auth is required on every host when an API key is configured', () => {
+  assert.equal(shouldRequireSharedBridgeAuth('127.0.0.1', 'secret-key'), true);
+  assert.equal(shouldRequireSharedBridgeAuth('localhost', 'secret-key'), true);
+  assert.equal(shouldRequireSharedBridgeAuth('::1', 'secret-key'), true);
   assert.equal(shouldRequireSharedBridgeAuth('0.0.0.0', ''), false);
   assert.equal(shouldRequireSharedBridgeAuth('0.0.0.0', 'secret-key'), true);
 
-  assert.deepEqual(sharedBridgeAuthHeaders('127.0.0.1', 'secret-key'), {});
+  assert.deepEqual(sharedBridgeAuthHeaders('127.0.0.1', 'secret-key'), {
+    Authorization: 'Bearer secret-key'
+  });
   assert.deepEqual(sharedBridgeAuthHeaders('0.0.0.0', 'secret-key'), {
     Authorization: 'Bearer secret-key'
   });
@@ -132,6 +136,11 @@ test('shared bridge auth is required only for non-loopback bridge hosts with an 
   assert.equal(isBearerAuthorized({ headers: { authorization: 'Bearer secret-key' } }, 'secret-key'), true);
   assert.equal(isBearerAuthorized({ headers: { Authorization: 'Bearer secret-key' } }, 'secret-key'), true);
   assert.equal(isBearerAuthorized({ headers: { authorization: 'Bearer wrong' } }, 'secret-key'), false);
+  assert.equal(isSharedBridgeRequestAuthorized({ headers: {} }, '127.0.0.1', 'secret-key'), false);
+  assert.equal(isSharedBridgeRequestAuthorized({
+    headers: { authorization: 'Bearer secret-key' }
+  }, '127.0.0.1', 'secret-key'), true);
+  assert.equal(isSharedBridgeRequestAuthorized({ headers: {} }, '127.0.0.1', ''), true);
 });
 
 test('chat completion maps messages to bridge /search payload and response shape', async () => {
@@ -161,10 +170,14 @@ test('chat completion maps messages to bridge /search payload and response shape
   assert.equal(parsed(res).choices[0].message.content, 'hello from bridge');
 });
 
-test('chat completion forwards DeepSeek account routing metadata to bridge payload', async () => {
+test('chat completion forwards capability and session semantics without physical routing', async () => {
   let bridgePayload;
   const req = mockReq({
-    headers: { 'x-deepseek-account-key': 'stock' },
+    headers: {
+      'x-deepseek-capability': 'stock.technical-analysis',
+      'x-deepseek-priority': '200',
+      'idempotency-key': 'openai-stock-request-1'
+    },
     body: {
       model: 'deepseek-web-bridge',
       metadata: {
@@ -184,41 +197,60 @@ test('chat completion forwards DeepSeek account routing metadata to bridge paylo
   }));
 
   assert.equal(res.statusCode, 200);
-  assert.equal(bridgePayload.accountKey, 'stock');
+  assert.equal(bridgePayload.capability, 'stock.technical-analysis');
+  assert.equal(bridgePayload.priority, 200);
+  assert.equal(bridgePayload.submissionKey, 'openai-stock-request-1');
+  assert.match(bridgePayload.requestDigest, /^[a-f0-9]{64}$/);
+  assert.equal(bridgePayload.accountKey, '');
   assert.equal(bridgePayload.sessionKey, 'stock-watch-smoke');
 });
 
-test('chat completion accepts DeepSeek account key from body and metadata', async () => {
-  const seen = [];
-  const bodyReq = mockReq({
+test('chat completion rejects physical account routing by default', async () => {
+  let invoked = false;
+  const req = mockReq({
     body: {
       model: 'deepseek-web-bridge',
       deepseek_account_key: 'body-account',
       messages: [{ role: 'user', content: 'hi' }]
     }
   });
-  const bodyRes = mockRes();
-  await handleOpenAiAdapterRequest(bodyReq, bodyRes, testContext({
-    onInvokeSearch: (payload) => seen.push(payload.accountKey)
-  }));
-
-  const metadataReq = mockReq({
-    body: {
-      model: 'deepseek-web-bridge',
-      metadata: {
-        deepseek_account_key: 'metadata-account'
-      },
-      messages: [{ role: 'user', content: 'hi' }]
+  const res = mockRes();
+  await handleOpenAiAdapterRequest(req, res, testContext({
+    onInvokeSearch: () => {
+      invoked = true;
     }
-  });
-  const metadataRes = mockRes();
-  await handleOpenAiAdapterRequest(metadataReq, metadataRes, testContext({
-    onInvokeSearch: (payload) => seen.push(payload.accountKey)
   }));
 
-  assert.equal(bodyRes.statusCode, 200);
-  assert.equal(metadataRes.statusCode, 200);
-  assert.deepEqual(seen, ['body-account', 'metadata-account']);
+  assert.equal(res.statusCode, 400);
+  assert.equal(parsed(res).error.code, 'account_override_forbidden');
+  assert.equal(invoked, false);
+});
+
+test('operator mode can explicitly select an account when enabled', async () => {
+  const previous = process.env.DEEPSEEK_WEB_ALLOW_ACCOUNT_OVERRIDE;
+  process.env.DEEPSEEK_WEB_ALLOW_ACCOUNT_OVERRIDE = 'true';
+  try {
+    let bridgePayload;
+    const req = mockReq({
+      headers: { 'x-deepseek-account-key': 'diagnostic-account' },
+      body: {
+        model: 'deepseek-web-bridge',
+        messages: [{ role: 'user', content: 'hi' }]
+      }
+    });
+    const res = mockRes();
+    await handleOpenAiAdapterRequest(req, res, testContext({
+      onInvokeSearch: (payload) => {
+        bridgePayload = payload;
+      }
+    }));
+
+    assert.equal(res.statusCode, 200);
+    assert.equal(bridgePayload.accountKey, 'diagnostic-account');
+  } finally {
+    if (previous === undefined) delete process.env.DEEPSEEK_WEB_ALLOW_ACCOUNT_OVERRIDE;
+    else process.env.DEEPSEEK_WEB_ALLOW_ACCOUNT_OVERRIDE = previous;
+  }
 });
 
 test('explicit mock mode returns a marked response without invoking bridge', async () => {
@@ -379,6 +411,53 @@ test('JSON mode sets expectedJson and rejects non-JSON bridge answer', async () 
   assert.equal(bridgePayload.expectedJson, true);
   assert.equal(res.statusCode, 502);
   assert.equal(parsed(res).error.code, 'invalid_json');
+  assert.equal(parsed(res).providerOutcomeUnknown, false);
+  assert.equal(parsed(res).retrySafe, false);
+});
+
+test('incomplete and empty bridge results are explicitly non-retriable', async () => {
+  for (const fixture of [
+    { result: { answerText: 'partial', contentStatus: 'incomplete' }, code: 'incomplete_generation' },
+    { result: { answerText: '', contentStatus: 'success' }, code: 'empty_answer' }
+  ]) {
+    const req = mockReq({
+      body: {
+        model: 'deepseek-web-bridge',
+        messages: [{ role: 'user', content: 'hi' }]
+      }
+    });
+    const res = mockRes();
+
+    await handleOpenAiAdapterRequest(req, res, testContext({
+      bridgeResponse: { statusCode: 200, payload: { ok: true, result: fixture.result } }
+    }));
+
+    const payload = parsed(res);
+    assert.equal(payload.error.code, fixture.code);
+    assert.equal(payload.providerOutcomeUnknown, false);
+    assert.equal(payload.retrySafe, false);
+  }
+});
+
+test('adapter preserves the bridge rejection of a budget-limited answer', async () => {
+  const bridgeResponse = bridgeResultResponse({
+    answerText: 'partial answer that must not be shown',
+    contentStatus: 'incomplete',
+    completionReason: 'quick_budget_reached'
+  }, { status: 'INVALID', error: 'provider_response_incomplete' });
+  const req = mockReq({ body: {
+    model: 'deepseek-web-bridge',
+    messages: [{ role: 'user', content: 'hi' }]
+  } });
+  const res = mockRes();
+  await handleOpenAiAdapterRequest(req, res, testContext({ bridgeResponse }));
+
+  const payload = parsed(res);
+  assert.equal(res.statusCode, 504);
+  assert.equal(payload.error.code, 'incomplete_generation');
+  assert.equal(payload.retrySafe, false);
+  assert.equal(payload.providerOutcomeUnknown, undefined);
+  assert.equal(res.body.includes('partial answer that must not be shown'), false);
 });
 
 test('unsupported Responses API, streaming, and tools fail explicitly', async () => {
@@ -435,12 +514,17 @@ test('bridge invocation exception returns explicit server error', async () => {
   await handleOpenAiAdapterRequest(req, res, {
     ...testContext(),
     invokeSearch: async () => {
-      throw new Error('connection refused');
+      throw new Error('ECONNREFUSED 127.0.0.1:8791 accountKey=technical profileRoot=/private/profile');
     }
   });
 
   assert.equal(res.statusCode, 502);
-  assert.equal(parsed(res).error.code, 'bridge_invocation_failed');
+  const error = parsed(res).error;
+  assert.equal(error.code, 'bridge_invocation_failed');
+  assert.equal(error.message, 'Analysis capacity is temporarily unavailable.');
+  assert.doesNotMatch(error.message, /127\.0\.0\.1|8791|accountKey|technical|profileRoot/i);
+  assert.equal(parsed(res).providerOutcomeUnknown, true);
+  assert.equal(parsed(res).retrySafe, false);
 });
 
 test('bridge busy response is mapped to OpenAI error shape', async () => {
@@ -458,13 +542,47 @@ test('bridge busy response is mapped to OpenAI error shape', async () => {
       payload: {
         ok: false,
         error: 'bridge_busy',
+        message: 'worker=technical profileRoot=/private/profile debugPort=9333',
         requestId: 7
       }
     }
   }));
 
   assert.equal(res.statusCode, 429);
-  assert.equal(parsed(res).error.code, 'bridge_busy');
+  const error = parsed(res).error;
+  assert.equal(error.code, 'bridge_busy');
+  assert.equal(error.message, 'The analysis request failed.');
+  assert.doesNotMatch(error.message, /technical|profileRoot|debugPort|9333/i);
+});
+
+test('bridge retry safety metadata survives OpenAI error mapping', async () => {
+  for (const expected of [
+    { providerOutcomeUnknown: false, retrySafe: true },
+    { providerOutcomeUnknown: true, retrySafe: false }
+  ]) {
+    const req = mockReq({
+      body: {
+        model: 'deepseek-web-bridge',
+        messages: [{ role: 'user', content: 'hi' }]
+      }
+    });
+    const res = mockRes();
+    await handleOpenAiAdapterRequest(req, res, testContext({
+      bridgeResponse: {
+        statusCode: 504,
+        payload: {
+          ok: false,
+          error: 'provider_timeout',
+          message: 'provider timeout',
+          ...expected
+        }
+      }
+    }));
+
+    assert.equal(res.statusCode, 504);
+    assert.equal(parsed(res).providerOutcomeUnknown, expected.providerOutcomeUnknown);
+    assert.equal(parsed(res).retrySafe, expected.retrySafe);
+  }
 });
 
 test('non-text message parts are rejected before invoking bridge', async () => {

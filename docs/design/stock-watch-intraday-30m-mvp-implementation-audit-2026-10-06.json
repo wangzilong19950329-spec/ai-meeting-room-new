@@ -1,0 +1,43 @@
+{
+  "packetVersion": "1",
+  "goalContract": {
+    "version": "v3",
+    "source": [{"kind": "user_request", "pointer": "Latest continue after the small M30 MVP proposal; previous full assistant explicitly rejected", "authority": "primary"}],
+    "outcome": "Deliver the bounded M30 code MVP with controlled verification and identify the remaining first real-window validation",
+    "stakeholders": ["user"],
+    "mustAccept": [
+      {"id": "G1", "statement": "Keep the same-call, no-new-schema MVP and legacy task/forecast behavior", "verification": {"statement": "Inspect prepare/replay and projection contracts plus regression reports", "surface": "code", "minimumLevel": "integration"}},
+      {"id": "G2", "statement": "Show only validated M30 values and fixed deadline states", "verification": {"statement": "API projection unit checks and controlled desktop/mobile component checks", "surface": "code", "minimumLevel": "integration"}},
+      {"id": "G3", "statement": "Provide readonly reproducible evaluation without fabricating accuracy", "verification": {"statement": "Script tests, real legacy export and qualified endpoint contract", "surface": "code", "minimumLevel": "integration"}},
+      {"id": "G4", "statement": "Complete a first real scheduled M30 window for quick practical validation", "verification": {"statement": "New request, original response, authenticated detail and qualified fixed endpoint", "surface": "workflow", "minimumLevel": "live"}}
+    ],
+    "constraints": ["No full assistant or 79-item repair rollout", "No new model calls or altered scheduling", "No orders or alerts", "Explicit pilot, default disabled", "Preserve dirty work and existing frozen tasks"],
+    "nonGoals": ["Proven trading edge", "Strict asOf predictive accuracy without cutoff proof"],
+    "preferences": ["One stock and one original scheduled task before expansion", "Existing raw storage and joined request metadata"],
+    "assumptions": ["Continue authorizes implementing the proposed bounded MVP, not the earlier larger design"],
+    "unknowns": ["User pilot selection", "Authenticated real detail", "Actual model output and latency", "Qualified endpoint acquisition", "Actual delivery time", "Model information cutoff"]
+  },
+  "evidence": [
+    {"id": "E1", "statement": "Optional extension only in new DAY pilot prepare; legacy parser and forecast validation unchanged", "sourceType": "artifact", "pointer": "src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java; src/main/java/com/aimeeting/room/service/StockWatchIntradayForecast.java", "kind": "direct", "freshness": "Final source reviewed 2026-10-06", "verification": {"surface": "code", "level": "static", "result": "pass"}},
+    {"id": "E2", "statement": "88 Java, 7 frontend node and 29 stdlib script tests pass; frontend build succeeds; controlled UI countdown expires", "sourceType": "test_result", "pointer": "docs/design/stock-watch-intraday-30m-mvp-verification-2026-10-06.md; target/surefire-reports; frontend/src/modules/stock-watch/runtime/intradayForecast.test.mjs; scripts/test_review_stock_watch_m30.py", "kind": "direct", "freshness": "Final targeted commands executed", "verification": {"surface": "code", "level": "integration", "result": "pass"}},
+    {"id": "E3", "statement": "Real latest-day export has 125 legacy tasks, excludes all125, zero M30; all-time M30 count zero; authenticated API/UI not completed", "sourceType": "workflow_observation", "pointer": "docs/design/m30-mvp-verification/db-latest-2026-08-14/report.json; docs/design/stock-watch-intraday-30m-mvp-verification-2026-10-06.md", "kind": "direct", "freshness": "Read-only DB transaction 2026-10-06", "verification": {"surface": "workflow", "level": "live", "result": "pass"}},
+    {"id": "E4", "statement": "Reviewer counterexamples invalidate strict future accuracy from this frozen quote and web-enabled model; implementation labels all results descriptive and strict accuracy null", "sourceType": "artifact", "pointer": "scripts/deepseek-web-client.js:1186; src/main/java/com/aimeeting/room/service/StockWatchIntradayForecast.java; scripts/review-stock-watch-m30.py; docs/design/stock-watch-intraday-30m-mvp-verification-2026-10-06.md", "kind": "direct", "freshness": "Challenge static review adjudicated and report labels checked", "verification": {"surface": "code", "level": "static", "result": "pass"}}
+  ],
+  "claims": [
+    {"id": "S1", "statement": "Bounded code and controlled engineering verification are complete, without proving a real prediction loop", "type": "inference", "dependsOn": ["E1", "E2", "E3"], "supportingEvidence": ["E1", "E2", "E3"], "hiddenAssumptions": [], "falsifiers": ["Legacy regression or optional extension error changes canonical success"], "alternativesConsidered": ["New table", "New model call", "Same-call frozen optional extension"], "verdict": "supported", "confidence": "high"},
+    {"id": "S2", "statement": "The implemented endpoint report is descriptive only and cannot certify strict future accuracy or avoided loss", "type": "inference", "dependsOn": ["E3", "E4"], "supportingEvidence": ["E3", "E4"], "hiddenAssumptions": [], "falsifiers": ["Verified exact input price, model cutoff and actual delivered forward samples establish a stronger contract"], "alternativesConsidered": ["Expand bridge now", "Retain bounded descriptive contract and defer strict experiment"], "verdict": "supported", "confidence": "high"}
+  ],
+  "conclusion": {
+    "statement": "Code MVP and controlled checks are delivered; pilot is disabled and the first authenticated real-window validation remains open",
+    "dependsOn": ["S1", "S2"],
+    "goalTrace": [
+      {"goalId": "G1", "supportedBy": ["S1"], "verification": ["E1", "E2"], "status": "met"},
+      {"goalId": "G2", "supportedBy": ["S1"], "verification": ["E1", "E2"], "status": "met"},
+      {"goalId": "G3", "supportedBy": ["S1", "S2"], "verification": ["E2", "E3", "E4"], "status": "met"},
+      {"goalId": "G4", "supportedBy": ["S1", "S2"], "verification": ["E3"], "status": "partial"}
+    ],
+    "verdict": "supported",
+    "goalVerdict": "partial",
+    "remainingBoundaries": ["No real new M30 output", "Pilot awaits explicit stock selection", "No authenticated API/UI loop", "No qualified live endpoint", "Recording is not delivery", "No strict accuracy or trading-effect proof", "Reviewers did not independently rerun tests"]
+  }
+}

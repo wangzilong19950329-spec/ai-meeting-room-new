@@ -10,6 +10,9 @@ import com.aimeeting.room.dto.ChatResult;
 import com.aimeeting.room.entity.AiMeetingMember;
 import com.aimeeting.room.entity.AiMeetingOpinion;
 import com.aimeeting.room.entity.AiMeetingRoom;
+import com.aimeeting.room.entity.MeetingReviewedSearchGap;
+import com.aimeeting.room.entity.MeetingReviewedSearchPlan;
+import com.aimeeting.room.entity.MeetingReviewedTurnSkip;
 import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.enums.MeetingStatusEnum;
 import com.aimeeting.room.enums.OpinionTypeEnum;
@@ -19,10 +22,15 @@ import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -33,7 +41,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -53,12 +64,26 @@ public class MeetingDebateService {
     @Autowired private ModelRegistryStore modelRegistryStore;
     @Autowired private EastmoneyMarketDataService eastmoneyMarketDataService;
     @Autowired private StockWatchItemMapper stockWatchItemMapper;
+    @Autowired private MeetingReviewedEvidenceService reviewedEvidenceService;
+    @Autowired private MeetingReviewedSearchLedgerService reviewedSearchLedgerService;
+    @Autowired private MeetingReviewedOpinionWriter reviewedOpinionWriter;
+    @Autowired private MeetingReviewedTurnSkipService reviewedTurnSkipService;
+    @Value("${AI_MEETING_REVIEWED_ROUND_BUDGET_MINUTES:30}")
+    private long reviewedRoundBudgetMinutes = 30;
+    private Supplier<String> reviewedAsOfSupplier = () -> LocalDate.now(REVIEWED_MARKET_ZONE).toString();
 
     private static final String REPLY_MARKER = "==REPLY==";
     private static final Pattern YEAR_PATTERN = Pattern.compile("(20\\d{2})");
     private static final Pattern FACT_PAIR_PATTERN = Pattern.compile("([\\u4e00-\\u9fa5A-Za-z][\\u4e00-\\u9fa5A-Za-z0-9_ /()%.,+\\-]{0,24})[：:]\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*([%A-Za-z\\u4e00-\\u9fa5]{0,8})");
+    private static final Pattern REVIEWED_DATED_FACT_PATTERN = Pattern.compile(
+            "(20\\d{2}年(?:上半年|下半年|一季度|二季度|三季度|四季度|全年)?[\\u4e00-\\u9fa5A-Za-z]{1,16})[：:]\\s*([-+]?\\d+(?:\\.\\d+)?)\\s*(%|亿元|万元|元|亿|万|倍|股|户|次)");
     private static final Pattern STOCK_CODE_WITH_MARKET_PATTERN = Pattern.compile("(?i)(?:\\b(?:sh|sz|bj)[._-]?(\\d{6})\\b|\\b(\\d{6})[._-]?(?:sh|sz|bj)\\b)");
-    private static final Pattern GROUNDED_NUMERIC_CLAIM_PATTERN = Pattern.compile("[-+]?\\d+(?:\\.\\d+)?\\s*(?:%|亿|万元|元|倍|bp|bps)");
+    private static final Pattern GROUNDED_NUMERIC_CLAIM_PATTERN = Pattern.compile(
+            "(?<![\\d.eE])([-+]?\\d+(?:\\.\\d+)?(?:[eE][-+]?\\d+)?)\\s*(亿元|万元|亿|元|%|倍|bps|bp)");
+    private static final Pattern REVIEWED_MA_PATTERN = Pattern.compile("(?i)ma(5|10|20|60|120)(?!\\d)");
+    private static final Pattern REVIEWED_TRADING_DAYS_PATTERN = Pattern.compile("(?:最近|近)(\\d{1,3})(?:个)?交易日");
+    private static final ZoneId REVIEWED_MARKET_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final Pattern MODEL_EVIDENCE_ONLY_PATTERN = Pattern.compile("(?s)^\\s*\\{\\s*\"(?:q|e)\"\\s*:");
     private static final String[][] GUARDED_STOCK_TERMS = {
             {"全a量化", "全a量化"},
             {"量化多头备选池", "量化多头备选池"},
@@ -83,6 +108,11 @@ public class MeetingDebateService {
     };
 
     public List<AiMeetingOpinion> executeDebateRound(Long meetingId, int roundNumber) {
+        return executeDebateRound(meetingId, roundNumber, null);
+    }
+
+    public List<AiMeetingOpinion> executeDebateRound(Long meetingId, int roundNumber,
+                                                      Long expectedRunEpoch) {
         List<AiMeetingMember> members = workflowService.resolveMembersForCurrentStage(
                 meetingId,
                 memberMapper.selectByMeetingId(meetingId)
@@ -102,6 +132,9 @@ public class MeetingDebateService {
                 log.info("Meeting {} round {} enters targeted reply mode, only member {} will answer",
                         meetingId, roundNumber, pendingTargetMemberId);
             }
+        }
+        if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+            return executeReviewedDebateRound(meetingId, roundNumber, members, expectedRunEpoch);
         }
         List<AiMeetingOpinion> roundOpinions = new ArrayList<>();
 
@@ -139,11 +172,1631 @@ public class MeetingDebateService {
     }
 
     public AiMeetingOpinion generateSingleTargetReply(Long meetingId, Long memberId, int roundNumber) {
+        return generateSingleTargetReply(meetingId, memberId, roundNumber, null);
+    }
+
+    public AiMeetingOpinion generateSingleTargetReply(Long meetingId, Long memberId, int roundNumber,
+                                                       Long expectedRunEpoch) {
         AiMeetingMember member = memberMapper.selectById(memberId);
         if (member == null || !meetingId.equals(member.getMeetingId())) {
             throw new IllegalArgumentException("指定议员不存在或不属于当前会议: " + memberId);
         }
+        if (reviewedEvidenceService != null && reviewedEvidenceService.isEnabled()) {
+            ReviewedRoundEvidence evidence = prepareReviewedRoundEvidence(meetingId, member, roundNumber,
+                    new HashMap<>(), new HashMap<>(), expectedRunEpoch, new ReviewedAttemptTrace());
+            assertReviewedMeetingState(meetingId, evidence.meetingStatusAtStart, expectedRunEpoch);
+            return generateReviewedOpinion(meetingId, member, roundNumber, evidence);
+        }
         return generateOpinionWithRetry(meetingId, member, roundNumber);
+    }
+
+    private List<AiMeetingOpinion> executeReviewedDebateRound(Long meetingId, int roundNumber,
+                                                               List<AiMeetingMember> members,
+                                                               Long expectedRunEpoch) {
+        if (members == null || members.isEmpty()) return Collections.emptyList();
+        List<AiMeetingOpinion> existing = opinionMapper.selectByMeetingIdAndRound(meetingId, roundNumber);
+        List<AiMeetingMember> pending = members.stream().filter(member -> {
+                    AiMeetingOpinion targeted = findLatestTargetedQuestion(meetingId, member.getId());
+                    Long targetId = targeted == null ? null : targeted.getId();
+                    boolean spoken = existing != null && existing.stream().anyMatch(opinion ->
+                            member.getId().equals(opinion.getMemberId())
+                                    && OpinionTypeEnum.STATEMENT.getCode().equals(opinion.getOpinionType())
+                                    && Objects.equals(targetId, opinion.getParentOpinionId()));
+                    boolean skipped = reviewedTurnSkipService != null &&
+                            reviewedTurnSkipService.findSkip(meetingId, roundNumber,
+                                    member.getId(), targetId) != null;
+                    return !spoken && !skipped;
+                })
+                .collect(Collectors.toList());
+        if (pending.isEmpty()) return existing == null ? Collections.emptyList() : existing;
+        Map<String, EastmoneyMarketDataService.MarketDataBundle> eastmoneyCache = new HashMap<>();
+        Map<String, MeetingReviewedEvidenceService.ReviewedEvidence> reviewedCache = new HashMap<>();
+        List<AiMeetingOpinion> generated = new ArrayList<>();
+        for (AiMeetingMember member : pending) {
+            if (!isMeetingActiveForDebate(meetingId)
+                    || !reviewedRunMatches(meetingId, expectedRunEpoch)) break;
+            Integer statusAtStart = requireReviewedMeetingStatus(meetingId);
+            String asOf = reviewedAsOfSupplier.get();
+            Long contextOpinionId = latestRoundHumanOpinionId(meetingId, roundNumber);
+            AiMeetingOpinion targeted = findLatestTargetedQuestion(meetingId, member.getId());
+            Long targetQuestionId = targeted == null ? null : targeted.getId();
+            ReviewedAttemptTrace attemptTrace = new ReviewedAttemptTrace();
+            try {
+                assertReviewedContext(meetingId, statusAtStart, expectedRunEpoch,
+                        roundNumber, asOf, contextOpinionId);
+                ReviewedRoundEvidence evidence = prepareReviewedRoundEvidence(meetingId, member, roundNumber,
+                        eastmoneyCache, reviewedCache, expectedRunEpoch, attemptTrace);
+                assertReviewedMeetingState(meetingId, evidence.meetingStatusAtStart, expectedRunEpoch);
+                generated.add(generateReviewedOpinion(meetingId, member, roundNumber, evidence));
+            } catch (MeetingReviewedEvidenceService.EvidenceRejected e) {
+                if (!isMemberLocalReviewedFailure(e.getMessage()) || reviewedTurnSkipService == null) {
+                    pauseForReviewedEvidence(meetingId, expectedRunEpoch,
+                            "议员 " + member.getMemberName() + " 的资料或发言失败：" + e.getMessage());
+                    break;
+                }
+                try {
+                    assertReviewedContext(meetingId, statusAtStart, expectedRunEpoch,
+                            roundNumber, asOf, contextOpinionId);
+                    MeetingReviewedTurnSkip skip = new MeetingReviewedTurnSkip();
+                    skip.setMeetingId(meetingId);
+                    skip.setRoundNumber(roundNumber);
+                    skip.setMemberId(member.getId());
+                    skip.setTargetQuestionId(targetQuestionId);
+                    skip.setReasonCode(e.getMessage());
+                    skip.setRunEpoch(expectedRunEpoch);
+                    skip.setAsOf(asOf);
+                    skip.setGapId(attemptTrace.failedGapId);
+                    if (reviewedSearchLedgerService != null) {
+                        MeetingReviewedSearchPlan plan = reviewedSearchLedgerService.findPlanVersion(meetingId,
+                                roundNumber, member.getId(), targetQuestionId, asOf, contextOpinionId);
+                        skip.setPlanId(plan == null ? null : plan.getId());
+                    }
+                    reviewedTurnSkipService.recordIfCurrent(skip, statusAtStart, contextOpinionId);
+                    log.warn("Meeting {} round {} member {} abstained after reviewed turn failure: {}",
+                            meetingId, roundNumber, member.getId(), e.getMessage());
+                } catch (RuntimeException staleOrPersistenceFailure) {
+                    pauseForReviewedEvidence(meetingId, expectedRunEpoch,
+                            "议员弃权状态无法安全提交：" + staleOrPersistenceFailure.getMessage());
+                    break;
+                }
+            } catch (RuntimeException e) {
+                pauseForReviewedEvidence(meetingId, expectedRunEpoch,
+                        "议员 " + member.getMemberName() + " 的执行状态异常");
+                break;
+            }
+        }
+        return generated;
+    }
+
+    private boolean isMemberLocalReviewedFailure(String reason) {
+        if (reason == null || !reason.matches("[A-Z][A-Z0-9_:-]{0,127}")) return false;
+        if (reason.startsWith("MEETING_") || reason.startsWith("ROUND_SEARCH_")
+                || reason.startsWith("MEMBER_SEARCH_PLAN_STALE")
+                || reason.startsWith("MEMBER_SEARCH_PLAN_CONTEXT_STALE")
+                || reason.equals("N8N_GAP_ALREADY_CLAIMED")
+                || reason.equals("N8N_GAP_IN_FLIGHT")
+                || reason.equals("N8N_PACKET_NOT_PERSISTED")) return false;
+        return reason.startsWith("MODEL_") || reason.startsWith("MEMBER_")
+                || reason.startsWith("N8N_") || reason.equals("PRIOR_SEARCH_OUTCOME_REQUIRES_REVIEW");
+    }
+
+    private ReviewedRoundEvidence prepareReviewedRoundEvidence(Long meetingId, AiMeetingMember member,
+                                                               int roundNumber,
+                                                               Map<String, EastmoneyMarketDataService.MarketDataBundle> eastmoneyCache,
+                                                               Map<String, MeetingReviewedEvidenceService.ReviewedEvidence> reviewedCache,
+                                                               Long expectedRunEpoch,
+                                                               ReviewedAttemptTrace attemptTrace) {
+        Integer meetingStatusAtStart = requireReviewedMeetingStatus(meetingId);
+        if (!reviewedRunMatches(meetingId, expectedRunEpoch)) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_RUN_STALE");
+        }
+        Long contextOpinionId = latestRoundHumanOpinionId(meetingId, roundNumber);
+        AiMeetingOpinion targetedQuestion = findLatestTargetedQuestion(meetingId, member.getId());
+        Long targetQuestionId = targetedQuestion == null ? null : targetedQuestion.getId();
+        String asOf = reviewedAsOfSupplier.get();
+        assertReviewedContext(meetingId, meetingStatusAtStart, expectedRunEpoch,
+                roundNumber, asOf, contextOpinionId);
+        ReviewedSearchDecision decision;
+        Long savedPlanId = null;
+        Long supersedesPlanId = null;
+        if (reviewedSearchLedgerService == null) {
+            // Directly constructed unit fixtures have no Spring wiring; runtime requires the ledger bean.
+            decision = decideReviewedSearchNeeds(meetingId, member, roundNumber);
+        } else {
+            MeetingReviewedSearchPlan saved = reviewedSearchLedgerService.findPlanVersion(meetingId,
+                    roundNumber, member.getId(), targetQuestionId, asOf, contextOpinionId);
+            if (saved == null) {
+                ReviewedSearchDecision proposed = decideReviewedSearchNeeds(meetingId, member, roundNumber);
+                assertReviewedContext(meetingId, meetingStatusAtStart, expectedRunEpoch,
+                        roundNumber, asOf, contextOpinionId);
+                proposed.raw.put("contextOpinionId", contextOpinionId == null ? 0L : contextOpinionId);
+                saved = reviewedSearchLedgerService.savePlanIfAbsent(meetingId, roundNumber, member.getId(),
+                        targetQuestionId, asOf, contextOpinionId, proposed.raw.toJSONString());
+            }
+            if (!asOf.equals(saved.getAsOf())
+                    || !Objects.equals(contextOpinionId == null ? 0L : contextOpinionId,
+                        saved.getContextOpinionId())) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_PLAN_CONTEXT_STALE");
+            }
+            assertReviewedContext(meetingId, meetingStatusAtStart, expectedRunEpoch,
+                    roundNumber, asOf, contextOpinionId);
+            decision = parseReviewedSearchDecision(meetingId, saved.getNormalizedPlanJson());
+            savedPlanId = saved.getId();
+            supersedesPlanId = saved.getSupersedesPlanId();
+        }
+        decision.raw.put("contextOpinionId", contextOpinionId == null ? 0L : contextOpinionId);
+        SearchPlan plan = decision.plan;
+        List<WebSearchService.SearchResult> results = new ArrayList<>();
+        List<JSONObject> packets = new ArrayList<>();
+        List<String> executedQueries = new ArrayList<>();
+        List<String> reviewQuestions = new ArrayList<>();
+        List<List<String>> questionsByNeed = new ArrayList<>();
+        List<String> unsearchedGaps = new ArrayList<>();
+        List<String> unverifiedGaps = new ArrayList<>();
+        List<String> partiallyReviewedGaps = new ArrayList<>();
+        List<String> noUsableReviewedGaps = new ArrayList<>();
+        JSONArray unverifiedGapFailures = new JSONArray();
+        BigDecimal evidenceConfidenceScore = BigDecimal.ONE;
+        String title = resolveMeetingTitle(meetingId);
+        if (title.isBlank()) throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_TITLE_MISSING");
+        for (ReviewedNeed need : decision.needs) {
+            List<String> needQuestions = new ArrayList<>();
+            ReviewedEastmoneyEvidence eastmoney = fetchReviewedEastmoneyEvidence(meetingId, plan,
+                    need, asOf, eastmoneyCache);
+            results.addAll(eastmoney.results);
+            Set<String> residuals = new LinkedHashSet<>();
+            residuals.addAll(eastmoney.missingFields);
+            // A missing whole section already covers its missing properties; do not spend two calls.
+            residuals.removeIf(residual -> residual.contains(".") && eastmoney.missingFields.contains(
+                    residual.substring(0, residual.indexOf('.')).replace("[]", "")));
+            residuals.addAll(need.unsupportedFields);
+            for (String residual : residuals) {
+                needQuestions.add(buildReviewedGapQuestion(title, need, eastmoney, residual));
+            }
+            if (need.webSearch && need.webQuestion != null && !need.webQuestion.isBlank()) {
+                needQuestions.add(buildReviewedGapQuestion(title, need, eastmoney, need.webQuestion));
+            } else if (need.webSearch && residuals.isEmpty()) {
+                needQuestions.add(buildReviewedGapQuestion(title, need, eastmoney, need.question));
+            }
+            questionsByNeed.add(new ArrayList<>(new LinkedHashSet<>(needQuestions)));
+        }
+        LinkedHashSet<String> prioritizedQuestions = new LinkedHashSet<>();
+        for (List<String> needQuestions : questionsByNeed) {
+            if (!needQuestions.isEmpty()) prioritizedQuestions.add(needQuestions.get(0));
+        }
+        for (List<String> needQuestions : questionsByNeed) prioritizedQuestions.addAll(needQuestions);
+        reviewQuestions = new ArrayList<>(prioritizedQuestions);
+        if (reviewQuestions.size() > 4) {
+            unsearchedGaps.addAll(reviewQuestions.subList(4, reviewQuestions.size()));
+            reviewQuestions = new ArrayList<>(reviewQuestions.subList(0, 4));
+        }
+        for (String gap : reviewQuestions) {
+            assertReviewedContext(meetingId, meetingStatusAtStart, expectedRunEpoch,
+                    roundNumber, asOf, contextOpinionId);
+            String cacheKey = asOf + "\n" + gap;
+            MeetingReviewedEvidenceService.ReviewedEvidence reviewed = reviewedCache.get(cacheKey);
+            if (reviewed == null) {
+                if (reviewedCache.size() >= 8) {
+                    unsearchedGaps.add(gap);
+                    continue;
+                }
+                try {
+                    reviewed = resolveReviewedGap(meetingId, roundNumber, asOf, gap,
+                            meetingStatusAtStart, expectedRunEpoch, contextOpinionId, attemptTrace);
+                } catch (MeetingReviewedEvidenceService.EvidenceRejected failedGap) {
+                    if (!"N8N_REVIEW_ERROR".equals(failedGap.getMessage())
+                            && !"N8N_GAP_REJECTED".equals(failedGap.getMessage())) throw failedGap;
+                    // The ledger has a terminal rejection. No candidate from this gap enters
+                    // the prompt, but other reviewed evidence can still support this speaker.
+                    assertReviewedContext(meetingId, meetingStatusAtStart, expectedRunEpoch,
+                            roundNumber, asOf, contextOpinionId);
+                    executedQueries.add(gap);
+                    unverifiedGaps.add(gap);
+                    noUsableReviewedGaps.add(gap);
+                    JSONObject failure = new JSONObject();
+                    failure.put("question", gap);
+                    failure.put("reason", failedGap.getMessage());
+                    unverifiedGapFailures.add(failure);
+                    evidenceConfidenceScore = evidenceConfidenceScore.min(new BigDecimal("0.25"));
+                    attemptTrace.failedGapId = null;
+                    continue;
+                }
+                reviewedCache.put(cacheKey, reviewed);
+            }
+            assertReviewedContext(meetingId, meetingStatusAtStart, expectedRunEpoch,
+                    roundNumber, asOf, contextOpinionId);
+            executedQueries.add(gap);
+            packets.add(reviewed.packet);
+            results.addAll(reviewed.results);
+            evidenceConfidenceScore = evidenceConfidenceScore.min(reviewed.confidenceScore);
+            JSONArray limitations = reviewed.packet.getJSONArray("limitations");
+            if ("ERROR".equals(reviewed.packet.getString("status"))
+                    || "UNVERIFIED".equals(reviewed.packet.getString("status"))
+                    || (limitations != null && (limitations.contains("CLAIM_CITATION_NOT_CAPTURED")
+                        || limitations.contains("CLAIM_CONTRADICTED")
+                        || limitations.contains("REVIEW_INCOMPLETE")
+                        || limitations.contains("SEARCH_INCOMPLETE")))) {
+                unverifiedGaps.add(gap);
+                if (reviewed.results.stream().anyMatch(result -> result != null && !isProvisionalResult(result))) {
+                    partiallyReviewedGaps.add(gap);
+                } else {
+                    noUsableReviewedGaps.add(gap);
+                }
+                evidenceConfidenceScore = evidenceConfidenceScore.min(new BigDecimal("0.25"));
+            }
+        }
+        if (!unsearchedGaps.isEmpty()) {
+            decision.raw.put("unsearchedGaps", unsearchedGaps);
+            decision.raw.put("unsearchedGapCount", unsearchedGaps.size());
+            decision.raw.put("unsearchedGapReason", "SEARCH_BUDGET_EXHAUSTED");
+            evidenceConfidenceScore = evidenceConfidenceScore.min(new BigDecimal("0.25"));
+        }
+        if (!unverifiedGaps.isEmpty()) {
+            decision.raw.put("unverifiedGaps", unverifiedGaps);
+            decision.raw.put("unverifiedGapCount", unverifiedGaps.size());
+            decision.raw.put("unverifiedGapReason", partiallyReviewedGaps.isEmpty()
+                    ? "NO_USABLE_REVIEWED_FACT" : "INCOMPLETE_REVIEW");
+            decision.raw.put("partiallyReviewedGaps", partiallyReviewedGaps);
+            decision.raw.put("noUsableReviewedGaps", noUsableReviewedGaps);
+            if (!unverifiedGapFailures.isEmpty()) {
+                decision.raw.put("unverifiedGapFailures", unverifiedGapFailures);
+            }
+        }
+        String status = !unsearchedGaps.isEmpty() || !unverifiedGaps.isEmpty() ? "LOW_CONFIDENCE" : packets.isEmpty()
+                ? (decision.needs.isEmpty() ? "NO_SEARCH_NEEDED" : "STRUCTURED_ONLY")
+                : packets.stream().allMatch(packet -> "CROSS_CHECKED".equals(packet.getString("status")))
+                    ? "CROSS_CHECKED" : "LOW_CONFIDENCE";
+        return new ReviewedRoundEvidence(plan, dedupeSearchResults(results), packets,
+                executedQueries, decision.raw, status, evidenceConfidenceScore,
+                meetingStatusAtStart, targetQuestionId,
+                expectedRunEpoch, roundNumber, asOf, contextOpinionId, savedPlanId, supersedesPlanId);
+    }
+
+    private MeetingReviewedEvidenceService.ReviewedEvidence resolveReviewedGap(Long meetingId,
+                                                                                int roundNumber, String asOf,
+                                                                                String exactQuestion,
+                                                                                Integer expectedStatus,
+                                                                                Long expectedRunEpoch,
+                                                                                Long contextOpinionId,
+                                                                                ReviewedAttemptTrace attemptTrace) {
+        assertReviewedContext(meetingId, expectedStatus, expectedRunEpoch,
+                roundNumber, asOf, contextOpinionId);
+        if (reviewedSearchLedgerService == null) return reviewedEvidenceService.search(exactQuestion);
+        MeetingReviewedSearchGap gap = reviewedSearchLedgerService.findOrCreateGap(meetingId, roundNumber,
+                asOf, exactQuestion);
+        attemptTrace.failedGapId = gap.getId();
+        if (MeetingReviewedSearchLedgerService.CROSS_CHECKED.equals(gap.getStatus())
+                || MeetingReviewedSearchLedgerService.LOW_CONFIDENCE.equals(gap.getStatus())) {
+            MeetingReviewedEvidenceService.ReviewedEvidence accepted =
+                    MeetingReviewedEvidenceService.acceptPacket(JSON.parseObject(gap.getPacketJson()),
+                            gap.getRequestId(), exactQuestion);
+            attemptTrace.failedGapId = null;
+            return accepted;
+        }
+        if (!MeetingReviewedSearchLedgerService.PENDING.equals(gap.getStatus())) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_GAP_" + gap.getStatus());
+        }
+        assertReviewedContext(meetingId, expectedStatus, expectedRunEpoch,
+                roundNumber, asOf, contextOpinionId);
+        if (!reviewedSearchLedgerService.claimPendingGap(gap.getId())) {
+            MeetingReviewedSearchGap latest = reviewedSearchLedgerService.findGapById(gap.getId());
+            if (latest != null && (MeetingReviewedSearchLedgerService.CROSS_CHECKED.equals(latest.getStatus())
+                    || MeetingReviewedSearchLedgerService.LOW_CONFIDENCE.equals(latest.getStatus()))) {
+                MeetingReviewedEvidenceService.ReviewedEvidence accepted =
+                        MeetingReviewedEvidenceService.acceptPacket(JSON.parseObject(latest.getPacketJson()),
+                        latest.getRequestId(), exactQuestion);
+                attemptTrace.failedGapId = null;
+                return accepted;
+            }
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_GAP_ALREADY_CLAIMED");
+        }
+        long timeoutMs;
+        try {
+            assertReviewedContext(meetingId, expectedStatus, expectedRunEpoch,
+                    roundNumber, asOf, contextOpinionId);
+            timeoutMs = remainingReviewedSearchTimeoutMs(meetingId, roundNumber, asOf,
+                    contextOpinionId);
+        } catch (MeetingReviewedEvidenceService.EvidenceRejected notSubmitted) {
+            reviewedSearchLedgerService.releaseUnsubmittedGap(gap.getId());
+            throw notSubmitted;
+        }
+        MeetingReviewedEvidenceService.ReviewedEvidence reviewed;
+        try {
+            reviewed = reviewedEvidenceService.search(gap.getRequestId(), exactQuestion, asOf,
+                    timeoutMs);
+        } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
+            if ("N8N_OUTCOME_UNKNOWN".equals(rejected.getMessage())) {
+                reviewedSearchLedgerService.markUnknown(gap.getId(), rejected.getMessage());
+            } else {
+                reviewedSearchLedgerService.markRejected(gap.getId(), rejected.getMessage());
+            }
+            throw rejected;
+        } catch (RuntimeException unknown) {
+            reviewedSearchLedgerService.markUnknown(gap.getId(), "PROVIDER_OUTCOME_UNKNOWN");
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_OUTCOME_UNKNOWN", unknown);
+        }
+        boolean persisted = "CROSS_CHECKED".equals(reviewed.packet.getString("status"))
+                ? reviewedSearchLedgerService.markCrossChecked(gap.getId(), reviewed.packet.toJSONString())
+                : reviewedSearchLedgerService.markLowConfidence(gap.getId(), reviewed.packet.toJSONString());
+        if (!persisted) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_PACKET_NOT_PERSISTED");
+        }
+        assertReviewedContext(meetingId, expectedStatus, expectedRunEpoch,
+                roundNumber, asOf, contextOpinionId);
+        attemptTrace.failedGapId = null;
+        return reviewed;
+    }
+
+    private static final class ReviewedAttemptTrace {
+        private Long failedGapId;
+    }
+
+    private long remainingReviewedSearchTimeoutMs(Long meetingId, int roundNumber,
+                                                  String asOf, Long contextOpinionId) {
+        long context = contextOpinionId == null ? 0L : contextOpinionId;
+        long oldestPlanMs = reviewedSearchLedgerService.listPlansByMeetingId(meetingId).stream()
+                .filter(plan -> plan.getRoundNumber() != null && plan.getRoundNumber() == roundNumber)
+                .filter(plan -> asOf.equals(plan.getAsOf())
+                        && Objects.equals(context, plan.getContextOpinionId()))
+                .filter(plan -> plan.getGmtCreate() != null)
+                .mapToLong(plan -> plan.getGmtCreate().getTime())
+                .min().orElseThrow(() -> new MeetingReviewedEvidenceService.EvidenceRejected(
+                        "ROUND_SEARCH_BUDGET_ANCHOR_MISSING"));
+        long remaining = oldestPlanMs + TimeUnit.MINUTES.toMillis(Math.max(1, reviewedRoundBudgetMinutes))
+                - System.currentTimeMillis();
+        if (remaining < 1000) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("ROUND_SEARCH_DEADLINE_EXCEEDED");
+        }
+        return Math.min(TimeUnit.MINUTES.toMillis(13), remaining);
+    }
+
+    private Integer requireReviewedMeetingStatus(Long meetingId) {
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        if (room == null || room.getStatus() == null) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_STATE_UNAVAILABLE");
+        }
+        return room.getStatus();
+    }
+
+    private boolean reviewedRunMatches(Long meetingId, Long expectedRunEpoch) {
+        if (expectedRunEpoch == null) return true; // Direct unit fixture and legacy caller.
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        return room != null && Objects.equals(room.getRunEpoch(), expectedRunEpoch);
+    }
+
+    private void assertReviewedMeetingState(Long meetingId, Integer expectedStatus,
+                                            Long expectedRunEpoch) {
+        if (!Objects.equals(expectedStatus, requireReviewedMeetingStatus(meetingId))
+                || !reviewedRunMatches(meetingId, expectedRunEpoch)
+                || (!MeetingStatusEnum.IN_PROGRESS.getCode().equals(expectedStatus)
+                    && !MeetingStatusEnum.REOPENED.getCode().equals(expectedStatus))) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_STATE_CHANGED_DURING_SEARCH");
+        }
+    }
+
+    private Long latestRoundHumanOpinionId(Long meetingId, int roundNumber) {
+        List<AiMeetingOpinion> opinions = opinionMapper.selectByMeetingIdAndRound(meetingId, roundNumber);
+        if (opinions == null) return null;
+        return opinions.stream()
+                .filter(opinion -> Objects.equals(opinion.getMemberId(), 0L))
+                .map(AiMeetingOpinion::getId).filter(Objects::nonNull)
+                .max(Long::compareTo).orElse(null);
+    }
+
+    private void assertReviewedContext(Long meetingId, Integer expectedStatus, Long expectedRunEpoch,
+                                       int roundNumber, String asOf, Long contextOpinionId) {
+        assertReviewedMeetingState(meetingId, expectedStatus, expectedRunEpoch);
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        if (room == null || (room.getCurrentRound() != null && room.getCurrentRound() != roundNumber)) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_ROUND_CHANGED_DURING_SEARCH");
+        }
+        if (!Objects.equals(contextOpinionId, latestRoundHumanOpinionId(meetingId, roundNumber))) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_HUMAN_CONTEXT_CHANGED");
+        }
+        if (!Objects.equals(asOf, reviewedAsOfSupplier.get())) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_PLAN_STALE");
+        }
+    }
+
+    private AiMeetingOpinion generateReviewedOpinion(Long meetingId, AiMeetingMember member,
+                                                     int roundNumber, ReviewedRoundEvidence evidence) {
+        if (supportsBuiltInSearch(member.getModelType())) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_SEARCH_CANNOT_BE_DISABLED");
+        }
+        String systemPrompt = buildSystemPrompt(member) + "\n资料规划和搜索已在模型外完成。禁止自行联网或引用本轮资料包之外的新事实。"
+                + "标为待核验的资料只可用作明确标注的条件假设，不得写成已证实事实；与复核结果冲突的候选不得引用。"
+                + "只对已审核通过的事实和可用结构化数据作确定性推理。若没有已核验的事实，只能指出缺口或作不含新增事实的条件分析。"
+                + "数值只能引用资料包直接提供的值或明确标注为系统已校验的派生值；不得自行新增差值、比率、利润率、目标价等数字。"
+                + "引用数值请保留来源精度及正负号，资金净流入为负数时保留负数，不改写为正数净流出金额。"
+                + "来源涨跌幅为负值时，写带负号的涨跌幅，不改写为正数跌幅。"
+                + "归母净利润与合并净利润、累计期间与单季期间等口径未经校验时不得混用。可作不新增数字的定性或条件分析。"
+                + "若本轮已审核数字与前序议员同口径数字不同，须在发言中明确指出这一差异，不能静默替换。";
+        assertReviewedContext(meetingId, evidence.meetingStatusAtStart, evidence.expectedRunEpoch,
+                evidence.roundNumber, evidence.asOf, evidence.contextOpinionId);
+        String searchContext = ("LOW_CONFIDENCE".equals(evidence.status)
+                ? "【本轮资料未充分交叉核验】候选数字仅是待核验假设；如引用必须紧邻写明待核验及其限制。不能把证据评分当作事实概率。\n"
+                : "") + buildSearchContext(evidence.results, null, evidence.plan);
+        JSONArray unsearchedGaps = evidence.decision.getJSONArray("unsearchedGaps");
+        if (unsearchedGaps != null && !unsearchedGaps.isEmpty()) {
+            searchContext += "\n【资料预算未覆盖的缺口】以下问题本轮没有执行搜索，也没有通过审核；"
+                    + "不能把这些问题的数字或结论写成事实："
+                    + unsearchedGaps.toJSONString() + "\n";
+        }
+        JSONArray partiallyReviewedGaps = evidence.decision.getJSONArray("partiallyReviewedGaps");
+        if (partiallyReviewedGaps != null && !partiallyReviewedGaps.isEmpty()) {
+            searchContext += "\n【部分资料已审核通过的缺口】以下问题尚未完整核验，但资料包中标为已审核的事实仍可引用；"
+                    + "未核验部分只能按各条资料的状态处理，已拒绝的候选不得引用。"
+                    + "未读取链接原文是审核方法的限制，不会将双会话搜索审核已通过的事实改为待核验："
+                    + partiallyReviewedGaps.toJSONString() + "\n";
+        }
+        JSONArray noUsableReviewedGaps = evidence.decision.getJSONArray("noUsableReviewedGaps");
+        if (noUsableReviewedGaps != null && !noUsableReviewedGaps.isEmpty()) {
+            searchContext += "\n【本轮没有可引用事实的缺口】以下问题没有得到可引用的已审核事实；"
+                    + "不得引用相关候选数字或结论，只能基于其他已审核资料分析："
+                    + noUsableReviewedGaps.toJSONString() + "\n";
+        }
+        String context = orchestrator.buildDebateContext(meetingId, member.getId(), roundNumber, searchContext);
+        ChatResult result;
+        try {
+            result = orchestrator.callModelExStrict(member.getModelType(), systemPrompt, context);
+        } catch (RuntimeException providerFailure) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_PROVIDER_ERROR", providerFailure);
+        }
+        if (result != null && result.modelStatus != null
+                && !"success".equalsIgnoreCase(result.modelStatus)) {
+            String status = result.modelStatus.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_]", "_");
+            if (status.length() > 64) status = "FAILED";
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_" + status);
+        }
+        if (result == null || result.content == null || result.content.isBlank()
+                || result.hasSearchEvidence()) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_OUTPUT_UNAVAILABLE");
+        }
+        String[] parsed = parseEvidenceAndContent(result.content);
+        if (parsed[1] == null || parsed[1].isBlank()) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_CONTENT_EMPTY");
+        }
+        if (evidence.results.stream().noneMatch(source -> source != null && !isProvisionalResult(source))
+                && GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(parsed[1]).find()) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_UNSUPPORTED_CLAIMS");
+        }
+        if (isBlockingClaimAudit(buildClaimAudit(result, evidence.results, evidence.plan))) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_UNSUPPORTED_CLAIMS");
+        }
+        JSONObject crossMemberConflict = findReviewedCrossMemberNumericConflict(
+                meetingId, member.getId(), roundNumber, evidence, parsed[1]);
+        if (crossMemberConflict != null && crossMemberConflict.getIntValue("undisclosedCount") > 0) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_CROSS_MEMBER_NUMERIC_CONFLICT");
+        }
+        JSONObject stored = JSON.parseObject(buildEvidenceJson(meetingId, member.getId(), roundNumber,
+                parsed[0], evidence.executedQueries,
+                evidence.results, evidence.plan, result, null, null, null));
+        if (crossMemberConflict != null) {
+            stored.put("reviewedCrossMemberConflict", crossMemberConflict);
+        }
+        stored.put("reviewedSearchDecision", evidence.decision);
+        if (!evidence.packets.isEmpty()) {
+            stored.put("reviewedSearchPacket", evidence.packets.get(0));
+            stored.put("reviewedSearchPackets", evidence.packets);
+        }
+        stored.put("reviewedSearchStatus", evidence.status);
+        if (evidence.decision.getIntValue("unsearchedGapCount") > 0) {
+            stored.put("reviewedSearchCoverageStatus", "UNSEARCHED_BUDGET");
+        } else if (evidence.decision.getIntValue("unverifiedGapCount") > 0) {
+            stored.put("reviewedSearchCoverageStatus", "UNVERIFIED_GAP");
+        }
+        stored.put("reviewedSearchConfidenceScore", evidence.confidenceScore);
+        stored.put("reviewedSearchConfidenceBasis", "UNCALIBRATED_POLICY_SCORE");
+        stored.put("reviewedSearchAsOf", evidence.asOf);
+        stored.put("reviewedSearchPlanId", evidence.planId);
+        stored.put("reviewedSearchSupersedesPlanId", evidence.supersedesPlanId);
+        stored.put("reviewedSearchContextOpinionId", evidence.contextOpinionId);
+        AiMeetingOpinion opinion = new AiMeetingOpinion();
+        opinion.setMeetingId(meetingId);
+        opinion.setMemberId(member.getId());
+        opinion.setRoundNumber(roundNumber);
+        opinion.setParentOpinionId(evidence.targetQuestionId);
+        opinion.setOpinionType(OpinionTypeEnum.STATEMENT.getCode());
+        opinion.setContent("LOW_CONFIDENCE".equals(evidence.status)
+                ? "【本轮资料未充分交叉核验：待核验数字仅作条件分析】\n" + parsed[1]
+                : parsed[1]);
+        opinion.setEvidence(stored.toJSONString());
+        assertReviewedContext(meetingId, evidence.meetingStatusAtStart, evidence.expectedRunEpoch,
+                evidence.roundNumber, evidence.asOf, evidence.contextOpinionId);
+        if (evidence.expectedRunEpoch != null) {
+            reviewedOpinionWriter.insertIfCurrent(opinion, evidence.expectedRunEpoch,
+                    evidence.meetingStatusAtStart, evidence.contextOpinionId);
+        } else {
+            opinionMapper.insert(opinion);
+        }
+        return opinion;
+    }
+
+    /**
+     * A reviewed speaker may disagree with a previous speaker, but may not quietly replace an
+     * earlier verified number for the same stock, metric and observation period. Ambiguous scope
+     * is deliberately left to human review rather than compared as if it were the same fact.
+     */
+    private JSONObject findReviewedCrossMemberNumericConflict(Long meetingId, Long memberId,
+                                                               int roundNumber, ReviewedRoundEvidence evidence,
+                                                               String speech) {
+        String symbol = evidence.plan == null ? null : evidence.plan.eastmoneySymbol;
+        if (symbol == null || symbol.isBlank()) return null;
+        List<ReviewedComparableNumber> current = reviewedNumbersFromLiveResults(evidence.results, evidence.asOf);
+        if (current.isEmpty()) return null;
+        List<AiMeetingOpinion> earlier = opinionMapper.selectByMeetingId(meetingId);
+        if (earlier == null || earlier.isEmpty()) return null;
+
+        JSONArray conflicts = new JSONArray();
+        int undisclosed = 0;
+        Set<String> seen = new LinkedHashSet<>();
+        for (AiMeetingOpinion prior : earlier) {
+            if (prior == null || prior.getMemberId() == null
+                    || prior.getMemberId().equals(memberId)
+                    || !OpinionTypeEnum.STATEMENT.getCode().equals(prior.getOpinionType())
+                    || (prior.getRoundNumber() != null && prior.getRoundNumber() > roundNumber)
+                    || prior.getEvidence() == null) continue;
+            JSONObject priorEvidence;
+            try { priorEvidence = JSON.parseObject(prior.getEvidence()); }
+            catch (RuntimeException invalid) { continue; }
+            if (priorEvidence == null || priorEvidence.getString("reviewedSearchStatus") == null) continue;
+            JSONObject priorPlan = priorEvidence.getJSONObject("searchPlan");
+            if (priorPlan == null || !symbol.equals(priorPlan.getString("eastmoneySymbol"))) continue;
+            List<ReviewedComparableNumber> previous = reviewedNumbersFromStoredResults(
+                    priorEvidence.getJSONArray("results"), priorEvidence.getString("reviewedSearchAsOf"));
+            for (ReviewedComparableNumber now : current) {
+                if (!reviewedSpeechStatesNumber(speech, now)) continue;
+                for (ReviewedComparableNumber then : previous) {
+                    if (!now.comparableTo(then) || !isConflictingFact(now.fact, then.fact)
+                            || !reviewedSpeechStatesNumber(prior.getContent(), then)) continue;
+                    String key = prior.getId() + "|" + now.key + "|" + now.fact.rawValue;
+                    if (!seen.add(key)) continue;
+                    boolean disclosed = reviewedSpeechDisclosesDifference(speech, then);
+                    JSONObject item = new JSONObject(true);
+                    item.put("previousOpinionId", prior.getId());
+                    item.put("metric", now.fact.label);
+                    item.put("period", now.period);
+                    item.put("previousValue", then.fact.rawValue);
+                    item.put("currentValue", now.fact.rawValue);
+                    item.put("disclosed", disclosed);
+                    conflicts.add(item);
+                    if (!disclosed) undisclosed++;
+                }
+            }
+        }
+        if (conflicts.isEmpty()) return null;
+        JSONObject result = new JSONObject(true);
+        result.put("status", undisclosed > 0 ? "UNDISCLOSED" : "DISCLOSED");
+        result.put("conflictCount", conflicts.size());
+        result.put("undisclosedCount", undisclosed);
+        result.put("conflicts", conflicts);
+        return result;
+    }
+
+    private List<ReviewedComparableNumber> reviewedNumbersFromLiveResults(
+            List<WebSearchService.SearchResult> results, String asOf) {
+        List<ReviewedComparableNumber> numbers = new ArrayList<>();
+        if (results == null) return numbers;
+        for (WebSearchService.SearchResult result : results) {
+            if (result == null || isProvisionalResult(result)) continue;
+            if ("STRUCTURED_DATA".equals(result.sourceType)) {
+                JSONObject payload = parseReviewedFactPayload(result.snippet);
+                for (NumericFact fact : extractFactsFromStructuredResult(result, null, result.source)) {
+                    addReviewedComparableNumber(numbers, fact, payload, asOf);
+                }
+            } else if ("CROSS_CHECKED_SEARCH".equals(result.sourceType)) {
+                for (NumericFact fact : extractReviewedDatedFacts(result.snippet, result.source)) {
+                    addReviewedComparableNumber(numbers, fact, null, asOf);
+                }
+            }
+        }
+        return numbers;
+    }
+
+    private List<ReviewedComparableNumber> reviewedNumbersFromStoredResults(JSONArray results, String asOf) {
+        List<ReviewedComparableNumber> numbers = new ArrayList<>();
+        if (results == null) return numbers;
+        for (int i = 0; i < results.size(); i++) {
+            JSONObject item = results.getJSONObject(i);
+            if (item == null) continue;
+            String sourceType = item.getString("sourceType");
+            if ("STRUCTURED_DATA".equals(sourceType)) {
+                JSONObject payload = parseReviewedFactPayload(item.getString("snippet"));
+                for (NumericFact fact : extractFactsFromFactJsonArray(
+                        item.getJSONArray("facts"), null, item.getString("source"))) {
+                    addReviewedComparableNumber(numbers, fact, payload, asOf);
+                }
+            } else if ("CROSS_CHECKED_SEARCH".equals(sourceType)) {
+                for (NumericFact fact : extractReviewedDatedFacts(item.getString("snippet"),
+                        item.getString("source"))) {
+                    addReviewedComparableNumber(numbers, fact, null, asOf);
+                }
+            }
+        }
+        return numbers;
+    }
+
+    private JSONObject parseReviewedFactPayload(String snippet) {
+        if (snippet == null || !snippet.trim().startsWith("{")) return null;
+        try { return JSON.parseObject(snippet); }
+        catch (RuntimeException invalid) { return null; }
+    }
+
+    private List<NumericFact> extractReviewedDatedFacts(String snippet, String source) {
+        List<NumericFact> facts = new ArrayList<>();
+        if (snippet == null) return facts;
+        Matcher matcher = REVIEWED_DATED_FACT_PATTERN.matcher(snippet);
+        while (matcher.find()) {
+            NumericFact fact = new NumericFact();
+            fact.label = matcher.group(1);
+            fact.labelKey = normalizeFactLabel(fact.label);
+            fact.value = Double.parseDouble(matcher.group(2));
+            fact.unit = matcher.group(3);
+            fact.rawValue = matcher.group(2) + fact.unit;
+            fact.source = source;
+            facts.add(fact);
+        }
+        return facts;
+    }
+
+    private void addReviewedComparableNumber(List<ReviewedComparableNumber> numbers, NumericFact fact,
+                                              JSONObject payload, String asOf) {
+        if (fact == null || fact.labelKey == null || !Double.isFinite(fact.value)) return;
+        String period;
+        String key;
+        if (fact.path != null && !fact.path.isBlank()) {
+            key = fact.path;
+            if (key.startsWith("financials[0].")) {
+                Object reportDate = readJsonPath(payload, "financials[0].reportDate");
+                period = reportDate == null ? null : String.valueOf(reportDate);
+                if (period == null || !period.matches("20\\d{2}-\\d{2}-\\d{2}")) return;
+            } else if (key.startsWith("quote.") || key.startsWith("stockDetail.")
+                    || key.startsWith("technicalIndicators.") || key.startsWith("valuation.")
+                    || key.startsWith("anchorFacts.")) {
+                period = asOf;
+            } else {
+                return;
+            }
+        } else {
+            if (YEAR_PATTERN.matcher(fact.label).find()) {
+                key = fact.labelKey;
+                period = key;
+            } else {
+                return;
+            }
+        }
+        if (period == null || period.isBlank()) return;
+        numbers.add(new ReviewedComparableNumber(fact, key, period));
+    }
+
+    private boolean reviewedSpeechStatesNumber(String speech, ReviewedComparableNumber number) {
+        if (speech == null || speech.isBlank() || number.fact.label == null) return false;
+        Pattern assertion = Pattern.compile(Pattern.quote(number.fact.label)
+                + "(?:\\s|[:：,，]|为|是|约|达|到|报|在){0,8}([-+]?\\d[\\d,]*(?:\\.\\d+)?)\\s*(%|亿元|万元|元|亿|万|倍|股|户|次)?",
+                Pattern.CASE_INSENSITIVE);
+        Matcher matcher = assertion.matcher(speech);
+        while (matcher.find()) {
+            Double stated = parseNumericValue(matcher.group(1));
+            String statedUnit = matcher.group(2) == null ? "" : matcher.group(2);
+            if (stated == null || !statedUnit.equals(number.fact.unit)
+                    || Math.abs(stated - number.fact.value) > Math.max(0.000001,
+                    Math.abs(number.fact.value) * 0.00001)) continue;
+            String prefix = speech.substring(Math.max(0, matcher.start() - 12), matcher.start());
+            if (!containsAny(prefix, "假设", "如果", "若", "预计", "预测", "目标", "情景", "可能")) return true;
+        }
+        return false;
+    }
+
+    private boolean reviewedSpeechDisclosesDifference(String speech, ReviewedComparableNumber previous) {
+        if (speech == null || previous.fact.label == null) return false;
+        int labelAt = speech.indexOf(previous.fact.label);
+        if (labelAt < 0) return false;
+        String vicinity = speech.substring(Math.max(0, labelAt - 35),
+                Math.min(speech.length(), labelAt + previous.fact.label.length() + 35));
+        return containsAny(vicinity, "前序", "前述", "此前", "其他议员", "上一位")
+                && containsAny(vicinity, "冲突", "不同", "分歧", "修正", "更正");
+    }
+
+    private static final class ReviewedComparableNumber {
+        private final NumericFact fact;
+        private final String key;
+        private final String period;
+
+        private ReviewedComparableNumber(NumericFact fact, String key, String period) {
+            this.fact = fact;
+            this.key = key;
+            this.period = period;
+        }
+
+        private boolean comparableTo(ReviewedComparableNumber other) {
+            return other != null && key.equals(other.key) && period.equals(other.period)
+                    && Objects.equals(fact.unit, other.fact.unit);
+        }
+    }
+
+    private void pauseForReviewedEvidence(Long meetingId, Long expectedRunEpoch, String reason) {
+        log.warn("Meeting {} paused before voting: {}", meetingId, reason);
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        if (room != null && (MeetingStatusEnum.IN_PROGRESS.getCode().equals(room.getStatus())
+                || MeetingStatusEnum.REOPENED.getCode().equals(room.getStatus()))) {
+            if (expectedRunEpoch == null) {
+                roomMapper.updateStatus(meetingId, MeetingStatusEnum.PAUSED.getCode());
+                workflowService.markReviewedEvidenceBlocked(meetingId, reason);
+            } else if (roomMapper.updateStatusIfCurrentAndEpoch(meetingId, room.getStatus(),
+                    expectedRunEpoch, MeetingStatusEnum.PAUSED.getCode()) == 1) {
+                workflowService.markReviewedEvidenceBlocked(meetingId, reason);
+            }
+        }
+    }
+
+    private static final class ReviewedRoundEvidence {
+        private final SearchPlan plan;
+        private final List<WebSearchService.SearchResult> results;
+        private final List<JSONObject> packets;
+        private final List<String> executedQueries;
+        private final JSONObject decision;
+        private final String status;
+        private final BigDecimal confidenceScore;
+        private final Integer meetingStatusAtStart;
+        private final Long targetQuestionId;
+        private final Long expectedRunEpoch;
+        private final int roundNumber;
+        private final String asOf;
+        private final Long contextOpinionId;
+        private final Long planId;
+        private final Long supersedesPlanId;
+
+        private ReviewedRoundEvidence(SearchPlan plan, List<WebSearchService.SearchResult> results,
+                                      List<JSONObject> packets, List<String> executedQueries,
+                                      JSONObject decision, String status, BigDecimal confidenceScore,
+                                      Integer meetingStatusAtStart,
+                                      Long targetQuestionId, Long expectedRunEpoch,
+                                      int roundNumber, String asOf, Long contextOpinionId,
+                                      Long planId, Long supersedesPlanId) {
+            this.plan = plan;
+            this.results = results;
+            this.packets = packets;
+            this.executedQueries = executedQueries;
+            this.decision = decision;
+            this.status = status;
+            this.confidenceScore = confidenceScore;
+            this.meetingStatusAtStart = meetingStatusAtStart;
+            this.targetQuestionId = targetQuestionId;
+            this.expectedRunEpoch = expectedRunEpoch;
+            this.roundNumber = roundNumber;
+            this.asOf = asOf;
+            this.contextOpinionId = contextOpinionId;
+            this.planId = planId;
+            this.supersedesPlanId = supersedesPlanId;
+        }
+    }
+
+    private ReviewedSearchDecision decideReviewedSearchNeeds(Long meetingId, AiMeetingMember member,
+                                                              int roundNumber) {
+        if (supportsBuiltInSearch(member.getModelType())) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_SEARCH_CANNOT_BE_DISABLED");
+        }
+        String prompt = orchestrator.buildReviewedEvidenceNeedsPrompt(meetingId, member.getId(), roundNumber);
+        String raw;
+        try {
+            raw = orchestrator.callModelStrict(member.getModelType(),
+                    systemPromptForDecision(member), prompt, 500);
+        } catch (RuntimeException providerFailure) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_PLAN_PROVIDER_ERROR",
+                    providerFailure);
+        }
+        return parseReviewedSearchDecision(meetingId, raw);
+    }
+
+    private ReviewedSearchDecision parseReviewedSearchDecision(Long meetingId, String raw) {
+        JSONObject answer;
+        try {
+            String value = raw == null ? "" : raw.trim();
+            if (value.startsWith("```")) {
+                value = value.replaceFirst("^\\x60{3}(?:json)?\\s*", "")
+                        .replaceFirst("\\s*\\x60{3}$", "").trim();
+            }
+            if (!value.startsWith("{") || !value.endsWith("}")) throw new IllegalArgumentException("not_json");
+            answer = JSON.parseObject(value);
+        } catch (Exception e) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_PLAN_INVALID", e);
+        }
+        if (answer == null || !(answer.get("need") instanceof Boolean)) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_PLAN_NEED_MISSING");
+        }
+        SearchPlan plan = defaultSearchPlan(meetingId);
+        StockRef declaredStock = parseStockRef(answer.getString("eastmoneySymbol"),
+                answer.getString("eastmoneyMarket"));
+        if (declaredStock != null) {
+            plan.eastmoneySymbol = declaredStock.symbol;
+            plan.eastmoneyMarket = declaredStock.market;
+        }
+        Object needsValue = answer.get("needs");
+        if (needsValue == null) needsValue = answer.get("items");
+        JSONArray rawNeeds = needsValue instanceof JSONArray ? (JSONArray) needsValue : null;
+        if (!answer.getBooleanValue("need")) {
+            if (rawNeeds != null && !rawNeeds.isEmpty()) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_PLAN_CONFLICT");
+            }
+            JSONObject normalized = new JSONObject(true);
+            normalized.put("need", false);
+            normalized.put("needs", new JSONArray());
+            return new ReviewedSearchDecision(plan, Collections.emptyList(), normalized);
+        }
+        if (rawNeeds == null || rawNeeds.isEmpty() || rawNeeds.size() > 3) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_NEEDS_INVALID");
+        }
+        List<ReviewedNeed> needs = new ArrayList<>();
+        Set<String> ids = new LinkedHashSet<>();
+        JSONArray normalizedNeeds = new JSONArray();
+        for (int i = 0; i < rawNeeds.size(); i++) {
+            JSONObject item = rawNeeds.getJSONObject(i);
+            if (item == null || !(item.get("webSearch") instanceof Boolean)) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_NEED_SCHEMA_INVALID");
+            }
+            String id = item.getString("id");
+            String question = item.getString("question");
+            if (id == null || !id.matches("[A-Za-z0-9_-]{1,64}") || !ids.add(id)
+                    || question == null || question.isBlank() || question.length() > 400) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_NEED_ID_OR_QUESTION_INVALID");
+            }
+            StockRef itemStock = parseStockRef(item.getString("eastmoneySymbol"),
+                    item.getString("eastmoneyMarket"));
+            if (itemStock == null) itemStock = parseStockRef(question, null);
+            if (itemStock == null) itemStock = resolveKnownAshareRef(question);
+            if (itemStock == null) itemStock = declaredStock;
+            JSONArray requested = item.getJSONArray("eastmoneyFields");
+            List<String> fields = new ArrayList<>();
+            List<String> unsupportedFields = new ArrayList<>();
+            List<String> granularFields = new ArrayList<>();
+            JSONArray restoredUnsupported = item.getJSONArray("unsupportedEastmoneyFields");
+            if (restoredUnsupported != null) {
+                for (Object unsupported : restoredUnsupported) {
+                    if (!(unsupported instanceof String) || ((String) unsupported).isBlank()
+                            || ((String) unsupported).length() > 64) {
+                        throw new MeetingReviewedEvidenceService.EvidenceRejected(
+                                "MEMBER_EASTMONEY_FIELD_INVALID");
+                    }
+                    addDistinctIgnoreCase(unsupportedFields, (String) unsupported);
+                }
+            }
+            if (requested != null) {
+                for (Object field : requested) {
+                    if (!(field instanceof String)) {
+                        throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_EASTMONEY_FIELD_INVALID");
+                    }
+                    String rawField = ((String) field).trim();
+                    if (!rawField.matches("[\\p{L}\\p{N}_-]{1,64}")) {
+                        throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_EASTMONEY_FIELD_INVALID");
+                    }
+                    String normalizedField = rawField.toLowerCase(Locale.ROOT)
+                            .replace("-", "").replace("_", "");
+                    String canonical = reviewedEastmoneyFieldAlias(normalizedField);
+                    if (canonical == null) {
+                        String unsupported = "fundflow".equals(normalizedField)
+                                && containsAny(question, "20个交易日", "近20日", "最近20日", "20日")
+                                ? "20日主力资金汇总"
+                                : containsAny(normalizedField, "margin", "financingbalance")
+                                && question.contains("融资余额") ? "融资余额" : rawField;
+                        addDistinctIgnoreCase(unsupportedFields, unsupported);
+                        continue;
+                    }
+                    if (!fields.contains(canonical)) fields.add(canonical);
+                    if (reviewedGranularFieldKey(normalizedField) != null
+                            && !granularFields.contains(normalizedField)) granularFields.add(normalizedField);
+                }
+            }
+            for (String unsupported : inferUnsupportedEastmoneyMetrics(question)) {
+                addDistinctIgnoreCase(unsupportedFields, unsupported);
+            }
+            if (itemStock != null) {
+                for (String inferred : inferReviewedEastmoneyFields(question)) {
+                    if (!fields.contains(inferred)) fields.add(inferred);
+                }
+                for (String inferred : inferReviewedGranularFields(question)) {
+                    if ("ma120".equals(inferred)) continue;
+                    String canonical = reviewedEastmoneyFieldAlias(inferred);
+                    if (canonical != null && !fields.contains(canonical)) fields.add(canonical);
+                    if (canonical != null && !granularFields.contains(inferred)) granularFields.add(inferred);
+                }
+            }
+            boolean webSearchRequired = item.getBooleanValue("webSearch");
+            if (fields.isEmpty() && unsupportedFields.isEmpty() && !webSearchRequired) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_NEED_NO_SOURCE");
+            }
+            List<String> sourceFocus = new ArrayList<>();
+            Object focusValue = item.get("sourceFocus");
+            JSONArray requestedDomains = focusValue instanceof JSONArray ? (JSONArray) focusValue : null;
+            if (requestedDomains != null) {
+                for (Object domain : requestedDomains) {
+                    if (!(domain instanceof String)) {
+                        throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_SOURCE_INVALID");
+                    }
+                    sourceFocus.add((String) domain);
+                }
+            } else if (focusValue instanceof String
+                    && ((String) focusValue).trim().matches("[a-zA-Z0-9.-]{3,120}")
+                    && ((String) focusValue).contains(".")) {
+                sourceFocus.add(((String) focusValue).trim());
+            }
+            sourceFocus = normalizeSourceFocus(sourceFocus);
+            if (sourceFocus.stream().anyMatch(domain -> !domain.matches("[a-z0-9.-]{3,120}")
+                            || !domain.contains(".") || domain.startsWith(".") || domain.endsWith("."))) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_SEARCH_SOURCE_LIMIT");
+            }
+            int sourceFocusCount = sourceFocus.size();
+            if (sourceFocusCount > 3) {
+                log.warn("Meeting {} reviewed need {} proposed {} source domains; retaining first three",
+                        meetingId, id, sourceFocusCount);
+                sourceFocus = new ArrayList<>(sourceFocus.subList(0, 3));
+            }
+            String webQuestion = item.getString("webQuestion");
+            if (webQuestion != null) webQuestion = webQuestion.trim();
+            if (webSearchRequired && itemStock != null && !fields.isEmpty() && unsupportedFields.isEmpty()
+                    && (webQuestion == null || webQuestion.isBlank())) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_WEB_GAP_MISSING");
+            }
+            if (webQuestion != null && webQuestion.length() > 400) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_WEB_GAP_INVALID");
+            }
+            List<String> requiredFieldPaths = reviewedRequiredFieldPaths(item, fields, question);
+            ReviewedNeed need = new ReviewedNeed(id, question.trim(), fields, granularFields, unsupportedFields,
+                    requiredFieldPaths, webSearchRequired, webQuestion, sourceFocus, itemStock);
+            needs.add(need);
+            plan.queries.add(need.question);
+            plan.sourceFocus.addAll(sourceFocus);
+            for (String field : fields) {
+                if (!plan.eastmoneyFields.contains(field)) plan.eastmoneyFields.add(field);
+            }
+            JSONObject normalizedNeed = new JSONObject(true);
+            normalizedNeed.put("id", id);
+            normalizedNeed.put("question", need.question);
+            normalizedNeed.put("eastmoneyFields", fields);
+            if (!requiredFieldPaths.isEmpty()) normalizedNeed.put("requiredFieldPaths", requiredFieldPaths);
+            if (!unsupportedFields.isEmpty()) normalizedNeed.put("unsupportedEastmoneyFields", unsupportedFields);
+            normalizedNeed.put("webSearch", webSearchRequired);
+            if (webQuestion != null && !webQuestion.isBlank()) normalizedNeed.put("webQuestion", webQuestion);
+            normalizedNeed.put("sourceFocus", sourceFocus);
+            if (sourceFocusCount > 3) {
+                normalizedNeed.put("sourceFocusTruncated", true);
+                normalizedNeed.put("sourceFocusDiscardedCount", sourceFocusCount - sourceFocus.size());
+            }
+            if (itemStock != null) {
+                normalizedNeed.put("eastmoneySymbol", itemStock.symbol);
+                normalizedNeed.put("eastmoneyMarket", itemStock.market);
+            }
+            normalizedNeeds.add(normalizedNeed);
+        }
+        List<StockRef> referencedStocks = needs.stream().map(need -> need.stockRef)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toList());
+        Set<String> distinctStocks = referencedStocks.stream()
+                .map(ref -> ref.symbol + "." + ref.market)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (distinctStocks.size() == 1) {
+            StockRef ref = referencedStocks.get(0);
+            plan.eastmoneySymbol = ref.symbol;
+            plan.eastmoneyMarket = ref.market;
+        } else if (distinctStocks.size() > 1) {
+            plan.eastmoneySymbol = null;
+            plan.eastmoneyMarket = null;
+        }
+        JSONObject normalized = new JSONObject(true);
+        normalized.put("need", true);
+        normalized.put("needs", normalizedNeeds);
+        if (plan.eastmoneySymbol != null) {
+            normalized.put("eastmoneySymbol", plan.eastmoneySymbol);
+            normalized.put("eastmoneyMarket", plan.eastmoneyMarket);
+        }
+        return new ReviewedSearchDecision(plan, needs, normalized);
+    }
+
+    /** A field group is a provider capability, not proof that a specific requested value exists. */
+    private List<String> reviewedRequiredFieldPaths(JSONObject item, List<String> fields, String question) {
+        List<String> paths = new ArrayList<>();
+        Object declared = item.get("requiredFieldPaths");
+        if (declared != null) {
+            if (!(declared instanceof JSONArray)) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_REQUIRED_FIELD_PATH_INVALID");
+            }
+            JSONArray declaredPaths = (JSONArray) declared;
+            // A persisted eight-entry plan may contain ten paths after expanding the MACD bundle.
+            boolean expandedMacd = declaredPaths.contains("technicalIndicators.macdDif")
+                    && declaredPaths.contains("technicalIndicators.macdDea")
+                    && declaredPaths.contains("technicalIndicators.macdHistogram");
+            if (declaredPaths.size() > 8 && (!expandedMacd || declaredPaths.size() > 10)) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_REQUIRED_FIELD_PATH_INVALID");
+            }
+            for (Object value : declaredPaths) {
+                if (!(value instanceof String) || !((String) value).matches(
+                        "[A-Za-z][A-Za-z0-9]{0,39}(?:\\[\\])?\\.[A-Za-z][A-Za-z0-9]{0,63}")) {
+                    throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_REQUIRED_FIELD_PATH_INVALID");
+                }
+                String path = (String) value;
+                String root = path.substring(0, path.indexOf('.')).replace("[]", "");
+                if (!fields.contains(root)) {
+                    throw new MeetingReviewedEvidenceService.EvidenceRejected("MEMBER_REQUIRED_FIELD_PATH_INVALID");
+                }
+                if ("technicalIndicators.macd".equalsIgnoreCase(path)) {
+                    addReviewedRequiredPath(paths, "technicalIndicators.macdDif");
+                    addReviewedRequiredPath(paths, "technicalIndicators.macdDea");
+                    addReviewedRequiredPath(paths, "technicalIndicators.macdHistogram");
+                } else if ("quote.turnoverRate".equals(path)) {
+                    addReviewedRequiredPath(paths, "quote.turnover");
+                } else {
+                    addReviewedRequiredPath(paths, path);
+                }
+            }
+        }
+        // Older persisted plans predate requiredFieldPaths. Preserve their concrete metric semantics.
+        String lower = question.toLowerCase(Locale.ROOT);
+        if (fields.contains("financials") && containsAny(lower, "经营现金流", "经营活动现金流", "经营活动产生的现金流")) {
+            String path = containsAny(lower, "营收比", "收入比", "占营业收入", "占营收")
+                    ? "financials[].cashToRevenuePct" : "financials[].netOperatingCashFlow";
+            if (!paths.contains(path)) paths.add(path);
+        }
+        if (fields.contains("quote") && containsAny(lower, "最新价", "收盘价", "股价", "价格")) {
+            addReviewedRequiredPath(paths, "quote.price");
+        }
+        if (fields.contains("financials")) {
+            if (containsAny(lower, "营收", "营业收入") && !containsAny(lower, "营收比", "收入比", "占营业收入", "占营收")) addReviewedRequiredPath(paths,
+                    "financials[]." + (lower.contains("同比") ? "revenueYoyPct" : "revenue"));
+            if (containsAny(lower, "扣非", "非经常性损益后")) {
+                addReviewedRequiredPath(paths, "financials[].netProfitExNonRecurring");
+            } else if (lower.contains("净利润") && !lower.contains("净利润率")) {
+                addReviewedRequiredPath(paths, "financials[]." + (lower.contains("同比") ? "netProfitYoyPct" : "netProfit"));
+            }
+            String[][] metrics = {{"毛利率", "grossMarginPct"}, {"净利率", "netMarginPct"},
+                    {"净利润率", "netMarginPct"}, {"每股收益", "eps"}, {"eps", "eps"},
+                    {"roe", "roePct"}, {"净资产收益率", "roePct"}, {"资产负债率", "debtRatioPct"},
+                    {"应收账款周转", "receivableTurnover"}, {"存货周转", "inventoryTurnover"}};
+            for (String[] metric : metrics) if (lower.contains(metric[0])) {
+                addReviewedRequiredPath(paths, "financials[]." + metric[1]);
+            }
+        }
+        if (fields.contains("valuation") && !lower.contains("分位")) {
+            if (containsAny(lower, "pe", "市盈率")) addReviewedRequiredPath(paths, "valuation.peTtm");
+            if (containsAny(lower, "pb", "市净率")) addReviewedRequiredPath(paths, "valuation.pbMrq");
+        }
+        if (fields.contains("valuation") && lower.contains("分位")) {
+            Matcher years = Pattern.compile("(?<![0-9])([1-9]|10|一|二|两|三|四|五|六|七|八|九|十)年").matcher(lower);
+            if (years.find()) {
+                String number = years.group(1);
+                int horizon = Character.isDigit(number.charAt(0)) ? Integer.parseInt(number)
+                        : "两".equals(number) ? 2 : "一二三四五六七八九十".indexOf(number) + 1;
+                String metric = containsAny(lower, "pb", "市净率") ? "pb"
+                        : containsAny(lower, "pe", "市盈率") ? "pe" : null;
+                if (metric != null) {
+                    String path = "valuation." + metric + "Percentile" + horizon + "y";
+                    if (!paths.contains(path)) paths.add(path);
+                }
+            }
+        }
+        return paths;
+    }
+
+    private void addReviewedRequiredPath(List<String> paths, String path) {
+        if (!paths.contains(path)) paths.add(path);
+    }
+
+    private boolean reviewedRequiredPathAvailable(Map<String, Object> raw, String path, ReviewedNeed need) {
+        if (raw == null) return false;
+        int dot = path.indexOf('.');
+        String section = path.substring(0, dot).replace("[]", "");
+        String field = path.substring(dot + 1);
+        Object content = raw.get(section);
+        if (path.substring(0, dot).endsWith("[]")) {
+            if (!(content instanceof List) || ((List<?>) content).isEmpty()) return false;
+            List<?> rows = (List<?>) content;
+            if ("financials".equals(section)) {
+                String period = reviewedRequestedFinancialPeriod(need.question);
+                if (period == null) {
+                    // An old report's populated value cannot cover a missing value in the latest report.
+                    return rows.get(0) instanceof Map && reviewedConcreteValue(((Map<?, ?>) rows.get(0)).get(field));
+                }
+                return rows.stream().anyMatch(row -> row instanceof Map
+                        && String.valueOf(((Map<?, ?>) row).get("reportDate")).startsWith(period)
+                        && reviewedConcreteValue(((Map<?, ?>) row).get(field)));
+            }
+            return rows.stream().anyMatch(row -> row instanceof Map
+                    && reviewedConcreteValue(((Map<?, ?>) row).get(field)));
+        }
+        return content instanceof Map && reviewedConcreteValue(((Map<?, ?>) content).get(field));
+    }
+
+    private boolean reviewedConcreteValue(Object value) {
+        return value instanceof Number && Double.isFinite(((Number) value).doubleValue())
+                || value instanceof String && !((String) value).isBlank()
+                    && !Arrays.asList("null", "n/a", "unknown", "--", "-", "未提供", "暂无")
+                        .contains(((String) value).trim().toLowerCase(Locale.ROOT));
+    }
+
+    private String reviewedRequestedFinancialPeriod(String question) {
+        Matcher explicitPeriod = Pattern.compile("(20\\d{2})年?(上半年|半年度报告|半年报|中报|第一季度|一季报|一季度|第二季度|二季度|第三季度|三季报|三季度|第四季度|四季度|年度报告|年报|全年)").matcher(question);
+        if (explicitPeriod.find()) {
+            String year = explicitPeriod.group(1);
+            String kind = explicitPeriod.group(2);
+            if (containsAny(kind, "上半年", "半年度报告", "半年报", "中报", "二季度", "第二季度")) return year + "-06-30";
+            if (containsAny(kind, "一季度", "第一季度", "一季报")) return year + "-03-31";
+            if (containsAny(kind, "三季度", "第三季度", "三季报")) return year + "-09-30";
+            return year + "-12-31";
+        }
+        Matcher exactDate = Pattern.compile("(20\\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12][0-9]|3[01])").matcher(question);
+        if (exactDate.find()) {
+            try {
+                return LocalDate.of(Integer.parseInt(exactDate.group(1)), Integer.parseInt(exactDate.group(2)),
+                        Integer.parseInt(exactDate.group(3))).toString();
+            } catch (RuntimeException invalidDate) { return "INVALID_REPORT_DATE"; }
+        }
+        Matcher year = YEAR_PATTERN.matcher(question);
+        return year.find() ? year.group(1) : null;
+    }
+
+    private boolean reviewedRequiresSingleQuarterValue(String question) {
+        if (containsAny(question, "单季", "单季度")) return true;
+        if (containsAny(question, "累计", "年初至", "期末", "季度末")) return false;
+        return containsAny(question, "第二季度", "二季度", "第三季度", "三季度", "第四季度", "四季度")
+                && containsAny(question, "净利润", "营收", "营业收入", "现金流", "每股收益", "EPS", "eps", "毛利率", "净利率");
+    }
+
+    private boolean reviewedRequiresClosedObservation(String question) {
+        return containsAny(question, "已收盘", "收盘价", "已完成", "已结束", "完整交易日", "完整日K");
+    }
+
+    private List<String> inferReviewedEastmoneyFields(String question) {
+        String value = question == null ? "" : question.toLowerCase(Locale.ROOT);
+        List<String> fields = new ArrayList<>();
+        if (containsAny(value, "最新价", "收盘价", "股价")) fields.add("quote");
+        if (containsAny(value, "换手率", "成交量")) fields.add("dailyKline");
+        if (containsAny(value, "量比")) fields.add("stockDetail");
+        if (containsAny(value, "日k", "k线")) fields.add("dailyKline");
+        if (containsAny(value, "均线", "macd", "rsi", "技术指标")) {
+            if (!fields.contains("dailyKline")) fields.add("dailyKline");
+            fields.add("technicalIndicators");
+        }
+        if (containsAny(value, "市盈率", "市净率", "估值", "pe", "pb")) fields.add("valuation");
+        if (containsAny(value, "财报", "营收", "净利润", "毛利率")) fields.add("financials");
+        if (containsAny(value, "公司公告", "交易所公告")) fields.add("announcements");
+        if (containsAny(value, "股东户数")) fields.add("shareholderCounts");
+        return fields;
+    }
+
+    private List<String> inferReviewedGranularFields(String question) {
+        String value = question == null ? "" : question.toLowerCase(Locale.ROOT);
+        List<String> fields = new ArrayList<>();
+        Matcher ma = REVIEWED_MA_PATTERN.matcher(value);
+        while (ma.find()) {
+            String field = "ma" + ma.group(1);
+            if (!fields.contains(field)) fields.add(field);
+        }
+        for (String field : Arrays.asList("macd", "rsi", "boll", "atr", "obv")) {
+            if (value.contains(field)) fields.add(field);
+        }
+        if (value.contains("布林") && !fields.contains("boll")) fields.add("boll");
+        if (value.contains("成交量")) fields.add("volume");
+        if (value.contains("换手率")) fields.add("turnover");
+        if (value.contains("量比")) fields.add("volumeratio");
+        return fields;
+    }
+
+    private String reviewedEastmoneyFieldAlias(String normalized) {
+        if (containsAny(normalized, "ma120", "margin", "fundflow", "financingbalance")
+                && !"intradayfundflow".equals(normalized)) return null;
+        if ("volumeratio".equals(normalized)) return "stockDetail";
+        if (containsAny(normalized, "volume", "turnover") && !"volumeratio".equals(normalized)) {
+            return "dailyKline";
+        }
+        if (containsAny(normalized, "ma5", "ma10", "ma20", "ma60", "macd", "rsi", "boll", "atr", "obv")) {
+            return "technicalIndicators";
+        }
+        return canonicalEastmoneyField(normalized);
+    }
+
+    private List<String> inferUnsupportedEastmoneyMetrics(String question) {
+        String value = question == null ? "" : question.toLowerCase(Locale.ROOT);
+        List<String> unsupported = new ArrayList<>();
+        if (value.contains("ma120")) unsupported.add("MA120");
+        if (value.contains("融资余额")) unsupported.add("融资余额");
+        if (value.contains("主力资金") && containsAny(value, "20个交易日", "近20日", "最近20日", "20日")) {
+            unsupported.add("20日主力资金汇总");
+        }
+        return unsupported;
+    }
+
+    private void addDistinctIgnoreCase(List<String> values, String candidate) {
+        if (values.stream().noneMatch(value -> value.equalsIgnoreCase(candidate))) values.add(candidate);
+    }
+
+    private String reviewedGranularFieldKey(String normalized) {
+        switch (normalized) {
+            case "ma5": case "ma10": case "ma20": case "ma60":
+            case "macd": case "rsi": case "boll": case "atr": case "obv":
+            case "volumeratio": case "volume": case "turnover":
+                return normalized;
+            default:
+                return null;
+        }
+    }
+
+    private static final class ReviewedSearchDecision {
+        private final SearchPlan plan;
+        private final List<ReviewedNeed> needs;
+        private final JSONObject raw;
+
+        private ReviewedSearchDecision(SearchPlan plan, List<ReviewedNeed> needs, JSONObject raw) {
+            this.plan = plan;
+            this.needs = needs;
+            this.raw = raw;
+        }
+    }
+
+    private static final class ReviewedNeed {
+        private final String id;
+        private final String question;
+        private final List<String> eastmoneyFields;
+        private final List<String> granularFields;
+        private final List<String> unsupportedFields;
+        private final List<String> requiredFieldPaths;
+        private final boolean webSearch;
+        private final String webQuestion;
+        private final List<String> sourceFocus;
+        private final StockRef stockRef;
+
+        private ReviewedNeed(String id, String question, List<String> eastmoneyFields,
+                             List<String> granularFields,
+                             List<String> unsupportedFields, List<String> requiredFieldPaths,
+                             boolean webSearch, String webQuestion, List<String> sourceFocus,
+                             StockRef stockRef) {
+            this.id = id;
+            this.question = question;
+            this.eastmoneyFields = eastmoneyFields;
+            this.granularFields = granularFields;
+            this.unsupportedFields = unsupportedFields;
+            this.requiredFieldPaths = requiredFieldPaths;
+            this.webSearch = webSearch;
+            this.webQuestion = webQuestion;
+            this.sourceFocus = sourceFocus;
+            this.stockRef = stockRef;
+        }
+    }
+
+    private ReviewedEastmoneyEvidence fetchReviewedEastmoneyEvidence(Long meetingId, SearchPlan plan,
+                                                                     ReviewedNeed need,
+                                                                     String asOf,
+                                                                     Map<String, EastmoneyMarketDataService.MarketDataBundle> cache) {
+        List<String> requestedFields = need.eastmoneyFields;
+        if (requestedFields.isEmpty()) return new ReviewedEastmoneyEvidence(null,
+                Collections.emptyList(), Collections.emptyList(), Collections.emptyList());
+        StockRef ref = need.stockRef;
+        if (ref == null) return new ReviewedEastmoneyEvidence(null, Collections.emptyList(),
+                Collections.emptyList(), requestedFields);
+        String key = ref.symbol + "." + ref.market;
+        String cacheKey = asOf + ":" + key;
+        EastmoneyMarketDataService.MarketDataBundle bundle = cache.get(cacheKey);
+        if (bundle == null) {
+            try {
+                bundle = eastmoneyMarketDataService.buildBundle(ref.symbol, ref.market, "DAY");
+                cache.put(cacheKey, bundle);
+            } catch (Exception e) {
+                log.warn("Reviewed Eastmoney lookup failed meetingId={} stock={} error={}",
+                        meetingId, key, e.getMessage());
+                return new ReviewedEastmoneyEvidence(ref, Collections.emptyList(),
+                        Collections.emptyList(), requestedFields);
+            }
+        }
+        Map<String, Object> raw = bundle == null ? null : bundle.getPayload();
+        if (!reviewedBundleMatchesStock(raw, ref)) {
+            log.warn("Reviewed Eastmoney bundle identity mismatch meetingId={} expected={}", meetingId, key);
+            return new ReviewedEastmoneyEvidence(ref, Collections.emptyList(),
+                    Collections.emptyList(), requestedFields);
+        }
+        List<String> available = new ArrayList<>();
+        List<String> missing = new ArrayList<>();
+        for (String field : requestedFields) {
+            (reviewedEastmoneyFieldAvailable(raw, field)
+                    && reviewedFieldCoversNeed(raw, field, need) ? available : missing).add(field);
+        }
+        if (available.isEmpty()) {
+            missing.addAll(need.granularFields);
+            missing.addAll(need.requiredFieldPaths);
+            return new ReviewedEastmoneyEvidence(ref, Collections.emptyList(), available, missing);
+        }
+        Map<String, Object> compact = compactEastmoneyPayload(raw, available, need);
+        Map<String, Object> promptPayload = new LinkedHashMap<>(compact);
+        // Provider health is checked above and retained in the trace. Keep the prompt budget for the facts.
+        promptPayload.remove("dataQuality");
+        String snippet = serializeStructuredSearchSnippet(promptPayload, 14000);
+        JSONObject delivered = JSON.parseObject(snippet);
+        List<String> deliveredFields = new ArrayList<>();
+        for (String field : available) {
+            if (delivered.get(field) != null && reviewedFieldCoversNeed(delivered, field, need)) {
+                deliveredFields.add(field);
+            } else {
+                missing.add(field);
+            }
+        }
+        for (String granular : need.granularFields) {
+            if (!reviewedGranularFieldAvailable(raw, granular)
+                    || !reviewedProjectedGranularFieldAvailable(delivered, granular)) missing.add(granular);
+        }
+        for (String requiredPath : need.requiredFieldPaths) {
+            if (!reviewedRequiredPathAvailable(raw, requiredPath, need)
+                    || !reviewedRequiredPathAvailable(delivered, requiredPath, need)) {
+                missing.add(requiredPath);
+            }
+        }
+        if (deliveredFields.isEmpty()) return new ReviewedEastmoneyEvidence(ref, Collections.emptyList(),
+                deliveredFields, missing);
+        WebSearchService.SearchResult result = new WebSearchService.SearchResult();
+        result.source = "东方财富优先结构化数据 " + key + " " + String.join(",", deliveredFields);
+        result.url = "https://quote.eastmoney.com/" + ref.market + ref.symbol + ".html";
+        result.snippet = snippet;
+        result.withTrace("eastmoney", "STRUCTURED_DATA",
+                "EASTMONEY:" + key + ":" + String.join(",", deliveredFields), JSON.toJSONString(compact));
+        return new ReviewedEastmoneyEvidence(ref, Collections.singletonList(result), deliveredFields, missing);
+    }
+
+    private boolean reviewedEastmoneyFieldAvailable(Map<String, Object> raw, String field) {
+        if (raw == null) return false;
+        Object value = raw.get(field);
+        if (value == null) return false;
+        if (value instanceof List && ((List<?>) value).isEmpty()) return false;
+        if (value instanceof Map && ((Map<?, ?>) value).isEmpty()) return false;
+        if ("dailyKline".equals(field) || "technicalIndicators".equals(field)) {
+            Object quality = raw.get("sourceTradeDateQuality");
+            if (quality instanceof Map && Boolean.FALSE.equals(((Map<?, ?>) quality).get("consistent"))) return false;
+        }
+        if (!reviewedSourceStatusOk(raw, field)) return false;
+        if ("quote".equals(field)) {
+            if (!(value instanceof Map)) return false;
+            Object price = ((Map<?, ?>) value).get("price");
+            Object source = ((Map<?, ?>) value).get("source");
+            if (source != null && !String.valueOf(source).toLowerCase(Locale.ROOT).contains("eastmoney")) return false;
+            return price instanceof Number && ((Number) price).doubleValue() > 0
+                    && reviewedRecentTradeDate(raw, "quoteTradeDate", "quote", "timestamp");
+        }
+        if ("dailyKline".equals(field)) {
+            return value instanceof List && ((List<?>) value).size() >= 30
+                    && reviewedRecentTradeDate(raw, "dailyKlineTradeDate", "dailyKline", "date");
+        }
+        if ("technicalIndicators".equals(field)) {
+            return reviewedEastmoneyFieldAvailable(raw, "dailyKline")
+                    && value instanceof Map && ((Map<?, ?>) value).get("ma20") != null;
+        }
+        return true;
+    }
+
+    private boolean reviewedBundleMatchesStock(Map<String, Object> raw, StockRef ref) {
+        if (raw == null || ref == null) return false;
+        return ref.symbol.equals(String.valueOf(raw.get("symbol")))
+                && ref.market.equalsIgnoreCase(String.valueOf(raw.get("market")));
+    }
+
+    private boolean reviewedFieldCoversNeed(Map<String, Object> raw, String field, ReviewedNeed need) {
+        if (("dailyKline".equals(field) || "technicalIndicators".equals(field) || "quote".equals(field))
+                && reviewedRequiresClosedObservation(need.question)
+                && !reviewedObservationIsClosed(raw, field)) return false;
+        if (Arrays.asList("financials", "valuation", "quote", "stockDetail", "technicalIndicators").contains(field)) {
+            boolean mappedRequirement = need.requiredFieldPaths.stream().anyMatch(path ->
+                    path.startsWith(field + ".") || path.startsWith(field + "[]."))
+                    || need.granularFields.stream().anyMatch(metric -> field.equals(reviewedEastmoneyFieldAlias(metric)));
+            // A broad group cannot prove an unrecognized concrete need, including old plans without paths.
+            if (!mappedRequirement) return false;
+        }
+        if ("dailyKline".equals(field)) {
+            Matcher days = REVIEWED_TRADING_DAYS_PATTERN.matcher(need.question);
+            if (days.find()) {
+                Object bars = raw.get("dailyKline");
+                return bars instanceof List && ((List<?>) bars).size() >= Integer.parseInt(days.group(1));
+            }
+        }
+        if ("financials".equals(field)) {
+            if (reviewedRequiresSingleQuarterValue(need.question)) return false;
+            String period = reviewedRequestedFinancialPeriod(need.question);
+            if (period != null) {
+                Object rows = raw.get("financials");
+                return rows instanceof List && ((List<?>) rows).stream().anyMatch(row -> row instanceof Map
+                        && String.valueOf(((Map<?, ?>) row).get("reportDate")).startsWith(period));
+            }
+        }
+        if ("announcements".equals(field) || "latestNews".equals(field)) {
+            // These adapters provide an index (news summaries are truncated), not event-level evidence.
+            String kind = "announcements".equals(field) ? "公告" : "新闻";
+            boolean indexOnly = containsAny(need.question, "最新" + kind + "标题", "最近" + kind + "标题",
+                    "最新" + kind + "列表", "最近" + kind + "列表");
+            if (!indexOnly) return reviewedExactIndexEntryCoversNeed(raw, field, need.question);
+            return !containsAny(need.question, "内容", "风险", "影响", "金额", "产能", "原因", "详情");
+        }
+        return true;
+    }
+
+    private boolean reviewedExactIndexEntryCoversNeed(Map<String, Object> raw, String field, String question) {
+        // An explicitly named document's existence/publication date is provable from the index.
+        Matcher title = Pattern.compile("《([^《》]{2,160})》").matcher(question);
+        if (!title.find() || !containsAny(question, "发布日期", "发布时间", "公告日期", "是否发布")) return false;
+        String request = question.substring(0, title.start()) + question.substring(title.end());
+        if (containsAny(request, "内容", "风险", "影响", "金额", "原因", "详情", "披露了")) return false;
+        Object value = raw.get(field);
+        if (!(value instanceof List)) return false;
+        String expected = title.group(1);
+        String dateField = "announcements".equals(field) ? "noticeDate" : "showTime";
+        return ((List<?>) value).stream().anyMatch(row -> row instanceof Map
+                && expected.equals(String.valueOf(((Map<?, ?>) row).get("title")))
+                && reviewedConcreteValue(((Map<?, ?>) row).get(dateField)));
+    }
+
+    private boolean reviewedObservationIsClosed(Map<String, Object> raw, String field) {
+        try {
+            Object asOf = raw.get("asOf");
+            if (asOf == null) return false;
+            java.time.ZonedDateTime captured = java.time.ZonedDateTime.parse(String.valueOf(asOf))
+                    .withZoneSameInstant(REVIEWED_MARKET_ZONE);
+            LocalDate observationDate;
+            if ("quote".equals(field)) {
+                Object quote = raw.get("quote");
+                if (!(quote instanceof Map) || !(((Map<?, ?>) quote).get("timestamp") instanceof Number)) return false;
+                java.time.ZonedDateTime quotedAt = Instant.ofEpochSecond(
+                        ((Number) ((Map<?, ?>) quote).get("timestamp")).longValue()).atZone(REVIEWED_MARKET_ZONE);
+                // Reading a stale intraday quote after close does not turn it into a closing quote.
+                if (quotedAt.toLocalTime().isBefore(java.time.LocalTime.of(15, 0))) return false;
+                observationDate = quotedAt.toLocalDate();
+            } else {
+                Object bars = raw.get("dailyKline");
+                if (!(bars instanceof List) || ((List<?>) bars).isEmpty()) return false;
+                Object latest = ((List<?>) bars).get(((List<?>) bars).size() - 1);
+                if (!(latest instanceof Map)) return false;
+                observationDate = LocalDate.parse(String.valueOf(((Map<?, ?>) latest).get("date")).substring(0, 10));
+            }
+            return observationDate.isBefore(captured.toLocalDate())
+                    || observationDate.equals(captured.toLocalDate())
+                        && !captured.toLocalTime().isBefore(java.time.LocalTime.of(15, 5));
+        } catch (RuntimeException invalidTimestamp) {
+            return false;
+        }
+    }
+
+    private boolean reviewedSourceStatusOk(Map<String, Object> raw, String field) {
+        String source = "technicalIndicators".equals(field) || "anchorFacts".equals(field)
+                ? "dailyKline" : field;
+        Object quality = raw.get("dataQuality");
+        if (!(quality instanceof Map)) return false;
+        Object sources = ((Map<?, ?>) quality).get("sourceStatus");
+        if (!(sources instanceof Map)) return false;
+        Object status = ((Map<?, ?>) sources).get(source);
+        if (!(status instanceof Map) || !Boolean.TRUE.equals(((Map<?, ?>) status).get("ok"))) return false;
+        Object provider = ((Map<?, ?>) status).get("selectedProvider");
+        return provider == null || "eastmoney".equalsIgnoreCase(String.valueOf(provider));
+    }
+
+    private boolean reviewedRecentTradeDate(Map<String, Object> raw, String qualityKey,
+                                            String section, String valueKey) {
+        LocalDate date = null;
+        Object quality = raw.get("sourceTradeDateQuality");
+        if (quality instanceof Map) {
+            Object value = ((Map<?, ?>) quality).get(qualityKey);
+            if (value != null) {
+                try { date = LocalDate.parse(String.valueOf(value).substring(0, 10)); }
+                catch (Exception ignored) { }
+            }
+        }
+        if (date == null) {
+            Object content = raw.get(section);
+            if ("quote".equals(section) && content instanceof Map) {
+                Object timestamp = ((Map<?, ?>) content).get(valueKey);
+                if (timestamp instanceof Number) {
+                    date = Instant.ofEpochSecond(((Number) timestamp).longValue())
+                            .atZone(REVIEWED_MARKET_ZONE).toLocalDate();
+                }
+            } else if (content instanceof List && !((List<?>) content).isEmpty()) {
+                Object latest = ((List<?>) content).get(((List<?>) content).size() - 1);
+                if (latest instanceof Map) {
+                    Object value = ((Map<?, ?>) latest).get(valueKey);
+                    if (value != null) {
+                        try { date = LocalDate.parse(String.valueOf(value).substring(0, 10)); }
+                        catch (Exception ignored) { }
+                    }
+                }
+            }
+        }
+        LocalDate today = LocalDate.now(REVIEWED_MARKET_ZONE);
+        return date != null && !date.isAfter(today)
+                && ChronoUnit.DAYS.between(date, today) <= 14;
+    }
+
+    private boolean reviewedGranularFieldAvailable(Map<String, Object> raw, String field) {
+        if (raw == null) return false;
+        if ("volumeratio".equals(field)) return nestedNumberPresent(raw, "stockDetail", "volumeRatio");
+        if ("volume".equals(field) || "turnover".equals(field)) {
+            Object bars = raw.get("dailyKline");
+            if (!reviewedEastmoneyFieldAvailable(raw, "dailyKline") || !(bars instanceof List)) return false;
+            Object last = ((List<?>) bars).get(((List<?>) bars).size() - 1);
+            return last instanceof Map && ((Map<?, ?>) last).get("volume".equals(field) ? "volume" : "turnoverPct") instanceof Number;
+        }
+        if (!reviewedEastmoneyFieldAvailable(raw, "technicalIndicators")) return false;
+        switch (field) {
+            case "macd":
+                return nestedNumberPresent(raw, "technicalIndicators", "macdDif")
+                        && nestedNumberPresent(raw, "technicalIndicators", "macdDea")
+                        && nestedNumberPresent(raw, "technicalIndicators", "macdHistogram");
+            case "rsi": return nestedNumberPresent(raw, "technicalIndicators", "rsi14");
+            case "boll":
+                return nestedNumberPresent(raw, "technicalIndicators", "bollMiddle")
+                        && nestedNumberPresent(raw, "technicalIndicators", "bollUpper")
+                        && nestedNumberPresent(raw, "technicalIndicators", "bollLower");
+            case "atr": return nestedNumberPresent(raw, "technicalIndicators", "atr14");
+            default: return nestedNumberPresent(raw, "technicalIndicators", field);
+        }
+    }
+
+    private boolean reviewedProjectedGranularFieldAvailable(Map<String, Object> delivered, String field) {
+        if (delivered == null) return false;
+        if ("volumeratio".equals(field)) return nestedNumberPresent(delivered, "stockDetail", "volumeRatio");
+        if ("volume".equals(field) || "turnover".equals(field)) {
+            Object bars = delivered.get("dailyKline");
+            if (!(bars instanceof List) || ((List<?>) bars).isEmpty()) return false;
+            Object last = ((List<?>) bars).get(((List<?>) bars).size() - 1);
+            return last instanceof Map && ((Map<?, ?>) last).get(
+                    "volume".equals(field) ? "volume" : "turnoverPct") instanceof Number;
+        }
+        switch (field) {
+            case "macd":
+                return nestedNumberPresent(delivered, "technicalIndicators", "macdDif")
+                        && nestedNumberPresent(delivered, "technicalIndicators", "macdDea")
+                        && nestedNumberPresent(delivered, "technicalIndicators", "macdHistogram");
+            case "rsi": return nestedNumberPresent(delivered, "technicalIndicators", "rsi14");
+            case "boll":
+                return nestedNumberPresent(delivered, "technicalIndicators", "bollMiddle")
+                        && nestedNumberPresent(delivered, "technicalIndicators", "bollUpper")
+                        && nestedNumberPresent(delivered, "technicalIndicators", "bollLower");
+            case "atr": return nestedNumberPresent(delivered, "technicalIndicators", "atr14");
+            default: return nestedNumberPresent(delivered, "technicalIndicators", field);
+        }
+    }
+
+    private boolean nestedNumberPresent(Map<String, Object> raw, String section, String field) {
+        Object value = raw.get(section);
+        return value instanceof Map && ((Map<?, ?>) value).get(field) instanceof Number;
+    }
+
+    private String buildReviewedGapQuestion(String title, ReviewedNeed need,
+                                            ReviewedEastmoneyEvidence eastmoney, String focus) {
+        StringBuilder question = new StringBuilder("会议主题：").append(title)
+                .append("。议员资料需求：").append(need.question)
+                .append("。本次唯一待核验缺口：").append(focus).append("。");
+        List<String> sectionRequirements = need.requiredFieldPaths.stream()
+                .filter(path -> path.startsWith(focus + ".") || path.startsWith(focus + "[]."))
+                .collect(Collectors.toList());
+        if (!sectionRequirements.isEmpty()) {
+            question.append("该缺口必须包含字段：").append(String.join("、", sectionRequirements)).append("。");
+        }
+        if (eastmoney.ref != null) {
+            question.append("标的：").append(eastmoney.ref.symbol).append(".")
+                    .append(eastmoney.ref.market).append("。");
+        }
+        // Do not include live Eastmoney availability here: the exact question is the
+        // persisted n8n identity and must remain stable when a paused meeting resumes.
+        question.append("只对本次唯一缺口返回可核验事实；其他字段不算本次审核通过。");
+        if (!need.sourceFocus.isEmpty()) {
+            question.append("优先搜索站点：")
+                    .append(need.sourceFocus.stream().map(domain -> "site:" + domain)
+                            .collect(Collectors.joining(" "))).append("。");
+        }
+        return question.append("只核验本项缺口，给出对应时间、单位和来源；不要延伸到其他议题。").toString();
+    }
+
+    private static final class ReviewedEastmoneyEvidence {
+        private final StockRef ref;
+        private final List<WebSearchService.SearchResult> results;
+        private final List<String> availableFields;
+        private final List<String> missingFields;
+
+        private ReviewedEastmoneyEvidence(StockRef ref, List<WebSearchService.SearchResult> results,
+                                          List<String> availableFields, List<String> missingFields) {
+            this.ref = ref;
+            this.results = results;
+            this.availableFields = availableFields;
+            this.missingFields = missingFields;
+        }
     }
 
     /**
@@ -254,7 +1907,10 @@ public class MeetingDebateService {
         String context = orchestrator.buildDebateContext(meetingId, member.getId(), roundNumber, searchContext);
         String generationModelType = resolveGenerationModelType(member.getModelType(), preferWebSearchProvider, searchResults);
         ChatResult chatResult = orchestrator.callModelEx(generationModelType, systemPrompt, context);
-        if ((chatResult == null || chatResult.content == null || chatResult.content.isBlank()) && !searchResults.isEmpty()) {
+        boolean automaticRetryBlocked = chatResult != null && chatResult.blocksAutomaticRetry();
+        if ((chatResult == null || chatResult.content == null || chatResult.content.isBlank())
+                && !automaticRetryBlocked
+                && !searchResults.isEmpty()) {
             ChatResult compactRetry = retryWithCompactSearchContext(
                     meetingId,
                     member,
@@ -269,6 +1925,7 @@ public class MeetingDebateService {
             );
             if (compactRetry != null && compactRetry.content != null && !compactRetry.content.isBlank()) {
                 chatResult = compactRetry;
+                automaticRetryBlocked = compactRetry.blocksAutomaticRetry();
             }
         }
         if (shouldRetryForUnresolvedConflict(chatResult, conflictValidation)) {
@@ -281,8 +1938,10 @@ public class MeetingDebateService {
                     chatResult,
                     conflictValidation
             );
-            if (conflictRetry != null && conflictRetry.content != null && !conflictRetry.content.isBlank()) {
+            if (conflictRetry != null && (conflictRetry.blocksAutomaticRetry()
+                    || (conflictRetry.content != null && !conflictRetry.content.isBlank()))) {
                 chatResult = conflictRetry;
+                automaticRetryBlocked = conflictRetry.blocksAutomaticRetry();
             }
         }
         if ((chatResult == null || chatResult.content == null || chatResult.content.isBlank()) && !searchResults.isEmpty()) {
@@ -343,22 +2002,26 @@ public class MeetingDebateService {
                             );
                             context = fallbackContext;
                             generationModelType = fallbackModelType;
+                        } else if (rerun != null && rerun.blocksAutomaticRetry()) {
+                            automaticRetryBlocked = true;
                         }
                     }
                 }
             }
         }
 
-        chatResult = enforceSearchEvidenceGrounding(
-                member,
-                systemPrompt,
-                context,
-                generationModelType,
-                searchQueries,
-                searchResults,
-                searchPlan,
-                chatResult
-        );
+        if (!automaticRetryBlocked) {
+            chatResult = enforceSearchEvidenceGrounding(
+                    member,
+                    systemPrompt,
+                    context,
+                    generationModelType,
+                    searchQueries,
+                    searchResults,
+                    searchPlan,
+                    chatResult
+            );
+        }
 
         // 合并外部搜索 + tool_call 搜索证据；strict fallback 会把同一批证据随 ChatResult 带回，必须去重后再入库。
         searchQueries = mergeSearchQueries(searchQueries, chatResult.searchQueries);
@@ -964,6 +2627,7 @@ public class MeetingDebateService {
             if (summary != null && !summary.isBlank()) {
                 return "结构化行情摘要：" + summary;
             }
+            return "结构化行情摘要：本轮数据无法完整解析，请查看原始来源链接复核。";
         }
         String snippet = result.snippet != null ? result.snippet.trim() : "";
         if (snippet.isBlank()) {
@@ -1019,7 +2683,7 @@ public class MeetingDebateService {
         if (value == null) {
             return;
         }
-        parts.add(label + " " + formatFactNumber(value) + firstNonBlank(unit, ""));
+        parts.add(label + " " + formatFactNumber(value) + (unit != null ? unit : ""));
     }
 
     private ChatResult retryWithCompactSearchContext(Long meetingId,
@@ -1082,6 +2746,9 @@ public class MeetingDebateService {
             return previousResult;
         }
         ChatResult revised = orchestrator.callModelEx(modelType, systemPrompt, context + "\n\n" + revisionPrompt);
+        if (revised != null && revised.blocksAutomaticRetry()) {
+            return revised;
+        }
         if (revised == null || revised.content == null || revised.content.isBlank()) {
             return previousResult;
         }
@@ -1183,6 +2850,11 @@ public class MeetingDebateService {
                 && !shouldRetryForUnsupportedStockClaims(revised, searchResults, searchPlan)) {
             return revised;
         }
+        ChatResult rejected = revised != null && revised.content != null && !revised.content.isBlank()
+                ? revised : current;
+        String rejectedReply = rejected == null || isEvidenceOnlyModelResponse(rejected.content)
+                ? null : parseEvidenceAndContent(rejected.content)[1];
+        JSONObject rejectedAudit = buildClaimAudit(rejected, searchResults, searchPlan);
         String content = synthesizeExternalSearchFallbackOpinion(member, searchPlan, searchResults, current);
         return new ChatResult(
                 content,
@@ -1192,7 +2864,11 @@ public class MeetingDebateService {
                 "strict_grounding_fallback",
                 "检测到正文包含未在本轮证据中出现的股票/量化/财务主张，已降级为仅依据 Provider 原始结果的保守整理稿。",
                 current != null ? current.modelStatus : null,
-                current != null ? current.modelNote : null
+                current != null ? current.modelNote : null,
+                false,
+                null,
+                rejectedReply != null && !rejectedReply.isBlank() ? limitText(rejectedReply, 10000) : null,
+                rejectedAudit != null ? rejectedAudit.toJSONString() : null
         );
     }
 
@@ -1207,6 +2883,9 @@ public class MeetingDebateService {
         }
         String revisionPrompt = buildStrictGroundingRevisionPrompt();
         ChatResult revised = orchestrator.callModelEx(modelType, systemPrompt, context + "\n\n" + revisionPrompt);
+        if (revised != null && revised.blocksAutomaticRetry()) {
+            return revised;
+        }
         if (revised == null || revised.content == null || revised.content.isBlank()) {
             return previousResult;
         }
@@ -1275,7 +2954,7 @@ public class MeetingDebateService {
         }
         StringBuilder sb = new StringBuilder();
         for (WebSearchService.SearchResult result : searchResults) {
-            if (result == null) {
+            if (result == null || isProvisionalResult(result)) {
                 continue;
             }
             sb.append(result.source).append('\n')
@@ -1292,8 +2971,68 @@ public class MeetingDebateService {
                     sb.append(fact.path).append('=').append(fact.rawValue).append('\n');
                 }
             }
+            appendSuppliedStructuredEvidence(sb, result);
         }
         return sb.toString();
+    }
+
+    private void appendSuppliedStructuredEvidence(StringBuilder corpus, WebSearchService.SearchResult result) {
+        if (!"STRUCTURED_DATA".equals(result.sourceType) || result.snippet == null) return;
+        try {
+            JSONObject payload = JSON.parseObject(result.snippet);
+            JSONObject quote = payload.getJSONObject("quote");
+            for (String field : List.of("price", "previousClose", "open", "high", "low", "changeAmount",
+                    "amount", "mainInflow", "superLargeInflow", "largeInflow", "mediumInflow", "smallInflow")) {
+                appendExactNumericEvidence(corpus, quote, field, "元");
+            }
+            for (String field : List.of("mainInflowRatio", "superLargeInflowRatio", "largeInflowRatio",
+                    "mediumInflowRatio", "smallInflowRatio")) {
+                appendExactNumericEvidence(corpus, quote, field, "%");
+            }
+            JSONArray dailyRows = payload.getJSONArray("dailyKline");
+            if (dailyRows != null) {
+                for (int i = 0; i < dailyRows.size(); i++) {
+                    JSONObject row = dailyRows.getJSONObject(i);
+                    for (String field : List.of("open", "high", "low", "close", "change", "amount")) {
+                        appendExactNumericEvidence(corpus, row, field, "元");
+                    }
+                    for (String field : List.of("changePct", "amplitudePct", "turnoverPct")) {
+                        appendExactNumericEvidence(corpus, row, field, "%");
+                    }
+                }
+            }
+            JSONArray rows = payload.getJSONArray("financials");
+            if (rows == null) return;
+            // Every supplied row is available to the speaker. Preserve raw decimal precision
+            // and units here; the general fact cards intentionally summarize only the latest row.
+            for (int i = 0; i < rows.size(); i++) {
+                JSONObject row = rows.getJSONObject(i);
+                for (String field : List.of("eps", "revenue", "netProfit", "netProfitExNonRecurring")) {
+                    appendExactNumericEvidence(corpus, row, field, "元");
+                }
+                for (String field : List.of("revenueYoyPct", "netProfitYoyPct", "roePct", "grossMarginPct",
+                        "netMarginPct", "cashToRevenuePct", "debtRatioPct")) {
+                    appendExactNumericEvidence(corpus, row, field, "%");
+                }
+            }
+        } catch (RuntimeException invalidStructuredPayload) {
+            // No source fields can be inferred from malformed JSON.
+        }
+    }
+
+    private void appendExactNumericEvidence(StringBuilder corpus, JSONObject row, String field, String unit) {
+        if (row == null || row.get(field) == null) return;
+        try {
+            BigDecimal value = new BigDecimal(row.get(field).toString());
+            corpus.append(field).append(':').append(value.toPlainString()).append(unit).append('\n');
+        } catch (NumberFormatException invalidNumber) {
+            // Missing/non-numeric provider values do not become evidence.
+        }
+    }
+
+    private boolean isProvisionalResult(WebSearchService.SearchResult result) {
+        return "n8n-deepseek-provisional".equals(result.provider)
+                || "LOW_CONFIDENCE_SEARCH".equals(result.sourceType);
     }
 
     private String normalizeGroundingText(String text) {
@@ -1759,6 +3498,15 @@ public class MeetingDebateService {
         if (claimAudit != null && !claimAudit.isEmpty()) {
             ev.put("claimAudit", claimAudit);
         }
+        if (chatResult != null && chatResult.unverifiedReply != null && !chatResult.unverifiedReply.isBlank()) {
+            ev.put("unverifiedModelReply", chatResult.unverifiedReply);
+        }
+        if (chatResult != null && chatResult.rejectedClaimAuditJson != null) {
+            try {
+                ev.put("rejectedClaimAudit", JSON.parseObject(chatResult.rejectedClaimAuditJson));
+            } catch (Exception ignored) {
+            }
+        }
         JSONObject factCatalog = buildFactCatalog(storedResults);
         if (factCatalog != null && !factCatalog.isEmpty()) {
             ev.put("factCatalog", factCatalog);
@@ -1813,7 +3561,9 @@ public class MeetingDebateService {
         if (!strictEvidenceRequired) {
             return null;
         }
-        String normalizedContent = normalizeGroundingText(chatResult.content);
+        // The JSON before ==REPLY== is the model's own evidence claim, not the
+        // published opinion. Auditing it as prose creates false violations.
+        String normalizedContent = normalizeGroundingText(parseEvidenceAndContent(chatResult.content)[1]);
         String normalizedEvidence = normalizeGroundingText(buildSearchEvidenceCorpus(searchResults));
         if (normalizedContent.isBlank()) {
             return null;
@@ -1823,10 +3573,12 @@ public class MeetingDebateService {
         JSONArray guardedTermViolations = findUnsupportedGuardedTerms(normalizedContent, normalizedEvidence);
         JSONArray stockCodeViolations = findUnsupportedStockCodeClaims(normalizedContent, normalizedEvidence, searchPlan);
         JSONArray targetMismatchViolations = findTargetMismatchViolations(searchResults, searchPlan);
+        boolean missingReply = isEvidenceOnlyModelResponse(chatResult.content);
         int totalViolations = unsupportedNumericClaims.size()
                 + guardedTermViolations.size()
                 + stockCodeViolations.size()
-                + targetMismatchViolations.size();
+                + targetMismatchViolations.size()
+                + (missingReply ? 1 : 0);
 
         JSONObject audit = new JSONObject(true);
         audit.put("strictEvidenceRequired", true);
@@ -1836,14 +3588,23 @@ public class MeetingDebateService {
         audit.put("guardedTermViolationCount", guardedTermViolations.size());
         audit.put("stockCodeViolationCount", stockCodeViolations.size());
         audit.put("targetMismatchViolationCount", targetMismatchViolations.size());
+        audit.put("formatViolationCount", missingReply ? 1 : 0);
         audit.put("unsupportedNumericClaims", unsupportedNumericClaims);
         audit.put("guardedTermViolations", guardedTermViolations);
         audit.put("stockCodeViolations", stockCodeViolations);
         audit.put("targetMismatchViolations", targetMismatchViolations);
-        audit.put("note", totalViolations > 0
+        audit.put("note", missingReply
+                ? "模型仅返回论据 JSON，未提供 ==REPLY== 后的发言正文。"
+                : totalViolations > 0
                 ? "正文存在未在本轮 Provider/东方财富证据中定位到的数字或受控事实，不能直接当作已核验结论。"
                 : "正文中的受控事实与硬数字未发现明显脱离本轮证据。");
         return audit;
+    }
+
+    private boolean isEvidenceOnlyModelResponse(String content) {
+        return content != null
+                && !content.contains(REPLY_MARKER)
+                && MODEL_EVIDENCE_ONLY_PATTERN.matcher(content).find();
     }
 
     private boolean isBlockingClaimAudit(JSONObject audit) {
@@ -1854,7 +3615,7 @@ public class MeetingDebateService {
         JSONArray violations = new JSONArray();
         for (String[] guard : GUARDED_STOCK_TERMS) {
             String trigger = guard[0];
-            if (!containsGuardedTerm(normalizedContent, trigger)) {
+            if (!containsAssertedGuardedTerm(normalizedContent, trigger)) {
                 continue;
             }
             boolean supported = false;
@@ -1872,6 +3633,37 @@ public class MeetingDebateService {
             }
         }
         return violations;
+    }
+
+    private boolean containsAssertedGuardedTerm(String content, String trigger) {
+        for (String clause : content.split("[。！？!?；;\\n，,]")) {
+            if (containsGuardedTerm(clause, trigger) && !isExplicitEvidenceDenial(clause, trigger)) return true;
+        }
+        return false;
+    }
+
+    private boolean isExplicitEvidenceDenial(String clause, String trigger) {
+        String text = clause.replaceAll("[\\s“”\"‘’]", "");
+        String term = Pattern.quote(normalizeGroundingText(trigger));
+        String subject = "(?:机构)?" + term + "(?:数据|信息|数值|指标|结论)?";
+        String denial = "(?:本轮)?(?:证据|资料)?(?:未提供|缺失|不足|无法核验|无法验证)"
+                + "(?:/(?:无法核验|无法验证))?";
+        // Only an entire omission clause is exempt. A positive assertion followed by
+        // a caveat remains an assertion, as does another occurrence elsewhere.
+        if (text.matches("(?:本轮(?:证据|资料)?[：:]?)?" + subject + denial)
+                || text.matches("(?:本轮)?(?:证据|资料)?(?:未提供|缺少)" + subject)
+                || text.matches(denial + "[：:]" + subject)) return true;
+        Matcher listDenial = Pattern.compile("^(.+?)均?(" + denial + ")$").matcher(text);
+        if (!listDenial.matches()) return false;
+        for (String item : listDenial.group(1).split("、")) {
+            boolean noun = item.matches("估值|当前市价|自由现金流|资本开支|有息负债结构|未来季度预测");
+            for (String[] guard : GUARDED_STOCK_TERMS) {
+                noun |= item.matches("(?:机构)?" + Pattern.quote(normalizeGroundingText(guard[0]))
+                        + "(?:数据|信息|数值|指标|结论)?");
+            }
+            if (!noun) return false;
+        }
+        return true;
     }
 
     private boolean containsGuardedTerm(String normalizedText, String rawTerm) {
@@ -1911,15 +3703,14 @@ public class MeetingDebateService {
         while (matcher.find()) {
             String raw = matcher.group();
             String normalizedRaw = raw.replaceAll("\\s+", "");
-            String numberOnly = normalizedRaw.replaceAll("(?:%|亿|万元|元|倍|bp|bps)$", "");
+            String numberOnly = matcher.group(1);
             if (numberOnly.isBlank()) {
                 continue;
             }
             if (searchPlan != null && searchPlan.eastmoneySymbol != null && numberOnly.equals(searchPlan.eastmoneySymbol)) {
                 continue;
             }
-            if (normalizedEvidence.contains(normalizedRaw)
-                    || evidenceContainsEquivalentNumericClaim(normalizedEvidence, normalizedRaw, numberOnly)) {
+            if (evidenceContainsEquivalentNumericClaim(normalizedEvidence, normalizedRaw, numberOnly)) {
                 continue;
             }
             if (!seen.add(normalizedRaw)) {
@@ -1941,29 +3732,44 @@ public class MeetingDebateService {
         if (normalizedEvidence == null || normalizedEvidence.isBlank() || numberOnly == null || numberOnly.isBlank()) {
             return false;
         }
-        Double target = parseNumericValue(numberOnly);
-        if (target == null || !Double.isFinite(target)) {
+        Matcher targetMatcher = GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(normalizedRaw);
+        if (!targetMatcher.matches()) return false;
+        BigDecimal target;
+        try {
+            target = new BigDecimal(numberOnly).multiply(numericUnitScale(targetMatcher.group(2)));
+        } catch (NumberFormatException invalidNumber) {
             return false;
         }
-        String targetUnit = normalizedRaw == null ? "" : normalizedRaw.replace(numberOnly, "");
+        String targetUnit = canonicalNumericUnit(targetMatcher.group(2));
         Matcher matcher = GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(normalizedEvidence);
         while (matcher.find()) {
-            String candidateRaw = matcher.group().replaceAll("\\s+", "");
-            String candidateNumber = candidateRaw.replaceAll("(?:%|亿|万元|元|倍|bp|bps)$", "");
-            String candidateUnit = candidateRaw.replace(candidateNumber, "");
-            if (!targetUnit.equals(candidateUnit)) {
-                continue;
-            }
-            Double candidate = parseNumericValue(candidateNumber);
-            if (candidate == null || !Double.isFinite(candidate)) {
-                continue;
-            }
-            double tolerance = Math.max(1e-6d, Math.abs(target) * 1e-6d);
-            if (Math.abs(candidate - target) <= tolerance) {
-                return true;
+            if (!targetUnit.equals(canonicalNumericUnit(matcher.group(2)))) continue;
+            try {
+                BigDecimal candidate = new BigDecimal(matcher.group(1)).multiply(numericUnitScale(matcher.group(2)));
+                if (candidate.compareTo(target) == 0) return true;
+                // Only ordinary decimal display rounding is allowed; a unit, sign,
+                // exponent or metric change is never covered by a relative epsilon.
+                BigDecimal displayed = new BigDecimal(numberOnly);
+                BigDecimal sourceInDisplayUnits = candidate.divide(numericUnitScale(targetMatcher.group(2)));
+                if (!numberOnly.toLowerCase(Locale.ROOT).contains("e")
+                        && candidate.signum() == target.signum()
+                        && sourceInDisplayUnits.setScale(displayed.scale(), RoundingMode.HALF_UP)
+                            .compareTo(displayed) == 0) return true;
+            } catch (NumberFormatException invalidNumber) {
+                // Continue looking for a valid, exact source value.
             }
         }
         return false;
+    }
+
+    private BigDecimal numericUnitScale(String unit) {
+        return "亿元".equals(unit) || "亿".equals(unit) ? new BigDecimal("100000000")
+                : "万元".equals(unit) ? new BigDecimal("10000") : BigDecimal.ONE;
+    }
+
+    private String canonicalNumericUnit(String unit) {
+        return "亿元".equals(unit) || "亿".equals(unit) || "万元".equals(unit) ? "元"
+                : "bps".equals(unit) ? "bp" : unit;
     }
 
     private JSONArray findUnsupportedStockCodeClaims(String normalizedContent,
@@ -2002,7 +3808,7 @@ public class MeetingDebateService {
         Matcher matcher = GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(normalizedContent);
         while (matcher.find()) {
             String normalizedRaw = matcher.group().replaceAll("\\s+", "");
-            String numberOnly = normalizedRaw.replaceAll("(?:%|亿|万元|元|倍|bp|bps)$", "");
+            String numberOnly = matcher.group(1);
             if (numberOnly.isBlank()) {
                 continue;
             }
@@ -2248,7 +4054,7 @@ public class MeetingDebateService {
             result.source = "东方财富结构化数据 " + ref.symbol + "." + ref.market + " " + String.join(",", fields);
             result.url = "https://quote.eastmoney.com/" + ref.market + ref.symbol + ".html";
             String rawPayload = JSON.toJSONString(compact);
-            result.snippet = limitText(rawPayload, 7000);
+            result.snippet = serializeStructuredSearchSnippet(compact, 7000);
             result.withTrace("eastmoney", "STRUCTURED_DATA",
                     buildEastmoneyQueryLabel(searchPlan, Collections.singletonList(result)), rawPayload);
             log.info("Eastmoney structured data fetched for meetingId={} stock={}.{} fields={}",
@@ -2549,6 +4355,11 @@ public class MeetingDebateService {
     }
 
     private Map<String, Object> compactEastmoneyPayload(Map<String, Object> raw, List<String> fields) {
+        return compactEastmoneyPayload(raw, fields, null);
+    }
+
+    private Map<String, Object> compactEastmoneyPayload(Map<String, Object> raw, List<String> fields,
+                                                        ReviewedNeed need) {
         Map<String, Object> compact = new LinkedHashMap<>();
         if (raw == null || raw.isEmpty() || fields == null || fields.isEmpty()) {
             return compact;
@@ -2557,11 +4368,15 @@ public class MeetingDebateService {
         copyIfPresent(raw, compact, "symbol");
         copyIfPresent(raw, compact, "market");
         copyIfPresent(raw, compact, "periodType");
+        if (fields.contains("technicalIndicators") && !fields.contains("dailyKline") && need != null
+                && reviewedRequiresClosedObservation(need.question)) {
+            compact.put("dailyKline", tailObjects(toObjectList(raw.get("dailyKline")), 1));
+        }
         for (String field : fields) {
             if (!raw.containsKey(field)) {
                 continue;
             }
-            compact.put(field, compactEastmoneyValue(field, raw.get(field)));
+            compact.put(field, compactEastmoneyValue(field, raw.get(field), need));
         }
         if (raw.containsKey("dataQuality")) {
             compact.put("dataQuality", raw.get("dataQuality"));
@@ -2573,19 +4388,108 @@ public class MeetingDebateService {
         return compact;
     }
 
-    private Object compactEastmoneyValue(String field, Object value) {
+    private Object compactEastmoneyValue(String field, Object value, ReviewedNeed need) {
         List<Object> values = toObjectList(value);
         if (values.isEmpty()) {
             return value;
         }
-        if ("dailyKline".equals(field)) return tailObjects(values, 40);
+        if ("dailyKline".equals(field)) {
+            int bars = 40;
+            if (need != null) {
+                Matcher requested = REVIEWED_TRADING_DAYS_PATTERN.matcher(need.question);
+                if (requested.find()) bars = Math.max(bars, Integer.parseInt(requested.group(1)));
+            }
+            return tailObjects(values, bars);
+        }
         if ("minuteTrends5d".equals(field)) return tailObjects(values, 25);
         if ("intradayFundFlow".equals(field)) return tailObjects(values, 25);
-        if ("financials".equals(field)) return headObjects(values, 4);
+        if ("financials".equals(field)) {
+            List<Object> selected = headObjects(values, 4);
+            if (need != null) {
+                String requiredPeriod = reviewedRequestedFinancialPeriod(need.question);
+                if (requiredPeriod != null) {
+                    for (Object row : values) {
+                        if (row instanceof Map && String.valueOf(((Map<?, ?>) row).get("reportDate"))
+                                .startsWith(requiredPeriod) && !selected.contains(row)) {
+                            selected.add(0, row);
+                            if (selected.size() > 4) selected.remove(selected.size() - 1);
+                            break;
+                        }
+                    }
+                }
+            }
+            return selected;
+        }
         if ("announcements".equals(field)) return headObjects(values, 6);
         if ("latestNews".equals(field)) return headObjects(values, 6);
         if ("shareholderCounts".equals(field)) return headObjects(values, 4);
         return values;
+    }
+
+    private String serializeStructuredSearchSnippet(Map<String, Object> compact, int limit) {
+        Map<String, Object> projected = new LinkedHashMap<>(compact);
+        String serialized = JSON.toJSONString(projected);
+        if (limit <= 0 || serialized.length() <= limit) {
+            return serialized;
+        }
+
+        // Keep a parseable projection. Cutting serialized JSON by character count
+        // makes every downstream fact extractor and fallback summarizer lose it.
+        while (serialized.length() > limit) {
+            String largestListField = null;
+            int largestListSize = 0;
+            for (Map.Entry<String, Object> entry : projected.entrySet()) {
+                List<Object> values = toObjectList(entry.getValue());
+                if (values.size() > 1 && JSON.toJSONString(values).length() > largestListSize) {
+                    largestListField = entry.getKey();
+                    largestListSize = JSON.toJSONString(values).length();
+                }
+            }
+            if (largestListField == null) {
+                break;
+            }
+            List<Object> reduced = toObjectList(projected.get(largestListField));
+            if ("dailyKline".equals(largestListField)
+                    || "minuteTrends5d".equals(largestListField)
+                    || "intradayFundFlow".equals(largestListField)) {
+                reduced.remove(0); // retain the newest market observations
+            } else {
+                reduced.remove(reduced.size() - 1); // retain the newest reports/news first
+            }
+            projected.put(largestListField, reduced);
+            serialized = JSON.toJSONString(projected);
+        }
+
+        while (serialized.length() > limit) {
+            String removable = null;
+            int largestSize = 0;
+            for (Map.Entry<String, Object> entry : projected.entrySet()) {
+                String key = entry.getKey();
+                if ("symbol".equals(key) || "market".equals(key) || "asOf".equals(key)
+                        || "periodType".equals(key) || "quote".equals(key)) {
+                    continue;
+                }
+                int size = JSON.toJSONString(entry.getValue()).length();
+                if (size > largestSize) {
+                    removable = key;
+                    largestSize = size;
+                }
+            }
+            if (removable == null) {
+                break;
+            }
+            projected.remove(removable);
+            serialized = JSON.toJSONString(projected);
+        }
+        if (serialized.length() <= limit) {
+            return serialized;
+        }
+        Map<String, Object> identity = new LinkedHashMap<>();
+        copyIfPresent(projected, identity, "symbol");
+        copyIfPresent(projected, identity, "market");
+        copyIfPresent(projected, identity, "quote");
+        serialized = JSON.toJSONString(identity);
+        return serialized.length() <= limit ? serialized : "{}";
     }
 
     private void copyIfPresent(Map<String, Object> source, Map<String, Object> target, String key) {
@@ -2788,6 +4692,18 @@ public class MeetingDebateService {
     private String buildSearchResultKey(WebSearchService.SearchResult result) {
         if (result == null) {
             return "null";
+        }
+        if (result.provider != null && result.provider.startsWith("n8n-deepseek-")) {
+            // One page may support multiple claims with different review outcomes.
+            // Collapsing these by URL would hide an UNKNOWN claim behind a PASS claim.
+            return result.provider + "|" + firstNonBlank(result.rawHash,
+                    result.source + "|" + result.snippet + "|" + result.url);
+        }
+        if ("STRUCTURED_DATA".equals(result.sourceType)) {
+            // Different requested fields/windows share a quote URL. Preserve each
+            // supplied projection while still collapsing an identical projection.
+            return result.sourceType + "|" + result.provider + "|" + result.query + "|"
+                    + firstNonBlank(result.rawHash, result.snippet) + "|" + result.url;
         }
         String url = result.url != null ? result.url.trim().toLowerCase() : "";
         if (!url.isBlank()) {
@@ -3853,6 +5769,7 @@ public class MeetingDebateService {
 
     private AiMeetingOpinion findLatestTargetedQuestion(Long meetingId, Long memberId) {
         List<AiMeetingOpinion> opinions = opinionMapper.selectByMeetingId(meetingId);
+        if (opinions == null || opinions.isEmpty()) return null;
         AiMeetingOpinion latestUnanswered = null;
         List<AiMeetingOpinion> directedReplies = new ArrayList<>();
         for (AiMeetingOpinion opinion : opinions) {
@@ -3882,6 +5799,7 @@ public class MeetingDebateService {
 
     private Long findPendingTargetMemberId(Long meetingId) {
         List<AiMeetingOpinion> opinions = opinionMapper.selectByMeetingId(meetingId);
+        if (opinions == null || opinions.isEmpty()) return null;
         AiMeetingOpinion latestUnanswered = null;
         List<AiMeetingOpinion> directedReplies = new ArrayList<>();
         for (AiMeetingOpinion opinion : opinions) {

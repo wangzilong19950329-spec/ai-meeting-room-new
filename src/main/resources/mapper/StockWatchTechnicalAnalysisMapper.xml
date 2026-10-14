@@ -15,6 +15,8 @@
 
     <sql id="AnalysisSelectColumns">
         t.*,
+        atask.request_digest AS task_request_digest,
+        atask.request_envelope_json AS task_request_envelope_json,
         CASE
             WHEN atask.purpose = 'stock-analysis-response-v6' THEN 6
             WHEN atask.purpose = 'stock-analysis-response-v5' THEN 5
@@ -57,6 +59,8 @@
         <result column="data_snapshot_json" property="dataSnapshotJson"/>
         <result column="raw_response" property="rawResponse"/>
         <result column="prompt_hash" property="promptHash"/>
+        <result column="task_request_digest" property="taskRequestDigest"/>
+        <result column="task_request_envelope_json" property="taskRequestEnvelopeJson"/>
         <result column="provider" property="provider"/>
         <result column="bridge_target_id" property="bridgeTargetId"/>
         <result column="conversation_url" property="conversationUrl"/>
@@ -164,6 +168,29 @@
           AND COALESCE(t.period_type, 'DAY') = #{periodType}
           AND t.gmt_create &gt;= #{since}
         ORDER BY t.gmt_create DESC, t.id DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectLatestSuccessfulBySession" resultMap="BaseResultMap">
+        SELECT <include refid="AnalysisSelectColumns"/> FROM stock_watch_technical_analysis t
+        JOIN stock_watch_analysis_observation_identity i
+          ON i.canonical_task_id = t.analysis_task_id AND i.analysis_scope = 'TECHNICAL_RUNTIME'
+        JOIN stock_watch_analysis_task atask ON atask.id = t.analysis_task_id
+        WHERE t.session_id = #{sessionId}
+          AND t.symbol = #{symbol}
+          AND t.market = #{market}
+          AND t.status = 'SUCCESS'
+          AND COALESCE(t.period_type, 'DAY') = #{periodType}
+          AND (
+              t.analysis_date &lt; #{maxAnalysisDate}
+              OR (t.analysis_date = #{maxAnalysisDate} AND t.run_slot &lt;= #{maxRunSlot})
+          )
+          AND t.analysis_task_id IS NOT NULL
+          AND t.data_snapshot_json IS NOT NULL
+          AND atask.request_digest IS NOT NULL
+          AND atask.request_envelope_json IS NOT NULL
+          AND atask.purpose = 'stock-analysis-response-v6'
+        ORDER BY t.analysis_date DESC, t.run_slot DESC, t.gmt_create DESC, t.id DESC
         LIMIT 1
     </select>
 

@@ -55,6 +55,9 @@ public class StockWatchAiJudgeService {
     @Value("${stock-watch.ai-rules.bridge-read-timeout-seconds:210}")
     private int bridgeReadTimeoutSeconds;
 
+    @Value("${stock-watch.deepseek-web.api-key:${DEEPSEEK_OPENAI_FACADE_API_KEY:}}")
+    private String bridgeApiKey;
+
     @Value("${stock-watch.ai-rules.bridge-first:false}")
     private boolean bridgeFirst;
 
@@ -155,21 +158,33 @@ public class StockWatchAiJudgeService {
         } catch (Exception e) {
             log.warn("DeepSeek stock-watch rule judgment failed ruleId={} model={} error={}",
                     rule.getId(), model, e.getMessage());
+            String failureCode = publicFailureCode(e);
             if (analysisTaskService.shouldMarkInvalid(e)) {
-                analysisTaskService.markInvalid(taskReservation, raw, null, null, e.getMessage());
+                analysisTaskService.markInvalid(taskReservation, raw, null, null, failureCode);
             } else if (analysisTaskService.shouldMarkUnknown(e)) {
-                analysisTaskService.markUnknown(taskReservation, raw, e.getMessage());
+                analysisTaskService.markUnknown(taskReservation, raw, failureCode);
             } else {
-                analysisTaskService.markFailed(taskReservation, raw, e.getMessage());
+                analysisTaskService.markFailed(taskReservation, raw, failureCode);
             }
             if (structuredDecision != null) {
                 structuredDecision.setRawResponse(raw);
                 structuredDecision.setModel(actualModel);
-                structuredDecision.setAnalysis("DeepSeek 分析调用异常，本轮仅保留结构化触发结果：" + e.getMessage());
+                structuredDecision.setAnalysis("DeepSeek 分析调用失败，本轮仅保留结构化触发结果；详细诊断仅保留在服务端。");
                 return structuredDecision;
             }
-            return AiDecision.failed("模型判断异常：" + e.getMessage(), raw);
+            return AiDecision.failed("DeepSeek 分析调用失败，本轮未产生新的模型判断。", raw);
         }
+    }
+
+    private String publicFailureCode(Exception error) {
+        if (error instanceof StockWatchBridgeHttpException) {
+            return ((StockWatchBridgeHttpException) error).getErrorCode();
+        }
+        return analysisTaskService.shouldMarkInvalid(error)
+                ? "model_response_invalid"
+                : (analysisTaskService.shouldMarkUnknown(error)
+                ? "provider_outcome_unknown"
+                : "bridge_call_failed");
     }
 
     private Reservation reserveTask(AiWatchRule rule,
@@ -188,8 +203,21 @@ public class StockWatchAiJudgeService {
         envelope.put("ruleId", rule.getId());
         envelope.put("observationKey", observationKey);
         envelope.put("provider", provider);
-        envelope.put("promptChars", userPrompt.length());
-        return analysisTaskService.reserve(submissionKey, sha256Hex(userPrompt), "stock-analysis-v1",
+        String requestPayload = shouldUseBridgeFirst(model) ? bridgeQuery(userPrompt) : userPrompt;
+        envelope.put("promptChars", requestPayload.length());
+        String requestDigest = shouldUseBridgeFirst(model)
+                ? StockWatchBridgeRequestIdentity.digest(
+                        requestPayload,
+                        "stock.rule-evaluation",
+                        bridgeSessionKey(rule),
+                        "expert",
+                        true,
+                        false,
+                        false,
+                        false,
+                        "")
+                : sha256Hex(requestPayload);
+        return analysisTaskService.reserve(submissionKey, requestDigest, "stock-analysis-v1",
                 rule.getSymbol(), rule.getMarket(), "DAY", observationKey, 1, provider, envelope);
     }
 
@@ -679,13 +707,15 @@ public class StockWatchAiJudgeService {
             throw new IllegalStateException("DeepSeek 网页 Bridge 未配置");
         }
         JSONObject body = new JSONObject();
-        body.put("query", SYSTEM_PROMPT + "\n\n任务数据：\n" + userPrompt);
-        body.put("sessionKey", "stock-watch-rule-" + rule.getMarket() + "-" + rule.getSymbol());
+        body.put("query", bridgeQuery(userPrompt));
+        body.put("sessionKey", bridgeSessionKey(rule));
         body.put("forceNewSession", forceNewSession);
         body.put("closeTargetAfter", false);
         body.put("expectedJson", true);
         body.put("mode", "expert");
-        body.put("purpose", "stock-analysis-v1");
+        body.put("capability", "stock.rule-evaluation");
+        body.put("purpose", "stock.rule-evaluation.v1");
+        body.put("priority", StockWatchBridgeAdmissionService.PRIORITY_GENERAL_LEGACY_RULE);
         body.put("requestDigest", reservation.getTask().getRequestDigest());
         body.put("submissionKey", reservation.getTask().getSubmissionKey());
 
@@ -695,7 +725,7 @@ public class StockWatchAiJudgeService {
                 .callTimeout(Math.max(40, bridgeReadTimeoutSeconds + 10), TimeUnit.SECONDS)
                 .retryOnConnectionFailure(false)
                 .build();
-        Request request = new Request.Builder()
+        Request request = authorizeBridgeRequest(new Request.Builder())
                 .url(bridgeUrl)
                 .header("Content-Type", "application/json")
                 .post(RequestBody.create(body.toJSONString(), JSON_TYPE))
@@ -711,11 +741,13 @@ public class StockWatchAiJudgeService {
         try (Response response = client.newCall(request).execute()) {
             String responseBody = response.body() == null ? "" : response.body().string();
             if (!response.isSuccessful()) {
-                throw new IllegalStateException("DeepSeek 网页 Bridge HTTP " + response.code() + " " + truncate(responseBody, 300));
+                throw StockWatchBridgeHttpException.fromResponse(
+                        "DeepSeek 网页 Bridge", response.code(), responseBody);
             }
             JSONObject payload = JSON.parseObject(responseBody);
             if (payload == null || !payload.getBooleanValue("ok")) {
-                throw new IllegalStateException("DeepSeek 网页 Bridge 返回无效结果：" + truncate(responseBody, 300));
+                throw StockWatchBridgeHttpException.fromResponse(
+                        "DeepSeek 网页 Bridge", response.code(), responseBody);
             }
             JSONObject result = payload == null ? null : payload.getJSONObject("result");
             String contentStatus = result == null ? "" : text(result.get("contentStatus"), "");
@@ -730,6 +762,21 @@ public class StockWatchAiJudgeService {
             }
             return answer;
         }
+    }
+
+    private String bridgeQuery(String userPrompt) {
+        return SYSTEM_PROMPT + "\n\n任务数据：\n" + userPrompt;
+    }
+
+    private String bridgeSessionKey(AiWatchRule rule) {
+        return "stock-watch-rule-" + rule.getMarket() + "-" + rule.getSymbol();
+    }
+
+    private Request.Builder authorizeBridgeRequest(Request.Builder builder) {
+        if (StringUtils.hasText(bridgeApiKey)) {
+            builder.header("Authorization", "Bearer " + bridgeApiKey.trim());
+        }
+        return builder;
     }
 
     private String sha256Hex(String value) {

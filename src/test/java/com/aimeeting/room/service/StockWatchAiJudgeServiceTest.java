@@ -1,5 +1,7 @@
 package com.aimeeting.room.service;
 
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONObject;
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
 import com.aimeeting.room.entity.StockWatchAnalysisTask;
@@ -47,18 +49,22 @@ class StockWatchAiJudgeServiceTest {
     @Mock private StockWatchBridgeAdmissionService bridgeAdmissionService;
     @Mock private Reservation reservation;
     @InjectMocks private StockWatchAiJudgeService service;
+    private StockWatchAnalysisTask reservationTask;
 
     @BeforeEach
     void setUpTaskReservation() throws Exception {
-        StockWatchAnalysisTask task = new StockWatchAnalysisTask();
-        task.setId(1L);
-        task.setSubmissionKey("test-submission");
-        task.setRequestDigest("test-digest");
-        task.setRowVersion(0L);
+        reservationTask = new StockWatchAnalysisTask();
+        reservationTask.setId(1L);
+        reservationTask.setSubmissionKey("test-submission");
+        reservationTask.setRequestDigest("test-digest");
+        reservationTask.setRowVersion(0L);
         when(analysisTaskService.reserve(anyString(), anyString(), anyString(), anyString(), anyString(),
-                anyString(), anyString(), anyInt(), anyString(), any())).thenReturn(reservation);
+                anyString(), anyString(), anyInt(), anyString(), any())).thenAnswer(invocation -> {
+                    reservationTask.setRequestDigest(invocation.getArgument(1));
+                    return reservation;
+                });
         when(reservation.isNewSubmission()).thenReturn(true);
-        lenient().when(reservation.getTask()).thenReturn(task);
+        lenient().when(reservation.getTask()).thenReturn(reservationTask);
         lenient().when(bridgeAdmissionService.execute(anyInt(), anyString(), any()))
                 .thenAnswer(invocation -> ((Callable<?>) invocation.getArgument(2)).call());
     }
@@ -279,9 +285,13 @@ class StockWatchAiJudgeServiceTest {
         quote.put("changePercent", 1.99);
 
         AtomicInteger requestCount = new AtomicInteger();
+        List<String> requestBodies = new ArrayList<>();
+        List<String> authorizationHeaders = new ArrayList<>();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/search", exchange -> {
             requestCount.incrementAndGet();
+            authorizationHeaders.add(exchange.getRequestHeaders().getFirst("Authorization"));
+            requestBodies.add(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
             String response = "{\"ok\":true,\"result\":{\"answerText\":\"{\\\"triggered\\\":true,\\\"confidence\\\":0.95,\\\"severity\\\":\\\"risk\\\",\\\"shouldNotify\\\":true,\\\"reason\\\":\\\"主力资金异动\\\",\\\"analysis\\\":\\\"本轮主力净流入明显，需观察持续性。\\\",\\\"matchedSignals\\\":[],\\\"missingData\\\":[]}\",\"contentStatus\":\"success\",\"completionReason\":\"complete_json_network\"}}";
             byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
@@ -297,11 +307,27 @@ class StockWatchAiJudgeServiceTest {
             ReflectionTestUtils.setField(service, "bridgeUrl", "http://127.0.0.1:" + server.getAddress().getPort() + "/search");
             ReflectionTestUtils.setField(service, "bridgeConnectTimeoutSeconds", 5);
             ReflectionTestUtils.setField(service, "bridgeReadTimeoutSeconds", 30);
+            ReflectionTestUtils.setField(service, "bridgeApiKey", "bridge-test-secret");
 
             AiDecision decision = service.judge(rule, quote, ZonedDateTime.now(ZoneId.of("Asia/Shanghai")));
 
             verify(aiModelRouter, never()).chat(anyString(), anyString(), anyString(), eq(900));
             assertEquals(1, requestCount.get());
+            assertEquals("Bearer bridge-test-secret", authorizationHeaders.get(0));
+            JSONObject requestBody = JSON.parseObject(requestBodies.get(0));
+            assertEquals("stock.rule-evaluation", requestBody.getString("capability"));
+            assertEquals(300, requestBody.getIntValue("priority"));
+            assertEquals(StockWatchBridgeRequestIdentity.digest(
+                            requestBody.getString("query"),
+                            requestBody.getString("capability"),
+                            requestBody.getString("sessionKey"),
+                            requestBody.getString("mode"),
+                            requestBody.getBooleanValue("expectedJson"),
+                            requestBody.getBooleanValue("forceNewSession"),
+                            requestBody.getBooleanValue("isolatedSession"),
+                            requestBody.getBooleanValue("closeTargetAfter"),
+                            requestBody.getString("accountKey")),
+                    requestBody.getString("requestDigest"));
             assertEquals("deepseek-web", decision.getModel());
             assertTrue(decision.isTriggered());
             assertTrue(decision.getAnalysis().contains("主力净流入明显"));
@@ -309,4 +335,84 @@ class StockWatchAiJudgeServiceTest {
             server.stop(0);
         }
     }
+
+    @Test
+    void bridgeUnknownOutcomeMarksTaskUnknownWithoutRetrying() throws Exception {
+        AiWatchRule rule = new AiWatchRule();
+        rule.setId("rule-bridge-unknown");
+        rule.setSymbol("002979");
+        rule.setMarket("sz");
+        rule.setName("雷赛智能");
+        rule.setModel("deepseek-web");
+        rule.setSeverity("risk");
+        rule.setConditionText("观察无法本地结构化执行的盘口变化");
+
+        AtomicInteger requestCount = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/search", exchange -> {
+            requestCount.incrementAndGet();
+            exchange.getRequestBody().readAllBytes();
+            String response = "{\"ok\":false,\"error\":\"provider_outcome_unknown\","
+                    + "\"providerOutcomeUnknown\":true,\"retrySafe\":false,"
+                    + "\"message\":\"accountKey=technical profileRoot=/private/profile debugPort=9333\"}";
+            byte[] bytes = response.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+            exchange.sendResponseHeaders(504, bytes.length);
+            try (OutputStream os = exchange.getResponseBody()) {
+                os.write(bytes);
+            }
+        });
+        server.start();
+
+        try {
+            when(analysisTaskService.shouldMarkUnknown(any())).thenCallRealMethod();
+            ReflectionTestUtils.setField(service, "bridgeUrl",
+                    "http://127.0.0.1:" + server.getAddress().getPort() + "/search");
+            ReflectionTestUtils.setField(service, "bridgeConnectTimeoutSeconds", 5);
+            ReflectionTestUtils.setField(service, "bridgeReadTimeoutSeconds", 30);
+
+            AiDecision decision = service.judge(
+                    rule,
+                    Map.of("price", 70.99, "timestamp", "2026-08-01T10:00:00+08:00"),
+                    ZonedDateTime.now(ZoneId.of("Asia/Shanghai")));
+
+            assertEquals(1, requestCount.get());
+            assertFalse(decision.isOk());
+            assertFalse(decision.getReason().contains("accountKey"));
+            assertFalse(decision.getAnalysis().contains("profileRoot"));
+            verify(analysisTaskService).markUnknown(eq(reservation), eq(null), anyString());
+            verify(analysisTaskService, never()).markFailed(eq(reservation), eq(null), anyString());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void modelExceptionDoesNotEscapeThroughStructuredDecision() {
+        AiWatchRule rule = new AiWatchRule();
+        rule.setId("rule-sanitized-failure");
+        rule.setSymbol("002979");
+        rule.setMarket("sz");
+        rule.setName("雷赛智能");
+        rule.setModel("deepseek-chat");
+        rule.setSeverity("risk");
+        rule.setConditionText("主力净流入或净流出 mainInflow 绝对值 >= 100000000");
+        when(aiModelRouter.chat(eq("deepseek-chat"), anyString(), anyString(), eq(900)))
+                .thenThrow(new IllegalStateException(
+                        "connect 127.0.0.1:8791 accountKey=technical profileRoot=/private/profile debugPort=9333"));
+
+        AiDecision decision = service.judge(
+                rule,
+                Map.of("mainInflow", 178_128_819.0, "price", 70.99, "changePercent", 1.99),
+                ZonedDateTime.now(ZoneId.of("Asia/Shanghai")));
+
+        String publicDecision = JSON.toJSONString(decision);
+        assertFalse(publicDecision.contains("127.0.0.1"));
+        assertFalse(publicDecision.contains("accountKey"));
+        assertFalse(publicDecision.contains("profileRoot"));
+        assertFalse(publicDecision.contains("debugPort"));
+        assertTrue(decision.getAnalysis().contains("详细诊断仅保留在服务端"));
+        verify(analysisTaskService).markFailed(eq(reservation), eq(null), eq("bridge_call_failed"));
+    }
+
 }

@@ -1,29 +1,47 @@
 # Workflow Map
 
-Phase1 workflow:
+All workflow IDs are resolved from the n8n database by name after import. All
+four definitions remain inactive.
 
-`SW-01 POC Manual Pipeline`
+## SW-00 Error Handler
 
-Node chain:
+`Error Trigger -> Normalize Error -> Persist Run Failure`
 
-1. Manual Trigger
-2. Load Quote Fixture
-3. Normalize Quote
-4. Quote Quality Gate
-5. Build Approx Bars
-6. Calculate Facts
-7. Build Fact Registry
-8. Build Packet + Hash
-9. Resolve MODEL_PROVIDER
-10. MOCK Market Behavior
-11. Parse Strict JSON
-12. Structural Claim Validator
-13. Calculate STRESS_ONLY
-14. Render Markdown
-15. Build Persistence Payload
-16. Persist Phase1 Records
-17. Phase1 Result Summary
+The other workflows are statically bound to the resolved SW-00 ID. n8n 2.29.10
+does not execute an inactive error workflow, so runtime dispatch remains an
+explicit activation boundary.
 
-The workflow is inactive by default and is intended for manual or CLI execution only.
+## SW-10 Minute Quote Ingest
 
-The approximate bars are persisted in the packet and included in `packet.model_input` with explicit fixture-derived approximation metadata.
+`Schedule/Manual -> Runtime Gate -> China Session Guard -> Watchlist -> Java Adapter -> Quote Gate -> Previous Snapshot -> Delta/Approx Bar -> Persist`
+
+- The Java adapter uses a dedicated header credential.
+- Manual QA can exercise the source Gate outside a trading session.
+- Stale, invalid, empty, or schema-invalid envelopes fail closed.
+- Equal quote timestamps are treated as duplicates.
+- Snapshot bars are labeled approximate; empirical units cannot produce VWAP.
+
+## SW-20 Half-hour Analysis Pipeline
+
+`Schedule/Manual -> Runtime Gate -> Slot Resolution -> Recover/Create -> Atomic Backlog Claim -> Packet Inputs -> De-identified Packet -> Provider Branch -> Strict Validator -> Persist`
+
+- Slot creation and backlog dispatch are independent.
+- PostgreSQL owns retry, lease, attempt, and idempotency state.
+- DeepSeek uses model `deepseek-web-bridge`, capability `stock.technical-analysis`, a prompt version, packet hash, session key, and submission key.
+- Zero-bar jobs become accepted `INSUFFICIENT_DATA` records rather than remaining RUNNING.
+- Invalid JSON, transport failures, timeouts, unknown facts, unsupported hypotheses, extra schema fields, and unmapped narrative numbers are rejected.
+
+## SW-30 Stress Report Publisher
+
+`Schedule/Manual -> Runtime Gate -> Report Claim -> Position/Risk Inputs -> Eight Stress Scenarios -> Persist/Complete Claim -> Local Delivery Claim -> Mailpit`
+
+- Report generation is claimed in `sw_report_claim`.
+- Mail is allowed only for `MAILPIT` and `.invalid` recipients.
+- Delivery rows are claimed before send and become `SENT_LOCAL_TEST`; an ambiguous stale send becomes `UNKNOWN` and is not retried automatically.
+- Repeated publisher execution does not duplicate a report or email.
+
+## Activation Boundary
+
+Schedule nodes exist but no workflow is active. Production activation, external
+SMTP, authoritative exchange calendars, and broker-position integration require
+separate approval and Gates.

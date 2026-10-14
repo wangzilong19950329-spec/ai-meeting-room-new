@@ -1,5 +1,8 @@
 'use strict';
 
+const { sha256Operation } = require('./deepseek-request-identity');
+const { publicBridgeErrorMessage } = require('./deepseek-public-error');
+
 const DEFAULT_MODEL_ID = 'deepseek-web-bridge';
 const MODEL_ALIASES = new Set([DEFAULT_MODEL_ID, 'deepseek-chat']);
 
@@ -203,6 +206,37 @@ function requestAccountKey(req, body) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function requestCapability(req, body) {
+  const value = getHeader(req, 'x-deepseek-capability')
+    || (body && body.capability)
+    || (body && body.deepseek_capability)
+    || (body && body.metadata && body.metadata.deepseek_capability)
+    || 'general.analysis';
+  return typeof value === 'string' ? value.trim() : 'general.analysis';
+}
+
+function requestPriority(req, body) {
+  const value = getHeader(req, 'x-deepseek-priority')
+    || (body && body.priority)
+    || (body && body.metadata && body.metadata.deepseek_priority);
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function requestSubmissionKey(req, body) {
+  const value = getHeader(req, 'idempotency-key')
+    || getHeader(req, 'x-deepseek-submission-key')
+    || (body && body.metadata && body.metadata.deepseek_submission_key)
+    || '';
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function accountOverrideAllowed() {
+  return ['1', 'true', 'yes'].includes(
+    String(process.env.DEEPSEEK_WEB_ALLOW_ACCOUNT_OVERRIDE || '').trim().toLowerCase()
+  );
+}
+
 function hasUnsupportedTools(body) {
   const hasConfiguredValue = (value) => {
     if (Array.isArray(value)) return value.length > 0;
@@ -270,9 +304,23 @@ function mockAnswerText(expectedJson) {
 
 function bridgeErrorToOpenAi(statusCode, payload) {
   const code = payload && payload.error ? payload.error : 'bridge_error';
-  const message = payload && payload.message ? payload.message : `DeepSeek web bridge error: ${code}`;
+  const message = publicBridgeErrorMessage(code);
   const type = statusCode >= 500 ? 'server_error' : 'invalid_request_error';
-  return makeOpenAiError(message, code, type);
+  const response = makeOpenAiError(message, code, type);
+  for (const field of ['providerOutcomeUnknown', 'retrySafe']) {
+    if (payload && typeof payload[field] === 'boolean') {
+      response[field] = payload[field];
+    }
+  }
+  return response;
+}
+
+function nonRetryableOpenAiError(message, code, providerOutcomeUnknown) {
+  return {
+    ...makeOpenAiError(message, code, 'server_error'),
+    providerOutcomeUnknown: providerOutcomeUnknown === true,
+    retrySafe: false
+  };
 }
 
 function chatCompletionResponse({ body, answerText, bridgeResult, created }) {
@@ -370,14 +418,33 @@ async function handleChatCompletions(req, res, context) {
   }
 
   const expectedJson = wantsJson(body);
+  const accountKey = requestAccountKey(req, body);
+  if (accountKey && !accountOverrideAllowed()) {
+    context.sendJson(res, 400, makeOpenAiError(
+      'Normal requests must declare a capability instead of selecting a DeepSeek account',
+      'account_override_forbidden',
+      'invalid_request_error',
+      'deepseek_account_key'
+    ));
+    return true;
+  }
+  const query = buildBridgeQuery(normalized.messages, body.max_tokens || body.maxTokens);
+  const submissionKey = requestSubmissionKey(req, body);
   const bridgeRequest = {
-    query: buildBridgeQuery(normalized.messages, body.max_tokens || body.maxTokens),
+    query,
     expectedJson,
     mode: requestMode(req, body),
-    accountKey: requestAccountKey(req, body),
+    capability: requestCapability(req, body),
+    purpose: typeof body.purpose === 'string' ? body.purpose : 'openai.chat-completions',
+    priority: requestPriority(req, body),
+    accountKey,
     sessionKey: requestSessionKey(req, body),
     closeTargetAfter: false
   };
+  if (submissionKey) {
+    bridgeRequest.submissionKey = submissionKey;
+    bridgeRequest.requestDigest = sha256Operation(bridgeRequest);
+  }
 
   if (isMockEnabled()) {
     const answerText = mockAnswerText(expectedJson);
@@ -399,10 +466,10 @@ async function handleChatCompletions(req, res, context) {
   try {
     bridgeResponse = await context.invokeSearch(bridgeRequest);
   } catch (error) {
-    context.sendJson(res, 502, makeOpenAiError(
-      error && error.message ? error.message : 'Failed to invoke DeepSeek web bridge',
+    context.sendJson(res, 502, nonRetryableOpenAiError(
+      publicBridgeErrorMessage('bridge_invocation_failed'),
       'bridge_invocation_failed',
-      'server_error'
+      true
     ));
     return true;
   }
@@ -414,29 +481,29 @@ async function handleChatCompletions(req, res, context) {
 
   const bridgeResult = bridgeResponse.payload.result || {};
   if (bridgeResult.contentStatus === 'incomplete') {
-    context.sendJson(res, 504, makeOpenAiError(
+    context.sendJson(res, 504, nonRetryableOpenAiError(
       'DeepSeek web bridge returned incomplete generation',
       'incomplete_generation',
-      'server_error'
+      false
     ));
     return true;
   }
 
   const answerText = typeof bridgeResult.answerText === 'string' ? bridgeResult.answerText : '';
   if (!answerText.trim()) {
-    context.sendJson(res, 502, makeOpenAiError(
+    context.sendJson(res, 502, nonRetryableOpenAiError(
       'DeepSeek web bridge returned an empty answer',
       'empty_answer',
-      'server_error'
+      false
     ));
     return true;
   }
 
   if (expectedJson && !isStrictJson(answerText)) {
-    context.sendJson(res, 502, makeOpenAiError(
+    context.sendJson(res, 502, nonRetryableOpenAiError(
       'DeepSeek web bridge returned invalid JSON for JSON mode',
       'invalid_json',
-      'server_error'
+      false
     ));
     return true;
   }
@@ -481,6 +548,7 @@ async function handleOpenAiAdapterRequest(req, res, context) {
 module.exports = {
   handleOpenAiAdapterRequest,
   _internals: {
+    bridgeErrorToOpenAi,
     buildBridgeQuery,
     chatCompletionResponse,
     flattenContent,
@@ -491,7 +559,10 @@ module.exports = {
     modelList,
     mockAnswerText,
     normalizeMessages,
+    requestCapability,
     requestAccountKey,
+    requestPriority,
+    requestSubmissionKey,
     wantsJson
   }
 };

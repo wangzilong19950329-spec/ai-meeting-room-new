@@ -3,6 +3,7 @@
 
 const http = require('http');
 const https = require('https');
+const { sha256Operation } = require('./deepseek-request-identity');
 
 const bridgeUrl = process.env.STOCK_WATCH_AI_RULES_BRIDGE_URL
   || process.env.STOCK_WATCH_TECH_BRIDGE_URL
@@ -10,7 +11,16 @@ const bridgeUrl = process.env.STOCK_WATCH_AI_RULES_BRIDGE_URL
   || 'http://127.0.0.1:8789/search';
 const timeoutMs = Number(process.env.SMOKE_TIMEOUT_MS || 240000);
 const requireDeepThink = String(process.env.SMOKE_REQUIRE_DEEP_THINK || '').toLowerCase() === 'true';
+const bridgeApiKey = process.env.DEEPSEEK_OPENAI_FACADE_API_KEY || '';
 const token = `stock_watch_ai_rule_expert_smoke_${Date.now()}`;
+
+function requestHeaders(body, apiKey = bridgeApiKey) {
+  return {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
+  };
+}
 
 function requestJson(url, payload) {
   const parsed = new URL(url);
@@ -24,10 +34,7 @@ function requestJson(url, payload) {
       path: `${parsed.pathname}${parsed.search}`,
       method: 'POST',
       timeout: timeoutMs,
-      headers: {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Length': Buffer.byteLength(body)
-      }
+      headers: requestHeaders(body)
     }, (res) => {
       let data = '';
       res.setEncoding('utf8');
@@ -65,7 +72,10 @@ function assertSmoke(result) {
   if (modeState.expertMode !== true) failures.push(`expertMode=${modeState.expertMode}`);
   if (modeState.quickMode !== false) failures.push(`quickMode=${modeState.quickMode}`);
   if (modeState.modeVerified !== true) failures.push(`modeVerified=${modeState.modeVerified}`);
-  if (modeState.headerMode !== 'expert') failures.push(`headerMode=${modeState.headerMode}`);
+  if (!['expert', 'unified'].includes(modeState.headerMode)) failures.push(`headerMode=${modeState.headerMode}`);
+  if (modeState.headerMode === 'unified' && modeState.searchEnabled !== true) {
+    failures.push(`searchEnabled=${modeState.searchEnabled}`);
+  }
   if (modeState.deepThinkEnabled !== true) {
     const message = `deepThinkEnabled=${modeState.deepThinkEnabled}`;
     if (requireDeepThink) failures.push(message);
@@ -84,7 +94,6 @@ function assertSmoke(result) {
     answerHasToken: answerText.includes(token),
     requireDeepThink,
     modeState,
-    finalUrl: payload.finalUrl || null,
     warnings,
     failures
   };
@@ -94,25 +103,39 @@ function assertSmoke(result) {
   }
 }
 
-async function main() {
+function buildSmokePayload(smokeToken) {
+  const query = `你是DeepSeek网页专业模式冒烟测试。只输出一个JSON对象，字段固定为 {"ok":true,"token":"${smokeToken}"}，不要输出Markdown或解释。`;
   const payload = {
-    query: `你是DeepSeek网页专业模式冒烟测试。只输出一个JSON对象，字段固定为 {"ok":true,"token":"${token}"}，不要输出Markdown或解释。`,
+    query,
+    capability: 'stock.rule-evaluation',
+    priority: 300,
     sessionKey: 'stock-watch-ai-rule-expert-smoke',
     forceNewSession: true,
     closeTargetAfter: false,
     expectedJson: true,
-    mode: 'expert'
+    mode: 'expert',
+    submissionKey: `stock-rule-smoke:${smokeToken}`
   };
+  payload.requestDigest = sha256Operation(payload);
+  return payload;
+}
+
+async function main() {
+  const payload = buildSmokePayload(token);
   const result = await requestJson(bridgeUrl, payload);
   assertSmoke(result);
 }
 
-main().catch((error) => {
-  console.log(JSON.stringify({
-    ok: false,
-    bridgeUrl,
-    token,
-    error: error && error.message ? error.message : String(error)
-  }, null, 2));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.log(JSON.stringify({
+      ok: false,
+      bridgeUrl,
+      token,
+      error: error && error.message ? error.message : String(error)
+    }, null, 2));
+    process.exit(1);
+  });
+}
+
+module.exports = { buildSmokePayload, requestHeaders };

@@ -42,6 +42,8 @@ const server = http.createServer((req, res) => {
     const isReviewProofRetry = query.includes('fixture_review_proof_retry');
     const isSearchProofRetry = query.includes('fixture_search_proof_retry');
     const isCoverageGap = query.includes('fixture_coverage_gap');
+    const isUncertain = query.includes('fixture_uncertain');
+    const isContradicted = query.includes('fixture_contradicted');
     const key = `${isRetry ? 'retry' : isReviewProofRetry ? 'review-proof' :
       isSearchProofRetry ? 'search-proof' : isCoverageGap ? 'coverage' :
       'pass'}:${isReview ? 'review' : 'search'}`;
@@ -76,6 +78,16 @@ const server = http.createServer((req, res) => {
       reason: '原始披露为 10，不是 100', missingFields: ['value'],
       requestedSource: '平台原始披露'
     }] }, url));
+    if (isReview && isUncertain) return send(res, 200, bridgeAnswer({
+      coverage: 'UNKNOWN', coverageReason: '没有独立同口径资料',
+      verdicts: [{ id: claim.id, verdict: 'UNKNOWN', observed: null,
+        reason: '独立搜索未找到同口径数字' }]
+    }, url));
+    if (isReview && isContradicted) return send(res, 200, bridgeAnswer({
+      coverage: 'UNKNOWN', coverageReason: '数字与独立来源矛盾',
+      verdicts: [{ id: claim.id, verdict: 'REJECT', observed: null,
+        reason: '独立搜索数字不一致' }]
+    }, url));
     if (isReview && isCoverageGap && count === 1) return send(res, 200, bridgeAnswer({
       coverage: 'PARTIAL', coverageReason: '缺少全球总量',
       verdicts: [{ id: claim.id, verdict: 'PASS', observed: claim,

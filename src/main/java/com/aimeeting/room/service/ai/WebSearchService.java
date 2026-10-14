@@ -15,8 +15,12 @@ import java.io.InputStreamReader;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -82,6 +86,8 @@ public class WebSearchService {
     private int deepseekWebTimeoutSeconds;
     @Value("${ai.search.deepseek-web.bridge-url:http://127.0.0.1:8789/search}")
     private String deepseekWebBridgeUrl;
+    @Value("${ai.search.deepseek-web.api-key:${DEEPSEEK_OPENAI_FACADE_API_KEY:}}")
+    private String deepseekWebApiKey;
     @Value("${ai.search.deepseek-web.connect-timeout-seconds:10}")
     private int deepseekWebConnectTimeoutSeconds;
     @Value("${ai.search.deepseek-web.read-timeout-seconds:180}")
@@ -120,10 +126,11 @@ public class WebSearchService {
                     .connectTimeout(2, TimeUnit.SECONDS)
                     .readTimeout(2, TimeUnit.SECONDS)
                     .build();
-            Request request = new Request.Builder()
+            Request.Builder requestBuilder = new Request.Builder()
                     .url(resolveDeepSeekWebBridgeHealthUrl())
-                    .get()
-                    .build();
+                    .get();
+            applyDeepSeekWebAuthorization(requestBuilder);
+            Request request = requestBuilder.build();
             try (Response response = bridgeClient.newCall(request).execute()) {
                 if (!response.isSuccessful()) {
                     return false;
@@ -179,9 +186,26 @@ public class WebSearchService {
             if (!providerResults.isEmpty()) {
                 return copyResults(providerResults, maxResults);
             }
+            if ("deepseek-web".equals(provider) && deepSeekBridgeBlocksRetry()) {
+                return Collections.emptyList();
+            }
         }
         markMeta("none", "provider_exhausted", buildProviderExhaustedNote());
         return Collections.emptyList();
+    }
+
+    /** Only Tavily currently supports a strict dated search; do not fall back to undated providers. */
+    public List<SearchResult> searchRecent(String query, int maxResults, LocalDate earliest, LocalDate latest) {
+        if (earliest == null || latest == null || earliest.isAfter(latest)) {
+            throw new IllegalArgumentException("Invalid recent search date window");
+        }
+        if (!hasTavily()) {
+            markMeta("tavily", "unavailable", "限时搜索需要配置 Tavily，当前未配置搜索密钥。");
+            return Collections.emptyList();
+        }
+        SiteDirective directive = extractSiteDirectives(normalizeQuery(query));
+        return copyResults(searchViaTavily(directive.strippedQuery, maxResults,
+                directive.domains.isEmpty() ? null : directive.domains, earliest, latest), maxResults);
     }
 
     /**
@@ -238,7 +262,7 @@ public class WebSearchService {
         List<String> providers = new ArrayList<>();
         if (preferredProviders != null) {
             for (String token : preferredProviders) {
-                String normalized = token == null ? "" : token.trim().toLowerCase();
+                String normalized = canonicalProviderName(token);
                 if (!normalized.isBlank() && !providers.contains(normalized)) {
                     providers.add(normalized);
                 }
@@ -249,7 +273,7 @@ public class WebSearchService {
         }
         if (providerOrder != null && !providerOrder.isBlank()) {
             for (String token : providerOrder.split(",")) {
-                String normalized = token == null ? "" : token.trim().toLowerCase();
+                String normalized = canonicalProviderName(token);
                 if (!normalized.isBlank() && !providers.contains(normalized)) {
                     providers.add(normalized);
                 }
@@ -262,6 +286,20 @@ public class WebSearchService {
             providers.add("serper");
         }
         return providers;
+    }
+
+    private String canonicalProviderName(String value) {
+        String normalized = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
+        if ("deepseek".equals(normalized) || "deepseek_web".equals(normalized)) {
+            return "deepseek-web";
+        }
+        if ("tavily-web".equals(normalized)) {
+            return "tavily";
+        }
+        if ("zhipu-web".equals(normalized) || "zhipu_web".equals(normalized)) {
+            return "zhipu";
+        }
+        return normalized;
     }
 
     private List<SearchResult> searchViaProvider(String provider, SiteDirective directive, int maxResults, boolean isolatedDeepSeekSession) {
@@ -295,7 +333,7 @@ public class WebSearchService {
             return Collections.emptyList();
         }
         List<SearchResult> webResults = searchViaDeepSeekWebBridge(normalizedQuery, maxResults, isolatedDeepSeekSession);
-        if (webResults.isEmpty() && deepseekWebAllowScriptFallback) {
+        if (webResults.isEmpty() && deepseekWebAllowScriptFallback && !deepSeekBridgeBlocksRetry()) {
             webResults = searchViaDeepSeekWebScript(normalizedQuery, maxResults);
         }
         return webResults;
@@ -318,6 +356,11 @@ public class WebSearchService {
      * includeDomains 非空时执行定向搜索（仅检索指定站点）。
      */
     public List<SearchResult> searchViaTavily(String query, int maxResults, List<String> includeDomains) {
+        return searchViaTavily(query, maxResults, includeDomains, null, null);
+    }
+
+    private List<SearchResult> searchViaTavily(String query, int maxResults, List<String> includeDomains,
+                                               LocalDate earliest, LocalDate latest) {
         if (!hasTavily()) {
             markProviderSkipped("tavily", "未配置 TAVILY_API_KEY。");
             return Collections.emptyList();
@@ -331,8 +374,14 @@ public class WebSearchService {
             body.put("api_key", tavilyApiKey);
             body.put("query", normalizedQuery);
             body.put("search_depth", tavilySearchDepth);
-            body.put("max_results", Math.max(1, Math.min(maxResults, 10)));
+            body.put("max_results", earliest == null ? Math.max(1, Math.min(maxResults, 10)) : 10);
             body.put("include_answer", tavilyIncludeAnswer);
+            if (earliest != null) {
+                body.put("start_date", earliest.toString());
+                body.put("end_date", latest.plusDays(1).toString());
+                body.put("include_published_date", true);
+                body.put("filter_by_published_date", true);
+            }
             if (tavilyCountry != null && !tavilyCountry.isBlank()) {
                 body.put("country", tavilyCountry.trim());
             }
@@ -378,16 +427,22 @@ public class WebSearchService {
                         String content = item.getString("content");
                         String title = item.getString("title");
                         if ((content == null || content.isBlank()) && (title == null || title.isBlank())) continue;
+                        LocalDate published = earliest == null ? null : parsePublishedDate(item.getString("published_date"));
+                        if (earliest != null && (published == null || published.isBefore(earliest) || published.isAfter(latest))) {
+                            continue;
+                        }
                         SearchResult r = new SearchResult();
                         r.source = title != null && !title.isBlank() ? title : "Tavily 搜索结果";
-                        r.snippet = content;
+                        r.snippet = published == null ? content : "发布日期：" + published + "；" + (content == null ? "" : content);
                         r.url = item.getString("url");
                         r.withTrace("tavily", "WEB_PAGE", normalizedQuery, item.toJSONString());
                         results.add(r);
                     }
                 }
                 if (results.isEmpty()) {
-                    markMeta("tavily", "empty", includeDomains != null && !includeDomains.isEmpty()
+                    markMeta("tavily", "empty", earliest != null
+                            ? "指定时间范围内未找到可核实发布日期的结果。"
+                            : includeDomains != null && !includeDomains.isEmpty()
                             ? "Tavily 定向搜索未在指定站点检索到有效结果。"
                             : "Tavily 未返回可用结果。");
                     return Collections.emptyList();
@@ -403,6 +458,25 @@ public class WebSearchService {
             log.warn("Tavily search error for '{}': {}", normalizedQuery, e.getMessage());
             markMeta("tavily", "error", "Tavily 搜索失败：" + e.getMessage());
             return Collections.emptyList();
+        }
+    }
+
+    private LocalDate parsePublishedDate(String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String value = raw.trim();
+        try {
+            return LocalDate.parse(value);
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME)
+                    .withZoneSameInstant(ZoneId.of("Asia/Shanghai")).toLocalDate();
+        } catch (DateTimeParseException ignored) {
+        }
+        try {
+            return OffsetDateTime.parse(value).atZoneSameInstant(ZoneId.of("Asia/Shanghai")).toLocalDate();
+        } catch (DateTimeParseException ignored) {
+            return null;
         }
     }
 
@@ -576,13 +650,15 @@ public class WebSearchService {
             OkHttpClient bridgeClient = httpClient.newBuilder()
                     .connectTimeout(Math.max(5, deepseekWebConnectTimeoutSeconds), TimeUnit.SECONDS)
                     .readTimeout(Math.max(30, deepseekWebReadTimeoutSeconds), TimeUnit.SECONDS)
+                    .retryOnConnectionFailure(false)
                     .build();
             long startedAt = System.currentTimeMillis();
-            Request request = new Request.Builder()
+            Request.Builder requestBuilder = new Request.Builder()
                     .url(deepseekWebBridgeUrl)
                     .header("Content-Type", "application/json")
-                    .post(RequestBody.create(body.toJSONString(), JSON_TYPE))
-                    .build();
+                    .post(RequestBody.create(body.toJSONString(), JSON_TYPE));
+            applyDeepSeekWebAuthorization(requestBuilder);
+            Request request = requestBuilder.build();
             try (Response response = bridgeClient.newCall(request).execute()) {
                 if (!response.isSuccessful()) {
                     String responseBody = response.body() != null ? response.body().string() : "";
@@ -596,7 +672,8 @@ public class WebSearchService {
                 String responseBody = response.body() != null ? response.body().string() : "";
                 JSONObject payload = JSON.parseObject(responseBody);
                 if (payload == null || !payload.getBooleanValue("ok")) {
-                    markMeta("deepseek_web_bridge", "invalid_payload", "DeepSeek 网页搜索 bridge 返回无效结果。");
+                    markMeta("deepseek_web_bridge", "provider_outcome_unknown",
+                            "DeepSeek 网页搜索 bridge 返回状态不确定，本次不会自动重试。");
                     return Collections.emptyList();
                 }
                 JSONObject result = payload.getJSONObject("result");
@@ -624,9 +701,31 @@ public class WebSearchService {
             }
         } catch (Exception e) {
             log.warn("DeepSeek web bridge error for '{}': {}", normalizedQuery, e.getMessage());
-            markMeta("deepseek_web_bridge", "error", "DeepSeek 网页搜索 bridge 异常：" + e.getMessage());
+            if (isDefinitelyPreSubmitTransport(e)) {
+                markMeta("deepseek_web_bridge", "pre_submit_failed", "DeepSeek 网页搜索 bridge 暂时不可用，且本次请求未提交。");
+            } else {
+                markMeta("deepseek_web_bridge", "provider_outcome_unknown",
+                        "DeepSeek 网页搜索 bridge 返回状态不确定，本次不会自动重试。");
+            }
             return Collections.emptyList();
         }
+    }
+
+    private boolean deepSeekBridgeBlocksRetry() {
+        SearchMeta meta = currentSearchMeta.get();
+        return meta != null && ("provider_outcome_unknown".equalsIgnoreCase(meta.status)
+                || "provider_outcome_not_retriable".equalsIgnoreCase(meta.status));
+    }
+
+    private boolean isDefinitelyPreSubmitTransport(Exception error) {
+        Throwable current = error;
+        while (current != null) {
+            if (current instanceof java.net.ConnectException || current instanceof java.net.UnknownHostException) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
     }
 
     private String normalizeDeepSeekWebMode(String rawMode) {
@@ -695,7 +794,7 @@ public class WebSearchService {
             return results;
         } catch (Exception e) {
             log.warn("DeepSeek web search error for '{}': {}", normalizedQuery, e.getMessage());
-            markMeta("deepseek_web_script", "error", "DeepSeek 网页搜索异常：" + e.getMessage());
+            markMeta("deepseek_web_script", "error", "DeepSeek 网页搜索脚本执行失败，详细诊断仅保留在服务端。");
             return Collections.emptyList();
         }
     }
@@ -1287,6 +1386,12 @@ public class WebSearchService {
         return base + "/health";
     }
 
+    private void applyDeepSeekWebAuthorization(Request.Builder requestBuilder) {
+        if (deepseekWebApiKey != null && !deepseekWebApiKey.isBlank()) {
+            requestBuilder.header("Authorization", "Bearer " + deepseekWebApiKey.trim());
+        }
+    }
+
     private String truncate(String text, int limit) {
         if (text == null) return "";
         if (text.length() <= limit) return text;
@@ -1407,6 +1512,13 @@ public class WebSearchService {
 
     private String resolveBridgeErrorStatus(int code, JSONObject errorPayload) {
         String error = errorPayload != null ? errorPayload.getString("error") : null;
+        if (errorPayload != null && Boolean.TRUE.equals(errorPayload.getBoolean("providerOutcomeUnknown"))) {
+            return "provider_outcome_unknown";
+        }
+        if (errorPayload != null && errorPayload.containsKey("retrySafe")
+                && Boolean.FALSE.equals(errorPayload.getBoolean("retrySafe"))) {
+            return "provider_outcome_not_retriable";
+        }
         if ("provider_timeout".equals(error) || code == 504) {
             return "timeout";
         }
@@ -1426,8 +1538,12 @@ public class WebSearchService {
     }
 
     private String resolveBridgeErrorNote(int code, JSONObject errorPayload) {
-        String message = errorPayload != null ? errorPayload.getString("message") : null;
         String error = errorPayload != null ? errorPayload.getString("error") : null;
+        if (errorPayload != null && (Boolean.TRUE.equals(errorPayload.getBoolean("providerOutcomeUnknown"))
+                || (errorPayload.containsKey("retrySafe")
+                && Boolean.FALSE.equals(errorPayload.getBoolean("retrySafe"))))) {
+            return "DeepSeek 网页搜索 bridge 返回状态不确定，本次不会自动重试。";
+        }
         if ("provider_timeout".equals(error) || code == 504) {
             return "DeepSeek 网页搜索等待超时，当前未拿到稳定返回。";
         }
@@ -1435,7 +1551,7 @@ public class WebSearchService {
             return "DeepSeek 网页会话不可用，可能需要重新登录。";
         }
         if ("debugger_unavailable".equals(error)) {
-            return "Chrome 远程调试端口不可用，bridge 当前无法接管页面。";
+            return "DeepSeek 分析容量暂时不可用。";
         }
         if ("submit_failed".equals(error)) {
             return "DeepSeek 页面已打开，但提交查询失败。";
@@ -1443,9 +1559,7 @@ public class WebSearchService {
         if (code == 429) {
             return "DeepSeek bridge 当前繁忙，未在等待窗口内拿到空闲槽位。";
         }
-        return message != null && !message.isBlank()
-                ? "DeepSeek 网页搜索 bridge 异常：" + message
-                : "DeepSeek 网页搜索 bridge 不可用。";
+        return "DeepSeek 网页搜索 bridge 不可用。";
     }
 
     private String resolveZhipuErrorStatus(int code, String responseBody) {

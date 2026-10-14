@@ -26,10 +26,94 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.never;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.argThat;
 
 class MeetingDebateServiceEvidenceTraceTest {
+
+    @Test
+    void reviewedSearchFailurePausesRoundBeforeModelOpinionAndVoting() {
+        MeetingDebateService service = new MeetingDebateService();
+        AiMeetingMember member = new AiMeetingMember();
+        member.setId(141L);
+        member.setMeetingId(62L);
+        member.setMemberName("资料分析师");
+        member.setModelType("deepseek-chat");
+        member.setPersona("公开资料");
+        AiMeetingRoom room = new AiMeetingRoom();
+        room.setId(62L);
+        room.setTitle("联合国宪章签署年份");
+        room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        AiMeetingRoomMapper roomMapper = mock(AiMeetingRoomMapper.class);
+        AiMeetingMemberMapper memberMapper = mock(AiMeetingMemberMapper.class);
+        AiMeetingOpinionMapper opinionMapper = mock(AiMeetingOpinionMapper.class);
+        MeetingWorkflowService workflow = mock(MeetingWorkflowService.class);
+        MeetingReviewedEvidenceService reviewed = mock(MeetingReviewedEvidenceService.class);
+        MeetingOrchestratorService orchestrator = mock(MeetingOrchestratorService.class);
+        com.aimeeting.room.config.ModelRegistryStore registry = mock(com.aimeeting.room.config.ModelRegistryStore.class);
+        when(memberMapper.selectByMeetingId(62L)).thenReturn(List.of(member));
+        when(workflow.resolveMembersForCurrentStage(eq(62L), anyList())).thenReturn(List.of(member));
+        when(roomMapper.selectById(62L)).thenReturn(room);
+        when(opinionMapper.selectByMeetingIdAndRound(62L, 1)).thenReturn(Collections.emptyList());
+        when(reviewed.isEnabled()).thenReturn(true);
+        when(orchestrator.buildReviewedEvidenceNeedsPrompt(62L, 141L, 1)).thenReturn("member-plan");
+        when(orchestrator.callModelStrict(eq("deepseek-chat"), anyString(), eq("member-plan"), eq(500)))
+                .thenReturn("{\"need\":true,\"needs\":[{\"id\":\"year\",\"question\":\"联合国宪章签署年份是哪年？\",\"eastmoneyFields\":[],\"webSearch\":true,\"sourceFocus\":[]}]}");
+        when(reviewed.search(anyString())).thenThrow(new MeetingReviewedEvidenceService.EvidenceRejected("N8N_REVIEW_UNVERIFIED"));
+        ReflectionTestUtils.setField(service, "roomMapper", roomMapper);
+        ReflectionTestUtils.setField(service, "memberMapper", memberMapper);
+        ReflectionTestUtils.setField(service, "opinionMapper", opinionMapper);
+        ReflectionTestUtils.setField(service, "workflowService", workflow);
+        ReflectionTestUtils.setField(service, "reviewedEvidenceService", reviewed);
+        ReflectionTestUtils.setField(service, "orchestrator", orchestrator);
+        ReflectionTestUtils.setField(service, "modelRegistryStore", registry);
+
+        assertEquals(0, service.executeDebateRound(62L, 1).size());
+        verify(reviewed).search(argThat(query -> query.contains("本次唯一待核验缺口：联合国宪章签署年份是哪年？")
+                && !query.contains("优先给出近期事件")));
+        verify(roomMapper).updateStatus(62L, MeetingStatusEnum.PAUSED.getCode());
+        verify(workflow).markReviewedEvidenceBlocked(eq(62L), anyString());
+        verify(opinionMapper, never()).insert(org.mockito.ArgumentMatchers.any());
+        verify(orchestrator, never()).callModelExStrict(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void strictGroundingRetryPreservesUnknownOutcomeBlock() {
+        MeetingDebateService service = new MeetingDebateService();
+        MeetingOrchestratorService orchestrator = mock(MeetingOrchestratorService.class);
+        ReflectionTestUtils.setField(service, "orchestrator", orchestrator);
+        ChatResult unknown = new ChatResult(
+                null,
+                Collections.emptyList(),
+                Collections.emptyList(),
+                "deepseek_web_bridge",
+                "provider_outcome_unknown",
+                "不会自动重试",
+                "provider_outcome_unknown",
+                "不会自动重试",
+                true,
+                false
+        );
+        when(orchestrator.callModelEx(eq("deepseek-chat"), anyString(), anyString())).thenReturn(unknown);
+
+        ChatResult result = ReflectionTestUtils.invokeMethod(
+                service,
+                "retryWithStrictEvidenceGrounding",
+                "system",
+                "context",
+                "deepseek-chat",
+                Collections.emptyList(),
+                Collections.emptyList(),
+                new ChatResult("previous")
+        );
+
+        assertNotNull(result);
+        assertTrue(result.blocksAutomaticRetry());
+    }
 
     @Test
     void extractsStructuredSourceTraceFromEastmoneySnippet() {
@@ -86,6 +170,290 @@ class MeetingDebateServiceEvidenceTraceTest {
         assertEquals(2, audit.getIntValue("numericClaimCount"));
         assertEquals(1, audit.getJSONArray("unsupportedNumericClaims").size());
         assertEquals("18.5%", audit.getJSONArray("unsupportedNumericClaims").getJSONObject(0).getString("claim"));
+    }
+
+    @Test
+    void claimAuditAcceptsScientificAmountsAndAllSuppliedFundFlowFields() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult("东方财富结构化数据 300750.sz quote",
+                "{\"quote\":{\"price\":285.27,\"previousClose\":291.11,\"open\":292.0,"
+                + "\"high\":293.47,\"low\":285.17,\"amount\":9.30697261057E9,"
+                + "\"mainInflow\":-3.75513504E8,\"mainInflowRatio\":-4.03,"
+                + "\"superLargeInflow\":-6.013768E7,\"largeInflow\":-3.15375824E8,"
+                + "\"mediumInflow\":3.39201328E8,\"smallInflow\":3.6312192E7}}");
+        JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "成交额9.30697261057E9元，主力净流入-3.75513504E8元，超大单-6.013768E7元，"
+                + "大单-3.15375824E8元，中单3.39201328E8元，小单3.6312192E7元；"
+                + "昨收291.11元，今开292元，高293.47元，低285.17元。"), List.of(result), newSearchPlan("300750"));
+        assertEquals("ok", audit.getString("status"));
+        assertEquals(10, audit.getIntValue("numericClaimCount"));
+
+        JSONObject invalid = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "金额7元，资金比例4.03%，主力净流入3.75513504E8元，金额9.30697261057E8元，金额1E10元。"),
+                List.of(result), newSearchPlan("300750"));
+        assertEquals(5, invalid.getIntValue("unsupportedNumericClaimCount"));
+    }
+
+    @Test
+    void claimAuditAllowsOnlyDisplayPrecisionRoundingWithSameSignAndUnits() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult("东方财富结构化数据 300750.sz quote",
+                "{\"quote\":{\"amount\":9.30697261057E9,\"mainInflow\":-3.75513504E8}}");
+        JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "成交额约93.07亿元，主力净流入约-3.76亿元。"), List.of(result), newSearchPlan("300750"));
+        assertEquals("ok", audit.getString("status"));
+        JSONObject invalid = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "成交额93.06亿元，净流入3.76亿元，比率93.07%。"), List.of(result), newSearchPlan("300750"));
+        assertEquals(3, invalid.getIntValue("unsupportedNumericClaimCount"));
+    }
+
+    @Test
+    void claimAuditUsesSuppliedHistoricalFinancialRowsButRejectsNewDerivatives() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult("东方财富结构化数据 300750.sz financials",
+                "{\"financials\":[{\"reportDate\":\"2026-06-30\",\"revenue\":276917000000,"
+                + "\"netProfit\":43284000000,\"netMarginPct\":16.9843},"
+                + "{\"reportDate\":\"2026-03-31\",\"revenue\":129131000000,"
+                + "\"netProfit\":20738000000,\"netMarginPct\":17.61},"
+                + "{\"reportDate\":\"2025-12-31\",\"revenue\":423702000000,\"netMarginPct\":18.12}]}");
+        JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "中报净利率16.98%，一季报营收1291.31亿元、归母净利润207.38亿元、净利率17.61%；"
+                + "上年营收4237.02亿元、净利率18.12%。"), List.of(result), newSearchPlan("300750"));
+        assertEquals("ok", audit.getString("status"));
+        JSONObject invalid = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "一季报净利率17.62%；推算二季度营收1477.86亿元，这是派生计算。"),
+                List.of(result), newSearchPlan("300750"));
+        assertEquals(2, invalid.getIntValue("unsupportedNumericClaimCount"));
+    }
+
+    @Test
+    void claimAuditUsesSuppliedDailyKlinePricesAmountsAndPercentages() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult("东方财富结构化数据 300750.sz dailyKline",
+                "{\"dailyKline\":[{\"date\":\"2026-10-08\",\"open\":292.00,\"high\":293.47,"
+                + "\"low\":285.17,\"close\":287.06,\"change\":-4.05,\"amount\":10230000000,"
+                + "\"changePct\":-1.39,\"amplitudePct\":2.85,\"turnoverPct\":0.84},"
+                + "{\"date\":\"2026-09-30\",\"close\":291.11,\"changePct\":1.50}]}");
+        JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "当日开盘292元，最高293.47元，最低285.17元，收盘287.06元，涨跌额-4.05元，"
+                + "成交额102.3亿元，涨跌幅-1.39%，振幅2.85%，换手率0.84%；"
+                + "上一交易日收盘291.11元，涨跌幅1.50%。"), List.of(result), newSearchPlan("300750"));
+        assertEquals("ok", audit.getString("status"));
+        JSONObject invalid = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit", new ChatResult(
+                "涨跌幅-1.38%，振幅2.86%，换手率0.85%，收盘287.07元。"),
+                List.of(result), newSearchPlan("300750"));
+        assertEquals(4, invalid.getIntValue("unsupportedNumericClaimCount"));
+    }
+
+    @Test
+    void guardedTermAuditAllowsExplicitOmissionButStillChecksEveryAssertion() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult("东方财富结构化数据 300750.sz quote",
+                "{\"quote\":{\"price\":285.27}}");
+        for (String omission : List.of("机构一致预期本轮证据未提供/无法核验。", "本轮未提供机构一致预期。",
+                "估值、当前市价、自由现金流、资本开支、有息负债结构、机构一致预期、未来季度预测均“本轮证据未提供/无法核验”。")) {
+            JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit",
+                    new ChatResult(omission), List.of(result), newSearchPlan("300750"));
+            assertEquals("ok", audit.getString("status"), omission);
+        }
+        for (String assertion : List.of("机构一致预期上修。本轮未提供机构一致预期。",
+                "机构一致预期上修，但本轮证据未提供/无法核验。",
+                "机构一致预期上修本轮证据未提供/无法核验。",
+                "机构一致预期本轮证据未提供/无法核验，但一致预期仍然上修。")) {
+            JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit",
+                    new ChatResult(assertion), List.of(result), newSearchPlan("300750"));
+            assertEquals(1, audit.getIntValue("guardedTermViolationCount"), assertion);
+        }
+    }
+
+    @Test
+    void structuredProjectionsSharingQuoteUrlRemainDistinctButExactCopiesCollapse() {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult quote = structuredResult("东方财富结构化数据 300750.sz quote",
+                "{\"quote\":{\"price\":285.27}}");
+        WebSearchService.SearchResult history = structuredResult("东方财富结构化数据 300750.sz dailyKline",
+                "{\"dailyKline\":[{\"date\":\"2026-10-08\",\"close\":285.27}]}");
+        WebSearchService.SearchResult indicators = structuredResult("东方财富结构化数据 300750.sz technicalIndicators",
+                "{\"technicalIndicators\":{\"rsi14\":41.2}}");
+        for (WebSearchService.SearchResult result : List.of(quote, history, indicators)) {
+            result.url = "https://quote.eastmoney.com/sz300750.html";
+            result.withTrace("eastmoney", "STRUCTURED_DATA", result.source, result.snippet);
+        }
+        List<WebSearchService.SearchResult> retained = ReflectionTestUtils.invokeMethod(service,
+                "dedupeSearchResults", List.of(quote, history, indicators, quote));
+        assertEquals(List.of(quote, history, indicators), retained);
+    }
+
+    @Test
+    void claimAuditDoesNotTreatProvisionalNumbersAsVerifiedFacts() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult provisional = new WebSearchService.SearchResult();
+        provisional.source = "n8n 待核验候选：利润率";
+        provisional.snippet = "【待核验】利润率为18.5%";
+        provisional.url = "https://example.org/candidate";
+        provisional.withTrace("n8n-deepseek-provisional", "LOW_CONFIDENCE_SEARCH",
+                "利润率是多少？", "candidate");
+        WebSearchService.SearchResult verified = structuredResult(
+                "东方财富结构化数据 300750.sz quote",
+                "{\"symbol\":\"300750\",\"quote\":{\"price\":291.11}}");
+
+        JSONObject audit = ReflectionTestUtils.invokeMethod(service, "buildClaimAudit",
+                new ChatResult("利润率已达到18.5%。"), List.of(verified, provisional),
+                newSearchPlan("300750"));
+
+        assertNotNull(audit);
+        assertEquals("unsupported_claims", audit.getString("status"));
+        assertEquals("18.5%", audit.getJSONArray("unsupportedNumericClaims")
+                .getJSONObject(0).getString("claim"));
+    }
+
+    @Test
+    void claimAuditChecksPublishedReplyInsteadOfModelEvidencePreamble() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult(
+                "东方财富结构化数据 300750.sz quote",
+                "{\"symbol\":\"300750\",\"market\":\"sz\",\"quote\":{\"price\":291.11}}"
+        );
+        ChatResult chatResult = new ChatResult(
+                "{\"e\":[{\"p\":\"模型自述股息率 9.9%\"}]}\n==REPLY==\n本轮证据显示最新价 291.11元，后续走势仍需观察。"
+        );
+
+        JSONObject audit = ReflectionTestUtils.invokeMethod(
+                service, "buildClaimAudit", chatResult, List.of(result), newSearchPlan("300750")
+        );
+
+        assertNotNull(audit);
+        assertEquals("ok", audit.getString("status"));
+        assertEquals(1, audit.getIntValue("numericClaimCount"));
+    }
+
+    @Test
+    void claimAuditRejectsEvidenceJsonWithoutReplyBody() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        WebSearchService.SearchResult result = structuredResult(
+                "东方财富结构化数据 300750.sz quote",
+                "{\"symbol\":\"300750\",\"quote\":{\"price\":291.11}}"
+        );
+
+        JSONObject audit = ReflectionTestUtils.invokeMethod(
+                service, "buildClaimAudit", new ChatResult("{\"q\":[],\"e\":[]}"),
+                List.of(result), newSearchPlan("300750")
+        );
+
+        assertNotNull(audit);
+        assertEquals("unsupported_claims", audit.getString("status"));
+        assertEquals(1, audit.getIntValue("formatViolationCount"));
+    }
+
+    @Test
+    void structuredSnippetFitsBudgetAsValidJsonWithoutLosingQuoteOrRecentKline() {
+        MeetingDebateService service = new MeetingDebateService();
+        JSONObject payload = new JSONObject(true);
+        payload.put("symbol", "300750");
+        payload.put("market", "sz");
+        payload.put("quote", JSONObject.parseObject("{\"price\":291.11,\"changePercent\":1.5}"));
+        JSONArray klines = new JSONArray();
+        for (int i = 0; i < 40; i++) {
+            JSONObject day = new JSONObject(true);
+            day.put("date", String.format("2026-09-%02d", i + 1));
+            day.put("close", 290 + i);
+            day.put("detail", "行情明细".repeat(30));
+            klines.add(day);
+        }
+        payload.put("dailyKline", klines);
+
+        String snippet = ReflectionTestUtils.invokeMethod(
+                service, "serializeStructuredSearchSnippet", payload, 7000
+        );
+
+        assertNotNull(snippet);
+        assertTrue(snippet.length() <= 7000);
+        JSONObject parsed = JSONObject.parseObject(snippet);
+        assertEquals("300750", parsed.getString("symbol"));
+        assertEquals(291.11, parsed.getJSONObject("quote").getDoubleValue("price"));
+        assertEquals(329, parsed.getJSONArray("dailyKline").getJSONObject(
+                parsed.getJSONArray("dailyKline").size() - 1).getIntValue("close"));
+    }
+
+    @Test
+    void fallbackDoesNotExposeCutOffStructuredJsonAsProse() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        AiMeetingMember member = new AiMeetingMember();
+        member.setMemberName("股票深度价值派分析师");
+        WebSearchService.SearchResult result = structuredResult(
+                "东方财富结构化数据 300750.sz quote",
+                "{\"symbol\":\"300750\",\"quote\":{\"price\":291.11},\"dailyKline\":[{\"date\":\"2026-09-30\"…"
+        );
+
+        String content = ReflectionTestUtils.invokeMethod(
+                service, "synthesizeExternalSearchFallbackOpinion", member,
+                newSearchPlan("300750"), List.of(result), new ChatResult("未核验数字")
+        );
+
+        assertNotNull(content);
+        assertTrue(content.contains("结构化行情"));
+        assertFalse(content.contains("{\"symbol\""));
+        assertFalse(content.contains("\"dailyKline\""));
+    }
+
+    @Test
+    void rejectedDeepSeekReplyRemainsVisibleOnlyAsUnverifiedEvidence() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        MeetingOrchestratorService orchestrator = mock(MeetingOrchestratorService.class);
+        ReflectionTestUtils.setField(service, "orchestrator", orchestrator);
+        WebSearchService.SearchResult result = structuredResult(
+                "东方财富结构化数据 300750.sz quote",
+                "{\"symbol\":\"300750\",\"market\":\"sz\",\"quote\":{\"price\":291.11}}"
+        );
+        ChatResult first = new ChatResult("初稿：股息率 9.9%。");
+        ChatResult revision = new ChatResult("{\"e\":[]}\n==REPLY==\n复核稿：预计上涨 88%，仍需观察。");
+        when(orchestrator.callModelEx(eq("deepseek-chat"), anyString(), anyString())).thenReturn(revision);
+        AiMeetingMember member = new AiMeetingMember();
+        member.setMemberName("股票深度价值派分析师");
+
+        ChatResult stored = ReflectionTestUtils.invokeMethod(
+                service, "enforceSearchEvidenceGrounding", member, "system", "context", "deepseek-chat",
+                List.of("宁德时代行情"), List.of(result), newSearchPlan("300750"), first
+        );
+        assertNotNull(stored);
+        assertEquals("strict_grounding_fallback", stored.searchStatus);
+        assertFalse(stored.content.contains("预计上涨 88%"));
+        String evidenceJson = ReflectionTestUtils.invokeMethod(
+                service, "buildEvidenceJson", null, null, 1, null,
+                List.of("宁德时代行情"), List.of(result), newSearchPlan("300750"),
+                stored, null, null, null
+        );
+        JSONObject evidence = JSONObject.parseObject(evidenceJson);
+        assertEquals("复核稿：预计上涨 88%，仍需观察。", evidence.getString("unverifiedModelReply"));
+        assertEquals("unsupported_claims", evidence.getJSONObject("rejectedClaimAudit").getString("status"));
+        assertEquals("ok", evidence.getJSONObject("claimAudit").getString("status"));
+    }
+
+    @Test
+    void evidenceOnlyModelReplyStoresFormatFailureWithoutPublishingJson() throws Exception {
+        MeetingDebateService service = new MeetingDebateService();
+        MeetingOrchestratorService orchestrator = mock(MeetingOrchestratorService.class);
+        ReflectionTestUtils.setField(service, "orchestrator", orchestrator);
+        WebSearchService.SearchResult result = structuredResult(
+                "东方财富结构化数据 300750.sz quote",
+                "{\"symbol\":\"300750\",\"quote\":{\"price\":291.11}}"
+        );
+        ChatResult onlyEvidence = new ChatResult("{\"q\":[],\"e\":[]}");
+        when(orchestrator.callModelEx(eq("deepseek-chat"), anyString(), anyString())).thenReturn(onlyEvidence);
+
+        ChatResult stored = ReflectionTestUtils.invokeMethod(
+                service, "enforceSearchEvidenceGrounding", new AiMeetingMember(), "system", "context",
+                "deepseek-chat", List.of(), List.of(result), newSearchPlan("300750"), onlyEvidence
+        );
+        assertEquals("strict_grounding_fallback", stored.searchStatus);
+        assertFalse(stored.content.contains("\"q\""));
+        String evidenceJson = ReflectionTestUtils.invokeMethod(
+                service, "buildEvidenceJson", null, null, 1, null,
+                List.of(), List.of(result), newSearchPlan("300750"), stored, null, null, null
+        );
+        JSONObject evidence = JSONObject.parseObject(evidenceJson);
+        assertFalse(evidence.containsKey("unverifiedModelReply"));
+        assertEquals(1, evidence.getJSONObject("rejectedClaimAudit").getIntValue("formatViolationCount"));
     }
 
     @Test
@@ -388,6 +756,8 @@ class MeetingDebateServiceEvidenceTraceTest {
         assertNotNull(content);
         assertTrue(content.contains("结构化行情摘要"));
         assertTrue(content.contains("最新价 24.8元"));
+        assertTrue(content.contains("MA20 23.6"));
+        assertFalse(content.contains("23.6null"));
         assertFalse(content.contains("\"quote\""));
         assertFalse(content.contains("{\"symbol\""));
     }

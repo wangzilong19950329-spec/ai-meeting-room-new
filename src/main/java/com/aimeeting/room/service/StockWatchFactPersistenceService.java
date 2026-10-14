@@ -17,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -30,6 +31,12 @@ import java.util.Map;
 @Service
 @RequiredArgsConstructor
 public class StockWatchFactPersistenceService {
+
+    public static final String STANDARD_FACT_SCHEMA = "stock-watch-fact-v1";
+    public static final String QUOTE_ALERT_FACT_SCHEMA = "stock-watch-quote-alert-fact-v1";
+    public static final String QUOTE_ALERT_SOURCE_TIME_QUALITY = "QUOTE_ALERT";
+    private static final long MAX_QUOTE_ALERT_AGE_MILLIS = 24L * 60L * 60L * 1000L;
+    private static final long MAX_QUOTE_ALERT_FUTURE_SKEW_MILLIS = 5L * 60L * 1000L;
 
     private static final List<String> QUOTE_ALLOWLIST = Arrays.asList(
             "symbol", "market", "name", "source", "timestamp", "updateTime", "price", "open", "high", "low",
@@ -56,7 +63,10 @@ public class StockWatchFactPersistenceService {
         long sourceTimeEpochMs = riskPattern.getQuoteObservedAt().toInstant().toEpochMilli();
         Map<String, Object> factSnapshot = canonicalFactSnapshot(symbol, normalizedMarket, quote, riskPattern);
         String factJson = JSON.toJSONString(factSnapshot);
-        String factHash = sha256(factJson);
+        // Research metadata must not create canonical facts or trigger existing consumers.
+        Map<String, Object> identitySnapshot = new LinkedHashMap<>(factSnapshot);
+        identitySnapshot.remove("priceFailureResearchFeatures");
+        String factHash = sha256(JSON.toJSONString(identitySnapshot));
         String observationKey = sha256(symbol + "|" + normalizedMarket + "|" + sourceTimeEpochMs + "|" + factHash);
         StockWatchFactObservation existing = observationMapper.selectByObservationKey(observationKey);
         if (existing != null) {
@@ -100,6 +110,67 @@ public class StockWatchFactPersistenceService {
         List<Map<String, Object>> verdicts = evaluateExistingTests(observation, riskPattern);
         int createdTests = createTests(observation, riskPattern);
         return ObservationReceipt.created(observation, verdicts, createdTests);
+    }
+
+    @Transactional
+    public ObservationReceipt observeQuoteAlert(String symbol,
+                                                String market,
+                                                String stockName,
+                                                Map<String, Object> quote,
+                                                ZonedDateTime sampledAt) {
+        ZonedDateTime effectiveSampledAt = sampledAt == null ? ZonedDateTime.now() : sampledAt;
+        QuoteTimestampResolution timestamp = quoteAlertTimestamp(quote, effectiveSampledAt);
+        if (!timestamp.accepted) {
+            return ObservationReceipt.skipped(timestamp.reason);
+        }
+        String normalizedMarket = market == null ? "" : market.trim().toLowerCase(Locale.ROOT);
+        long sourceTimeEpochMs = timestamp.observedAt.toInstant().toEpochMilli();
+        Map<String, Object> sourceQuality = quoteAlertSourceQuality(quote, timestamp.observedAt, effectiveSampledAt);
+        Map<String, Object> factSnapshot = canonicalQuoteAlertSnapshot(symbol, normalizedMarket, quote, sourceQuality);
+        String factJson = JSON.toJSONString(factSnapshot);
+        String factHash = sha256(JSON.toJSONString(canonicalQuoteAlertIdentitySnapshot(factSnapshot)));
+        String observationKey = sha256("quote-alert|" + symbol + "|" + normalizedMarket + "|"
+                + sourceTimeEpochMs + "|" + factHash);
+        StockWatchFactObservation existing = observationMapper.selectByObservationKey(observationKey);
+        if (existing != null) {
+            return ObservationReceipt.duplicate(existing);
+        }
+
+        StockWatchFactHead head = lockOrCreateHead(symbol, normalizedMarket);
+        long arrivalVersion = value(head.getArrivalVersion(), 0L) + 1L;
+        StockWatchFactObservation observation = new StockWatchFactObservation();
+        observation.setSymbol(symbol);
+        observation.setMarket(normalizedMarket);
+        observation.setStockName(stockName);
+        observation.setObservationKey(observationKey);
+        observation.setArrivalVersion(arrivalVersion);
+        observation.setSourceTimeEpochMs(sourceTimeEpochMs);
+        observation.setSourceDate(timestamp.observedAt.toLocalDate().toString());
+        observation.setSourceTimeQuality(QUOTE_ALERT_SOURCE_TIME_QUALITY);
+        observation.setFactHash(factHash);
+        observation.setFactSnapshotJson(factJson);
+        observation.setDataQualityJson(JSON.toJSONString(sourceQuality));
+        observation.setSampledAt(Date.from(effectiveSampledAt.toInstant()));
+        try {
+            observationMapper.insert(observation);
+        } catch (DuplicateKeyException duplicate) {
+            StockWatchFactObservation raced = observationMapper.selectByObservationKey(observationKey);
+            if (raced != null) return ObservationReceipt.duplicate(raced);
+            throw duplicate;
+        }
+
+        boolean advances = head.getLatestObservationId() == null
+                || head.getLastSourceTimeEpochMs() == null
+                || sourceTimeEpochMs > head.getLastSourceTimeEpochMs()
+                || (sourceTimeEpochMs == head.getLastSourceTimeEpochMs() && !factHash.equals(head.getLastFactHash()));
+        int updated = advances
+                ? headMapper.updateLatest(head.getId(), value(head.getRowVersion(), 0L), arrivalVersion,
+                observation.getId(), sourceTimeEpochMs, observation.getSourceDate(), observation.getSourceTimeQuality(), factHash)
+                : headMapper.updateArrivalVersion(head.getId(), value(head.getRowVersion(), 0L), arrivalVersion);
+        if (updated != 1) throw new IllegalStateException("fact_head_concurrent_update");
+        return advances
+                ? ObservationReceipt.created(observation, Collections.emptyList(), 0)
+                : ObservationReceipt.stale(observation);
     }
 
     @Transactional
@@ -291,18 +362,91 @@ public class StockWatchFactPersistenceService {
                                                       Map<String, Object> quote,
                                                       RiskPatternResult riskPattern) {
         Map<String, Object> snapshot = new LinkedHashMap<>();
-        snapshot.put("schema", "stock-watch-fact-v1");
+        snapshot.put("schema", STANDARD_FACT_SCHEMA);
         snapshot.put("symbol", symbol);
         snapshot.put("market", market);
+        snapshot.put("quote", canonicalQuote(quote));
+        snapshot.put("riskPatternObservations", riskPattern.getObservations());
+        snapshot.put("priceFailureResearchFeatures", riskPattern.getPriceFailureResearchFeatures());
+        return snapshot;
+    }
+
+    private Map<String, Object> canonicalQuoteAlertSnapshot(String symbol,
+                                                            String market,
+                                                            Map<String, Object> quote,
+                                                            Map<String, Object> sourceQuality) {
+        Map<String, Object> snapshot = new LinkedHashMap<>();
+        snapshot.put("schema", QUOTE_ALERT_FACT_SCHEMA);
+        snapshot.put("symbol", symbol);
+        snapshot.put("market", market);
+        snapshot.put("quote", canonicalQuote(quote));
+        snapshot.put("quoteAlertObservation", sourceQuality);
+        return snapshot;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> canonicalQuoteAlertIdentitySnapshot(Map<String, Object> factSnapshot) {
+        Map<String, Object> identity = new LinkedHashMap<>(factSnapshot);
+        Object rawQuality = identity.get("quoteAlertObservation");
+        if (rawQuality instanceof Map) {
+            Map<String, Object> quality = new LinkedHashMap<>((Map<String, Object>) rawQuality);
+            quality.remove("sampledAt");
+            quality.remove("quoteAgeSeconds");
+            identity.put("quoteAlertObservation", quality);
+        }
+        return identity;
+    }
+
+    private Map<String, Object> canonicalQuote(Map<String, Object> quote) {
         Map<String, Object> canonicalQuote = new LinkedHashMap<>();
         if (quote != null) {
             for (String key : QUOTE_ALLOWLIST) {
                 if (quote.containsKey(key)) canonicalQuote.put(key, quote.get(key));
             }
         }
-        snapshot.put("quote", canonicalQuote);
-        snapshot.put("riskPatternObservations", riskPattern.getObservations());
-        return snapshot;
+        return canonicalQuote;
+    }
+
+    private Map<String, Object> quoteAlertSourceQuality(Map<String, Object> quote,
+                                                        ZonedDateTime observedAt,
+                                                        ZonedDateTime sampledAt) {
+        Map<String, Object> sourceQuality = new LinkedHashMap<>();
+        sourceQuality.put("schema", QUOTE_ALERT_FACT_SCHEMA);
+        sourceQuality.put("canonicalQuoteSource", text(quote == null ? null : quote.get("source"), "monitor.quote"));
+        sourceQuality.put("canonicalQuoteObservedAt", observedAt.toString());
+        sourceQuality.put("canonicalQuoteTradeDate", observedAt.toLocalDate().toString());
+        sourceQuality.put("sampledAt", sampledAt.toString());
+        sourceQuality.put("timestampSource", "quote.timestamp");
+        sourceQuality.put("quoteAgeSeconds", Math.max(0L,
+                (sampledAt.toInstant().toEpochMilli() - observedAt.toInstant().toEpochMilli()) / 1000L));
+        sourceQuality.put("freshnessStatus", QUOTE_ALERT_SOURCE_TIME_QUALITY);
+        sourceQuality.put("consistent", true);
+        return sourceQuality;
+    }
+
+    private QuoteTimestampResolution quoteAlertTimestamp(Map<String, Object> quote, ZonedDateTime sampledAt) {
+        Long rawTimestamp = longNumber(quote == null ? null : quote.get("timestamp"));
+        if (rawTimestamp == null) {
+            return QuoteTimestampResolution.rejected("quote_alert_timestamp_missing");
+        }
+        long epochMs = rawTimestamp > 9_999_999_999L ? rawTimestamp : rawTimestamp * 1000L;
+        if (epochMs <= 0) {
+            return QuoteTimestampResolution.rejected("quote_alert_timestamp_invalid");
+        }
+        ZonedDateTime observedAt;
+        try {
+            observedAt = Instant.ofEpochMilli(epochMs).atZone(sampledAt.getZone());
+        } catch (Exception invalid) {
+            return QuoteTimestampResolution.rejected("quote_alert_timestamp_invalid");
+        }
+        long sampledEpochMs = sampledAt.toInstant().toEpochMilli();
+        if (epochMs - sampledEpochMs > MAX_QUOTE_ALERT_FUTURE_SKEW_MILLIS) {
+            return QuoteTimestampResolution.rejected("quote_alert_timestamp_future");
+        }
+        if (sampledEpochMs - epochMs > MAX_QUOTE_ALERT_AGE_MILLIS) {
+            return QuoteTimestampResolution.rejected("quote_alert_timestamp_stale");
+        }
+        return QuoteTimestampResolution.accepted(observedAt);
     }
 
     private String sourceTimeQuality(RiskPatternResult riskPattern) {
@@ -333,6 +477,21 @@ public class StockWatchFactPersistenceService {
         } catch (Exception ignored) {
             return null;
         }
+    }
+
+    private Long longNumber(Object raw) {
+        if (raw == null) return null;
+        try {
+            return raw instanceof Number ? ((Number) raw).longValue() : Long.parseLong(String.valueOf(raw).trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String text(Object raw, String fallback) {
+        if (raw == null) return fallback;
+        String value = String.valueOf(raw).trim();
+        return value.isEmpty() ? fallback : value;
     }
 
     private int value(Integer raw, int fallback) {
@@ -368,6 +527,26 @@ public class StockWatchFactPersistenceService {
             this.target = target;
             this.maxAge = maxAge;
             this.requiredObserved = requiredObserved;
+        }
+    }
+
+    private static class QuoteTimestampResolution {
+        private final boolean accepted;
+        private final ZonedDateTime observedAt;
+        private final String reason;
+
+        private QuoteTimestampResolution(boolean accepted, ZonedDateTime observedAt, String reason) {
+            this.accepted = accepted;
+            this.observedAt = observedAt;
+            this.reason = reason;
+        }
+
+        private static QuoteTimestampResolution accepted(ZonedDateTime observedAt) {
+            return new QuoteTimestampResolution(true, observedAt, null);
+        }
+
+        private static QuoteTimestampResolution rejected(String reason) {
+            return new QuoteTimestampResolution(false, null, reason);
         }
     }
 
@@ -416,6 +595,9 @@ public class StockWatchFactPersistenceService {
             result.put("observationKey", observation == null ? null : observation.getObservationKey());
             result.put("arrivalVersion", observation == null ? null : observation.getArrivalVersion());
             result.put("sourceTimeEpochMs", observation == null ? null : observation.getSourceTimeEpochMs());
+            result.put("sourceDate", observation == null ? null : observation.getSourceDate());
+            result.put("sourceTimeQuality", observation == null ? null : observation.getSourceTimeQuality());
+            result.put("factHash", observation == null ? null : observation.getFactHash());
             result.put("testVerdicts", testVerdicts);
             result.put("createdTestCount", createdTestCount);
             return result;

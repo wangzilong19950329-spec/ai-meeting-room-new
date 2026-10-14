@@ -11,6 +11,7 @@ import com.aimeeting.room.entity.StockWatchItem;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
 import com.aimeeting.room.service.StockWatchAiJudgeService.AiDecision;
 import com.aimeeting.room.service.StockWatchAiRuleService.AiWatchRule;
+import com.aimeeting.room.service.StockWatchAnalysisDemandService.DemandCreationResult;
 import com.aimeeting.room.service.StockWatchRiskPatternService.RiskPatternResult;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -234,9 +235,12 @@ public class StockWatchMonitorService {
 
         saveStateQuietly();
         lastRunStatus = "success";
+        List<Map<String, Object>> analysisFactObservations = analysisFactObservations(evaluations);
         Map<String, Object> result = buildRunResult(now, reason, false, "盯盘扫描完成", evaluations);
         result.put("factObservations", factObservations);
         result.put("factObservationCount", factObservations.size());
+        result.put("analysisFactObservations", analysisFactObservations);
+        result.put("analysisFactObservationCount", analysisFactObservations.size());
         return result;
     }
 
@@ -449,9 +453,7 @@ public class StockWatchMonitorService {
         event.put("belief_update", decision.getBeliefUpdate());
         event.put("quote", quote);
         if (validFactReceipt(factReceipt)) {
-            event.put("target_fact_observation_id", longNumber(factReceipt.get("observationId")));
-            event.put("target_fact_observation_key", text(factReceipt.get("observationKey"), ""));
-            event.put("target_source_time_epoch_ms", longNumber(factReceipt.get("sourceTimeEpochMs")));
+            applyFactReceipt(event, factReceipt);
         }
         event.put("ai_context_status", aiContextStatus(aiContext));
         event.put("ai_context_missing_data", aiContext == null ? Collections.emptyList() : aiContext.get("missingData"));
@@ -471,7 +473,7 @@ public class StockWatchMonitorService {
         event.put("ai_alert_signal_shape_changed", alertGate.signalShapeChanged);
         event.put("ai_alert_severity_rank_up", alertGate.severityRankUp);
         event.put("ai_alert_material_risk_delta", alertGate.materialRiskDelta);
-        queueUnifiedAnalysisDemand(rule, event, now);
+        queueUnifiedAnalysisDemand(rule, event, quote, factReceipt, now);
 
         if (notificationAttempted) {
             alertResult = sendAiTriggeredEmail(rule, decision, event, now);
@@ -498,6 +500,13 @@ public class StockWatchMonitorService {
         result.put("decision", decision);
         result.put("reason", decision.getReason());
         result.put("event", event);
+        result.put("analysisFactObservation", event.get("analysis_fact_observation"));
+        result.put("analysisDemandStatus", event.get("analysis_demand_status"));
+        result.put("analysisDemandReason", event.get("analysis_demand_reason"));
+        result.put("analysisDemandId", event.get("analysis_demand_id"));
+        result.put("analysisDemandKey", event.get("analysis_demand_key"));
+        result.put("analysisDemandTriggerType", event.get("analysis_demand_trigger_type"));
+        result.put("analysisDemandError", event.get("analysis_demand_error"));
         result.put("aiContextStatus", aiContextStatus(aiContext));
         result.put("duplicate", alertGate.duplicate);
         result.put("aiAlertStateKey", aiAlertStateKey(rule));
@@ -891,6 +900,19 @@ public class StockWatchMonitorService {
                 failed.put("reason", firstNonBlank(e.getMessage(), e.getClass().getSimpleName()));
                 receipts.add(failed);
                 log.warn("stock-watch fact observation persist failed symbol={}.{} error={}", symbol, market, e.getMessage());
+            }
+        }
+        return receipts;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> analysisFactObservations(List<Map<String, Object>> evaluations) {
+        if (evaluations == null || evaluations.isEmpty()) return Collections.emptyList();
+        List<Map<String, Object>> receipts = new ArrayList<>();
+        for (Map<String, Object> evaluation : evaluations) {
+            Object receipt = evaluation == null ? null : evaluation.get("analysisFactObservation");
+            if (receipt instanceof Map) {
+                receipts.add(new LinkedHashMap<>((Map<String, Object>) receipt));
             }
         }
         return receipts;
@@ -1757,23 +1779,32 @@ public class StockWatchMonitorService {
     private void queueUnifiedAnalysisDemand(AiWatchRule rule,
                                             Map<String, Object> event,
                                             ZonedDateTime now) {
+        queueUnifiedAnalysisDemand(rule, event, eventQuote(event), null, now);
+    }
+
+    private void queueUnifiedAnalysisDemand(AiWatchRule rule,
+                                            Map<String, Object> event,
+                                            Map<String, Object> quote,
+                                            Map<String, Object> factReceipt,
+                                            ZonedDateTime now) {
         if (rule == null || event == null || !bool(event.get("triggered"), false)) {
             return;
         }
-        if (rule.isGeneralLegacy()) {
-            event.put("analysis_demand_status", "SKIPPED_GENERAL_LEGACY");
-            return;
-        }
-        if (!validFactEvent(event)) {
-            event.put("analysis_demand_status", "SKIPPED_NO_FACT");
-            return;
-        }
-        if (analysisPolicyService == null || analysisDemandService == null) {
-            event.put("analysis_demand_status", "SKIPPED_SERVICE_UNAVAILABLE");
-            return;
-        }
         try {
-            StockWatchItem item = analysisPolicyService.currentItem(rule.getSymbol(), rule.getMarket());
+            AnalysisDemandGate gate = evaluateAnalysisDemandGate(rule);
+            if (!gate.allowed) {
+                event.put("analysis_demand_status", gate.status);
+                event.put("analysis_demand_reason", gate.reason);
+                return;
+            }
+            ensureAnalysisFactEvent(rule, event, quote, factReceipt, now);
+            if (!validFactEvent(event)) {
+                event.put("analysis_demand_status", "SKIPPED_NO_FACT");
+                event.put("analysis_demand_reason", firstNonBlank(
+                        text(event.get("analysis_fact_observation_reason"), ""),
+                        "target_fact_missing"));
+                return;
+            }
             List<String> reasonCodes = new ArrayList<>();
             reasonCodes.add("AI_RULE_TRIGGERED");
             Object matchedSignals = event.get("matched_signals");
@@ -1790,8 +1821,9 @@ public class StockWatchMonitorService {
             triggerContext.put("riskTier", event.get("ai_risk_tier"));
             triggerContext.put("triggerEvidencePolicy", event.get("trigger_evidence_policy"));
             triggerContext.put("triggerEvidenceGateReason", event.get("trigger_evidence_gate_reason"));
-            StockWatchAnalysisDemand demand = analysisDemandService.createAnomaly(
-                    item,
+            triggerContext.put("targetFactSourceTimeQuality", event.get("target_source_time_quality"));
+            DemandCreationResult demandResult = analysisDemandService.createAnomalyDetailed(
+                    gate.item,
                     longNumber(event.get("target_fact_observation_id")),
                     text(event.get("target_fact_observation_key"), ""),
                     longNumber(event.get("target_source_time_epoch_ms")),
@@ -1799,11 +1831,13 @@ public class StockWatchMonitorService {
                     triggerContext,
                     now
             );
+            StockWatchAnalysisDemand demand = demandResult == null ? null : demandResult.getDemand();
             if (demand == null) {
                 event.put("analysis_demand_status", "SKIPPED_BY_POLICY");
+                event.put("analysis_demand_reason", "analysis_demand_not_created");
                 return;
             }
-            event.put("analysis_demand_status", "QUEUED");
+            event.put("analysis_demand_status", demandResult.isCreated() ? "QUEUED" : "REUSED");
             event.put("analysis_demand_id", demand.getId());
             event.put("analysis_demand_key", demand.getDemandKey());
             event.put("analysis_demand_trigger_type", demand.getTriggerType());
@@ -1813,6 +1847,72 @@ public class StockWatchMonitorService {
             log.warn("stock-watch unified analysis demand queue failed symbol={}.{} ruleId={} error={}",
                     rule.getSymbol(), rule.getMarket(), rule.getId(), shortError(e));
         }
+    }
+
+    private AnalysisDemandGate evaluateAnalysisDemandGate(AiWatchRule rule) {
+        if (rule == null) {
+            return AnalysisDemandGate.blocked("SKIPPED_BY_POLICY", "rule_missing");
+        }
+        if (rule.isGeneralLegacy()) {
+            return AnalysisDemandGate.blocked("SKIPPED_GENERAL_LEGACY", "general_legacy_rule");
+        }
+        if (analysisPolicyService == null || analysisDemandService == null) {
+            return AnalysisDemandGate.blocked("SKIPPED_SERVICE_UNAVAILABLE", "analysis_services_unavailable");
+        }
+        StockWatchItem item = analysisPolicyService.currentItem(rule.getSymbol(), rule.getMarket());
+        if (item == null) {
+            return AnalysisDemandGate.blocked("SKIPPED_BY_POLICY", "analysis_policy_stock_missing");
+        }
+        if (!analysisPolicyService.allowsAutomaticDemand(item, "ANOMALY_IMMEDIATE")) {
+            return AnalysisDemandGate.blocked("SKIPPED_BY_POLICY", "analysis_policy_disallowed:ANOMALY_IMMEDIATE");
+        }
+        return AnalysisDemandGate.allowed(item);
+    }
+
+    private void ensureAnalysisFactEvent(AiWatchRule rule,
+                                         Map<String, Object> event,
+                                         Map<String, Object> quote,
+                                         Map<String, Object> factReceipt,
+                                         ZonedDateTime now) {
+        if (validFactEvent(event)) return;
+        if (validFactReceipt(factReceipt)) {
+            applyFactReceipt(event, factReceipt);
+            return;
+        }
+        if (rule == null || !rule.isQuoteAnomalyV1()) {
+            return;
+        }
+        StockWatchFactPersistenceService.ObservationReceipt receipt = factPersistenceService.observeQuoteAlert(
+                rule.getSymbol(),
+                rule.getMarket(),
+                text(quote, "name", rule.getName()),
+                quote,
+                now
+        );
+        Map<String, Object> receiptMap = receipt == null
+                ? StockWatchFactPersistenceService.ObservationReceipt.skipped("quote_alert_fact_receipt_missing").toMap()
+                : receipt.toMap();
+        receiptMap.put("symbol", rule.getSymbol());
+        receiptMap.put("market", rule.getMarket());
+        event.put("analysis_fact_observation", receiptMap);
+        event.put("analysis_fact_observation_status", receiptMap.get("status"));
+        event.put("analysis_fact_observation_reason", receiptMap.get("reason"));
+        if (validFactReceipt(receiptMap)) {
+            applyFactReceipt(event, receiptMap);
+        }
+    }
+
+    private void applyFactReceipt(Map<String, Object> event, Map<String, Object> factReceipt) {
+        event.put("target_fact_observation_id", longNumber(factReceipt.get("observationId")));
+        event.put("target_fact_observation_key", text(factReceipt.get("observationKey"), ""));
+        event.put("target_source_time_epoch_ms", longNumber(factReceipt.get("sourceTimeEpochMs")));
+        event.put("target_source_time_quality", factReceipt.get("sourceTimeQuality"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> eventQuote(Map<String, Object> event) {
+        Object quote = event == null ? null : event.get("quote");
+        return quote instanceof Map ? new LinkedHashMap<>((Map<String, Object>) quote) : Collections.emptyMap();
     }
 
     private String shortError(Exception e) {
@@ -2963,6 +3063,28 @@ public class StockWatchMonitorService {
 
         private static RuleCapabilityGate blocked(String policy, String reason) {
             return new RuleCapabilityGate(false, policy, reason);
+        }
+    }
+
+    private static class AnalysisDemandGate {
+        private final boolean allowed;
+        private final StockWatchItem item;
+        private final String status;
+        private final String reason;
+
+        private AnalysisDemandGate(boolean allowed, StockWatchItem item, String status, String reason) {
+            this.allowed = allowed;
+            this.item = item;
+            this.status = status;
+            this.reason = reason;
+        }
+
+        private static AnalysisDemandGate allowed(StockWatchItem item) {
+            return new AnalysisDemandGate(true, item, null, null);
+        }
+
+        private static AnalysisDemandGate blocked(String status, String reason) {
+            return new AnalysisDemandGate(false, null, status, reason);
         }
     }
 

@@ -34,9 +34,11 @@ function call(name, queryField, x, y) {
       method: 'POST', url: '={{ $json.bridgeEndpoint }}',
       authentication: 'genericCredentialType', genericAuthType: 'httpHeaderAuth',
       sendBody: true, specifyBody: 'json',
-      jsonBody: `={{ JSON.stringify({ query: $json.${queryField}, mode: 'expert', expectedJson: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 30000 }) }}`,
-      options: { timeout: '={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}', neverError: true,
-        response: { response: { responseFormat: 'json', fullResponse: true } } }
+      // The single-account bridge waits at least 45 seconds after a completed request.
+      // Review must be allowed to wait through that cooldown without repeating search.
+      jsonBody: `={{ JSON.stringify({ query: $json.${queryField}, mode: 'expert', expectedJson: true, requireSearchEvidence: true, capability: 'general.analysis', purpose: 'meeting.evidence-gap', isolatedSession: true, forceNewSession: true, closeTargetAfter: true, queueTimeoutMs: 90000 }) }}`,
+      options: { timeout: '={{ Math.max(1000, Math.min(240000, $json.deadlineAt - Date.now())) }}',
+        response: { response: { responseFormat: 'json', fullResponse: true, neverError: true } } }
     },
     credentials: { httpHeaderAuth: { id: 'SWDeepSeekFacadeHeaderAuth', name: 'SW DeepSeek Facade Header' } }
   };

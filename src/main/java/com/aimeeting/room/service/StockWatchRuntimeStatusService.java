@@ -42,7 +42,11 @@ public class StockWatchRuntimeStatusService {
         result.put("lastRunAt", technical.get("lastRunAt"));
         result.put("lastRunStatus", text(technical.get("lastRunStatus"), "unknown"));
         result.put("nextDueAt", nextDueAt(normalizedSymbol, normalizedMarket, warnings));
-        result.put("pendingJobs", pendingJobs(normalizedSymbol, normalizedMarket, warnings));
+        Map<String, Object> pendingJobBreakdown = pendingJobBreakdown(normalizedSymbol, normalizedMarket, warnings);
+        result.put("pendingJobs", pendingJobBreakdown == null ? null : pendingJobBreakdown.get("total"));
+        result.put("pendingJobBreakdown", pendingJobBreakdown);
+        result.put("dispatchablePendingJobs", pendingJobBreakdown == null ? null : pendingJobBreakdown.get("dispatchable"));
+        result.put("expiredPendingJobs", pendingJobBreakdown == null ? null : pendingJobBreakdown.get("expiredPending"));
         result.put("retryJobs", retryJobs(normalizedSymbol, normalizedMarket, warnings));
         result.put("retryPolicy", retryPolicy(normalizedSymbol, normalizedMarket, warnings));
         result.put("schedulerOwnership", ownership);
@@ -124,11 +128,30 @@ public class StockWatchRuntimeStatusService {
         return policy;
     }
 
-    private Integer pendingJobs(String symbol, String market, List<String> warnings) {
+    private Map<String, Object> pendingJobBreakdown(String symbol, String market, List<String> warnings) {
         String filter = stockFilter(symbol, market, "AND");
-        return safeCount("SELECT COUNT(*) FROM stock_watch_analysis_demand "
-                + "WHERE status IN ('PENDING','CLAIMED','SUBMITTED') " + filter, params(symbol, market),
-                warnings, "pending_jobs_unavailable");
+        List<Map<String, Object>> rows = safeRows("SELECT "
+                        + "COUNT(*) AS total, "
+                        + "SUM(CASE WHEN status IN ('PENDING','CLAIMED') "
+                        + "AND not_before <= CURRENT_TIMESTAMP AND deadline_at > CURRENT_TIMESTAMP "
+                        + "AND (status!='CLAIMED' OR lease_until <= CURRENT_TIMESTAMP) THEN 1 ELSE 0 END) AS dispatchable, "
+                        + "SUM(CASE WHEN status='PENDING' AND deadline_at <= CURRENT_TIMESTAMP THEN 1 ELSE 0 END) AS expired_pending, "
+                        + "SUM(CASE WHEN status='PENDING' AND not_before > CURRENT_TIMESTAMP AND deadline_at > CURRENT_TIMESTAMP THEN 1 ELSE 0 END) AS scheduled_pending, "
+                        + "SUM(CASE WHEN status='CLAIMED' AND (lease_until IS NULL OR lease_until > CURRENT_TIMESTAMP) THEN 1 ELSE 0 END) AS claimed_leased, "
+                        + "SUM(CASE WHEN status='SUBMITTED' THEN 1 ELSE 0 END) AS submitted "
+                        + "FROM stock_watch_analysis_demand WHERE status IN ('PENDING','CLAIMED','SUBMITTED') "
+                        + filter,
+                params(symbol, market), warnings, "pending_jobs_unavailable");
+        if (rows == null || rows.isEmpty()) return null;
+        Map<String, Object> row = rows.get(0);
+        Map<String, Object> breakdown = new LinkedHashMap<>();
+        breakdown.put("total", integer(row.get("total")));
+        breakdown.put("dispatchable", integer(row.get("dispatchable")));
+        breakdown.put("expiredPending", integer(row.get("expired_pending")));
+        breakdown.put("scheduledPending", integer(row.get("scheduled_pending")));
+        breakdown.put("claimedLeased", integer(row.get("claimed_leased")));
+        breakdown.put("submitted", integer(row.get("submitted")));
+        return breakdown;
     }
 
     private Integer retryJobs(String symbol, String market, List<String> warnings) {
@@ -149,7 +172,9 @@ public class StockWatchRuntimeStatusService {
     private String nextDueAt(String symbol, String market, List<String> warnings) {
         String filter = stockFilter(symbol, market, "AND");
         List<Map<String, Object>> rows = safeRows("SELECT MIN(not_before) AS next_due_at FROM stock_watch_analysis_demand "
-                + "WHERE status='PENDING' " + filter, params(symbol, market), warnings, "next_due_at_unavailable");
+                + "WHERE status IN ('PENDING','CLAIMED') AND deadline_at > CURRENT_TIMESTAMP "
+                + "AND (status!='CLAIMED' OR lease_until <= CURRENT_TIMESTAMP) "
+                + filter, params(symbol, market), warnings, "next_due_at_unavailable");
         if (rows == null || rows.isEmpty()) return null;
         return instant(rows.get(0).get("next_due_at"));
     }

@@ -39,6 +39,8 @@ const inputs = [
   { ...base, requestId: 'fixture-review-proof-retry', question: 'fixture_review_proof_retry 通用事实？' },
   { ...base, requestId: 'fixture-search-proof-retry', question: 'fixture_search_proof_retry 通用事实？' },
   { ...base, requestId: 'fixture-coverage-gap', question: 'fixture_coverage_gap 全球用量？' },
+  { ...base, requestId: 'fixture-uncertain', question: 'fixture_uncertain 某平台用量？' },
+  { ...base, requestId: 'fixture-contradicted', question: 'fixture_contradicted 某平台用量？' },
   { ...base, requestId: 'fixture-http-503', question: 'fixture_http_503 通用资料？' },
   { ...base, requestId: 'fixture-timeout', question: 'fixture_timeout 通用资料？', httpTimeoutMs: 1000 }
 ];
@@ -61,14 +63,15 @@ NODE
 
 prior_state=$(compose exec -T postgres sh -lc \
   'PGPASSWORD="$N8N_DB_PASSWORD" psql -U "$N8N_DB_USER" -d "$N8N_DB_NAME" -Atc "select active from workflow_entity where id = '\''GEN10GeneralEvidenceSearch'\''"')
-[ "$prior_state" != t ] || { echo '[error] GEN-10 is already published; refusing to alter it' >&2; exit 1; }
-
-compose run --rm n8n-import import:workflow \
-  --input=/workflows/general/GEN-10-General-Evidence-Search.json --activeState=false >/dev/null
+[ -n "$prior_state" ] || prior_state=f
+if [ "$prior_state" != t ]; then
+  compose run --rm n8n-import import:workflow \
+    --input=/workflows/general/GEN-10-General-Evidence-Search.json --activeState=false >/dev/null
+  compose run --rm n8n-import publish:workflow --id=GEN10GeneralEvidenceSearch >/dev/null
+  published=true
+fi
 compose run --rm n8n-import import:workflow \
   --input=/runtime/workflows/GEN-10-Fixture-Runner.json --activeState=false >/dev/null
-compose run --rm n8n-import publish:workflow --id=GEN10GeneralEvidenceSearch >/dev/null
-published=true
 
 if ! compose run --rm n8n-import execute --id=GEN10FixtureRunner --rawOutput > "$execution_log" 2>&1; then
   tail -n 100 "$execution_log" >&2
@@ -89,9 +92,12 @@ const retry = packets.get('fixture-retry');
 const proofRetry = packets.get('fixture-review-proof-retry');
 const searchProofRetry = packets.get('fixture-search-proof-retry');
 const coverageGap = packets.get('fixture-coverage-gap');
+const uncertain = packets.get('fixture-uncertain');
+const contradicted = packets.get('fixture-contradicted');
 const http503 = packets.get('fixture-http-503');
 const timeout = packets.get('fixture-timeout');
-if (!pass || !retry || !proofRetry || !searchProofRetry || !coverageGap || !http503 || !timeout) {
+if (!pass || !retry || !proofRetry || !searchProofRetry || !coverageGap ||
+    !uncertain || !contradicted || !http503 || !timeout) {
   throw new Error('MISSING_FIXTURE_OUTPUTS');
 }
 if (pass.status !== 'CROSS_CHECKED' || pass.claims.length !== 1 || pass.audit.reviewCalls !== 1) {
@@ -115,20 +121,36 @@ if (coverageGap.status !== 'CROSS_CHECKED' || coverageGap.audit.searchCalls !== 
     coverageGap.claims[1]?.id !== 'global_usage') {
   throw new Error('COVERAGE_GAP_RETRY_FAILED: ' + JSON.stringify(coverageGap));
 }
-if (http503.status !== 'UNVERIFIED' || http503.claims.length ||
-    http503.limitations[0] !== 'BRIDGE_HTTP_503' || http503.audit.reviewCalls !== 0) {
+if (uncertain.status !== 'UNVERIFIED' || uncertain.claims.length !== 0 ||
+    uncertain.provisionalClaims.length !== 1 ||
+    uncertain.provisionalClaims[0].reviewVerdict !== 'UNKNOWN' ||
+    uncertain.provisionalClaims[0].confidenceScore !== 0.25 ||
+    uncertain.audit.trail.filter(item => item.phase === 'review' && item.verdict === 'UNKNOWN').length !== 3) {
+  throw new Error('LOW_CONFIDENCE_UNKNOWN_FAILED: ' + JSON.stringify(uncertain));
+}
+if (contradicted.status !== 'UNVERIFIED' || contradicted.claims.length !== 0 ||
+    contradicted.provisionalClaims.length !== 0 ||
+    contradicted.audit.trail.filter(item => item.phase === 'review' && item.verdict === 'REJECT').length !== 3) {
+  throw new Error('CONTRADICTED_CLAIM_LEAKED: ' + JSON.stringify(contradicted));
+}
+if (http503.status !== 'ERROR' || http503.claims.length ||
+    http503.provisionalClaims.length || http503.limitations[0] !== 'BRIDGE_HTTP_503' ||
+    http503.audit.reviewCalls !== 0) {
   throw new Error('HTTP_503_NOT_CONTAINED: ' + JSON.stringify(http503));
 }
-if (timeout.status !== 'UNVERIFIED' || timeout.claims.length ||
+if (timeout.status !== 'ERROR' || timeout.claims.length ||
+    timeout.provisionalClaims.length ||
     timeout.limitations[0] !== 'BRIDGE_TRANSPORT_OUTCOME_UNKNOWN' ||
     timeout.audit.searchCalls !== 1 || timeout.audit.reviewCalls !== 0) {
   throw new Error('TIMEOUT_NOT_CONTAINED: ' + JSON.stringify(timeout));
 }
-console.log('GEN-10 n8n smoke passed: generic pass, targeted/coverage retries, search/review proof retries, HTTP 503, and transport timeout');
+console.log('GEN-10 n8n smoke passed: generic pass, targeted/coverage retries, low-confidence UNKNOWN, contradicted exclusion, search/review proof retries, HTTP 503, and transport timeout');
 NODE
 
-compose run --rm n8n-import unpublish:workflow --id=GEN10GeneralEvidenceSearch >/dev/null
-published=false
+if [ "$published" = true ]; then
+  compose run --rm n8n-import unpublish:workflow --id=GEN10GeneralEvidenceSearch >/dev/null
+  published=false
+fi
 state=$(compose exec -T postgres sh -lc \
   'PGPASSWORD="$N8N_DB_PASSWORD" psql -U "$N8N_DB_USER" -d "$N8N_DB_NAME" -Atc "select active from workflow_entity where id = '\''GEN10GeneralEvidenceSearch'\''"')
-[ "$state" = f ] || { echo '[error] GEN-10 did not return to inactive state' >&2; exit 1; }
+[ "$state" = "$prior_state" ] || { echo '[error] GEN-10 publish state changed during smoke test' >&2; exit 1; }

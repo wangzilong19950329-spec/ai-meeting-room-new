@@ -1,0 +1,41 @@
+{
+  "packetVersion": "1",
+  "goalContract": {
+    "version": "v2",
+    "source": [{"kind": "user_request", "pointer": "Latest user: do not implement the large plan; first think through a small future-30-minute prediction MVP for rapid validation", "authority": "primary"}],
+    "outcome": "Design a small, testable M30 extension without implementing the full holdings assistant or business changes in this turn",
+    "stakeholders": ["user"],
+    "mustAccept": [
+      {"id": "G1", "statement": "Keep this turn design-only and scope much smaller than the full assistant", "verification": {"statement": "Inspect MVP scope and actual document-only write actions", "surface": "code", "minimumLevel": "static"}},
+      {"id": "G2", "statement": "Define future-30-minute output, fixed timing and legacy compatibility", "verification": {"statement": "Inspect existing scheduler, forecast parser and frozen projection; map to the proposed extension", "surface": "code", "minimumLevel": "static"}},
+      {"id": "G3", "statement": "Provide a quick evaluation loop with all opportunity and quality states", "verification": {"statement": "Inspect endpoint protocol, timing, baselines and research snapshot design", "surface": "code", "minimumLevel": "static"}}
+    ],
+    "constraints": ["No business-code, business-DB or runtime changes this turn", "No default extra model calls", "No orders", "Preserve dirty work and old frozen tasks", "Do not treat delayed next analysis as fixed M30 endpoint"],
+    "nonGoals": ["Implementing the full assistant", "Automatic warnings", "Proven trading edge"],
+    "preferences": ["Reuse existing stack and raw replies", "No new business schema for first experiment"],
+    "assumptions": ["A future versioned optional root extension can coexist with the existing base contract, subject to tests"],
+    "unknowns": ["Live source freshness and minute timestamp/completion", "Actual deployed task cadence and latency", "M30 predictive increment"]
+  },
+  "evidence": [
+    {"id": "E1", "statement": "Technical scheduler default is a 30-minute fixedDelay; DAY currently requires T1/T5 and old horizon parser excludes M30", "sourceType": "artifact", "pointer": "src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java:229-264,1568-1707; StockWatchPredictionService.java:93-115,509-521", "kind": "direct", "freshness": "Current source inspected 2026-10-05", "verification": {"surface": "code", "level": "static", "result": "pass"}},
+    {"id": "E2", "statement": "Task preparation freezes request JSON; raw replies persist and public v6 output is rendered rather than raw text", "sourceType": "artifact", "pointer": "src/main/java/com/aimeeting/room/service/StockWatchTechnicalAnalysisService.java:667-701,803-851,3331-3379,3438-3451,4022-4036; StockWatchAnalysisProjectionService.java:47-84; entity/StockWatchTechnicalAnalysis.java:34", "kind": "direct", "freshness": "Current relevant source inspected, not runtime proof", "verification": {"surface": "code", "level": "static", "result": "pass"}},
+    {"id": "E3", "statement": "Minute interface exists but nonnull validity and inferred end time do not prove completed qualified endpoints", "sourceType": "artifact", "pointer": "src/main/java/com/aimeeting/room/service/StockQuoteService.java:128-208,259-290", "kind": "direct", "freshness": "Current complete displayed source inspected", "verification": {"surface": "code", "level": "static", "result": "pass"}},
+    {"id": "E4", "statement": "MVP draft specifies one same-call extension, existing reply storage, no new business tables, fixed windows, abstention and readonly evaluation", "sourceType": "artifact", "pointer": "docs/design/stock-watch-intraday-30m-mvp-2026-10-05.md", "kind": "direct", "freshness": "Current design draft inspected; not implemented", "verification": {"surface": "code", "level": "static", "result": "pass"}}
+  ],
+  "claims": [
+    {"id": "S1", "statement": "Analysis cadence and a future M30 forecast are distinct; appending M30 to the old daily forecast array is not a safe minimal path", "type": "inference", "dependsOn": ["E1"], "supportingEvidence": ["E1"], "hiddenAssumptions": [], "falsifiers": ["A deployed independent parser already handles M30 under a verified contract"], "alternativesConsidered": ["Append to old forecasts", "Separate optional root object"], "verdict": "supported", "confidence": "high"},
+    {"id": "S2", "statement": "An optional frozen extension and readonly research script are a smaller candidate path than new holdings, delivery and schema infrastructure", "type": "recommendation", "dependsOn": ["S1", "E2", "E3", "E4"], "supportingEvidence": ["E2", "E3", "E4"], "hiddenAssumptions": ["Only new eligible tasks receive the profile", "Malformed M30 does not invalidate otherwise valid legacy results", "Endpoint semantics and reference quote freshness are qualified before scoring"], "falsifiers": ["Required data or timing cannot support a fixed endpoint", "Legacy replay or publication regressions appear"], "alternativesConsidered": ["Full holdings assistant", "One new intraday DB table and automated evaluation", "No-schema optional extension plus manual readonly scoring"], "verdict": "supported", "confidence": "medium"}
+  ],
+  "conclusion": {
+    "statement": "A no-new-business-schema same-call M30 experiment is a scoped design candidate for discussion; implementation and effectiveness remain unproven",
+    "dependsOn": ["S1", "S2"],
+    "goalTrace": [
+      {"goalId": "G1", "supportedBy": ["S2"], "verification": ["E4"], "status": "met"},
+      {"goalId": "G2", "supportedBy": ["S1", "S2"], "verification": ["E1", "E2", "E4"], "status": "met"},
+      {"goalId": "G3", "supportedBy": ["S2"], "verification": ["E3", "E4"], "status": "met"}
+    ],
+    "verdict": "supported",
+    "goalVerdict": "aligned",
+    "remainingBoundaries": ["Local non-independent design review only", "No implementation authorization or changes", "No verified live source or deployed cadence", "Engineering trial defaults are proposed, not proven", "No statistical or avoided-loss proof"]
+  }
+}

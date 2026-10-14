@@ -1,63 +1,83 @@
-# n8n Stock Watch MVP - Phase1
+# n8n Stock Watch MVP
 
-This directory contains the local Phase1 implementation for a single manual n8n proof-of-concept workflow.
+This directory contains the local n8n stock-watch implementation through Phase3.
 
-Phase1 scope:
+Implemented:
 
-- local Docker Compose stack
-- isolated PostgreSQL 16 instance
-- n8n fixed to `2.29.10`
-- one inactive manual workflow: `SW-01 POC Manual Pipeline`
-- MOCK model provider only
-- no Java bridge, no DeepSeek, no email, no schedule activation
+- PostgreSQL migrations `V001` through `V011`
+- inactive `SW-00`, `SW-10`, `SW-20`, and `SW-30` workflows
+- token-protected Java quote adapter
+- authenticated DeepSeek OpenAI-compatible facade on `127.0.0.1:8793`
+- strict, fail-closed model validation and de-identified fact packets
+- deterministic stress reports with position, T+1, and risk-budget inputs
+- local-only Mailpit delivery with database claims and deduplication
+- explicit runtime gates; all workflow, ingest, analysis, publisher, and notification switches default off
 
 ## Start
 
 ```bash
-infra/n8n-stock-watch/scripts/bootstrap.sh
-infra/n8n-stock-watch/scripts/import-workflows.sh
-infra/n8n-stock-watch/scripts/smoke-test-phase1.sh
+infra/n8n-stock-watch/scripts/configure-deepseek-facade.sh
+scripts/start-stock-watch-deepseek-bridge-safe.sh
 ```
 
-Run the CATL real-quote variant:
+After the logged-in broker is healthy on `127.0.0.1:8791`, run in another
+terminal:
 
 ```bash
-infra/n8n-stock-watch/scripts/smoke-test-phase1-catl-real.sh
+infra/n8n-stock-watch/scripts/bootstrap.sh
+infra/n8n-stock-watch/scripts/configure-java-adapter.sh
+infra/n8n-stock-watch/scripts/import-workflows.sh
 ```
 
-This fetches `300750.sz` from Eastmoney, renders a temporary runtime workflow,
-executes it in n8n, and verifies the persisted report. The position and model
-remain Phase1 fixtures. During a closed market session, the quote is labeled
-`closed_session_snapshot` rather than fresh intraday data.
+Start the Java adapter in a separate terminal after configuration:
 
-The validation workflow uses the separate inactive ID
-`SW01Phase1POCCatlReal`, so the default `SW01Phase1POC` definition remains
-available. Its MOCK response is derived from the current fact registry and is
-rejected if a numeric output disagrees with the referenced fact.
-
-Open n8n at:
-
-```text
-http://127.0.0.1:5678
+```bash
+scripts/start-local-backend.sh 8127
 ```
+
+`configure-java-adapter.sh` sets `AI_SCHEDULING_ENABLED=false`, so this local
+adapter process does not run Spring `@Scheduled` tasks.
+
+Open:
+
+- n8n: `http://127.0.0.1:5678`
+- Mailpit: `http://127.0.0.1:8025`
+- authenticated DeepSeek facade: `http://127.0.0.1:8793/v1`
+
+## Verify
+
+```bash
+infra/n8n-stock-watch/scripts/smoke-test-phase2.sh
+infra/n8n-stock-watch/scripts/smoke-test-phase3-retry.sh
+```
+
+The smoke tests check Java and DeepSeek authentication, Java stale-data
+rejection, MOCK analysis, de-identification, VWAP fail-closed behavior, report
+claims, eight stress scenarios, local email deduplication, attempt fencing, and
+a real `504 -> RETRY -> accepted -> SW-30` recovery. They restore all runtime
+switches to off even when a check fails.
+
+Provider failures enter the bounded retry path only when the upstream response
+explicitly proves `retrySafe=true`. Unknown provider outcomes, unproven timeout
+safety, authentication, schema, capability, and policy failures remain terminal.
+Fact packet identity stays stable across retries, while each provider attempt
+uses a distinct submission key so broker ledger tombstones cannot block the
+next bounded attempt.
+
+The real DeepSeek canary is intentionally separate from the repeatable smoke.
+The validated Phase3 run retained one rejected numeric-policy response and then
+accepted prompt v2 as `STRUCTURE_VALID` before producing one local report email.
 
 ## Safety Defaults
 
-- `.env` is generated locally and ignored by Git.
-- Runtime credential import JSON is generated under `runtime/credentials/` and removed after import.
-- n8n binds only to `127.0.0.1`.
-- The workflow is imported with `active=false`.
-- `MODEL_PROVIDER=MOCK` and `NOTIFY_ENABLED=false`.
-- The real-quote smoke test does not enable DeepSeek, the Java bridge, email, or scheduling.
+- `.env` and generated runtime credentials are ignored by Git.
+- n8n, Mailpit, and the facade bind only to `127.0.0.1` on the host.
+- The facade requires a generated Bearer token from n8n and rejects missing or incorrect tokens.
+- The logged-in host broker uses the same token after it is restarted with the current source.
+- The Java endpoint requires a separate `X-N8N-Token`.
+- All workflows remain `active=false`; schedule triggers have not been activated.
+- Notification transport is constrained to Mailpit and recipients ending in `.invalid`.
+- No external SMTP message was sent or tested.
+- Eastmoney `f5/f6` units remain an empirical A-share contract, so VWAP stays unavailable.
 
-## Useful Commands
-
-```bash
-infra/n8n-stock-watch/scripts/preflight.sh
-infra/n8n-stock-watch/scripts/phase1-fixture-tests.js
-infra/n8n-stock-watch/scripts/export-workflows.sh
-infra/n8n-stock-watch/scripts/run-security-audit.sh
-infra/n8n-stock-watch/scripts/verify-recovery-readiness.sh
-```
-
-For handoff and day-to-day operation, see `docs/operations-handoff.md`.
+For operational details and known boundaries, see `docs/operations-handoff.md`.

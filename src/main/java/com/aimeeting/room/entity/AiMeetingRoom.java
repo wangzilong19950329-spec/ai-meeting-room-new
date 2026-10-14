@@ -13,6 +13,8 @@ public class AiMeetingRoom {
     private String inheritedContext;
     private Long creatorId;
     private Integer status;
+    /** Monotonic generation used to fence asynchronous reviewed meeting workers. */
+    private Long runEpoch;
     private Integer maxRounds;
     private Integer currentRound;
     private String finalConclusion;
