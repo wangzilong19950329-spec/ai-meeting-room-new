@@ -1183,6 +1183,7 @@ public class RoundtableV2Service {
         if (stored != null) return stored;
         JSONObject result = summarize(card, finalAnswers);
         annotate(result, classification, topUp);
+        markSettledDisputes(result, summarize(card, firstAnswers));
         result.put("loops", loops);
         JSONArray openQuestions = new JSONArray();
         for (Object item : facts) {
@@ -1235,6 +1236,16 @@ public class RoundtableV2Service {
             conclusion.put("resolvedAfterDispute", true);
             conclusion.put("type", entry.getString("type"));
             if (entry.getString("crux") != null) conclusion.put("crux", entry.getString("crux"));
+        }
+    }
+
+    /** A first-round dispute that ends as a conclusion was settled by cross-examination or new evidence. */
+    private static void markSettledDisputes(JSONObject result, JSONObject firstRound) {
+        Set<String> disputed = new LinkedHashSet<>();
+        for (Object item : firstRound.getJSONArray("disputes")) disputed.add(((JSONObject) item).getString("questionId"));
+        for (Object item : result.getJSONArray("conclusions")) {
+            JSONObject conclusion = (JSONObject) item;
+            if (disputed.contains(conclusion.getString("questionId"))) conclusion.put("resolvedAfterDispute", true);
         }
     }
 

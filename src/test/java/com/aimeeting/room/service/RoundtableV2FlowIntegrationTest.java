@@ -294,6 +294,25 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void disputeSettledByTheReestimateIsMarkedAsResolvedAfterDispute() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "需求偏弱", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.finalAnswers("乙", withChangeReason(answer("A", "营收稳健", "F-1", "A", "订单支撑需求", "L-1"),
+                "Q2", "质询后认可订单对需求的支撑"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        // Everyone agrees after the re-estimate, so no classification ran; the marker must not depend on it.
+        assertTrue(view.getClassification() == null, view.getClassification() + "");
+        JSONArray conclusions = view.getResult().getJSONArray("conclusions");
+        assertTrue(!conclusions.getJSONObject(0).getBooleanValue("resolvedAfterDispute"), conclusions.toJSONString());
+        assertTrue(conclusions.getJSONObject(1).getBooleanValue("resolvedAfterDispute"), conclusions.toJSONString());
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));

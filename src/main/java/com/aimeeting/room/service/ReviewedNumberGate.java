@@ -58,6 +58,10 @@ final class ReviewedNumberGate {
 
     private static final Pattern URL = Pattern.compile("https?://\\S+");
 
+    /** A fall written in words before an unsigned number ("下跌18.06%"); "下降至" names a level, not a fall. */
+    private static final Pattern FALL_BEFORE = Pattern.compile(
+            "(?:跌|跌幅|降幅|下降|下滑|回撤|回落|减少|降低|缩水|亏损|下行)(?:了|约|达|为|幅度为|幅度约)?\\s*$");
+
     private ReviewedNumberGate() {
     }
 
@@ -143,7 +147,7 @@ final class ReviewedNumberGate {
 
     private static boolean anySupports(List<Token> evidence, Token claim) {
         for (Token candidate : evidence) {
-            if (supports(candidate, claim)) return true;
+            if (supports(candidate, claim) || (claim.fall && supports(candidate, claim.negated()))) return true;
         }
         return false;
     }
@@ -172,12 +176,14 @@ final class ReviewedNumberGate {
             } catch (NumberFormatException invalid) {
                 continue;
             }
+            boolean fall = matcher.group(1) == null
+                    && FALL_BEFORE.matcher(text.substring(Math.max(0, matcher.start() - 8), matcher.start())).find();
             if (matcher.group(1) != null) displayed = displayed.negate();
             BigDecimal multiplier = multiplier(matcher.group(3));
             String unit = canonicalUnit(matcher.group(4));
             String visible = text.substring(matcher.start(), matcher.end()).trim();
             tokens.add(new Token(visible, matcher.start(), matcher.start() + visible.length(),
-                    displayed, multiplier, displayed.multiply(multiplier), unit));
+                    displayed, multiplier, displayed.multiply(multiplier), unit, fall));
         }
         return tokens;
     }
@@ -301,9 +307,11 @@ final class ReviewedNumberGate {
         private final BigDecimal multiplier;
         private final BigDecimal value;
         private final String unit;
+        /** Unsigned but preceded by a word for a fall, so it may also match the negative value. */
+        private final boolean fall;
 
         private Token(String text, int start, int end, BigDecimal displayed, BigDecimal multiplier,
-                      BigDecimal value, String unit) {
+                      BigDecimal value, String unit, boolean fall) {
             this.text = text;
             this.start = start;
             this.end = end;
@@ -311,6 +319,11 @@ final class ReviewedNumberGate {
             this.multiplier = multiplier;
             this.value = value;
             this.unit = unit;
+            this.fall = fall;
+        }
+
+        private Token negated() {
+            return new Token(text, start, end, displayed.negate(), multiplier, value.negate(), unit, false);
         }
     }
 }
