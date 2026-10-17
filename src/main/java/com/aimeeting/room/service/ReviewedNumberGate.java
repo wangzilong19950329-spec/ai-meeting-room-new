@@ -1,5 +1,8 @@
 package com.aimeeting.room.service;
 
+import com.aimeeting.room.entity.AiMeetingOpinion;
+import com.aimeeting.room.enums.OpinionTypeEnum;
+import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 
@@ -20,6 +23,7 @@ import java.util.regex.Pattern;
 final class ReviewedNumberGate {
 
     static final String LOW_CONFIDENCE_LABEL = "〔低置信〕";
+    static final String UNVERIFIED_MASK = "[未核验]";
 
     enum Support { VERIFIED, LOW_CONFIDENCE, UNSUPPORTED }
 
@@ -74,9 +78,65 @@ final class ReviewedNumberGate {
             if (listed.length() > 0) listed.append("、");
             listed.append(item.token.text);
         }
-        return "【数字来源校验未通过】你上一版发言中的这些数字在本轮资料包里找不到来源：" + listed + "。"
-                + "请重写整段发言：只能使用资料包中出现过的数字；找不到来源的数字请删除或改为不含数字的定性表述；"
-                + "论点计数请用中文数字。仍按 JSON 论据、==REPLY==、发言正文的格式输出。";
+        return "【数字来源校验未通过】你上一版输出中的这些数字在本场会议资料里找不到来源：" + listed + "。"
+                + "请重写全部内容：只能使用资料中出现过的数字；找不到来源的数字请删除或改为不含数字的定性表述；"
+                + "论点计数请用中文数字。输出格式与上一版要求相同。";
+    }
+
+    /**
+     * Collects the evidence stored on reviewed speeches up to {@code maxRound}. Provisional
+     * (low-confidence) results stay separate so their numbers keep their confidence downstream.
+     */
+    static StoredEvidence fromStoredOpinions(List<AiMeetingOpinion> opinions, int maxRound) {
+        StringBuilder verified = new StringBuilder();
+        StringBuilder provisional = new StringBuilder();
+        String stockSymbol = null;
+        if (opinions == null) opinions = Collections.emptyList();
+        for (AiMeetingOpinion opinion : opinions) {
+            if (opinion == null || opinion.getEvidence() == null
+                    || !OpinionTypeEnum.STATEMENT.getCode().equals(opinion.getOpinionType())
+                    || (opinion.getRoundNumber() != null && opinion.getRoundNumber() > maxRound)) continue;
+            JSONObject stored;
+            try { stored = JSON.parseObject(opinion.getEvidence()); }
+            catch (RuntimeException invalid) { continue; }
+            if (stored == null || stored.getString("reviewedSearchStatus") == null) continue;
+            JSONObject plan = stored.getJSONObject("searchPlan");
+            if (stockSymbol == null && plan != null) stockSymbol = plan.getString("eastmoneySymbol");
+            JSONArray results = stored.getJSONArray("results");
+            if (results == null) continue;
+            for (int i = 0; i < results.size(); i++) {
+                JSONObject item = results.getJSONObject(i);
+                if (item == null) continue;
+                boolean itemProvisional = "n8n-deepseek-provisional".equals(item.getString("provider"))
+                        || "LOW_CONFIDENCE_SEARCH".equals(item.getString("sourceType"));
+                StringBuilder target = itemProvisional ? provisional : verified;
+                target.append(item.getString("snippet")).append('\n');
+                JSONArray facts = item.getJSONArray("facts");
+                if (facts != null) target.append(facts.toJSONString()).append('\n');
+            }
+        }
+        return new StoredEvidence(verified.toString(), provisional.toString(), stockSymbol);
+    }
+
+    static final class StoredEvidence {
+        final String verified;
+        final String provisional;
+        final String stockSymbol;
+
+        private StoredEvidence(String verified, String provisional, String stockSymbol) {
+            this.verified = verified;
+            this.provisional = provisional;
+            this.stockSymbol = stockSymbol;
+        }
+
+        Audit audit(String text) {
+            return ReviewedNumberGate.audit(text, verified, provisional, stockSymbol);
+        }
+
+        /** Labels low-confidence numbers and replaces unsupported ones with {@link #UNVERIFIED_MASK}. */
+        String publishable(String text) {
+            return text == null ? null : audit(text).render(text, true);
+        }
     }
 
     private static boolean anySupports(List<Token> evidence, Token claim) {
@@ -179,14 +239,21 @@ final class ReviewedNumberGate {
 
         /** Appends the visible low-confidence label after each number only low-confidence evidence supports. */
         String label(String speech) {
-            StringBuilder labelled = new StringBuilder(speech);
+            return render(speech, false);
+        }
+
+        private String render(String text, boolean maskUnsupported) {
+            StringBuilder rendered = new StringBuilder(text);
             for (int i = items.size() - 1; i >= 0; i--) {
                 Item item = items.get(i);
-                if (item.support == Support.LOW_CONFIDENCE) {
-                    labelled.insert(item.token.end, LOW_CONFIDENCE_LABEL);
+                if (item.support == Support.LOW_CONFIDENCE
+                        && !text.startsWith(LOW_CONFIDENCE_LABEL, item.token.end)) {
+                    rendered.insert(item.token.end, LOW_CONFIDENCE_LABEL);
+                } else if (item.support == Support.UNSUPPORTED && maskUnsupported) {
+                    rendered.replace(item.token.start, item.token.end, UNVERIFIED_MASK);
                 }
             }
-            return labelled.toString();
+            return rendered.toString();
         }
 
         JSONObject toJson(int rewriteCount) {

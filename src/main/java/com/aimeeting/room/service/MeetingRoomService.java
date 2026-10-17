@@ -744,6 +744,14 @@ public class MeetingRoomService {
         if (result.getConclusion() == null || result.getConclusion().isBlank()) {
             result.setConclusion(buildFallbackConclusion(existing));
         }
+        ReviewedNumberGate.StoredEvidence finalEvidence = reviewed
+                ? ReviewedNumberGate.fromStoredOpinions(opinionMapper.selectByMeetingId(meetingId),
+                        existing.getCurrentRound() != null ? existing.getCurrentRound() : Integer.MAX_VALUE)
+                : null;
+        if (reviewed) {
+            // The voted conclusion has no rewrite step, so unsupported numbers are masked directly.
+            result.setConclusion(finalEvidence.publishable(result.getConclusion()));
+        }
         if (reviewed && hasLowConfidenceReviewedStatement(meetingId, existing.getCurrentRound())) {
             String warning = "【本轮部分材料未经充分交叉核验；以下结论为条件性判断】\n";
             if (!result.getConclusion().startsWith(warning)) {
@@ -764,13 +772,16 @@ public class MeetingRoomService {
         String reviewedAttendance = reviewed
                 ? buildReviewedFinalizationAttendance(meetingId, existing.getCurrentRound(), result)
                 : "";
+        String summarySystem = "你是专业会议记录员，请生成结构化会议总结。";
+        String reviewedSummaryPrompt = reviewed
+                ? orchestrator.buildSummaryPrompt(meetingId, result.getConclusion()) + reviewedAttendance
+                : null;
         String summary = reviewed
-                ? orchestrator.callModelStrict(meetingModelType,
-                    "你是专业会议记录员，请生成结构化会议总结。",
-                    orchestrator.buildSummaryPrompt(meetingId, result.getConclusion())
-                            + reviewedAttendance, null)
-                : orchestrator.callModel(meetingModelType,
-                    "你是专业会议记录员，请生成结构化会议总结。",
+                ? gateFinalText(finalEvidence,
+                    orchestrator.callModelStrict(meetingModelType, summarySystem, reviewedSummaryPrompt, null),
+                    rewrite -> orchestrator.callModelStrict(meetingModelType, summarySystem,
+                            reviewedSummaryPrompt + "\n\n" + rewrite, null))
+                : orchestrator.callModel(meetingModelType, summarySystem,
                     orchestrator.buildSummaryPrompt(meetingId));
         if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
         if (summary != null) {
@@ -780,17 +791,23 @@ public class MeetingRoomService {
                 roomMapper.updateSummary(meetingId, summary);
             }
         }
+        String artifactSystem = "你是企业决策秘书。请将会议结果整理成严格 JSON 决策卡片，便于后续项目复用。不要输出 JSON 以外的任何文字。";
+        String finalConclusion = result.getConclusion();
+        String reviewedArtifactPrompt = reviewed
+                ? orchestrator.buildDecisionArtifactPrompt(meetingId, finalConclusion)
+                        + reviewedAttendance + "\n只输出 JSON，不要 Markdown，不要代码块。"
+                : null;
         String decisionArtifact = reviewed
-                ? orchestrator.callModelStrict(meetingModelType,
-                    "你是企业决策秘书。请将会议结果整理成严格 JSON 决策卡片，便于后续项目复用。不要输出 JSON 以外的任何文字。",
-                    orchestrator.buildDecisionArtifactPrompt(meetingId, result.getConclusion())
-                            + reviewedAttendance + "\n只输出 JSON，不要 Markdown，不要代码块。", null)
-                : orchestrator.callModel(meetingModelType,
-                    "你是企业决策秘书。请将会议结果整理成严格 JSON 决策卡片，便于后续项目复用。不要输出 JSON 以外的任何文字。",
+                ? orchestrator.callModelStrict(meetingModelType, artifactSystem, reviewedArtifactPrompt, null)
+                : orchestrator.callModel(meetingModelType, artifactSystem,
                     orchestrator.buildDecisionArtifactPrompt(meetingId));
         if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
         String artifactJson = reviewed
-                ? buildDecisionArtifactJsonStrict(meetingId, result.getConclusion(), summary, decisionArtifact)
+                ? gateDecisionArtifact(finalEvidence,
+                    buildDecisionArtifactJsonStrict(meetingId, finalConclusion, summary, decisionArtifact),
+                    rewrite -> buildDecisionArtifactJsonStrict(meetingId, finalConclusion, summary,
+                            orchestrator.callModelStrict(meetingModelType, artifactSystem,
+                                    reviewedArtifactPrompt + "\n\n" + rewrite, null)))
                 : buildDecisionArtifactJson(meetingId, result.getConclusion(), summary, decisionArtifact);
 
         AiMeetingRoom conclusionContext = roomMapper.selectById(meetingId);
@@ -830,6 +847,55 @@ public class MeetingRoomService {
         AiMeetingRoom concluded = roomMapper.selectById(meetingId);
         notificationService.sendMeetingConclusion(
                 concluded.getTitle(), result.getConclusion());
+    }
+
+    /** Asks the model once to drop unsupported numbers, then masks whatever is still unsupported. */
+    private String gateFinalText(ReviewedNumberGate.StoredEvidence evidence, String text,
+                                 java.util.function.UnaryOperator<String> rewrite) {
+        if (text == null || text.isBlank()) return text;
+        ReviewedNumberGate.Audit audit = evidence.audit(text);
+        if (audit.hasUnsupported()) {
+            String rewritten = rewrite.apply(ReviewedNumberGate.rewriteInstruction(audit));
+            if (rewritten != null && !rewritten.isBlank()) text = rewritten;
+        }
+        return evidence.publishable(text);
+    }
+
+    /** Same policy as {@link #gateFinalText}, applied to every string in the decision card before tracking items are created. */
+    private String gateDecisionArtifact(ReviewedNumberGate.StoredEvidence evidence, String artifactJson,
+                                        java.util.function.UnaryOperator<String> rewrite) {
+        List<String> texts = new ArrayList<>();
+        mapArtifactStrings(com.alibaba.fastjson.JSON.parseObject(artifactJson), text -> {
+            texts.add(text);
+            return text;
+        });
+        ReviewedNumberGate.Audit audit = evidence.audit(String.join("\n；", texts));
+        if (audit.hasUnsupported()) {
+            try {
+                artifactJson = rewrite.apply(ReviewedNumberGate.rewriteInstruction(audit));
+            } catch (RuntimeException invalidRewrite) {
+                log.warn("Decision artifact rewrite was unusable; masking the original card instead: {}",
+                        invalidRewrite.getMessage());
+            }
+        }
+        return mapArtifactStrings(com.alibaba.fastjson.JSON.parseObject(artifactJson), evidence::publishable)
+                .toString();
+    }
+
+    private Object mapArtifactStrings(Object node, java.util.function.UnaryOperator<String> mapper) {
+        if (node instanceof String) return mapper.apply((String) node);
+        if (node instanceof com.alibaba.fastjson.JSONObject) {
+            com.alibaba.fastjson.JSONObject object = (com.alibaba.fastjson.JSONObject) node;
+            for (String key : new ArrayList<>(object.keySet())) {
+                object.put(key, mapArtifactStrings(object.get(key), mapper));
+            }
+        } else if (node instanceof com.alibaba.fastjson.JSONArray) {
+            com.alibaba.fastjson.JSONArray array = (com.alibaba.fastjson.JSONArray) node;
+            for (int i = 0; i < array.size(); i++) {
+                array.set(i, mapArtifactStrings(array.get(i), mapper));
+            }
+        }
+        return node;
     }
 
     private String buildReviewedFinalizationAttendance(Long meetingId, int roundNumber,

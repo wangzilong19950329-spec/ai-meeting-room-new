@@ -753,29 +753,10 @@ public class MeetingDebateService {
         for (WebSearchService.SearchResult result : evidence.results) {
             if (result != null && isProvisionalResult(result)) provisional.append(result.snippet).append('\n');
         }
-        List<AiMeetingOpinion> earlier = opinionMapper.selectByMeetingId(meetingId);
-        if (earlier == null) earlier = Collections.emptyList();
-        for (AiMeetingOpinion prior : earlier) {
-            if (prior == null || prior.getEvidence() == null
-                    || !OpinionTypeEnum.STATEMENT.getCode().equals(prior.getOpinionType())
-                    || (prior.getRoundNumber() != null && prior.getRoundNumber() > roundNumber)) continue;
-            JSONObject stored;
-            try { stored = JSON.parseObject(prior.getEvidence()); }
-            catch (RuntimeException invalid) { continue; }
-            if (stored == null || stored.getString("reviewedSearchStatus") == null) continue;
-            JSONArray results = stored.getJSONArray("results");
-            if (results == null) continue;
-            for (int i = 0; i < results.size(); i++) {
-                JSONObject item = results.getJSONObject(i);
-                if (item == null) continue;
-                boolean itemProvisional = "n8n-deepseek-provisional".equals(item.getString("provider"))
-                        || "LOW_CONFIDENCE_SEARCH".equals(item.getString("sourceType"));
-                StringBuilder target = itemProvisional ? provisional : verified;
-                target.append(item.getString("snippet")).append('\n');
-                JSONArray facts = item.getJSONArray("facts");
-                if (facts != null) target.append(facts.toJSONString()).append('\n');
-            }
-        }
+        ReviewedNumberGate.StoredEvidence earlier = ReviewedNumberGate.fromStoredOpinions(
+                opinionMapper.selectByMeetingId(meetingId), roundNumber);
+        verified.append(earlier.verified);
+        provisional.append(earlier.provisional);
         return new String[]{verified.toString(), provisional.toString()};
     }
 
