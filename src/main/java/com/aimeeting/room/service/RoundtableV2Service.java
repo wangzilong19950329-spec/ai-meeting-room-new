@@ -131,11 +131,15 @@ public class RoundtableV2Service {
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
         Map<Long, AiMeetingMember> membersById = new LinkedHashMap<>();
         JSONArray answers = new JSONArray();
+        List<JSONObject> unreachable = new ArrayList<>();
         for (AiMeetingMember member : members) {
             if (activeRoom(meetingId, epoch) == null) return;
             membersById.put(member.getId(), member);
-            answers.add(answer(meetingId, epoch, card, facts, member));
+            JSONObject answer = answer(meetingId, epoch, card, facts, member);
+            if (answer.getBooleanValue("unreachable")) unreachable.add(answer);
+            answers.add(answer);
         }
+        settleUnreachable(meetingId, epoch, answers, unreachable);
         JSONArray firstCrossExams = new JSONArray();
         JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams);
         if (finalAnswers == null) return;
@@ -206,7 +210,7 @@ public class RoundtableV2Service {
         String system = "你是中立的会议主持人，只负责把议题拆成可以选边的子问题并列出取证题，"
                 + "不表达立场、不打分。只输出 JSON。";
         String asOf = LocalDate.now(MARKET_ZONE).toString();
-        String prompt = issueCardPrompt(room, asOf, domainHints());
+        String prompt = issueCardPrompt(room, asOf, domainHints(), domainFields());
         String error;
         JSONObject card;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.ISSUE_CARD)) {
@@ -236,7 +240,7 @@ public class RoundtableV2Service {
         return save(meetingId, ISSUE_CARD, MEETING_LEVEL, epoch, normalized);
     }
 
-    private static String issueCardPrompt(AiMeetingRoom room, String asOf, String domainHints) {
+    private static String issueCardPrompt(AiMeetingRoom room, String asOf, String domainHints, String domainFields) {
         StringBuilder sb = new StringBuilder();
         sb.append("【议题】").append(room.getTitle()).append("\n");
         if (room.getDescription() != null && !room.getDescription().isBlank()) {
@@ -248,12 +252,14 @@ public class RoundtableV2Service {
         sb.append("【截至日期】").append(asOf).append("\n\n");
         sb.append("请把议题拆成 2–4 个子问题（推动结论的关键驱动因素），每个子问题给 2–4 个互斥选项，")
                 .append("选项要能让议员明确选边。\n");
-        sb.append("再列出不超过 8 道需要联网核实的取证题，每题只问一个可以核实的事实，多空两方面都要覆盖。\n");
+        sb.append("再列出不超过 8 道需要联网核实的取证题，每题只问一个可以核实的事实，多空两方面都要覆盖；")
+                .append("只问截至日期前已经公开的信息，不要问尚未发布的数据（例如还没披露的财报）。\n");
         sb.append("如果有合适的参照类（过去的类似情况），写在 referenceClass，否则写 null。\n");
         sb.append(domainHints);
         sb.append("把展望期折算成交易日数写在 horizonTradingDays（20–250，三个月约 60）。\n");
         sb.append("只输出 JSON：{\"topic\":\"\",\"horizon\":\"\",\"horizonTradingDays\":60,\"subQuestions\":[{\"id\":\"Q1\",\"title\":\"\",")
-                .append("\"options\":[{\"id\":\"A\",\"label\":\"\"}]}],\"evidenceQuestions\":[\"\"],\"referenceClass\":null}");
+                .append("\"options\":[{\"id\":\"A\",\"label\":\"\"}]}],\"evidenceQuestions\":[\"\"],\"referenceClass\":null")
+                .append(domainFields).append("}");
         return sb.toString();
     }
 
@@ -422,6 +428,16 @@ public class RoundtableV2Service {
         return null;
     }
 
+    /** Extra output fields the domains read, shown in the JSON template so models do not drop them. */
+    private String domainFields() {
+        StringBuilder fields = new StringBuilder();
+        for (MeetingDomain domain : domains()) {
+            String field = domain.issueCardField();
+            if (!blank(field)) fields.append(",").append(field);
+        }
+        return fields.toString();
+    }
+
     private String domainHints() {
         StringBuilder hints = new StringBuilder();
         for (MeetingDomain domain : domains()) {
@@ -433,6 +449,10 @@ public class RoundtableV2Service {
 
     // ---- P2 back-to-back answers ----
 
+    /**
+     * Returns the stored answer, or a new one. A member whose model cannot be reached gets an unsaved record
+     * marked unreachable, so the decision to skip them or pause the meeting is made once all members were asked.
+     */
     private JSONObject answer(Long meetingId, Long epoch, JSONObject card, JSONArray facts, AiMeetingMember member) {
         JSONObject stored = loadObject(meetingId, ANSWER, member.getId());
         if (stored != null) return stored;
@@ -441,17 +461,28 @@ public class RoundtableV2Service {
         String[] corpora = corpora(facts, card);
         Set<String> factIds = factIds(facts);
         Answer parsed;
-        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
-                meetingId, 1, member.getId(), MeetingCallContext.DIVERGENCE)) {
-            parsed = parseAnswer(callQuietly(member.getModelType(), system, prompt), card, factIds, corpora);
-        }
-        if (parsed.error != null) {
+        try {
             try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
-                    meetingId, 1, member.getId(), MeetingCallContext.DIVERGENCE_REWRITE)) {
-                parsed = parseAnswer(callQuietly(member.getModelType(), system,
-                        prompt + "\n\n【上一版作答不合格】" + parsed.error + "。请按要求重新输出完整 JSON。"),
+                    meetingId, 1, member.getId(), MeetingCallContext.DIVERGENCE)) {
+                parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system, prompt),
                         card, factIds, corpora);
             }
+            if (parsed.error != null) {
+                try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                        meetingId, 1, member.getId(), MeetingCallContext.DIVERGENCE_REWRITE)) {
+                    parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system,
+                            prompt + "\n\n【上一版作答不合格】" + parsed.error + "。请按要求重新输出完整 JSON。"),
+                            card, factIds, corpora);
+                }
+            }
+        } catch (ModelUnavailable unavailable) {
+            JSONObject record = new JSONObject(true);
+            record.put("memberId", member.getId());
+            record.put("memberName", member.getMemberName());
+            record.put("skipped", true);
+            record.put("unreachable", true);
+            record.put("reason", unavailable.getMessage());
+            return record;
         }
         JSONObject record = new JSONObject(true);
         record.put("memberId", member.getId());
@@ -471,11 +502,30 @@ public class RoundtableV2Service {
                 + firstNonBlank(member.getPersona(), "独立分析") + "\n";
     }
 
-    private String callQuietly(String model, String system, String prompt) {
+    /**
+     * Members whose model could not be reached are skipped for good only if at least two others answered;
+     * otherwise the meeting pauses without storing them, and resuming asks them again.
+     */
+    private void settleUnreachable(Long meetingId, Long epoch, JSONArray answers, List<JSONObject> unreachable) {
+        if (unreachable.isEmpty()) return;
+        long answered = answers.stream().filter(item -> !((JSONObject) item).getBooleanValue("skipped")).count();
+        if (answered < 2) {
+            StringBuilder reasons = new StringBuilder();
+            for (JSONObject record : unreachable) {
+                if (reasons.length() > 0) reasons.append("；");
+                reasons.append(record.getString("reason"));
+            }
+            throw new Blocked("有效作答不足 2 人，会议暂停：" + reasons + "。请检查模型或账号后继续会议");
+        }
+        for (JSONObject record : unreachable) save(meetingId, ANSWER, record.getLong("memberId"), epoch, record);
+    }
+
+    /** A provider failure is not a bad answer: it surfaces as ModelUnavailable instead of an empty reply. */
+    private String call(String model, String who, String system, String prompt) {
         try {
             return orchestrator.callModelStrict(model, system, prompt, null);
-        } catch (RuntimeException unavailable) {
-            return null;
+        } catch (RuntimeException failure) {
+            throw new ModelUnavailable(who, failure.getMessage());
         }
     }
 
@@ -813,13 +863,13 @@ public class RoundtableV2Service {
                              String system, String prompt, String[] corpora) {
         String reply;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, 1, member.getId(), stage)) {
-            reply = callQuietly(member.getModelType(), system, prompt);
+            reply = call(member.getModelType(), member.getMemberName(), system, prompt);
         }
         String gated = blank(reply) ? null : gateNumbers(reply.trim(), corpora);
         if (gated != null) return gated;
         String why = blank(reply) ? "没有输出内容" : unsupportedNumbers(reply, corpora);
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, 1, member.getId(), rewriteStage)) {
-            reply = callQuietly(member.getModelType(), system, prompt + "\n\n【上一版不合格】" + why);
+            reply = call(member.getModelType(), member.getMemberName(), system, prompt + "\n\n【上一版不合格】" + why);
         }
         return blank(reply) ? null : gateNumbers(reply.trim(), corpora);
     }
@@ -859,12 +909,13 @@ public class RoundtableV2Service {
         Answer parsed;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
                 meetingId, 1, member.getId(), MeetingCallContext.REESTIMATE)) {
-            parsed = parseAnswer(callQuietly(member.getModelType(), system, prompt), card, factIds, corpora);
+            parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system, prompt),
+                    card, factIds, corpora);
         }
         if (parsed.error != null) {
             try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
                     meetingId, 1, member.getId(), MeetingCallContext.REESTIMATE_REWRITE)) {
-                parsed = parseAnswer(callQuietly(member.getModelType(), system,
+                parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system,
                         prompt + "\n\n【上一版作答不合格】" + parsed.error + "。请按要求重新输出完整 JSON。"),
                         card, factIds, corpora);
             }
@@ -961,13 +1012,13 @@ public class RoundtableV2Service {
         for (Object item : disputes) expected.add(((JSONObject) item).getString("questionId"));
         Map<String, JSONObject> valid;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.CLASSIFY)) {
-            valid = parseClassification(callQuietly(model, system, prompt), expected);
+            valid = parseClassification(call(model, "主持人", system, prompt), expected);
         }
         if (valid.size() < expected.size()) {
             Set<String> missing = new LinkedHashSet<>(expected);
             missing.removeAll(valid.keySet());
             try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.CLASSIFY_REWRITE)) {
-                Map<String, JSONObject> retried = parseClassification(callQuietly(model, system, prompt
+                Map<String, JSONObject> retried = parseClassification(call(model, "主持人", system, prompt
                         + "\n\n【上一版不合格】这些分歧缺少合格的类型、关键分歧点或取证题：" + missing
                         + "。请重新输出全部分歧的完整 JSON。"), expected);
                 for (Map.Entry<String, JSONObject> entry : retried.entrySet()) valid.putIfAbsent(entry.getKey(), entry.getValue());
@@ -1578,9 +1629,16 @@ public class RoundtableV2Service {
     }
 
     /** A stage cannot continue without the user, so the meeting is paused with a visible reason. */
-    private static final class Blocked extends RuntimeException {
+    private static class Blocked extends RuntimeException {
         private Blocked(String reason) {
             super(reason);
+        }
+    }
+
+    /** The model could not be reached; nothing is stored for the step, so resuming the meeting retries it. */
+    private static final class ModelUnavailable extends Blocked {
+        private ModelUnavailable(String who, String detail) {
+            super("「" + who + "」的模型调用失败（" + detail + "）");
         }
     }
 }

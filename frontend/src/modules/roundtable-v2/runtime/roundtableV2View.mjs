@@ -51,6 +51,10 @@ export function buildRoundtableV2View(v2, usage) {
   const questions = questionIndex(card, v2.outcomeQuestion)
   const facts = factRows(v2.facts, v2.topUp)
   const factById = new Map(facts.map(fact => [fact.id, fact]))
+  const crossExams = [
+    ...(v2.crossExams || []).map(exam => crossExam(exam, 1)),
+    ...(v2.secondCrossExams || []).map(exam => crossExam(exam, 2))
+  ]
 
   return {
     finished: Boolean(result),
@@ -62,15 +66,19 @@ export function buildRoundtableV2View(v2, usage) {
     conclusions: (result?.conclusions || []).map(conclusion),
     disputes: (result?.disputes || []).map(line => dispute(line, factById)),
     insufficient: (result?.insufficient || []).map(line => ({ title: line.title, reason: line.reason })),
-    crossExams: [
-      ...(v2.crossExams || []).map(exam => crossExam(exam, 1)),
-      ...(v2.secondCrossExams || []).map(exam => crossExam(exam, 2))
-    ],
+    crossExams,
     redTeam: redTeam(v2.redTeam),
     changes: (result?.changes || []).map(change => changeRow(change, questions)),
     openQuestions: result?.openQuestions || [],
+    skippedMembers: (v2.answers || []).filter(answer => answer.skipped)
+      .map(answer => ({ memberName: answer.memberName, reason: answer.reason || '' })),
     stats: result
-      ? { answeredCount: result.answeredCount ?? 0, skippedCount: result.skippedCount ?? 0, loops: result.loops ?? 1 }
+      ? {
+          answeredCount: result.answeredCount ?? 0,
+          skippedCount: result.skippedCount ?? 0,
+          // The summary counts one loop even when the agenda had nothing to cross-examine.
+          loops: crossExams.length ? (result.loops ?? 1) : 0
+        }
       : null,
     usage: usageView(usage)
   }
@@ -79,7 +87,7 @@ export function buildRoundtableV2View(v2, usage) {
 function header(card) {
   const days = card.horizonTradingDays
   const horizonText = card.horizon
-    ? card.horizon + (days ? `（${days} 个交易日）` : '')
+    ? card.horizon + (days && !card.horizon.includes('交易日') ? `（${days} 个交易日）` : '')
     : (days ? `${days} 个交易日` : '')
   const stock = card.stock
   return {

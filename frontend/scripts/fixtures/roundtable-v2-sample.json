@@ -686,6 +686,7 @@
 		}
 	},
 	"outcomeQuestion":{
+		"baseDate":"2026-10-16",
 		"kind":"PROBABILITY",
 		"options":[
 			{
@@ -719,8 +720,9 @@
 		],
 		"sigmaPct":15.37,
 		"horizonTradingDays":60,
+		"baseClose":102,
 		"id":"OUTCOME",
-		"title":"未来60个交易日收益率（以2026-10-17收盘价为起点，前复权）"
+		"title":"未来60个交易日收益率（以2026-10-16收盘价为起点，前复权）"
 	},
 	"redTeam":{
 		"optionLabel":"支撑股价",
@@ -913,7 +915,7 @@
 					"label":"涨幅超过23%"
 				}
 			],
-			"title":"未来60个交易日收益率（以2026-10-17收盘价为起点，前复权）",
+			"title":"未来60个交易日收益率（以2026-10-16收盘价为起点，前复权）",
 			"minority":[
 				{
 					"mode":"B",

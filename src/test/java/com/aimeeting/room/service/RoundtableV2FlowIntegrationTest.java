@@ -149,6 +149,94 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void issueCardPromptShowsTheDomainFieldInItsJsonTemplateAndAsksOnlyForPublishedFacts() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        String prompt = fixture.moderatorPrompts.get(0);
+        String template = prompt.substring(prompt.indexOf("只输出 JSON"));
+        // Models copy the output template; a field only described in prose gets dropped.
+        assertTrue(template.contains("\"stock\":"), template);
+        assertTrue(prompt.contains("不要再问股价涨跌"), prompt);
+        assertTrue(prompt.contains("尚未发布"), prompt);
+    }
+
+    @Test
+    void memberWhoseModelIsDownIsSkippedWithTheRealReasonWhenTwoOthersAnswered() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.down.add("divergence:乙");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject skipped = answerOf(view, "乙");
+        assertTrue(skipped.getBooleanValue("skipped"), skipped.toJSONString());
+        assertTrue(skipped.getString("reason").contains("模型调用失败"), skipped.toJSONString());
+        // A provider failure is not a format problem, so there is no rewrite attempt.
+        assertEquals(1, fixture.calls.stream().filter("divergence:乙"::equals).count(), fixture.calls.toString());
+        assertEquals(2, view.getResult().getIntValue("answeredCount"));
+    }
+
+    @Test
+    void meetingPausesWhenFewerThanTwoMembersCanAnswerAndResumeAsksThemAgain() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.down.add("divergence:甲");
+        fixture.down.add("divergence:乙");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(MeetingStatusEnum.PAUSED.getCode(), fixture.room.getStatus());
+        ArgumentCaptor<String> reason = ArgumentCaptor.forClass(String.class);
+        verify(fixture.workflow).markReviewedEvidenceBlocked(eq(meetingId), reason.capture());
+        assertTrue(reason.getValue().contains("模型调用失败") && reason.getValue().contains("甲")
+                && reason.getValue().contains("乙"), reason.getValue());
+        RoundtableV2ViewVO paused = controller.getRoundtableV2(meetingId).getData();
+        assertEquals(1, paused.getAnswers().size(), paused.getAnswers().toJSONString());
+        verify(fixture.writer, never()).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
+                nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+
+        fixture.down.clear();
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(!answerOf(view, "甲").getBooleanValue("skipped"), answerOf(view, "甲").toJSONString());
+        assertEquals(3, view.getResult().getIntValue("answeredCount"));
+        assertEquals(1, fixture.calls.stream().filter("divergence:丙"::equals).count(), fixture.calls.toString());
+    }
+
+    @Test
+    void modelFailureDuringCrossExamPausesInsteadOfLookingLikeAnUnsourcedNumber() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "需求偏弱", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.down.add("cross_exam:甲");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(MeetingStatusEnum.PAUSED.getCode(), fixture.room.getStatus());
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getCrossExams().isEmpty());
+
+        fixture.down.clear();
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        fixture.service.run(meetingId, EPOCH);
+
+        JSONObject exam = controller.getRoundtableV2(meetingId).getData().getCrossExams().getJSONObject(0);
+        assertTrue(!exam.getBooleanValue("failed") && exam.getString("question") != null, exam.toJSONString());
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
@@ -469,6 +557,24 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void outcomeQuestionStartsFromTheLastTradingDayClose() {
+        Fixture fixture = stockFixtureWithHistory();
+        String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        String valid = withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        // The meeting date may be a weekend; the interval is measured from the latest close actually available.
+        JSONObject outcome = controller.getRoundtableV2(meetingId).getData().getOutcomeQuestion();
+        assertEquals("2026-10-16", outcome.getString("baseDate"), outcome.toJSONString());
+        assertEquals(0, new java.math.BigDecimal("102").compareTo(outcome.getBigDecimal("baseClose")), outcome.toJSONString());
+        assertTrue(outcome.getString("title").contains("以2026-10-16收盘价为起点"), outcome.toJSONString());
+    }
+
+    @Test
     void outcomeProbabilitiesNotSummingToOneAreRewrittenOnce() {
         Fixture fixture = stockFixtureWithHistory();
         String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
@@ -533,7 +639,7 @@ class RoundtableV2FlowIntegrationTest {
         List<Map<String, Object>> history = new ArrayList<>();
         for (int i = 0; i < 400; i++) {
             Map<String, Object> bar = new java.util.LinkedHashMap<>();
-            bar.put("date", "d" + i);
+            bar.put("date", i == 399 ? "2026-10-16" : "d" + i);
             bar.put("close", new java.math.BigDecimal(i % 2 == 0 ? "100" : "102"));
             history.add(bar);
         }
@@ -657,6 +763,9 @@ class RoundtableV2FlowIntegrationTest {
         private final Map<String, List<String>> crossExamReplies = new HashMap<>();
         private final List<String> calls = new ArrayList<>();
         private final List<String> classifyReplies = new ArrayList<>();
+        private final List<String> moderatorPrompts = new ArrayList<>();
+        /** "stage:name" entries whose model call fails as if the provider were down. */
+        private final java.util.Set<String> down = new java.util.HashSet<>();
         private final RoundtableV2Service service = new RoundtableV2Service();
 
         private Fixture() {
@@ -708,6 +817,7 @@ class RoundtableV2FlowIntegrationTest {
                         String stage = frame == null ? "none" : frame.stage.replace("_rewrite", "");
                         if (system.contains("主持人")) {
                             calls.add(stage + ":主持人");
+                            moderatorPrompts.add(invocation.getArgument(2));
                             if (MeetingCallContext.CLASSIFY.equals(stage)) {
                                 return classifyReplies.isEmpty() ? DEFAULT_CLASSIFY
                                         : classifyReplies.size() > 1 ? classifyReplies.remove(0) : classifyReplies.get(0);
@@ -716,6 +826,9 @@ class RoundtableV2FlowIntegrationTest {
                         }
                         String name = memberIn(system);
                         calls.add(stage + ":" + name);
+                        if (down.contains(stage + ":" + name)) {
+                            throw new IllegalStateException("meeting_selected_model_unavailable");
+                        }
                         switch (stage) {
                             case MeetingCallContext.DIVERGENCE:
                                 return next(memberReplies.get(name));

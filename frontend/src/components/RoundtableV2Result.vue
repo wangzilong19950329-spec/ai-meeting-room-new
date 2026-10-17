@@ -5,7 +5,7 @@
         <span>🧭 圆桌研判结果</span>
         <span v-if="view.stats" class="v2-muted">
           {{ view.stats.answeredCount }} 人有效作答<template v-if="view.stats.skippedCount"> · {{ view.stats.skippedCount }} 人作答无效</template>
-          · 交锋 {{ view.stats.loops }} 轮
+          · {{ view.stats.loops ? `交锋 ${view.stats.loops} 轮` : '未进行交锋' }}
         </span>
       </div>
     </template>
@@ -16,6 +16,10 @@
         {{ step.done ? '✓' : '○' }} {{ step.label }}<small v-if="step.detail"> · {{ step.detail }}</small>
       </span>
     </div>
+
+    <el-alert v-if="view.skippedMembers.length" type="warning" :closable="false" class="v2-skipped">
+      <div v-for="member in view.skippedMembers" :key="member.memberName">{{ member.memberName }} 作答无效：{{ member.reason }}</div>
+    </el-alert>
 
     <!-- 问题卡 -->
     <section class="v2-section">
@@ -233,6 +237,7 @@ const MemberReasons = defineComponent({
 .v2-card { border-radius: 12px; }
 .v2-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 .v2-muted { color: #8492a6; font-size: 12px; }
+.v2-skipped { margin-bottom: 12px; }
 .v2-progress { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 14px; font-size: 13px; color: #8492a6; }
 .v2-step.done { color: #3a8f3a; }
 .v2-section { padding: 12px 0; border-top: 1px solid #eef1f6; }

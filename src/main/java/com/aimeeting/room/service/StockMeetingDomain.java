@@ -40,7 +40,14 @@ public class StockMeetingDomain implements MeetingDomain {
         return "如果议题针对一只 A 股个股，在 stock 字段给出 {\"symbol\":\"300750\",\"market\":\"sz\"}（6 位代码，市场为 sh/sz/bj），"
                 + "否则 stock 写 null。给出股票时，系统会自动提供东方财富结构化数据：收盘价、当日涨跌幅、总市值、"
                 + "市盈率与市净率及其近一年分位、最近一期营业总收入与归母净利润及同比、近 5/20/60 个交易日涨跌幅、"
-                + "距近 60 个交易日最高价回撤、相对 MA20/MA60 偏离、20 日历史波动率。取证题不要再问这些。";
+                + "距近 60 个交易日最高价回撤、相对 MA20/MA60 偏离、20 日历史波动率。取证题不要再问这些。"
+                + "给出股票时，程序还会自动生成“未来 N 个交易日收益率”的结果区间题，子问题不要再问股价涨跌方向或幅度，"
+                + "只拆推动走势的驱动因素。";
+    }
+
+    @Override
+    public String issueCardField() {
+        return "\"stock\":null";
     }
 
     @Override
@@ -64,16 +71,21 @@ public class StockMeetingDomain implements MeetingDomain {
             return new DomainEvidence(facts, null);
         }
         List<BigDecimal> closes = new ArrayList<>();
+        String baseDate = null;
         for (Map<String, Object> bar : history == null ? List.<Map<String, Object>>of() : history) {
             BigDecimal close = decimal(bar.get("close"));
-            if (close != null && close.signum() > 0) closes.add(close);
+            if (close != null && close.signum() > 0) {
+                closes.add(close);
+                baseDate = text(bar.get("date"));
+            }
         }
         if (horizon <= 0 || closes.size() < horizon + VOLATILITY_WINDOW + 1) {
             facts.add(gap(label, "HISTORY_TOO_SHORT: " + closes.size() + " bars"));
             return new DomainEvidence(facts, null);
         }
         facts.add(referenceFact(closes, horizon));
-        return new DomainEvidence(facts, outcomeQuestion(closes, horizon, issueCard.getString("asOf")));
+        return new DomainEvidence(facts, outcomeQuestion(closes, horizon,
+                baseDate == null ? issueCard.getString("asOf") : baseDate));
     }
 
     /** Reference class: the distribution of every rolling horizon-day return in the available history. */
@@ -103,7 +115,7 @@ public class StockMeetingDomain implements MeetingDomain {
      * Five return intervals cut symmetrically at ±0.5σ and ±1.5σ, where σ is the recent daily volatility scaled
      * to the horizon. Bounds are whole percentage points and are stored for judging the outcome at expiry.
      */
-    private static JSONObject outcomeQuestion(List<BigDecimal> closes, int horizon, String asOf) {
+    private static JSONObject outcomeQuestion(List<BigDecimal> closes, int horizon, String baseDate) {
         List<Double> daily = new ArrayList<>();
         for (int i = closes.size() - VOLATILITY_WINDOW; i < closes.size(); i++) {
             daily.add(closes.get(i).doubleValue() / closes.get(i - 1).doubleValue() - 1);
@@ -122,8 +134,11 @@ public class StockMeetingDomain implements MeetingDomain {
         JSONObject question = new JSONObject(true);
         question.put("id", "OUTCOME");
         question.put("kind", "PROBABILITY");
-        question.put("title", "未来" + horizon + "个交易日收益率（以" + asOf + "收盘价为起点，前复权）");
+        question.put("title", "未来" + horizon + "个交易日收益率（以" + baseDate + "收盘价为起点，前复权）");
         question.put("horizonTradingDays", horizon);
+        // The starting point for judging the outcome at expiry: the latest close actually available.
+        question.put("baseDate", baseDate);
+        question.put("baseClose", closes.get(closes.size() - 1));
         question.put("sigmaPct", BigDecimal.valueOf(sigmaPct).setScale(2, RoundingMode.HALF_UP));
         question.put("options", options);
         return question;

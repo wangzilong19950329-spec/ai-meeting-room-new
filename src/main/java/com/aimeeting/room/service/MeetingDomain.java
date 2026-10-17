@@ -18,6 +18,11 @@ public interface MeetingDomain {
     /** Tells the moderator what this domain supplies automatically, so evidence questions skip it. */
     String issueCardHint();
 
+    /** A field this domain reads from the issue card, as it appears in the output template (e.g. "stock":null). */
+    default String issueCardField() {
+        return null;
+    }
+
     /** Copies this domain's validated fields (for example the stock code) from the raw card; invalid ones are dropped. */
     default void normalizeIssueCard(JSONObject raw, JSONObject normalized) {
     }

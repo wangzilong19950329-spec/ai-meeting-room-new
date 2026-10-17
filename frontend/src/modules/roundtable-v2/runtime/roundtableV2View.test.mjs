@@ -74,7 +74,7 @@ test('fact base rows carry tier labels and visible confidence badges', () => {
 test('outcome distribution shows pooled means, ranges, the mode and the program-picked minority', () => {
   const view = buildRoundtableV2View(sample, usage)
   const outcome = view.outcome
-  assert.equal(outcome.title, '未来60个交易日收益率（以2026-10-17收盘价为起点，前复权）')
+  assert.equal(outcome.title, '未来60个交易日收益率（以2026-10-16收盘价为起点，前复权）')
   assert.equal(outcome.memberCount, 3)
   assert.deepEqual(outcome.bars.map(b => [b.id, b.label, b.meanText, b.rangeText, b.isMode]), [
     ['A', '跌幅超过23%', '3.3%', '0%–10%', false],
@@ -217,4 +217,27 @@ test('a meeting still running shows which stages are done and no summary yet', (
   assert.equal(view.redTeam, null)
 
   assert.equal(buildRoundtableV2View(sample, null).finished, true)
+})
+
+test('horizon text does not repeat trading days the moderator already wrote', () => {
+  const v2 = clone(sample)
+  v2.issueCard.horizon = '2026-10-17至2027-01-17（约60个交易日）'
+  assert.equal(buildRoundtableV2View(v2, null).header.horizonText, '2026-10-17至2027-01-17（约60个交易日）')
+})
+
+test('a meeting without any cross-examination reports zero loops', () => {
+  const v2 = clone(sample)
+  v2.crossExams = []
+  v2.secondCrossExams = []
+  assert.equal(buildRoundtableV2View(v2, null).stats.loops, 0)
+  assert.equal(buildRoundtableV2View(sample, null).stats.loops, 1)
+})
+
+test('members without a valid answer are listed with the reason', () => {
+  const v2 = clone(sample)
+  v2.answers[1] = { memberId: 22, memberName: '乙', skipped: true, reason: '「乙」的模型调用失败（meeting_selected_model_unavailable）' }
+  assert.deepEqual(buildRoundtableV2View(v2, null).skippedMembers, [
+    { memberName: '乙', reason: '「乙」的模型调用失败（meeting_selected_model_unavailable）' }
+  ])
+  assert.deepEqual(buildRoundtableV2View(sample, null).skippedMembers, [])
 })
