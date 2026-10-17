@@ -39,6 +39,8 @@ const STAGE_LABELS = {
   summary_rewrite: '总结重写',
   decision_card: '决策卡片',
   decision_card_rewrite: '决策卡片重写',
+  solo: '单人对照',
+  solo_rewrite: '单人对照重写',
   other: '其他'
 }
 
@@ -64,6 +66,8 @@ export function buildRoundtableV2View(v2, usage) {
     factCounts: countTiers(facts),
     outcome: outcome(result?.outcome),
     judgement: judgementView(v2.outcomeJudgement),
+    solo: soloView(v2.solo, result, card, v2.outcomeQuestion),
+    canRequestSolo: Boolean(result) && !v2.solo,
     judgementPendingText: judgementPending(v2),
     conclusions: (result?.conclusions || []).map(conclusion),
     disputes: (result?.disputes || []).map(line => dispute(line, factById)),
@@ -222,6 +226,12 @@ function judgementView(verdict) {
     uniformRpsText: score(uniform),
     uniformBrierText: score(verdict.uniform?.brier),
     verdictText: comparison === '持平于' ? '合议分布与均匀猜测持平' : `合议分布${comparison}均匀猜测`,
+    solo: verdict.solo ? {
+      rpsText: score(verdict.solo.rps),
+      brierText: score(verdict.solo.brier),
+      beatsUniform: Number(verdict.solo.rps) < uniform,
+      beatsRoundtable: Number(verdict.solo.rps) < pooled
+    } : null,
     members: [...(verdict.members || [])]
       .sort((a, b) => Number(a.rps) - Number(b.rps))
       .map(member => ({
@@ -230,6 +240,59 @@ function judgementView(verdict) {
         brierText: score(member.brier),
         beatsUniform: Number(member.rps) < uniform
       }))
+  }
+}
+
+const RELATION_LABELS = { same: '一致', different: '不同', disputed: '圆桌有分歧', open: '圆桌未下结论' }
+
+/** The single-analyst control next to what the roundtable concluded, question by question. */
+function soloView(solo, result, card, outcomeQuestion) {
+  if (!solo || solo.skipped) return null
+  const choices = new Map((solo.answers || []).map(answer => [answer.questionId, answer]))
+  const rows = (card.subQuestions || []).filter(q => q.kind !== 'PROBABILITY').map(question => {
+    const labels = new Map((question.options || []).map(o => [o.id, o.label]))
+    const choice = choices.get(question.id)
+    const conclusion = (result?.conclusions || []).find(line => line.questionId === question.id)
+    const dispute = (result?.disputes || []).find(line => line.questionId === question.id)
+    let roundtableText = '证据不足，未下结论'
+    let relation = 'open'
+    if (conclusion) {
+      roundtableText = `${conclusion.optionLabel}（${conclusion.support}/${conclusion.total} 人）`
+      relation = choice?.optionId === conclusion.optionId ? 'same' : 'different'
+    } else if (dispute) {
+      roundtableText = '有分歧：' + (dispute.positions || [])
+        .map(position => `${position.optionLabel} ${(position.members || []).length} 人`).join(' / ')
+      relation = 'disputed'
+    }
+    return {
+      questionId: question.id,
+      title: question.title,
+      roundtableText,
+      soloText: labels.get(choice?.optionId) || choice?.optionId || '未作答',
+      relation,
+      relationLabel: RELATION_LABELS[relation],
+      soloReasons: reasons(choice?.reasons)
+    }
+  })
+  return {
+    modelType: solo.modelType,
+    rows,
+    differentCount: rows.filter(row => row.relation === 'different').length,
+    outcome: soloOutcome(choices.get(outcomeQuestion?.id), outcomeQuestion, result?.outcome)
+  }
+}
+
+function soloOutcome(choice, outcomeQuestion, pooled) {
+  if (!choice?.probabilities || !outcomeQuestion || !pooled) return null
+  const labels = new Map((outcomeQuestion.options || []).map(o => [o.id, o.label]))
+  let mode = null
+  for (const option of outcomeQuestion.options || []) {
+    if (mode === null || Number(choice.probabilities[option.id]) > Number(choice.probabilities[mode])) mode = option.id
+  }
+  return {
+    soloModeLabel: labels.get(mode),
+    roundtableModeLabel: labels.get(pooled.aggregateMode),
+    same: mode === pooled.aggregateMode
   }
 }
 

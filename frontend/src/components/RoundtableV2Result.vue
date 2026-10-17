@@ -74,7 +74,8 @@
       <el-table :data="[
         { name: '合议分布（等权）', rps: view.judgement.pooledRpsText, brier: view.judgement.pooledBrierText },
         { name: '均匀猜测（基准）', rps: view.judgement.uniformRpsText, brier: view.judgement.uniformBrierText },
-        ...view.judgement.members.map(m => ({ name: m.memberName + (m.beatsUniform ? '' : '（不如基准）'), rps: m.rpsText, brier: m.brierText }))
+        ...view.judgement.members.map(m => ({ name: m.memberName + (m.beatsUniform ? '' : '（不如基准）'), rps: m.rpsText, brier: m.brierText })),
+        ...(view.judgement.solo ? [{ name: '单人分析（对照）' + (view.judgement.solo.beatsRoundtable ? '：优于圆桌' : '：不如圆桌'), rps: view.judgement.solo.rpsText, brier: view.judgement.solo.brierText }] : [])
       ]" size="small" class="v2-judge-table">
         <el-table-column prop="name" label="预测" />
         <el-table-column prop="rps" label="RPS" width="110" />
@@ -170,6 +171,44 @@
       </div>
     </section>
 
+    <!-- 单人对照：按需生成 -->
+    <section v-if="view.solo || view.canRequestSolo" class="v2-section">
+      <div class="v2-title">单人对照</div>
+      <template v-if="view.solo">
+        <div class="v2-muted v2-caption">
+          同一模型（{{ view.solo.modelType }}）、同一问题卡和会前底稿，一个人一次答完。与圆桌不同的子问题 {{ view.solo.differentCount }} 道。
+        </div>
+        <div v-for="row in view.solo.rows" :key="row.questionId" class="v2-solo-row">
+          <div class="v2-item-head">
+            <el-tag size="small" effect="plain">{{ row.questionId }}</el-tag>
+            <span class="v2-item-title">{{ row.title }}</span>
+            <el-tag size="small" :type="relationType(row.relation)">{{ row.relationLabel }}</el-tag>
+          </div>
+          <div class="v2-solo-sides">
+            <span>圆桌：{{ row.roundtableText }}</span>
+            <span>单人：{{ row.soloText }}</span>
+          </div>
+          <div v-if="row.relation !== 'same' && row.soloReasons.length" class="v2-members">
+            <div class="v2-member">
+              <strong>单人理由：</strong>
+              <template v-for="(reason, i) in row.soloReasons" :key="i">
+                {{ reason.text }}<FactRefs :ids="reason.factIds" :facts="factById" />；
+              </template>
+            </div>
+          </div>
+        </div>
+        <div v-if="view.solo.outcome" class="v2-solo-row">
+          结果区间：圆桌最可能「{{ view.solo.outcome.roundtableModeLabel }}」，单人最可能「{{ view.solo.outcome.soloModeLabel }}」
+          <el-tag size="small" :type="view.solo.outcome.same ? 'success' : 'warning'">{{ view.solo.outcome.same ? '一致' : '不同' }}</el-tag>
+        </div>
+      </template>
+      <template v-else>
+        <div class="v2-muted v2-caption">用同一模型、同一问题卡和会前底稿让一个人一次答完，看圆桌改变了什么；到期时一起打分。约 1–2 次模型调用。</div>
+        <el-button size="small" type="primary" plain :loading="soloLoading" @click="emit('request-solo')">生成单人对照</el-button>
+        <div v-if="soloError" class="v2-solo-error">{{ soloError }}</div>
+      </template>
+    </section>
+
     <!-- 事实底稿与消耗 -->
     <el-collapse class="v2-collapse">
       <el-collapse-item name="facts">
@@ -212,8 +251,15 @@ import { computed, defineComponent, h } from 'vue'
 import { ElTooltip } from 'element-plus'
 
 const props = defineProps({
-  view: { type: Object, required: true }
+  view: { type: Object, required: true },
+  soloLoading: { type: Boolean, default: false },
+  soloError: { type: String, default: '' }
 })
+const emit = defineEmits(['request-solo'])
+
+function relationType(relation) {
+  return ({ same: 'success', different: 'danger', disputed: 'warning', open: 'info' })[relation] || 'info'
+}
 
 const factById = computed(() => new Map(props.view.facts.map(fact => [fact.id, fact])))
 
@@ -277,6 +323,10 @@ const MemberReasons = defineComponent({
 .v2-bar-row.mode .v2-bar-label, .v2-bar-row.mode .v2-bar-value { font-weight: 700; }
 .v2-bar-value { text-align: right; }
 .v2-pending { margin-top: 8px; }
+.v2-solo-row { padding: 6px 0; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.v2-solo-row + .v2-solo-row { border-top: 1px dashed #eef1f6; }
+.v2-solo-sides { display: flex; flex-wrap: wrap; gap: 4px 24px; }
+.v2-solo-error { margin-top: 6px; font-size: 13px; color: #c45656; }
 .v2-judge-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
 .v2-judge-table { margin-top: 8px; }
 .v2-minority { margin-top: 10px; padding: 8px 12px; background: #fdf6ec; border-radius: 8px; font-size: 13px; }

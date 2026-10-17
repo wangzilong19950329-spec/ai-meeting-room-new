@@ -63,7 +63,8 @@
       </el-card>
 
       <template v-if="isRoundtableV2">
-        <RoundtableV2Result v-if="roundtableV2View" :view="roundtableV2View" />
+        <RoundtableV2Result v-if="roundtableV2View" :view="roundtableV2View" :solo-loading="soloLoading"
+          :solo-error="soloError" @request-solo="handleRequestSolo" />
         <el-card v-else-if="[1, 6].includes(meeting.status)" shadow="never" class="header-card">
           <span class="v2-waiting">主持人正在拟定问题卡…</span>
         </el-card>
@@ -1976,6 +1977,22 @@ async function loadDetail(silent = false) {
       setTimeout(() => { newIds.value = new Set() }, 2500)
     }
   } finally { if (!silent) loading.value = false }
+}
+
+const soloLoading = ref(false)
+const soloError = ref('')
+
+async function handleRequestSolo() {
+  soloLoading.value = true
+  soloError.value = ''
+  try {
+    await meetingApi.createRoundtableV2Solo(meetingId)
+    await loadRoundtableV2()
+  } catch (failure) {
+    soloError.value = failure?.msg || failure?.message || '单人对照生成失败，可以再试一次'
+  } finally {
+    soloLoading.value = false
+  }
 }
 
 async function loadRoundtableV2() {

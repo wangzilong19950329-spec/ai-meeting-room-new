@@ -289,3 +289,48 @@ test('after expiry the review shows the actual move, the pooled score against a 
     ['乙', '0.2950', '1.1600', false]
   ])
 })
+
+const soloAnswer = {
+  memberName: '单人分析', modelType: 'b6465a2d', skipped: false,
+  answers: [
+    { questionId: 'Q1', optionId: 'B', reasons: [{ text: '营收增速放缓', factIds: ['F-9'] }], falsifier: '若营收回升则失效' },
+    { questionId: 'Q2', optionId: 'B', reasons: [{ text: '订单待核', factIds: ['L-1'] }], falsifier: '若订单落地则失效' },
+    { questionId: 'OUTCOME', probabilities: { A: 0, B: 0.2, C: 0.3, D: 0.4, E: 0.1 }, reasons: [{ text: '估值低', factIds: ['F-5'] }] }
+  ]
+}
+
+test('a concluded meeting without a solo control offers to create one', () => {
+  assert.equal(buildRoundtableV2View(sample, null).solo, null)
+  assert.equal(buildRoundtableV2View(sample, null).canRequestSolo, true)
+  const running = clone(sample)
+  running.result = null
+  assert.equal(buildRoundtableV2View(running, null).canRequestSolo, false)
+})
+
+test('the solo control is compared question by question with what the roundtable concluded', () => {
+  const v2 = clone(sample)
+  v2.solo = soloAnswer
+  const view = buildRoundtableV2View(v2, null)
+  assert.equal(view.canRequestSolo, false)
+  assert.deepEqual(view.solo.rows.map(r => [r.questionId, r.roundtableText, r.soloText, r.relationLabel]), [
+    ['Q1', '支撑股价（3/3 人）', '拖累股价', '不同'],
+    ['Q2', '有分歧：偏强 1 人 / 偏弱 2 人', '偏弱', '圆桌有分歧']
+  ])
+  assert.deepEqual(view.solo.rows[0].soloReasons, [{ text: '营收增速放缓', factIds: ['F-9'] }])
+  assert.equal(view.solo.differentCount, 1)
+  assert.deepEqual(view.solo.outcome, { soloModeLabel: '上涨8%–23%', roundtableModeLabel: '在±8%以内', same: false })
+})
+
+test('the expiry review scores the solo control next to the roundtable', () => {
+  const v2 = clone(sample)
+  v2.outcomeJudgement = { ...judgement, solo: { rps: 0.075, brier: 0.5 } }
+  const review = buildRoundtableV2View(v2, null).judgement
+  assert.deepEqual(review.solo, { rpsText: '0.0750', brierText: '0.5000', beatsUniform: true, beatsRoundtable: true })
+  assert.equal(buildRoundtableV2View({ ...clone(sample), outcomeJudgement: judgement }, null).judgement.solo, null)
+})
+
+test('usage names the solo control stage', () => {
+  const stages = [{ stage: 'solo', calls: 1, meteredCalls: 0, unmeteredCalls: 1, promptChars: 900, completionChars: 600, durationMs: 80000 }]
+  const view = buildRoundtableV2View(sample, { total: { calls: 1, meteredCalls: 0, unmeteredCalls: 1, promptChars: 900, completionChars: 600, durationMs: 80000 }, stages })
+  assert.equal(view.usage.stages[0].stageLabel, '单人对照')
+})
