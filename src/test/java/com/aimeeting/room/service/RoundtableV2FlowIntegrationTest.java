@@ -362,6 +362,119 @@ class RoundtableV2FlowIntegrationTest {
         return root.toJSONString();
     }
 
+    @Test
+    void stockTopicPutsEastmoneyFactsFirstAndMembersMayCiteTheirNumbers() {
+        Fixture fixture = new Fixture();
+        fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,"
+                + "\"stock\":{\"symbol\":\"300750\",\"market\":\"sz\"}");
+        when(fixture.eastmoney.buildBundle("300750", "sz", "DAY")).thenReturn(stockBundle());
+        String reply = answer("A", "市盈率22.5倍，处于近一年较低分位", "F-1", "A", "订单需求偏强", "L-1");
+        fixture.answers("甲", reply);
+        fixture.answers("乙", reply);
+        fixture.answers("丙", reply);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject firstFact = view.getFacts().getJSONObject(0);
+        assertEquals("F-1", firstFact.getString("id"));
+        assertEquals("东方财富", firstFact.getString("source"));
+        assertTrue(firstFact.getBooleanValue("singleSource"), firstFact.toJSONString());
+        assertTrue(view.getFacts().toJSONString().contains("22.5倍"), view.getFacts().toJSONString());
+        assertTrue(view.getFacts().toJSONString().contains("近60个交易日涨跌幅"), view.getFacts().toJSONString());
+        assertTrue(!answerOf(view, "甲").getBooleanValue("skipped"), answerOf(view, "甲").toJSONString());
+        assertTrue(answerOf(view, "甲").toJSONString().contains("22.5倍，"), answerOf(view, "甲").toJSONString());
+        verify(fixture.eastmoney, times(1)).buildBundle("300750", "sz", "DAY");
+        verify(fixture.reviewed, times(3)).search(anyString(), anyString(), anyString(), anyLong());
+        ArgumentCaptor<String> prompts = ArgumentCaptor.forClass(String.class);
+        verify(fixture.orchestrator, org.mockito.Mockito.atLeastOnce())
+                .callModelStrict(anyString(), org.mockito.ArgumentMatchers.contains("主持人"), prompts.capture(),
+                        nullable(Integer.class));
+        assertTrue(prompts.getAllValues().get(0).contains("东方财富"), prompts.getAllValues().get(0));
+    }
+
+    @Test
+    void generalTopicNeverCallsEastmoney() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        verify(fixture.eastmoney, never()).buildBundle(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void eastmoneyFailureBecomesAGapAndTheMeetingContinues() {
+        Fixture fixture = new Fixture();
+        fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,"
+                + "\"stock\":{\"symbol\":\"300750\",\"market\":\"sz\"}");
+        when(fixture.eastmoney.buildBundle("300750", "sz", "DAY")).thenThrow(new IllegalStateException("quote_unavailable"));
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals("G-1", view.getFacts().getJSONObject(0).getString("id"));
+        assertTrue(view.getFacts().getJSONObject(0).getString("question").contains("东方财富"));
+        verify(fixture.writer).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
+                nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+    }
+
+    @Test
+    void invalidStockCodeIsTreatedAsAGeneralTopic() {
+        Fixture fixture = new Fixture();
+        fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,"
+                + "\"stock\":{\"symbol\":\"CATL\",\"market\":\"sz\"}");
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        verify(fixture.eastmoney, never()).buildBundle(anyString(), anyString(), anyString());
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getIssueCard().get("stock") == null, view.getIssueCard().toJSONString());
+    }
+
+    private static EastmoneyMarketDataService.MarketDataBundle stockBundle() {
+        Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("symbol", "300750");
+        payload.put("market", "sz");
+        payload.put("stockDetail", Map.of("changePercent", new java.math.BigDecimal("1.23"),
+                "marketCap", new java.math.BigDecimal("850000000000")));
+        payload.put("valuation", Map.of("tradeDate", "2026-10-16", "peTtm", new java.math.BigDecimal("22.5"),
+                "pePercentile1y", new java.math.BigDecimal("35.0"), "pbMrq", new java.math.BigDecimal("4.8"),
+                "pbPercentile1y", new java.math.BigDecimal("40.0")));
+        payload.put("financials", List.of(Map.of("reportDate", "2026-06-30 00:00:00",
+                "revenue", new java.math.BigDecimal("178000000000"), "revenueYoyPct", new java.math.BigDecimal("8.5"),
+                "netProfit", new java.math.BigDecimal("30500000000"), "netProfitYoyPct", new java.math.BigDecimal("12.3"))));
+        Map<String, Object> indicators = new java.util.LinkedHashMap<>();
+        indicators.put("asOfDate", "2026-10-16");
+        indicators.put("close", new java.math.BigDecimal("180.50"));
+        indicators.put("ma60", new java.math.BigDecimal("175.00"));
+        indicators.put("priceVsMa20Pct", new java.math.BigDecimal("2.10"));
+        indicators.put("return5Pct", new java.math.BigDecimal("-1.20"));
+        indicators.put("return20Pct", new java.math.BigDecimal("3.40"));
+        indicators.put("historicalVolatility20Pct", new java.math.BigDecimal("28.50"));
+        payload.put("technicalIndicators", indicators);
+        List<Map<String, Object>> bars = new ArrayList<>();
+        for (int i = 0; i < 70; i++) {
+            Map<String, Object> bar = new java.util.LinkedHashMap<>();
+            java.math.BigDecimal close = new java.math.BigDecimal(150 + i);
+            bar.put("date", "day-" + i);
+            bar.put("close", close);
+            bar.put("high", close.add(java.math.BigDecimal.ONE));
+            bars.add(bar);
+        }
+        bars.get(bars.size() - 1).put("close", new java.math.BigDecimal("180.50"));
+        payload.put("dailyKline", bars);
+        return new EastmoneyMarketDataService.MarketDataBundle(payload, List.of(), List.of());
+    }
+
     private static String withChangeReason(String answerJson, String questionId, String reason) {
         JSONObject root = JSON.parseObject(answerJson);
         for (Object item : root.getJSONArray("answers")) {
@@ -418,6 +531,7 @@ class RoundtableV2FlowIntegrationTest {
         private final MeetingReviewedEvidenceService reviewed = mock(MeetingReviewedEvidenceService.class);
         private final MeetingReviewedFinalizationWriter writer = mock(MeetingReviewedFinalizationWriter.class);
         private final MeetingWorkflowService workflow = mock(MeetingWorkflowService.class);
+        private final EastmoneyMarketDataService eastmoney = mock(EastmoneyMarketDataService.class);
         private final List<String> moderatorReplies = new ArrayList<>();
         private String card = CARD;
         private final Map<String, List<String>> memberReplies = new HashMap<>();
@@ -508,6 +622,7 @@ class RoundtableV2FlowIntegrationTest {
             ReflectionTestUtils.setField(service, "reviewedFinalizationWriter", writer);
             ReflectionTestUtils.setField(service, "workflowService", workflow);
             ReflectionTestUtils.setField(service, "aiModelProperties", new AiModelProperties());
+            ReflectionTestUtils.setField(service, "domains", List.of(new StockMeetingDomain(eastmoney)));
         }
 
         private void answers(String memberName, String... replies) {

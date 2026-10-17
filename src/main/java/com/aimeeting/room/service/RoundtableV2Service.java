@@ -75,6 +75,7 @@ public class RoundtableV2Service {
     @Autowired private MeetingReviewedFinalizationWriter reviewedFinalizationWriter;
     @Autowired private MeetingWorkflowService workflowService;
     @Autowired private AiModelProperties aiModelProperties;
+    @Autowired(required = false) private List<MeetingDomain> domains;
 
     public void run(Long meetingId, Long expectedEpoch) {
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
@@ -198,7 +199,7 @@ public class RoundtableV2Service {
         String system = "你是中立的会议主持人，只负责把议题拆成可以选边的子问题并列出取证题，"
                 + "不表达立场、不打分。只输出 JSON。";
         String asOf = LocalDate.now(MARKET_ZONE).toString();
-        String prompt = issueCardPrompt(room, asOf);
+        String prompt = issueCardPrompt(room, asOf, domainHints());
         String error;
         JSONObject card;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.ISSUE_CARD)) {
@@ -221,10 +222,11 @@ public class RoundtableV2Service {
         JSONArray evidenceQuestions = card.getJSONArray("evidenceQuestions");
         normalized.put("evidenceQuestions", evidenceQuestions == null ? new JSONArray() : evidenceQuestions);
         normalized.put("referenceClass", card.get("referenceClass"));
+        for (MeetingDomain domain : domains()) domain.normalizeIssueCard(card, normalized);
         return save(meetingId, ISSUE_CARD, MEETING_LEVEL, epoch, normalized);
     }
 
-    private static String issueCardPrompt(AiMeetingRoom room, String asOf) {
+    private static String issueCardPrompt(AiMeetingRoom room, String asOf, String domainHints) {
         StringBuilder sb = new StringBuilder();
         sb.append("【议题】").append(room.getTitle()).append("\n");
         if (room.getDescription() != null && !room.getDescription().isBlank()) {
@@ -238,6 +240,7 @@ public class RoundtableV2Service {
                 .append("选项要能让议员明确选边。\n");
         sb.append("再列出不超过 8 道需要联网核实的取证题，每题只问一个可以核实的事实，多空两方面都要覆盖。\n");
         sb.append("如果有合适的参照类（过去的类似情况），写在 referenceClass，否则写 null。\n");
+        sb.append(domainHints);
         sb.append("只输出 JSON：{\"topic\":\"\",\"horizon\":\"\",\"subQuestions\":[{\"id\":\"Q1\",\"title\":\"\",")
                 .append("\"options\":[{\"id\":\"A\",\"label\":\"\"}]}],\"evidenceQuestions\":[\"\"],\"referenceClass\":null}");
         return sb.toString();
@@ -290,6 +293,17 @@ public class RoundtableV2Service {
         int verified = 0;
         int provisional = 0;
         int gaps = 0;
+        // The domain's structured source comes first; reviewed search covers what it cannot.
+        MeetingDomain domain = domainFor(card);
+        if (domain != null) {
+            for (JSONObject structured : domain.structuredFacts(card)) {
+                String tier = structured.getString("tier");
+                JSONObject fact = new JSONObject(true);
+                fact.put("id", "G".equals(tier) ? "G-" + (++gaps) : "F-" + (++verified));
+                fact.putAll(structured);
+                facts.add(fact);
+            }
+        }
         for (Object item : card.getJSONArray("evidenceQuestions")) {
             if (activeRoom(meetingId, epoch) == null) return null;
             String question = (String) item;
@@ -382,6 +396,26 @@ public class RoundtableV2Service {
         fact.put("question", question);
         fact.put("reason", reason);
         return fact;
+    }
+
+    private List<MeetingDomain> domains() {
+        return domains == null ? List.of() : domains;
+    }
+
+    private MeetingDomain domainFor(JSONObject card) {
+        for (MeetingDomain domain : domains()) {
+            if (domain.appliesTo(card)) return domain;
+        }
+        return null;
+    }
+
+    private String domainHints() {
+        StringBuilder hints = new StringBuilder();
+        for (MeetingDomain domain : domains()) {
+            String hint = domain.issueCardHint();
+            if (!blank(hint)) hints.append(hint).append("\n");
+        }
+        return hints.toString();
     }
 
     // ---- P2 back-to-back answers ----

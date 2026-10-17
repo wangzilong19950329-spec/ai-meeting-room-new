@@ -1,0 +1,30 @@
+package com.aimeeting.room.service;
+
+import com.alibaba.fastjson.JSONObject;
+
+import java.util.List;
+
+/**
+ * A topic domain plugs domain-specific inputs into the one roundtable v2 flow. The flow never branches
+ * on the domain; it only asks the domain that applies to the issue card. Without a matching domain the
+ * meeting runs as a general topic. Further replaceable points (number caliber rules, reference-class data,
+ * outcome judgment, default lenses) are added here as their slices are built.
+ */
+public interface MeetingDomain {
+
+    /** True when the issue card names this domain's subject, for example a valid A-share code. */
+    boolean appliesTo(JSONObject issueCard);
+
+    /** Tells the moderator what this domain supplies automatically, so evidence questions skip it. */
+    String issueCardHint();
+
+    /** Copies this domain's validated fields (for example the stock code) from the raw card; invalid ones are dropped. */
+    default void normalizeIssueCard(JSONObject raw, JSONObject normalized) {
+    }
+
+    /**
+     * Evidence source: structured facts gathered before reviewed search. Each fact carries tier, statement,
+     * value, unit, period and source but no id; the flow numbers them. A failed lookup returns a tier "G" gap.
+     */
+    List<JSONObject> structuredFacts(JSONObject issueCard);
+}
