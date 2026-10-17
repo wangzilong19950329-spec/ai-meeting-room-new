@@ -2,6 +2,7 @@ package com.aimeeting.room.service;
 
 import com.alibaba.fastjson.JSONObject;
 
+import java.math.BigDecimal;
 import java.util.List;
 
 /**
@@ -33,6 +34,54 @@ public interface MeetingDomain {
      * when the domain has a judgeable result, is answered with probabilities instead of a single option.
      */
     DomainEvidence evidence(JSONObject issueCard);
+
+    /**
+     * At or after expiry: what actually happened to the outcome question's quantity, or null when this domain
+     * does not judge outcomes for the card.
+     */
+    default OutcomeObservation observeOutcome(JSONObject issueCard, JSONObject outcomeQuestion) {
+        return null;
+    }
+
+    final class OutcomeObservation {
+        public static final String DUE = "DUE";
+        public static final String NOT_DUE = "NOT_DUE";
+        public static final String UNAVAILABLE = "UNAVAILABLE";
+
+        public final String status;
+        public final int elapsedTradingDays;
+        public final String baseDate;
+        public final BigDecimal baseClose;
+        public final String endDate;
+        public final BigDecimal endClose;
+        public final String source;
+        public final String reason;
+
+        private OutcomeObservation(String status, int elapsedTradingDays, String baseDate, BigDecimal baseClose,
+                                   String endDate, BigDecimal endClose, String source, String reason) {
+            this.status = status;
+            this.elapsedTradingDays = elapsedTradingDays;
+            this.baseDate = baseDate;
+            this.baseClose = baseClose;
+            this.endDate = endDate;
+            this.endClose = endClose;
+            this.source = source;
+            this.reason = reason;
+        }
+
+        public static OutcomeObservation due(int elapsed, String baseDate, BigDecimal baseClose,
+                                             String endDate, BigDecimal endClose, String source) {
+            return new OutcomeObservation(DUE, elapsed, baseDate, baseClose, endDate, endClose, source, null);
+        }
+
+        public static OutcomeObservation notDue(int elapsed) {
+            return new OutcomeObservation(NOT_DUE, elapsed, null, null, null, null, null, null);
+        }
+
+        public static OutcomeObservation unavailable(String reason) {
+            return new OutcomeObservation(UNAVAILABLE, 0, null, null, null, null, null, reason);
+        }
+    }
 
     final class DomainEvidence {
         public final List<JSONObject> facts;

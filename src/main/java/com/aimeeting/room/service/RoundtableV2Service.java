@@ -5,6 +5,7 @@ import com.aimeeting.room.dao.AiMeetingMemberMapper;
 import com.aimeeting.room.dao.AiMeetingRoomMapper;
 import com.aimeeting.room.dao.AiMeetingV2RecordMapper;
 import com.aimeeting.room.dto.MeetingDetailVO;
+import com.aimeeting.room.dto.ProgramTrackingItemSpec;
 import com.aimeeting.room.dto.RoundtableV2ViewVO;
 import com.aimeeting.room.entity.AiMeetingMember;
 import com.aimeeting.room.entity.AiMeetingRoom;
@@ -112,6 +113,9 @@ public class RoundtableV2Service {
             else if (CLASSIFY.equals(record.getKind())) view.setClassification(JSON.parseObject(record.getPayload()));
             else if (TOP_UP.equals(record.getKind())) view.setTopUp(JSON.parseObject(record.getPayload()));
             else if (OUTCOME.equals(record.getKind())) view.setOutcomeQuestion(JSON.parseObject(record.getPayload()));
+            else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
+                view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
+            }
         }
         return view;
     }
@@ -1551,11 +1555,59 @@ public class RoundtableV2Service {
         trackingCard.setKeyViewpoints(conclusionLines);
         trackingCard.setMajorDisputes(disputeLines);
         trackingCard.setDecisionBasis(basis);
-        trackingCard.setOpenQuestions(openQuestions);
+        // Gaps stay listed in the result; following them up daily through ordinary web search broke the evidence rules.
+        trackingCard.setOpenQuestions(new ArrayList<>());
         room.setFinalConclusion(conclusion);
         room.setConclusionTime(concludedAt);
         room.setStatus(MeetingStatusEnum.CONCLUDED.getCode());
-        workflowService.markMeetingConcluded(room, trackingCard);
+        workflowService.markMeetingConcluded(room, trackingCard, trackingItems(meetingId, result));
+    }
+
+    /**
+     * What the program follows up after the meeting: the outcome at expiry (judged by the program) and each
+     * assumption dispute (judged by a person on the same date). Falsifiers are not tracked yet.
+     */
+    private List<ProgramTrackingItemSpec> trackingItems(Long meetingId, JSONObject result) {
+        List<ProgramTrackingItemSpec> specs = new ArrayList<>();
+        JSONObject outcome = loadObject(meetingId, OUTCOME, MEETING_LEVEL);
+        Date expiry = expiryEstimate(outcome);
+        if (outcome != null && expiry != null) {
+            ProgramTrackingItemSpec spec = new ProgramTrackingItemSpec();
+            spec.setItemType(RoundtableV2OutcomeJudge.OUTCOME_EXPIRY);
+            spec.setTitle("结果到期判定：" + outcome.getString("title"));
+            spec.setDescription("到期后由程序用前复权日K判定实际涨跌落在哪一档，并给合议分布和每位议员打分（RPS 为主，Brier 为辅）");
+            spec.setOwnerType("SYSTEM");
+            spec.setAutoRefresh(true);
+            spec.setNextCheckAt(expiry);
+            spec.setDueAt(expiry);
+            specs.add(spec);
+        }
+        for (Object item : result.getJSONArray("disputes")) {
+            JSONObject dispute = (JSONObject) item;
+            if (!"ASSUMPTION".equals(dispute.getString("type"))) continue;
+            ProgramTrackingItemSpec spec = new ProgramTrackingItemSpec();
+            spec.setItemType("ASSUMPTION_DISPUTE");
+            spec.setTitle("假设分歧：" + dispute.getString("title")
+                    + (dispute.getString("crux") == null ? "" : "（" + dispute.getString("crux") + "）"));
+            spec.setDescription("圆桌 v2 的假设分歧：到期时人工判定哪一方的假设成立");
+            spec.setOwnerType("HUMAN");
+            spec.setAutoRefresh(false);
+            spec.setDueAt(expiry);
+            specs.add(spec);
+        }
+        return specs;
+    }
+
+    /** Horizon trading days ≈ horizon × 7/5 calendar days after the base close, checked at 16:00 after the close. */
+    private static Date expiryEstimate(JSONObject outcome) {
+        if (outcome == null || outcome.getString("baseDate") == null) return null;
+        try {
+            LocalDate base = LocalDate.parse(outcome.getString("baseDate"));
+            long days = (long) Math.ceil(outcome.getIntValue("horizonTradingDays") * 7.0 / 5);
+            return Date.from(base.plusDays(days).atTime(16, 0).atZone(MARKET_ZONE).toInstant());
+        } catch (java.time.DateTimeException invalid) {
+            return null;
+        }
     }
 
     private static String typeLabel(String type) {

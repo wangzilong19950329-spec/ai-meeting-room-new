@@ -120,6 +120,13 @@ public class TrackingCenterService {
         return buildTrackingItemVO(trackingItemMapper.selectById(item.getId()));
     }
 
+    private List<ProgramTrackingHandler> programHandlers = Collections.emptyList();
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setProgramHandlers(List<ProgramTrackingHandler> programHandlers) {
+        this.programHandlers = programHandlers == null ? Collections.emptyList() : programHandlers;
+    }
+
     public TrackingOverviewVO.TrackingItemVO refreshItemNow(Long trackingItemId) {
         AiMeetingTrackingItem item = requireItem(trackingItemId);
         refreshItemInternal(item, "MANUAL_REFRESH");
@@ -180,6 +187,12 @@ public class TrackingCenterService {
     }
 
     private void refreshItemInternal(AiMeetingTrackingItem item, String updateType) {
+        for (ProgramTrackingHandler handler : programHandlers) {
+            if (handler.supports(item.getItemType())) {
+                refreshByProgram(item, handler, updateType);
+                return;
+            }
+        }
         Date now = new Date();
         String query = firstNonBlank(trimToNull(item.getWatchQuery()), item.getTitle());
         LocalDate latest = Instant.ofEpochMilli(now.getTime()).atZone(RECENCY_ZONE).toLocalDate();
@@ -245,6 +258,34 @@ public class TrackingCenterService {
                     evidenceRef
             );
         }
+    }
+
+    /** Program-judged items (an outcome at expiry) never go through web search. */
+    private void refreshByProgram(AiMeetingTrackingItem item, ProgramTrackingHandler handler, String updateType) {
+        Date now = new Date();
+        ProgramTrackingHandler.Check check;
+        try {
+            check = handler.refresh(item);
+        } catch (RuntimeException failure) {
+            check = new ProgramTrackingHandler.Check("error", "程序判定失败：" + firstNonBlank(trimToNull(failure.getMessage()), "未知错误"),
+                    new Date(now.getTime() + TimeUnit.HOURS.toMillis(24)), false);
+        }
+        trackingItemMapper.updateRefreshState(item.getId(), check.nextCheckAt, now, check.status, check.note,
+                item.getLastCheckFingerprint(), "NONE", now);
+        String statusAfter = item.getStatus();
+        if (check.done) {
+            statusAfter = TrackingItemStatusEnum.READY_FOR_REVIEW.getCode();
+            trackingItemMapper.updateStatus(item.getId(), statusAfter, now, null);
+        }
+        AiMeetingTrackingUpdate update = new AiMeetingTrackingUpdate();
+        update.setTrackingItemId(item.getId());
+        update.setMeetingId(item.getMeetingId());
+        update.setUpdateType(updateType);
+        update.setStatusBefore(item.getStatus());
+        update.setStatusAfter(statusAfter);
+        update.setContent(check.note);
+        update.setEvidenceRef(null);
+        trackingUpdateMapper.insert(update);
     }
 
     private void markRefreshFailure(AiMeetingTrackingItem item, String message) {

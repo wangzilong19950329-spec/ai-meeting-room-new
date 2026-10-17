@@ -63,21 +63,15 @@ public class StockMeetingDomain implements MeetingDomain {
         int horizon = issueCard.getIntValue("horizonTradingDays");
         String label = "历史参照数据（" + stock.getString("symbol") + "." + stock.getString("market")
                 + "，展望" + horizon + "个交易日）";
-        // Eastmoney's history endpoint drops connections now and then: retry once, then use Tencent and say so.
-        String source = "东方财富";
-        List<Map<String, Object>> history;
+        History fetched;
         try {
-            history = eastmoneyHistory(stock);
-        } catch (RuntimeException eastmoneyDown) {
-            try {
-                history = eastmoney.fetchTencentDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
-                source = "腾讯证券";
-            } catch (RuntimeException tencentDown) {
-                facts.add(gap(label, "EASTMONEY_HISTORY_UNAVAILABLE: " + eastmoneyDown.getMessage()
-                        + "; TENCENT: " + tencentDown.getMessage()));
-                return new DomainEvidence(facts, null);
-            }
+            fetched = history(stock);
+        } catch (IllegalStateException unavailable) {
+            facts.add(gap(label, unavailable.getMessage()));
+            return new DomainEvidence(facts, null);
         }
+        String source = fetched.source;
+        List<Map<String, Object>> history = fetched.bars;
         List<BigDecimal> closes = new ArrayList<>();
         String baseDate = null;
         for (Map<String, Object> bar : history == null ? List.<Map<String, Object>>of() : history) {
@@ -96,7 +90,65 @@ public class StockMeetingDomain implements MeetingDomain {
                 baseDate == null ? issueCard.getString("asOf") : baseDate));
     }
 
-    /** Reference class: the distribution of every rolling horizon-day return in the available history. */
+    /**
+     * Base and end closes come from one freshly fetched forward-adjusted series, so dividends between the
+     * meeting and the judgment cannot shift the return. Expiry is the horizon-th bar after the base date.
+     */
+    @Override
+    public OutcomeObservation observeOutcome(JSONObject issueCard, JSONObject outcomeQuestion) {
+        JSONObject stock = normalizeStock(issueCard == null ? null : issueCard.getJSONObject("stock"));
+        if (stock == null || outcomeQuestion == null) return null;
+        String baseDate = outcomeQuestion.getString("baseDate");
+        int horizon = outcomeQuestion.getIntValue("horizonTradingDays");
+        if (baseDate == null || horizon <= 0) return OutcomeObservation.unavailable("结果题缺少起点日期或展望期");
+        History fetched;
+        try {
+            fetched = history(stock);
+        } catch (IllegalStateException unavailable) {
+            return OutcomeObservation.unavailable(unavailable.getMessage());
+        }
+        List<Map<String, Object>> bars = fetched.bars == null ? List.of() : fetched.bars;
+        int base = -1;
+        for (int i = 0; i < bars.size(); i++) {
+            if (baseDate.equals(text(bars.get(i).get("date")))) base = i;
+        }
+        if (base < 0) return OutcomeObservation.unavailable("起点 " + baseDate + " 不在" + fetched.source + "日K序列中");
+        int elapsed = bars.size() - 1 - base;
+        if (elapsed < horizon) return OutcomeObservation.notDue(elapsed);
+        Map<String, Object> end = bars.get(base + horizon);
+        BigDecimal baseClose = decimal(bars.get(base).get("close"));
+        BigDecimal endClose = decimal(end.get("close"));
+        if (baseClose == null || baseClose.signum() <= 0 || endClose == null) {
+            return OutcomeObservation.unavailable("起点或终点收盘价缺失");
+        }
+        return OutcomeObservation.due(elapsed, baseDate, baseClose, text(end.get("date")), endClose, fetched.source);
+    }
+
+    private static final class History {
+        private final List<Map<String, Object>> bars;
+        private final String source;
+
+        private History(List<Map<String, Object>> bars, String source) {
+            this.bars = bars;
+            this.source = source;
+        }
+    }
+
+    /** Eastmoney's history endpoint drops connections now and then: retry once, then use Tencent and say so. */
+    private History history(JSONObject stock) {
+        try {
+            return new History(eastmoneyHistory(stock), "东方财富");
+        } catch (RuntimeException eastmoneyDown) {
+            try {
+                return new History(eastmoney.fetchTencentDailyHistory(stock.getString("symbol"),
+                        stock.getString("market"), HISTORY_BARS), "腾讯证券");
+            } catch (RuntimeException tencentDown) {
+                throw new IllegalStateException("EASTMONEY_HISTORY_UNAVAILABLE: " + eastmoneyDown.getMessage()
+                        + "; TENCENT: " + tencentDown.getMessage());
+            }
+        }
+    }
+
     private List<Map<String, Object>> eastmoneyHistory(JSONObject stock) {
         try {
             return eastmoney.fetchDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
@@ -105,6 +157,7 @@ public class StockMeetingDomain implements MeetingDomain {
         }
     }
 
+    /** Reference class: the distribution of every rolling horizon-day return in the available history. */
     private static JSONObject referenceFact(List<BigDecimal> closes, int horizon, String source) {
         List<Double> returns = new ArrayList<>();
         for (int i = 0; i + horizon < closes.size(); i++) {

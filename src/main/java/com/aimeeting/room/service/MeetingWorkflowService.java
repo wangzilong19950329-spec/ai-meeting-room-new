@@ -694,13 +694,49 @@ public class MeetingWorkflowService {
         return filtered.isEmpty() ? members : filtered;
     }
 
+    /** A tracking item the program asked for; it never blocks continuing the meeting. */
+    static AiMeetingTrackingItem buildProgramTrackingItem(AiMeetingRoom room, Long workflowRunId, Long stageRunId,
+                                                          com.aimeeting.room.dto.ProgramTrackingItemSpec spec, Date now) {
+        AiMeetingTrackingItem item = new AiMeetingTrackingItem();
+        item.setMeetingId(room.getId());
+        item.setWorkflowRunId(workflowRunId);
+        item.setStageRunId(stageRunId);
+        item.setCreatorId(room.getCreatorId());
+        item.setSourceType("MEETING");
+        item.setItemType(spec.getItemType());
+        item.setTitle(spec.getTitle());
+        item.setDescription(spec.getDescription());
+        item.setStatus(TrackingItemStatusEnum.OPEN.getCode());
+        item.setOwnerType(spec.getOwnerType());
+        item.setReopenTrigger(0);
+        item.setRequiredForContinue(0);
+        item.setReopenPolicy("SUGGEST");
+        item.setAutoRefreshEnabled(spec.isAutoRefresh() ? 1 : 0);
+        item.setRefreshMode(spec.isAutoRefresh() ? "DAILY" : "MANUAL");
+        item.setRefreshIntervalHours(24);
+        item.setWatchQuery(spec.getTitle());
+        item.setWatchScope(room.getTitle());
+        item.setNextCheckAt(spec.isAutoRefresh() ? spec.getNextCheckAt() : null);
+        item.setChangeSeverity("NONE");
+        item.setDueAt(spec.getDueAt());
+        item.setLastUpdateAt(now);
+        return item;
+    }
+
     public void markMeetingConcluded(AiMeetingRoom room, MeetingDetailVO.DecisionArtifactVO artifact) {
+        markMeetingConcluded(room, artifact, Collections.emptyList());
+    }
+
+    /** Concludes the roundtable; program-requested tracking items are created next to the decision card's items. */
+    public void markMeetingConcluded(AiMeetingRoom room, MeetingDetailVO.DecisionArtifactVO artifact,
+                                     List<com.aimeeting.room.dto.ProgramTrackingItemSpec> programItems) {
         AiWorkflowRun run = ensureWorkflowForMeeting(room, DEFAULT_TEMPLATE_KEY);
         publishRoundtableConclusionArtifacts(room, artifact);
         completeStage(room.getId(), STAGE_DISCUSSION, "CONCLUDED", null);
         completeStage(room.getId(), STAGE_CONCLUSION, "ARCHIVED", null);
 
         List<AiMeetingTrackingItem> createdItems = createTrackingItemsFromArtifact(room, run, artifact);
+        createdItems.addAll(createProgramTrackingItems(room, run, programItems));
         if (!createdItems.isEmpty()) {
             activateStage(room.getId(), STAGE_TRACKING);
             updateRunCurrentStage(run.getId(), STAGE_TRACKING, 3);
@@ -5916,6 +5952,34 @@ public class MeetingWorkflowService {
 
     private void updateRunCurrentStage(Long workflowRunId, String stageKey, int stageOrder) {
         workflowRunMapper.updateCurrentStage(workflowRunId, stageKey, stageOrder);
+    }
+
+    private List<AiMeetingTrackingItem> createProgramTrackingItems(AiMeetingRoom room, AiWorkflowRun run,
+                                                                   List<com.aimeeting.room.dto.ProgramTrackingItemSpec> specs) {
+        List<AiMeetingTrackingItem> created = new ArrayList<>();
+        if (specs == null || specs.isEmpty()) return created;
+        AiWorkflowStageRun sourceStageRun = workflowStageRunMapper.selectLatestByMeetingAndStageKey(room.getId(), STAGE_CONCLUSION);
+        Long stageRunId = sourceStageRun != null ? sourceStageRun.getId() : null;
+        Date now = new Date();
+        for (com.aimeeting.room.dto.ProgramTrackingItemSpec spec : specs) {
+            if (!StringUtils.hasText(spec.getTitle())
+                    || trackingItemMapper.selectByMeetingIdAndTitle(room.getId(), spec.getTitle().trim()) != null) {
+                continue;
+            }
+            AiMeetingTrackingItem item = buildProgramTrackingItem(room, run.getId(), stageRunId, spec, now);
+            trackingItemMapper.insert(item);
+            AiMeetingTrackingUpdate update = new AiMeetingTrackingUpdate();
+            update.setTrackingItemId(item.getId());
+            update.setMeetingId(room.getId());
+            update.setUpdateType("CREATED");
+            update.setStatusBefore(null);
+            update.setStatusAfter(TrackingItemStatusEnum.OPEN.getCode());
+            update.setContent("由圆桌 v2 收尾时按规则生成");
+            update.setEvidenceRef(null);
+            trackingUpdateMapper.insert(update);
+            created.add(item);
+        }
+        return created;
     }
 
     private List<AiMeetingTrackingItem> createTrackingItemsFromArtifact(AiMeetingRoom room,

@@ -110,7 +110,7 @@ class RoundtableV2FlowIntegrationTest {
         assertTrue(conclusion.getValue().contains("业绩基本面"), conclusion.getValue());
         assertTrue(JSON.parseObject(artifact.getValue()).getJSONArray("majorDisputes").toJSONString()
                 .contains("订单与需求"), artifact.getValue());
-        verify(fixture.workflow).markMeetingConcluded(any(), any());
+        verify(fixture.workflow).markMeetingConcluded(any(), any(), any());
     }
 
     @Test
@@ -719,6 +719,143 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void stockMeetingAsksForAnOutcomeExpiryItemAndNoLongerForOneItemPerGap() {
+        Fixture fixture = stockFixtureWithHistory();
+        String valid = withOutcome(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        ArgumentCaptor<com.aimeeting.room.dto.MeetingDetailVO.DecisionArtifactVO> card =
+                ArgumentCaptor.forClass(com.aimeeting.room.dto.MeetingDetailVO.DecisionArtifactVO.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<com.aimeeting.room.dto.ProgramTrackingItemSpec>> specs = ArgumentCaptor.forClass(List.class);
+        verify(fixture.workflow).markMeetingConcluded(any(), card.capture(), specs.capture());
+        // Gaps stay visible in the result; they are no longer refreshed daily through ordinary web search.
+        assertTrue(card.getValue().getOpenQuestions() == null || card.getValue().getOpenQuestions().isEmpty(),
+                card.getValue().getOpenQuestions() + "");
+        assertEquals(1, specs.getValue().size(), specs.getValue().toString());
+        com.aimeeting.room.dto.ProgramTrackingItemSpec expiry = specs.getValue().get(0);
+        assertEquals("OUTCOME_EXPIRY", expiry.getItemType());
+        assertTrue(expiry.getTitle().startsWith("结果到期判定："), expiry.getTitle());
+        assertTrue(expiry.isAutoRefresh());
+        assertEquals("SYSTEM", expiry.getOwnerType());
+        // 60 trading days ≈ 84 calendar days after the base close, checked after the 15:00 close.
+        Date expected = Date.from(java.time.LocalDate.parse("2026-10-16").plusDays(84).atTime(16, 0)
+                .atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
+        assertEquals(expected, expiry.getNextCheckAt());
+        assertEquals(expected, expiry.getDueAt());
+    }
+
+    @Test
+    void assumptionDisputeBecomesAManualTrackingItem() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "需求偏弱", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.classifyReplies.add("{\"disputes\":[{\"questionId\":\"Q2\",\"type\":\"ASSUMPTION\","
+                + "\"crux\":\"若下季度订单回暖，则偏强；否则偏弱\"}]}");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<com.aimeeting.room.dto.ProgramTrackingItemSpec>> specs = ArgumentCaptor.forClass(List.class);
+        verify(fixture.workflow).markMeetingConcluded(any(), any(), specs.capture());
+        assertEquals(1, specs.getValue().size(), specs.getValue().toString());
+        com.aimeeting.room.dto.ProgramTrackingItemSpec assumption = specs.getValue().get(0);
+        assertEquals("ASSUMPTION_DISPUTE", assumption.getItemType());
+        assertTrue(assumption.getTitle().contains("订单与需求") && assumption.getTitle().contains("若下季度订单回暖"),
+                assumption.getTitle());
+        assertTrue(!assumption.isAutoRefresh() && assumption.getNextCheckAt() == null, assumption.toString());
+        assertEquals("HUMAN", assumption.getOwnerType());
+    }
+
+    @Test
+    void outcomeIsNotJudgedBeforeTheHorizonHasPassed() {
+        Fixture fixture = judgedStockMeeting();
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(10, "103"));
+        RoundtableV2OutcomeJudge judge = new RoundtableV2OutcomeJudge(records, List.of(new StockMeetingDomain(fixture.eastmoney)));
+
+        JSONObject verdict = judge.judge(meetingId);
+
+        assertEquals("NOT_DUE", verdict.getString("status"), verdict.toJSONString());
+        assertEquals(10, verdict.getIntValue("elapsedTradingDays"));
+        assertEquals(60, verdict.getIntValue("horizonTradingDays"));
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getOutcomeJudgement() == null);
+    }
+
+    @Test
+    void outcomeIsJudgedOnTheSameSeriesAndScoredAgainstAUniformGuess() {
+        Fixture fixture = judgedStockMeeting();
+        // Base close 102 on 2026-10-16; 60 bars later the close is 112.2, a 10.00% rise → "上涨8%–23%" (D).
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(60, "112.2"));
+        org.mockito.Mockito.clearInvocations(fixture.eastmoney);
+        RoundtableV2OutcomeJudge judge = new RoundtableV2OutcomeJudge(records, List.of(new StockMeetingDomain(fixture.eastmoney)));
+
+        JSONObject verdict = judge.judge(meetingId);
+
+        assertEquals("JUDGED", verdict.getString("status"), verdict.toJSONString());
+        assertEquals("2026-10-16", verdict.getString("baseDate"));
+        assertEquals("x60", verdict.getString("endDate"));
+        assertEquals(10.00, verdict.getDoubleValue("returnPct"), 0.001);
+        assertEquals("D", verdict.getString("observedOptionId"));
+        assertEquals("上涨8%–23%", verdict.getString("observedLabel"));
+        assertEquals("东方财富", verdict.getString("source"));
+        assertEquals(0.1416, verdict.getJSONObject("pooled").getDoubleValue("rps"), 0.001);
+        assertEquals(0.8356, verdict.getJSONObject("pooled").getDoubleValue("brier"), 0.001);
+        assertEquals(0.15, verdict.getJSONObject("uniform").getDoubleValue("rps"), 0.0001);
+        assertEquals(0.8, verdict.getJSONObject("uniform").getDoubleValue("brier"), 0.0001);
+        JSONObject first = memberScore(verdict, "甲");
+        assertEquals(0.095, first.getDoubleValue("rps"), 0.0001);
+        assertEquals(0.76, first.getDoubleValue("brier"), 0.0001);
+        JSONObject second = memberScore(verdict, "乙");
+        assertEquals(0.295, second.getDoubleValue("rps"), 0.0001);
+        assertEquals(1.16, second.getDoubleValue("brier"), 0.0001);
+
+        // Judged once: the stored verdict is shown and later checks do not fetch prices again.
+        assertEquals("JUDGED", controller.getRoundtableV2(meetingId).getData().getOutcomeJudgement().getString("status"));
+        assertEquals("JUDGED", judge.judge(meetingId).getString("status"));
+        verify(fixture.eastmoney, times(1)).fetchDailyHistory(eq("300750"), eq("sz"), anyInt());
+    }
+
+    @Test
+    void historyUnavailableAtExpiryIsReportedAndNotScored() {
+        Fixture fixture = judgedStockMeeting();
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt()))
+                .thenThrow(new IllegalStateException("unexpected end of stream"));
+        when(fixture.eastmoney.fetchTencentDailyHistory(eq("300750"), eq("sz"), anyInt()))
+                .thenThrow(new IllegalStateException("empty_tencent_kline"));
+        RoundtableV2OutcomeJudge judge = new RoundtableV2OutcomeJudge(records, List.of(new StockMeetingDomain(fixture.eastmoney)));
+
+        JSONObject verdict = judge.judge(meetingId);
+
+        assertEquals("UNAVAILABLE", verdict.getString("status"), verdict.toJSONString());
+        assertTrue(verdict.getString("reason") != null && !verdict.getString("reason").isBlank(), verdict.toJSONString());
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getOutcomeJudgement() == null);
+    }
+
+    @Test
+    void programJudgedTrackingItemSaysWhereTheVerdictStands() {
+        Fixture fixture = judgedStockMeeting();
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(60, "112.2"));
+        RoundtableV2OutcomeJudge judge = new RoundtableV2OutcomeJudge(records, List.of(new StockMeetingDomain(fixture.eastmoney)));
+        com.aimeeting.room.entity.AiMeetingTrackingItem item = new com.aimeeting.room.entity.AiMeetingTrackingItem();
+        item.setId(9L);
+        item.setMeetingId(meetingId);
+        item.setItemType("OUTCOME_EXPIRY");
+
+        assertTrue(judge.supports("OUTCOME_EXPIRY") && !judge.supports("OPEN_QUESTION"));
+        ProgramTrackingHandler.Check check = judge.refresh(item);
+
+        assertEquals("success", check.status);
+        assertTrue(check.done && check.nextCheckAt == null, check.note);
+        assertTrue(check.note.contains("+10.00%") && check.note.contains("上涨8%–23%")
+                && check.note.contains("RPS") && check.note.contains("均匀"), check.note);
+    }
+
+    @Test
     void outcomeProbabilitiesNotSummingToOneAreRewrittenOnce() {
         Fixture fixture = stockFixtureWithHistory();
         String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
@@ -793,6 +930,37 @@ class RoundtableV2FlowIntegrationTest {
             history.add(bar);
         }
         return history;
+    }
+
+    /** A concluded stock meeting: 甲 and 丙 forecast (0, .1, .5, .3, .1), 乙 forecasts (.1, .5, .3, .1, 0). */
+    private Fixture judgedStockMeeting() {
+        Fixture fixture = stockFixtureWithHistory();
+        String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+        fixture.answers("乙", withOutcome(base, "估值偏高", 0.1, 0.5, 0.3, 0.1, 0));
+        fixture.answers("丙", withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+        fixture.service.run(meetingId, EPOCH);
+        return fixture;
+    }
+
+    /** The meeting's history plus bars x1..xN after the 2026-10-16 base close of 102; the last one closes at lastClose. */
+    private static List<Map<String, Object>> historyAfterBase(int bars, String lastClose) {
+        List<Map<String, Object>> history = history();
+        for (int i = 1; i <= bars; i++) {
+            Map<String, Object> bar = new java.util.LinkedHashMap<>();
+            bar.put("date", "x" + i);
+            bar.put("close", new java.math.BigDecimal(i == bars ? lastClose : "105"));
+            history.add(bar);
+        }
+        return history;
+    }
+
+    private static JSONObject memberScore(JSONObject verdict, String memberName) {
+        for (Object item : verdict.getJSONArray("members")) {
+            JSONObject member = (JSONObject) item;
+            if (memberName.equals(member.getString("memberName"))) return member;
+        }
+        throw new AssertionError("no score for " + memberName + " in " + verdict);
     }
 
     private static JSONObject factWhoseQuestionContains(RoundtableV2ViewVO view, String text) {
