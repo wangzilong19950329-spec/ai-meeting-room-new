@@ -307,7 +307,7 @@ class MeetingDebateReviewedLedgerIntegrationTest {
     }
 
     @Test
-    void provisionalOnlyNumericAssertionCannotBecomeAReviewedOpinion() {
+    void provisionalNumberIsPublishedWithVisibleLowConfidenceLabel() {
         Fixture fixture = new Fixture();
         fixture.skipEnabled = true;
         when(fixture.reviewed.search(anyString(), anyString(), anyString(), anyLong()))
@@ -317,11 +317,87 @@ class MeetingDebateReviewedLedgerIntegrationTest {
                 .thenReturn(new ChatResult("{\"q\":[],\"e\":[]}\n==REPLY==\n"
                         + "该指标已经达到100亿元。"));
 
+        List<AiMeetingOpinion> opinions = fixture.newDebateService().executeDebateRound(meetingId, 1);
+
+        assertEquals(1, opinions.size());
+        assertTrue(opinions.get(0).getContent().contains("100亿元〔低置信〕"), opinions.get(0).getContent());
+        JSONObject numbers = JSON.parseObject(opinions.get(0).getEvidence()).getJSONObject("reviewedNumberAudit");
+        assertEquals(1, numbers.getIntValue("lowConfidenceCount"));
+        assertEquals(0, numbers.getIntValue("verifiedCount"));
+        verify(fixture.skipService, never()).recordIfCurrent(any(), anyInt(), nullable(Long.class));
+    }
+
+    @Test
+    void unitlessNumberMissingFromEvidenceIsRewrittenOnceThenSkipped() {
+        Fixture fixture = new Fixture();
+        fixture.skipEnabled = true;
+        fixture.reviewSuccessWith("该指数市盈率为25");
+        when(fixture.orchestrator.callModelExStrict(eq("deepseek-chat"), anyString(), anyString()))
+                .thenReturn(speech("该指数PE 30，估值偏高。"));
+
         assertTrue(fixture.newDebateService().executeDebateRound(meetingId, 1).isEmpty());
+
         assertTrue(fixture.inserted.isEmpty());
+        verify(fixture.orchestrator, times(2)).callModelExStrict(eq("deepseek-chat"), anyString(), anyString());
         ArgumentCaptor<MeetingReviewedTurnSkip> skips = ArgumentCaptor.forClass(MeetingReviewedTurnSkip.class);
         verify(fixture.skipService).recordIfCurrent(skips.capture(), anyInt(), nullable(Long.class));
         assertEquals("MODEL_UNSUPPORTED_CLAIMS", skips.getValue().getReasonCode());
+    }
+
+    @Test
+    void rewriteThatOnlyUsesEvidenceNumbersIsPublished() {
+        Fixture fixture = new Fixture();
+        fixture.reviewSuccessWith("该指数市盈率为25");
+        when(fixture.orchestrator.callModelExStrict(eq("deepseek-chat"), anyString(), anyString()))
+                .thenReturn(speech("该指数PE 30，估值偏高。"), speech("该指数PE 25，估值中性。"));
+
+        List<AiMeetingOpinion> opinions = fixture.newDebateService().executeDebateRound(meetingId, 1);
+
+        assertEquals(1, opinions.size());
+        assertEquals("该指数PE 25，估值中性。", opinions.get(0).getContent());
+        ArgumentCaptor<String> prompts = ArgumentCaptor.forClass(String.class);
+        verify(fixture.orchestrator, times(2))
+                .callModelExStrict(eq("deepseek-chat"), anyString(), prompts.capture());
+        assertTrue(prompts.getAllValues().get(1).contains("30"), prompts.getAllValues().get(1));
+        JSONObject numbers = JSON.parseObject(opinions.get(0).getEvidence()).getJSONObject("reviewedNumberAudit");
+        assertEquals(1, numbers.getIntValue("verifiedCount"));
+        assertEquals(1, numbers.getIntValue("rewriteCount"));
+    }
+
+    @Test
+    void unitlessAndScaledNumbersFoundInVerifiedEvidencePublishWithoutRewrite() {
+        Fixture fixture = new Fixture();
+        fixture.reviewSuccessWith("该指数市盈率为25，当日成交量32000手");
+        when(fixture.orchestrator.callModelExStrict(eq("deepseek-chat"), anyString(), anyString()))
+                .thenReturn(speech("该指数PE 25，成交3.2万手。"));
+
+        List<AiMeetingOpinion> opinions = fixture.newDebateService().executeDebateRound(meetingId, 1);
+
+        assertEquals(1, opinions.size());
+        assertEquals("该指数PE 25，成交3.2万手。", opinions.get(0).getContent());
+        verify(fixture.orchestrator, times(1)).callModelExStrict(eq("deepseek-chat"), anyString(), anyString());
+        JSONObject numbers = JSON.parseObject(opinions.get(0).getEvidence()).getJSONObject("reviewedNumberAudit");
+        assertEquals(2, numbers.getIntValue("verifiedCount"));
+    }
+
+    @Test
+    void datesRoundsListMarkersDurationsAndCodesAreNotTreatedAsClaims() {
+        Fixture fixture = new Fixture();
+        fixture.reviewSuccess();
+        when(fixture.orchestrator.callModelExStrict(eq("deepseek-chat"), anyString(), anyString()))
+                .thenReturn(speech("第1轮判断：截至2026年10月17日，未来3个月、近20个交易日、"
+                        + "MA20 与 300750.sz 只是时间、序号或代码。\n1、结论维持不变。"));
+
+        List<AiMeetingOpinion> opinions = fixture.newDebateService().executeDebateRound(meetingId, 1);
+
+        assertEquals(1, opinions.size());
+        verify(fixture.orchestrator, times(1)).callModelExStrict(eq("deepseek-chat"), anyString(), anyString());
+        JSONObject numbers = JSON.parseObject(opinions.get(0).getEvidence()).getJSONObject("reviewedNumberAudit");
+        assertEquals(0, numbers.getIntValue("checkedCount"));
+    }
+
+    private static ChatResult speech(String reply) {
+        return new ChatResult("{\"q\":[],\"e\":[]}\n==REPLY==\n" + reply);
     }
 
     private static ChatResult validOpinion() {
@@ -330,6 +406,11 @@ class MeetingDebateReviewedLedgerIntegrationTest {
 
     private static MeetingReviewedEvidenceService.ReviewedEvidence acceptedPacket(
             String requestId, String question, String asOf) {
+        return acceptedPacket(requestId, question, asOf, "经交叉搜索核验的公开事实");
+    }
+
+    private static MeetingReviewedEvidenceService.ReviewedEvidence acceptedPacket(
+            String requestId, String question, String asOf, String statement) {
         JSONObject packet = JSON.parseObject("{\"schemaVersion\":\"general.evidence-search.v1\","
                 + "\"status\":\"CROSS_CHECKED\",\"audit\":{\"reviewCalls\":1,\"trail\":["
                 + "{\"phase\":\"search\",\"status\":\"FOUND\",\"searchCount\":1,"
@@ -337,10 +418,11 @@ class MeetingDebateReviewedLedgerIntegrationTest {
                 + "{\"phase\":\"review\",\"id\":\"fact\",\"verdict\":\"PASS\","
                 + "\"reviewerVerdict\":\"PASS\",\"searchCount\":1,"
                 + "\"links\":[\"https://example.org/review\"]}]},"
-                + "\"claims\":[{\"id\":\"fact\",\"statement\":\"经交叉搜索核验的公开事实\","
+                + "\"claims\":[{\"id\":\"fact\","
                 + "\"sourceUrls\":[\"https://example.org/source\"],"
                 + "\"reviewLinks\":[\"https://example.org/review\"],"
                 + "\"reviewMethod\":\"TWO_ISOLATED_DEEPSEEK_SEARCHES\"}]}");
+        packet.getJSONArray("claims").getJSONObject(0).put("statement", statement);
         packet.put("requestId", requestId);
         packet.put("question", question);
         packet.put("asOf", asOf);
@@ -474,6 +556,12 @@ class MeetingDebateReviewedLedgerIntegrationTest {
             when(reviewed.search(anyString(), anyString(), anyString(), anyLong()))
                     .thenAnswer(invocation -> acceptedPacket(invocation.getArgument(0),
                             invocation.getArgument(1), invocation.getArgument(2)));
+        }
+
+        private void reviewSuccessWith(String statement) {
+            when(reviewed.search(anyString(), anyString(), anyString(), anyLong()))
+                    .thenAnswer(invocation -> acceptedPacket(invocation.getArgument(0),
+                            invocation.getArgument(1), invocation.getArgument(2), statement));
         }
 
         private MeetingReviewedSearchGap savedGap() {

@@ -636,32 +636,24 @@ public class MeetingDebateService {
                     + noUsableReviewedGaps.toJSONString() + "\n";
         }
         String context = orchestrator.buildDebateContext(meetingId, member.getId(), roundNumber, searchContext);
-        ChatResult result;
-        try {
-            result = orchestrator.callModelExStrict(member.getModelType(), systemPrompt, context);
-        } catch (RuntimeException providerFailure) {
-            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_PROVIDER_ERROR", providerFailure);
-        }
-        if (result != null && result.modelStatus != null
-                && !"success".equalsIgnoreCase(result.modelStatus)) {
-            String status = result.modelStatus.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_]", "_");
-            if (status.length() > 64) status = "FAILED";
-            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_" + status);
-        }
-        if (result == null || result.content == null || result.content.isBlank()
-                || result.hasSearchEvidence()) {
-            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_OUTPUT_UNAVAILABLE");
-        }
-        String[] parsed = parseEvidenceAndContent(result.content);
-        if (parsed[1] == null || parsed[1].isBlank()) {
-            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_CONTENT_EMPTY");
-        }
-        if (evidence.results.stream().noneMatch(source -> source != null && !isProvisionalResult(source))
-                && GROUNDED_NUMERIC_CLAIM_PATTERN.matcher(parsed[1]).find()) {
-            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_UNSUPPORTED_CLAIMS");
-        }
-        if (isBlockingClaimAudit(buildClaimAudit(result, evidence.results, evidence.plan))) {
-            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_UNSUPPORTED_CLAIMS");
+        ChatResult result = callReviewedSpeaker(member, systemPrompt, context);
+        String[] parsed = parseReviewedSpeech(result, evidence);
+        String[] numberCorpora = buildReviewedNumberCorpora(meetingId, roundNumber, evidence);
+        String stockSymbol = evidence.plan == null ? null : evidence.plan.eastmoneySymbol;
+        ReviewedNumberGate.Audit numbers = ReviewedNumberGate.audit(
+                parsed[1], numberCorpora[0], numberCorpora[1], stockSymbol);
+        int numberRewrites = 0;
+        if (numbers.hasUnsupported()) {
+            assertReviewedContext(meetingId, evidence.meetingStatusAtStart, evidence.expectedRunEpoch,
+                    evidence.roundNumber, evidence.asOf, evidence.contextOpinionId);
+            numberRewrites = 1;
+            result = callReviewedSpeaker(member, systemPrompt,
+                    context + "\n\n" + ReviewedNumberGate.rewriteInstruction(numbers));
+            parsed = parseReviewedSpeech(result, evidence);
+            numbers = ReviewedNumberGate.audit(parsed[1], numberCorpora[0], numberCorpora[1], stockSymbol);
+            if (numbers.hasUnsupported()) {
+                throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_UNSUPPORTED_CLAIMS");
+            }
         }
         JSONObject crossMemberConflict = findReviewedCrossMemberNumericConflict(
                 meetingId, member.getId(), roundNumber, evidence, parsed[1]);
@@ -680,6 +672,7 @@ public class MeetingDebateService {
             stored.put("reviewedSearchPackets", evidence.packets);
         }
         stored.put("reviewedSearchStatus", evidence.status);
+        stored.put("reviewedNumberAudit", numbers.toJson(numberRewrites));
         if (evidence.decision.getIntValue("unsearchedGapCount") > 0) {
             stored.put("reviewedSearchCoverageStatus", "UNSEARCHED_BUDGET");
         } else if (evidence.decision.getIntValue("unverifiedGapCount") > 0) {
@@ -697,9 +690,10 @@ public class MeetingDebateService {
         opinion.setRoundNumber(roundNumber);
         opinion.setParentOpinionId(evidence.targetQuestionId);
         opinion.setOpinionType(OpinionTypeEnum.STATEMENT.getCode());
+        String published = numbers.label(parsed[1]);
         opinion.setContent("LOW_CONFIDENCE".equals(evidence.status)
-                ? "【本轮资料未充分交叉核验：待核验数字仅作条件分析】\n" + parsed[1]
-                : parsed[1]);
+                ? "【本轮资料未充分交叉核验：待核验数字仅作条件分析】\n" + published
+                : published);
         opinion.setEvidence(stored.toJSONString());
         assertReviewedContext(meetingId, evidence.meetingStatusAtStart, evidence.expectedRunEpoch,
                 evidence.roundNumber, evidence.asOf, evidence.contextOpinionId);
@@ -710,6 +704,79 @@ public class MeetingDebateService {
             opinionMapper.insert(opinion);
         }
         return opinion;
+    }
+
+    private ChatResult callReviewedSpeaker(AiMeetingMember member, String systemPrompt, String prompt) {
+        ChatResult result;
+        try {
+            result = orchestrator.callModelExStrict(member.getModelType(), systemPrompt, prompt);
+        } catch (RuntimeException providerFailure) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_PROVIDER_ERROR", providerFailure);
+        }
+        if (result != null && result.modelStatus != null
+                && !"success".equalsIgnoreCase(result.modelStatus)) {
+            String status = result.modelStatus.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_]", "_");
+            if (status.length() > 64) status = "FAILED";
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_" + status);
+        }
+        if (result == null || result.content == null || result.content.isBlank()
+                || result.hasSearchEvidence()) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_OUTPUT_UNAVAILABLE");
+        }
+        return result;
+    }
+
+    /** Numbers are judged by {@link ReviewedNumberGate}; the remaining claim audit still blocks the turn. */
+    private String[] parseReviewedSpeech(ChatResult result, ReviewedRoundEvidence evidence) {
+        String[] parsed = parseEvidenceAndContent(result.content);
+        if (parsed[1] == null || parsed[1].isBlank()) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_CONTENT_EMPTY");
+        }
+        JSONObject audit = buildClaimAudit(result, evidence.results, evidence.plan);
+        if (audit != null && audit.getIntValue("guardedTermViolationCount")
+                + audit.getIntValue("stockCodeViolationCount")
+                + audit.getIntValue("targetMismatchViolationCount")
+                + audit.getIntValue("formatViolationCount") > 0) {
+            throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_UNSUPPORTED_CLAIMS");
+        }
+        return parsed;
+    }
+
+    /**
+     * Returns {verified, low-confidence} evidence text for the number gate. Earlier reviewed speeches in
+     * this meeting contribute their stored evidence, so a speaker can cite or dispute another member's
+     * number and that number keeps the confidence of the evidence it came from.
+     */
+    private String[] buildReviewedNumberCorpora(Long meetingId, int roundNumber, ReviewedRoundEvidence evidence) {
+        StringBuilder verified = new StringBuilder(buildSearchEvidenceCorpus(evidence.results)).append('\n');
+        StringBuilder provisional = new StringBuilder();
+        for (WebSearchService.SearchResult result : evidence.results) {
+            if (result != null && isProvisionalResult(result)) provisional.append(result.snippet).append('\n');
+        }
+        List<AiMeetingOpinion> earlier = opinionMapper.selectByMeetingId(meetingId);
+        if (earlier == null) earlier = Collections.emptyList();
+        for (AiMeetingOpinion prior : earlier) {
+            if (prior == null || prior.getEvidence() == null
+                    || !OpinionTypeEnum.STATEMENT.getCode().equals(prior.getOpinionType())
+                    || (prior.getRoundNumber() != null && prior.getRoundNumber() > roundNumber)) continue;
+            JSONObject stored;
+            try { stored = JSON.parseObject(prior.getEvidence()); }
+            catch (RuntimeException invalid) { continue; }
+            if (stored == null || stored.getString("reviewedSearchStatus") == null) continue;
+            JSONArray results = stored.getJSONArray("results");
+            if (results == null) continue;
+            for (int i = 0; i < results.size(); i++) {
+                JSONObject item = results.getJSONObject(i);
+                if (item == null) continue;
+                boolean itemProvisional = "n8n-deepseek-provisional".equals(item.getString("provider"))
+                        || "LOW_CONFIDENCE_SEARCH".equals(item.getString("sourceType"));
+                StringBuilder target = itemProvisional ? provisional : verified;
+                target.append(item.getString("snippet")).append('\n');
+                JSONArray facts = item.getJSONArray("facts");
+                if (facts != null) target.append(facts.toJSONString()).append('\n');
+            }
+        }
+        return new String[]{verified.toString(), provisional.toString()};
     }
 
     /**
