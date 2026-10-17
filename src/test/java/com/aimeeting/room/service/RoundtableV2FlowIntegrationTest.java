@@ -440,6 +440,98 @@ class RoundtableV2FlowIntegrationTest {
         assertTrue(view.getIssueCard().get("stock") == null, view.getIssueCard().toJSONString());
     }
 
+    @Test
+    void stockMeetingAddsReferenceClassAndAnOutcomeDistributionWithMinority() {
+        Fixture fixture = stockFixtureWithHistory();
+        String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", withOutcome(base, "下跌8%–23%的可能性不高", 0, 0.1, 0.5, 0.3, 0.1));
+        fixture.answers("乙", withOutcome(base, "估值偏高", 0.1, 0.5, 0.3, 0.1, 0));
+        fixture.answers("丙", withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getFacts().toJSONString().contains("历史参照"), view.getFacts().toJSONString());
+        assertTrue(view.getFacts().toJSONString().contains("P50"), view.getFacts().toJSONString());
+        JSONArray options = view.getOutcomeQuestion().getJSONArray("options");
+        assertEquals(List.of("跌幅超过23%", "下跌8%–23%", "在±8%以内", "上涨8%–23%", "涨幅超过23%"),
+                options.stream().map(option -> ((JSONObject) option).getString("label"))
+                        .collect(java.util.stream.Collectors.toList()));
+        assertTrue(!answerOf(view, "甲").getBooleanValue("skipped"), answerOf(view, "甲").toJSONString());
+
+        JSONObject outcome = view.getResult().getJSONObject("outcome");
+        assertEquals("C", outcome.getString("aggregateMode"));
+        JSONObject middle = outcome.getJSONArray("options").getJSONObject(2);
+        assertEquals(0.4333, middle.getDoubleValue("mean"), 0.001);
+        assertEquals(List.of("乙"), outcome.getJSONArray("minority").stream()
+                .map(member -> ((JSONObject) member).getString("memberName"))
+                .collect(java.util.stream.Collectors.toList()));
+    }
+
+    @Test
+    void outcomeProbabilitiesNotSummingToOneAreRewrittenOnce() {
+        Fixture fixture = stockFixtureWithHistory();
+        String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        String valid = withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", withOutcome(base, "需求稳定", 0, 0.1, 0.4, 0.2, 0.1), valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(!answerOf(view, "甲").getBooleanValue("skipped"), answerOf(view, "甲").toJSONString());
+        assertEquals(2, fixture.calls.stream().filter("divergence:甲"::equals).count(), fixture.calls.toString());
+    }
+
+    @Test
+    void generalTopicHasNoOutcomeQuestion() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getOutcomeQuestion() == null);
+        assertTrue(view.getResult().get("outcome") == null, view.getResult().toJSONString());
+    }
+
+    private Fixture stockFixtureWithHistory() {
+        Fixture fixture = new Fixture();
+        fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,\"horizonTradingDays\":60,"
+                + "\"stock\":{\"symbol\":\"300750\",\"market\":\"sz\"}");
+        when(fixture.eastmoney.buildBundle("300750", "sz", "DAY")).thenReturn(stockBundle());
+        // Closes alternate 100/102: daily volatility ≈ 1.98%, so σ over 60 days ≈ 15.4% → bounds 8% and 23%.
+        List<Map<String, Object>> history = new ArrayList<>();
+        for (int i = 0; i < 400; i++) {
+            Map<String, Object> bar = new java.util.LinkedHashMap<>();
+            bar.put("date", "d" + i);
+            bar.put("close", new java.math.BigDecimal(i % 2 == 0 ? "100" : "102"));
+            history.add(bar);
+        }
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(history);
+        return fixture;
+    }
+
+    private static String withOutcome(String answerJson, String reason, double... probabilities) {
+        JSONObject root = JSON.parseObject(answerJson);
+        JSONObject outcome = new JSONObject(true);
+        outcome.put("questionId", "OUTCOME");
+        JSONObject distribution = new JSONObject(true);
+        String[] ids = {"A", "B", "C", "D", "E"};
+        for (int i = 0; i < ids.length; i++) distribution.put(ids[i], probabilities[i]);
+        outcome.put("probabilities", distribution);
+        JSONObject because = new JSONObject(true);
+        because.put("text", reason);
+        because.put("factIds", List.of("F-1"));
+        outcome.put("reasons", List.of(because));
+        outcome.put("falsifier", "若需求明显转弱则判断失效");
+        root.getJSONArray("answers").add(outcome);
+        return root.toJSONString();
+    }
+
     private static EastmoneyMarketDataService.MarketDataBundle stockBundle() {
         Map<String, Object> payload = new java.util.LinkedHashMap<>();
         payload.put("symbol", "300750");

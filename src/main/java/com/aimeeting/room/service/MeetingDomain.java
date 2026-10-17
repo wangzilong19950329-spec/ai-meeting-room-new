@@ -23,8 +23,20 @@ public interface MeetingDomain {
     }
 
     /**
-     * Evidence source: structured facts gathered before reviewed search. Each fact carries tier, statement,
-     * value, unit, period and source but no id; the flow numbers them. A failed lookup returns a tier "G" gap.
+     * Evidence source, reference class and outcome judgment. Facts carry tier, statement, value, unit, period
+     * and source but no id; the flow numbers them, and a failed lookup is a tier "G" gap. The outcome question,
+     * when the domain has a judgeable result, is answered with probabilities instead of a single option.
      */
-    List<JSONObject> structuredFacts(JSONObject issueCard);
+    DomainEvidence evidence(JSONObject issueCard);
+
+    final class DomainEvidence {
+        public final List<JSONObject> facts;
+        /** Null when the topic has no judgeable outcome. */
+        public final JSONObject outcomeQuestion;
+
+        public DomainEvidence(List<JSONObject> facts, JSONObject outcomeQuestion) {
+            this.facts = facts;
+            this.outcomeQuestion = outcomeQuestion;
+        }
+    }
 }

@@ -254,6 +254,11 @@ public class EastmoneyMarketDataService {
         return bars;
     }
 
+    /** Front-adjusted daily bars, oldest first, for reference-class statistics over several years. */
+    public List<Map<String, Object>> fetchDailyHistory(String symbol, String market, int bars) {
+        return fetchKlines(symbol, normalizeMarket(market, symbol), 101, bars);
+    }
+
     private List<Map<String, Object>> fetchCanonicalDailyKlines(String symbol,
                                                                  String market,
                                                                  int limit,

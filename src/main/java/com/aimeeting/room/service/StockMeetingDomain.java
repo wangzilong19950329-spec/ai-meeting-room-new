@@ -18,6 +18,10 @@ import java.util.Set;
 public class StockMeetingDomain implements MeetingDomain {
 
     private static final BigDecimal HUNDRED_MILLION = new BigDecimal("100000000");
+    /** About five years of daily bars for the reference class. */
+    private static final int HISTORY_BARS = 1300;
+    /** Volatility for the outcome intervals comes from the most recent year of daily returns. */
+    private static final int VOLATILITY_WINDOW = 250;
     private static final Set<String> MARKETS = Set.of("sh", "sz", "bj");
 
     private final EastmoneyMarketDataService eastmoney;
@@ -46,7 +50,104 @@ public class StockMeetingDomain implements MeetingDomain {
     }
 
     @Override
-    public List<JSONObject> structuredFacts(JSONObject issueCard) {
+    public DomainEvidence evidence(JSONObject issueCard) {
+        List<JSONObject> facts = new ArrayList<>(marketFacts(issueCard));
+        JSONObject stock = normalizeStock(issueCard.getJSONObject("stock"));
+        int horizon = issueCard.getIntValue("horizonTradingDays");
+        String label = "历史参照数据（" + stock.getString("symbol") + "." + stock.getString("market")
+                + "，展望" + horizon + "个交易日）";
+        List<Map<String, Object>> history;
+        try {
+            history = eastmoney.fetchDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
+        } catch (RuntimeException unavailable) {
+            facts.add(gap(label, "EASTMONEY_HISTORY_UNAVAILABLE: " + unavailable.getMessage()));
+            return new DomainEvidence(facts, null);
+        }
+        List<BigDecimal> closes = new ArrayList<>();
+        for (Map<String, Object> bar : history == null ? List.<Map<String, Object>>of() : history) {
+            BigDecimal close = decimal(bar.get("close"));
+            if (close != null && close.signum() > 0) closes.add(close);
+        }
+        if (horizon <= 0 || closes.size() < horizon + VOLATILITY_WINDOW + 1) {
+            facts.add(gap(label, "HISTORY_TOO_SHORT: " + closes.size() + " bars"));
+            return new DomainEvidence(facts, null);
+        }
+        facts.add(referenceFact(closes, horizon));
+        return new DomainEvidence(facts, outcomeQuestion(closes, horizon, issueCard.getString("asOf")));
+    }
+
+    /** Reference class: the distribution of every rolling horizon-day return in the available history. */
+    private static JSONObject referenceFact(List<BigDecimal> closes, int horizon) {
+        List<Double> returns = new ArrayList<>();
+        for (int i = 0; i + horizon < closes.size(); i++) {
+            returns.add(closes.get(i + horizon).doubleValue() / closes.get(i).doubleValue() - 1);
+        }
+        java.util.Collections.sort(returns);
+        long up = returns.stream().filter(value -> value > 0).count();
+        String label = "历史参照（近" + closes.size() + "个交易日，滚动" + horizon
+                + "个交易日涨跌幅，程序按东财前复权日K计算）";
+        String statement = label + "：P10 " + pct(percentile(returns, 0.10)) + "，P25 " + pct(percentile(returns, 0.25))
+                + "，P50 " + pct(percentile(returns, 0.50)) + "，P75 " + pct(percentile(returns, 0.75))
+                + "，P90 " + pct(percentile(returns, 0.90)) + "，上涨占比 " + pct((double) up / returns.size());
+        JSONObject fact = new JSONObject(true);
+        fact.put("tier", "F");
+        fact.put("question", label);
+        fact.put("statement", statement);
+        fact.put("source", "东方财富");
+        fact.put("singleSource", true);
+        fact.put("referenceClass", true);
+        return fact;
+    }
+
+    /**
+     * Five return intervals cut symmetrically at ±0.5σ and ±1.5σ, where σ is the recent daily volatility scaled
+     * to the horizon. Bounds are whole percentage points and are stored for judging the outcome at expiry.
+     */
+    private static JSONObject outcomeQuestion(List<BigDecimal> closes, int horizon, String asOf) {
+        List<Double> daily = new ArrayList<>();
+        for (int i = closes.size() - VOLATILITY_WINDOW; i < closes.size(); i++) {
+            daily.add(closes.get(i).doubleValue() / closes.get(i - 1).doubleValue() - 1);
+        }
+        double mean = daily.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+        double variance = daily.stream().mapToDouble(value -> (value - mean) * (value - mean)).sum() / (daily.size() - 1);
+        double sigmaPct = Math.sqrt(variance) * Math.sqrt(horizon) * 100;
+        int inner = Math.max(1, (int) Math.round(0.5 * sigmaPct));
+        int outer = Math.max(inner + 1, (int) Math.round(1.5 * sigmaPct));
+        com.alibaba.fastjson.JSONArray options = new com.alibaba.fastjson.JSONArray();
+        options.add(option("A", "跌幅超过" + outer + "%", null, -outer));
+        options.add(option("B", "下跌" + inner + "%–" + outer + "%", -outer, -inner));
+        options.add(option("C", "在±" + inner + "%以内", -inner, inner));
+        options.add(option("D", "上涨" + inner + "%–" + outer + "%", inner, outer));
+        options.add(option("E", "涨幅超过" + outer + "%", outer, null));
+        JSONObject question = new JSONObject(true);
+        question.put("id", "OUTCOME");
+        question.put("kind", "PROBABILITY");
+        question.put("title", "未来" + horizon + "个交易日收益率（以" + asOf + "收盘价为起点，前复权）");
+        question.put("horizonTradingDays", horizon);
+        question.put("sigmaPct", BigDecimal.valueOf(sigmaPct).setScale(2, RoundingMode.HALF_UP));
+        question.put("options", options);
+        return question;
+    }
+
+    private static JSONObject option(String id, String label, Integer lower, Integer upper) {
+        JSONObject option = new JSONObject(true);
+        option.put("id", id);
+        option.put("label", label);
+        option.put("lowerPct", lower);
+        option.put("upperPct", upper);
+        return option;
+    }
+
+    private static double percentile(List<Double> sorted, double p) {
+        int index = (int) Math.ceil(p * sorted.size()) - 1;
+        return sorted.get(Math.max(0, Math.min(sorted.size() - 1, index)));
+    }
+
+    private static String pct(double ratio) {
+        return BigDecimal.valueOf(ratio * 100).setScale(2, RoundingMode.HALF_UP).toPlainString() + "%";
+    }
+
+    private List<JSONObject> marketFacts(JSONObject issueCard) {
         JSONObject stock = normalizeStock(issueCard.getJSONObject("stock"));
         String label = "东方财富结构化数据（" + stock.getString("symbol") + "." + stock.getString("market") + "）";
         Map<String, Object> payload;

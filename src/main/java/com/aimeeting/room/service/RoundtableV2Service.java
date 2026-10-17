@@ -54,6 +54,11 @@ public class RoundtableV2Service {
     static final String SECOND_CROSS_EXAM = "CROSS_EXAM_R2_";
     static final String CLASSIFY = "CLASSIFY";
     static final String TOP_UP = "TOP_UP";
+    static final String OUTCOME = "OUTCOME_Q";
+    private static final String PROBABILITY = "PROBABILITY";
+    private static final int DEFAULT_HORIZON_TRADING_DAYS = 60;
+    /** A member is in the minority when any interval differs from the pooled probability by this much. */
+    private static final double MINORITY_DEVIATION = 0.25;
     /** Evidence top-up for fact disputes is capped per meeting. */
     private static final int TOP_UP_BUDGET = 3;
     private static final Set<String> DISPUTE_TYPES = Set.of("FACT", "INTERPRETATION", "ASSUMPTION", "RISK_PREFERENCE");
@@ -106,6 +111,7 @@ public class RoundtableV2Service {
             else if (FINAL_ANSWER.equals(record.getKind())) view.getFinalAnswers().add(JSON.parseObject(record.getPayload()));
             else if (CLASSIFY.equals(record.getKind())) view.setClassification(JSON.parseObject(record.getPayload()));
             else if (TOP_UP.equals(record.getKind())) view.setTopUp(JSON.parseObject(record.getPayload()));
+            else if (OUTCOME.equals(record.getKind())) view.setOutcomeQuestion(JSON.parseObject(record.getPayload()));
         }
         return view;
     }
@@ -121,6 +127,7 @@ public class RoundtableV2Service {
         if (activeRoom(meetingId, epoch) == null) return;
         JSONArray facts = factBase(meetingId, epoch, card);
         if (facts == null) return;
+        card = withOutcome(card, loadObject(meetingId, OUTCOME, MEETING_LEVEL));
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
         Map<Long, AiMeetingMember> membersById = new LinkedHashMap<>();
         JSONArray answers = new JSONArray();
@@ -217,6 +224,9 @@ public class RoundtableV2Service {
         JSONObject normalized = new JSONObject(true);
         normalized.put("topic", firstNonBlank(card.getString("topic"), room.getTitle()));
         normalized.put("horizon", card.getString("horizon"));
+        int horizonDays = card.getIntValue("horizonTradingDays");
+        normalized.put("horizonTradingDays", horizonDays >= 20 && horizonDays <= 250
+                ? horizonDays : DEFAULT_HORIZON_TRADING_DAYS);
         normalized.put("asOf", asOf);
         normalized.put("subQuestions", card.getJSONArray("subQuestions"));
         JSONArray evidenceQuestions = card.getJSONArray("evidenceQuestions");
@@ -241,7 +251,8 @@ public class RoundtableV2Service {
         sb.append("再列出不超过 8 道需要联网核实的取证题，每题只问一个可以核实的事实，多空两方面都要覆盖。\n");
         sb.append("如果有合适的参照类（过去的类似情况），写在 referenceClass，否则写 null。\n");
         sb.append(domainHints);
-        sb.append("只输出 JSON：{\"topic\":\"\",\"horizon\":\"\",\"subQuestions\":[{\"id\":\"Q1\",\"title\":\"\",")
+        sb.append("把展望期折算成交易日数写在 horizonTradingDays（20–250，三个月约 60）。\n");
+        sb.append("只输出 JSON：{\"topic\":\"\",\"horizon\":\"\",\"horizonTradingDays\":60,\"subQuestions\":[{\"id\":\"Q1\",\"title\":\"\",")
                 .append("\"options\":[{\"id\":\"A\",\"label\":\"\"}]}],\"evidenceQuestions\":[\"\"],\"referenceClass\":null}");
         return sb.toString();
     }
@@ -296,7 +307,9 @@ public class RoundtableV2Service {
         // The domain's structured source comes first; reviewed search covers what it cannot.
         MeetingDomain domain = domainFor(card);
         if (domain != null) {
-            for (JSONObject structured : domain.structuredFacts(card)) {
+            MeetingDomain.DomainEvidence evidence = domain.evidence(card);
+            if (evidence.outcomeQuestion != null) save(meetingId, OUTCOME, MEETING_LEVEL, epoch, evidence.outcomeQuestion);
+            for (JSONObject structured : evidence.facts) {
                 String tier = structured.getString("tier");
                 JSONObject fact = new JSONObject(true);
                 fact.put("id", "G".equals(tier) ? "G-" + (++gaps) : "F-" + (++verified));
@@ -425,7 +438,7 @@ public class RoundtableV2Service {
         if (stored != null) return stored;
         String system = memberSystem(member) + "你只能依据问题卡和事实底稿独立作答，看不到其他议员的观点。只输出 JSON。";
         String prompt = answerPrompt(card, facts);
-        String[] corpora = corpora(facts);
+        String[] corpora = corpora(facts, card);
         Set<String> factIds = factIds(facts);
         Answer parsed;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
@@ -468,6 +481,11 @@ public class RoundtableV2Service {
 
     private static String answerPrompt(JSONObject card, JSONArray facts) {
         StringBuilder sb = new StringBuilder(cardAndFacts(card, facts));
+        if (outcomeOf(card) != null) {
+            sb.append("\n结果题 OUTCOME 不选单个选项，而是在 probabilities 里给每个区间打概率（0–1，合计为 1），")
+                    .append("例如 {\"questionId\":\"OUTCOME\",\"probabilities\":{\"A\":0.1,\"B\":0.2,\"C\":0.4,\"D\":0.2,\"E\":0.1},")
+                    .append("\"reasons\":[...],\"falsifier\":\"\"}；理由里不要写概率数字。");
+        }
         sb.append("\n【作答要求】对每个子问题各选一个选项；每个选择给 1–3 条理由，每条理由注明引用的事实编号；")
                 .append("再写一个会推翻你判断的信号（falsifier）。理由里的数字只能来自上面的事实，")
                 .append("低置信事实可以用，但它没有经过交叉核实。\n");
@@ -483,7 +501,8 @@ public class RoundtableV2Service {
         sb.append("；截至：").append(card.getString("asOf")).append("\n子问题：\n");
         for (Object item : card.getJSONArray("subQuestions")) {
             JSONObject question = (JSONObject) item;
-            sb.append(question.getString("id")).append(" ").append(question.getString("title")).append("：");
+            sb.append(question.getString("id")).append(" ").append(question.getString("title"))
+                    .append(isProbability(question) ? "（结果题：给每个区间打概率，合计为 1）" : "").append("：");
             List<String> options = new ArrayList<>();
             for (Object option : question.getJSONArray("options")) {
                 JSONObject json = (JSONObject) option;
@@ -525,9 +544,18 @@ public class RoundtableV2Service {
             String questionId = question.getString("id");
             JSONObject answer = byQuestion.remove(questionId);
             if (answer == null) return Answer.invalid("没有回答子问题 " + questionId);
-            String optionId = answer.getString("optionId");
-            if (optionLabel(question, optionId) == null) {
-                return Answer.invalid("子问题 " + questionId + " 没有选项 " + optionId);
+            String optionId = null;
+            JSONObject probabilities = null;
+            if (isProbability(question)) {
+                probabilities = parseProbabilities(question, answer.getJSONObject("probabilities"));
+                if (probabilities == null) {
+                    return Answer.invalid("结果题 " + questionId + " 必须给每个区间一个 0–1 的概率，且合计为 1");
+                }
+            } else {
+                optionId = answer.getString("optionId");
+                if (optionLabel(question, optionId) == null) {
+                    return Answer.invalid("子问题 " + questionId + " 没有选项 " + optionId);
+                }
             }
             JSONArray reasons = answer.getJSONArray("reasons");
             if (reasons == null || reasons.isEmpty() || reasons.size() > 3) {
@@ -560,7 +588,8 @@ public class RoundtableV2Service {
             if (!blank(changeReason) && gatedChange == null) return Answer.invalid(unsupportedNumbers(changeReason, corpora));
             JSONObject clean = new JSONObject(true);
             clean.put("questionId", questionId);
-            clean.put("optionId", optionId);
+            if (probabilities != null) clean.put("probabilities", probabilities);
+            else clean.put("optionId", optionId);
             clean.put("reasons", cleanReasons);
             clean.put("falsifier", gatedFalsifier);
             if (gatedChange != null) clean.put("changeReason", gatedChange);
@@ -580,9 +609,16 @@ public class RoundtableV2Service {
         return ReviewedNumberGate.rewriteInstruction(ReviewedNumberGate.audit(text, corpora[0], corpora[1], null));
     }
 
-    private static String[] corpora(JSONArray facts) {
+    /** Interval bounds of the outcome question are definitions, so members may cite them like facts. */
+    private static String[] corpora(JSONArray facts, JSONObject card) {
         StringBuilder verified = new StringBuilder();
         StringBuilder provisional = new StringBuilder();
+        JSONObject outcome = outcomeOf(card);
+        if (outcome != null) {
+            for (Object option : outcome.getJSONArray("options")) {
+                verified.append(((JSONObject) option).getString("label")).append('\n');
+            }
+        }
         for (Object item : facts) {
             JSONObject fact = (JSONObject) item;
             StringBuilder target = "F".equals(fact.getString("tier")) ? verified
@@ -595,6 +631,48 @@ public class RoundtableV2Service {
             }
         }
         return new String[]{verified.toString(), provisional.toString()};
+    }
+
+    private static JSONObject withOutcome(JSONObject card, JSONObject outcome) {
+        if (outcome == null) return card;
+        JSONObject working = JSON.parseObject(card.toJSONString());
+        working.getJSONArray("subQuestions").add(outcome);
+        return working;
+    }
+
+    private static JSONObject outcomeOf(JSONObject card) {
+        if (card == null || card.getJSONArray("subQuestions") == null) return null;
+        for (Object item : card.getJSONArray("subQuestions")) {
+            if (isProbability((JSONObject) item)) return (JSONObject) item;
+        }
+        return null;
+    }
+
+    private static boolean isProbability(JSONObject question) {
+        return PROBABILITY.equals(question.getString("kind"));
+    }
+
+    /** Every interval needs a probability in [0, 1] and the total must be 1 within rounding; null otherwise. */
+    private static JSONObject parseProbabilities(JSONObject question, JSONObject raw) {
+        if (raw == null) return null;
+        JSONObject clean = new JSONObject(true);
+        double total = 0;
+        Set<String> ids = new HashSet<>();
+        for (Object item : question.getJSONArray("options")) {
+            String id = ((JSONObject) item).getString("id");
+            ids.add(id);
+            Double value;
+            try {
+                value = raw.getDouble(id);
+            } catch (RuntimeException notANumber) {
+                return null;
+            }
+            if (value == null || value < 0 || value > 1) return null;
+            clean.put(id, value);
+            total += value;
+        }
+        if (!ids.containsAll(raw.keySet()) || Math.abs(total - 1.0) > 0.01) return null;
+        return clean;
     }
 
     private static Set<String> factIds(JSONArray facts) {
@@ -679,7 +757,7 @@ public class RoundtableV2Service {
         JSONObject b = dispute.getJSONObject("b");
         AiMeetingMember asker = membersById.get(a.getLong("memberId"));
         AiMeetingMember answerer = membersById.get(b.getLong("memberId"));
-        String[] corpora = corpora(facts);
+        String[] corpora = corpora(facts, card);
         String topic = "子问题 " + dispute.getString("questionId") + " " + dispute.getString("title");
         JSONObject record = new JSONObject(true);
         record.put("questionId", dispute.getString("questionId"));
@@ -722,7 +800,7 @@ public class RoundtableV2Service {
                         + target.getString("questionId") + " " + target.getString("title") + " 上选择了「"
                         + target.getString("optionLabel") + "」。请站在反方论证这条结论最可能错在哪里："
                         + "列出 1–2 个最可能的失败原因，并说明需要什么证据才能确认或排除，不超过 250 字。"
-                        + "数字只能来自事实底稿。直接输出论证内容。", corpora(facts));
+                        + "数字只能来自事实底稿。直接输出论证内容。", corpora(facts, card));
         JSONObject record = new JSONObject(true);
         record.putAll(target);
         record.put("failed", argument == null);
@@ -776,7 +854,7 @@ public class RoundtableV2Service {
         String system = memberSystem(member) + "这是匿名再估：你能看到其他人选择的分布和交锋记录，但看不到是谁选的。只输出 JSON。";
         String prompt = answerPrompt(card, facts) + "\n\n【再估任务】" + reestimateContext(card, answers, crossExams, redTeam, first)
                 + "请重新作答全部子问题，格式同上；如果某题改了选项，在该题加 changeReason 说明原因。";
-        String[] corpora = corpora(facts);
+        String[] corpora = corpora(facts, card);
         Set<String> factIds = factIds(facts);
         Answer parsed;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
@@ -814,6 +892,18 @@ public class RoundtableV2Service {
         sb.append("\n各子问题的匿名分布：\n");
         for (Object item : card.getJSONArray("subQuestions")) {
             JSONObject question = (JSONObject) item;
+            if (isProbability(question)) {
+                JSONObject pooled = outcomeSummary(question, answeredOnly(answers));
+                List<String> means = new ArrayList<>();
+                for (Object option : pooled.getJSONArray("options")) {
+                    JSONObject json = (JSONObject) option;
+                    means.add(json.getString("id") + " " + json.getString("label") + " 平均 "
+                            + Math.round(json.getDoubleValue("mean") * 100) + "%");
+                }
+                sb.append(question.getString("id")).append(" ").append(question.getString("title")).append("：")
+                        .append(String.join(" / ", means)).append("\n");
+                continue;
+            }
             List<String> counts = new ArrayList<>();
             for (Object optionItem : question.getJSONArray("options")) {
                 JSONObject option = (JSONObject) optionItem;
@@ -1135,8 +1225,13 @@ public class RoundtableV2Service {
         JSONArray conclusions = new JSONArray();
         JSONArray disputes = new JSONArray();
         JSONArray insufficient = new JSONArray();
+        JSONObject outcome = null;
         for (Object item : card.getJSONArray("subQuestions")) {
             JSONObject question = (JSONObject) item;
+            if (isProbability(question)) {
+                outcome = total == 0 ? null : outcomeSummary(question, answered);
+                continue;
+            }
             String questionId = question.getString("id");
             Map<String, JSONArray> byOption = new LinkedHashMap<>();
             for (Object option : question.getJSONArray("options")) {
@@ -1193,7 +1288,97 @@ public class RoundtableV2Service {
         summary.put("conclusions", conclusions);
         summary.put("disputes", disputes);
         summary.put("insufficient", insufficient);
+        if (outcome != null) summary.put("outcome", outcome);
         return summary;
+    }
+
+    private static List<JSONObject> answeredOnly(JSONArray answers) {
+        List<JSONObject> answered = new ArrayList<>();
+        for (Object item : answers) {
+            JSONObject answer = (JSONObject) item;
+            if (!answer.getBooleanValue("skipped")) answered.add(answer);
+        }
+        return answered;
+    }
+
+    /**
+     * Equal-weight pooled probabilities without extremizing. A member is in the minority when their most likely
+     * interval differs from the pooled one or any interval deviates from the pool by at least 0.25.
+     */
+    private static JSONObject outcomeSummary(JSONObject question, List<JSONObject> answered) {
+        String questionId = question.getString("id");
+        List<JSONObject> distributions = new ArrayList<>();
+        List<JSONObject> owners = new ArrayList<>();
+        for (JSONObject answer : answered) {
+            for (Object item : answer.getJSONArray("answers")) {
+                JSONObject choice = (JSONObject) item;
+                if (questionId.equals(choice.getString("questionId")) && choice.getJSONObject("probabilities") != null) {
+                    distributions.add(choice.getJSONObject("probabilities"));
+                    JSONObject owner = new JSONObject(true);
+                    owner.put("memberId", answer.get("memberId"));
+                    owner.put("memberName", answer.getString("memberName"));
+                    owner.put("reasons", choice.getJSONArray("reasons"));
+                    owner.put("falsifier", choice.getString("falsifier"));
+                    owners.add(owner);
+                }
+            }
+        }
+        JSONArray options = new JSONArray();
+        Map<String, Double> pooled = new LinkedHashMap<>();
+        String aggregateMode = null;
+        for (Object item : question.getJSONArray("options")) {
+            JSONObject option = (JSONObject) item;
+            String id = option.getString("id");
+            double sum = 0;
+            double min = 1;
+            double max = 0;
+            for (JSONObject distribution : distributions) {
+                double value = distribution.getDoubleValue(id);
+                sum += value;
+                min = Math.min(min, value);
+                max = Math.max(max, value);
+            }
+            double mean = distributions.isEmpty() ? 0 : sum / distributions.size();
+            pooled.put(id, mean);
+            if (aggregateMode == null || mean > pooled.get(aggregateMode)) aggregateMode = id;
+            JSONObject line = new JSONObject(true);
+            line.put("id", id);
+            line.put("label", option.getString("label"));
+            line.put("lowerPct", option.get("lowerPct"));
+            line.put("upperPct", option.get("upperPct"));
+            line.put("mean", round4(mean));
+            line.put("min", distributions.isEmpty() ? 0 : round4(min));
+            line.put("max", distributions.isEmpty() ? 0 : round4(max));
+            options.add(line);
+        }
+        JSONArray minority = new JSONArray();
+        for (int i = 0; i < distributions.size(); i++) {
+            JSONObject distribution = distributions.get(i);
+            String mode = null;
+            boolean deviates = false;
+            for (Map.Entry<String, Double> entry : pooled.entrySet()) {
+                double value = distribution.getDoubleValue(entry.getKey());
+                if (mode == null || value > distribution.getDoubleValue(mode)) mode = entry.getKey();
+                if (Math.abs(value - entry.getValue()) >= MINORITY_DEVIATION - 1e-9) deviates = true;
+            }
+            if (!Objects.equals(mode, aggregateMode) || deviates) {
+                JSONObject member = owners.get(i);
+                member.put("mode", mode);
+                minority.add(member);
+            }
+        }
+        JSONObject summary = new JSONObject(true);
+        summary.put("questionId", questionId);
+        summary.put("title", question.getString("title"));
+        summary.put("total", distributions.size());
+        summary.put("aggregateMode", aggregateMode);
+        summary.put("options", options);
+        summary.put("minority", minority);
+        return summary;
+    }
+
+    private static double round4(double value) {
+        return Math.round(value * 10000) / 10000.0;
     }
 
     private static JSONObject questionLine(JSONObject question, int total) {
@@ -1231,6 +1416,16 @@ public class RoundtableV2Service {
             }
             String why = line.getString("crux") == null ? "" : "；" + typeLabel(line.getString("type")) + "：" + line.getString("crux");
             disputeLines.add(line.getString("title") + "（" + String.join("，", sides) + why + "）");
+        }
+        JSONObject outcome = result.getJSONObject("outcome");
+        if (outcome != null && outcome.getString("aggregateMode") != null) {
+            for (Object item : outcome.getJSONArray("options")) {
+                JSONObject option = (JSONObject) item;
+                if (!option.getString("id").equals(outcome.getString("aggregateMode"))) continue;
+                conclusionLines.add(outcome.getString("title") + " → 合议最可能「" + option.getString("label") + "」（"
+                        + Math.round(option.getDoubleValue("mean") * 100) + "%，少数派 "
+                        + outcome.getJSONArray("minority").size() + " 人）");
+            }
         }
         String conclusion = (conclusionLines.isEmpty() ? "未形成多方一致的结论。" : "结论：" + String.join("；", conclusionLines) + "。")
                 + (disputeLines.isEmpty() ? "" : "分歧：" + String.join("；", disputeLines) + "。");
