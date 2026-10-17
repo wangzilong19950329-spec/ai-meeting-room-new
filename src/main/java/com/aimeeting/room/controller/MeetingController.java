@@ -6,6 +6,7 @@ import com.aimeeting.room.dto.MeetingCreateRequest;
 import com.aimeeting.room.dto.MeetingDetailVO;
 import com.aimeeting.room.dto.MeetingReviewedTurnRetryRequest;
 import com.aimeeting.room.dto.MeetingUsageVO;
+import com.aimeeting.room.dto.RoundtableV2ViewVO;
 import com.aimeeting.room.dto.SkillFileVO;
 import com.aimeeting.room.dto.TrackingItemCreateRequest;
 import com.aimeeting.room.dto.TrackingItemUpdateRequest;
@@ -19,6 +20,7 @@ import com.aimeeting.room.entity.AiWorkflowTemplate;
 import com.aimeeting.room.entity.MeetingReviewedTurnSkip;
 import com.aimeeting.room.service.MeetingCallLogService;
 import com.aimeeting.room.service.MeetingRoomService;
+import com.aimeeting.room.service.RoundtableV2Service;
 import com.aimeeting.room.service.MeetingScoreService;
 import com.aimeeting.room.service.SkillFileService;
 import com.aimeeting.room.service.TrackingCenterService;
@@ -59,6 +61,9 @@ public class MeetingController {
 
     @Autowired
     private MeetingCallLogService meetingCallLogService;
+
+    @Autowired
+    private RoundtableV2Service roundtableV2Service;
 
     @Autowired
     private SkillFileService skillFileService;
@@ -120,6 +125,12 @@ public class MeetingController {
     @GetMapping("/meetings/{id}/usage")
     public ApiResponse<MeetingUsageVO> getMeetingUsage(@PathVariable Long id) {
         return ApiResponse.ok(meetingCallLogService.usage(id));
+    }
+
+    /** 圆桌 v2：问题卡、事实底稿、各议员选择与理由、结论清单与分歧清单 */
+    @GetMapping("/meetings/{id}/roundtable-v2")
+    public ApiResponse<RoundtableV2ViewVO> getRoundtableV2(@PathVariable Long id) {
+        return ApiResponse.ok(roundtableV2Service.view(id));
     }
 
     /** 查询用户的会议列表 */

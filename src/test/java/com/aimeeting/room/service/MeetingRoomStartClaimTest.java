@@ -105,6 +105,24 @@ class MeetingRoomStartClaimTest {
         verify(fixture.meetingExecutor).submit(any(Runnable.class));
     }
 
+    @Test
+    void roundtableV2TemplateStartsTheV2RunnerWithTheClaimedEpoch() {
+        Fixture fixture = new Fixture(true, MeetingStatusEnum.CREATED.getCode());
+        RoundtableV2Service v2 = mock(RoundtableV2Service.class);
+        ReflectionTestUtils.setField(fixture.service, "roundtableV2Service", v2);
+        when(fixture.workflow.isRoundtableV2Workflow(1L)).thenReturn(true);
+        when(fixture.workflow.isDefaultRoundtableWorkflow(1L)).thenReturn(false);
+        when(fixture.meetingExecutor.submit(any(Runnable.class))).thenAnswer(invocation -> {
+            ((Runnable) invocation.getArgument(0)).run();
+            return CompletableFuture.completedFuture(null);
+        });
+
+        fixture.service.startMeeting(1L);
+
+        verify(v2).run(1L, 1L);
+        assertEquals(MeetingStatusEnum.IN_PROGRESS.getCode(), fixture.status.get());
+    }
+
     private static final class Fixture {
         private final MeetingRoomService service = new MeetingRoomService();
         private final AiMeetingRoomMapper rooms = mock(AiMeetingRoomMapper.class);

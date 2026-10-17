@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.aimeeting.room.dao.AiMeetingV2RecordMapper">
+    <resultMap id="V2RecordMap" type="com.aimeeting.room.entity.AiMeetingV2Record">
+        <id column="id" property="id"/>
+        <result column="meeting_id" property="meetingId"/>
+        <result column="kind" property="kind"/>
+        <result column="member_id" property="memberId"/>
+        <result column="payload" property="payload"/>
+        <result column="run_epoch" property="runEpoch"/>
+        <result column="gmt_create" property="gmtCreate"/>
+    </resultMap>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO ai_meeting_v2_record (meeting_id, kind, member_id, payload, run_epoch)
+        VALUES (#{meetingId}, #{kind}, #{memberId}, #{payload}, #{runEpoch})
+    </insert>
+
+    <select id="selectOne" resultMap="V2RecordMap">
+        SELECT * FROM ai_meeting_v2_record
+        WHERE meeting_id = #{meetingId} AND kind = #{kind} AND member_id = #{memberId}
+    </select>
+
+    <select id="selectByMeetingId" resultMap="V2RecordMap">
+        SELECT * FROM ai_meeting_v2_record WHERE meeting_id = #{meetingId} ORDER BY id
+    </select>
+
+    <delete id="deleteByMeetingId">
+        DELETE FROM ai_meeting_v2_record WHERE meeting_id = #{meetingId}
+    </delete>
+</mapper>

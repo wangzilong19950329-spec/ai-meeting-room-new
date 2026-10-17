@@ -69,6 +69,7 @@ import java.util.regex.Pattern;
 public class MeetingWorkflowService {
 
     public static final String DEFAULT_TEMPLATE_KEY = "default-roundtable";
+    public static final String ROUNDTABLE_V2_TEMPLATE_KEY = "roundtable-v2";
     public static final String STAGE_DISCUSSION = "discussion";
     public static final String STAGE_CONCLUSION = "conclusion";
     public static final String STAGE_TRACKING = "tracking";
@@ -381,6 +382,35 @@ public class MeetingWorkflowService {
         log.info("Seeded default workflow template {}", DEFAULT_TEMPLATE_KEY);
     }
 
+    public void ensureRoundtableV2TemplateExists() {
+        if (workflowTemplateMapper.selectByKey(ROUNDTABLE_V2_TEMPLATE_KEY) != null) {
+            return;
+        }
+        AiWorkflowTemplate template = new AiWorkflowTemplate();
+        template.setTemplateKey(ROUNDTABLE_V2_TEMPLATE_KEY);
+        template.setName("圆桌 v2（深度论证）");
+        template.setDescription("问题卡 → 事实底稿 → 议员背靠背作答 → 程序汇总出结论清单与分歧清单。需要开启审核搜索。");
+        template.setActorSlotsConfig(null);
+        template.setBuiltIn(1);
+        template.setActive(1);
+        workflowTemplateMapper.insert(template);
+
+        List<AiWorkflowStageTemplate> stages = new ArrayList<>();
+        stages.add(buildStageTemplate(template.getId(), STAGE_DISCUSSION, "圆桌研判", 1,
+                "DEBATE", "ALL_MEMBERS", "MEETING_CONCLUDED", null, null, "OFF", STAGE_CONCLUSION, null, STAGE_DISCUSSION, 1));
+        stages.add(buildStageTemplate(template.getId(), STAGE_CONCLUSION, "结论归档", 2,
+                "CONCLUDE", "SYSTEM", "AUTO_COMPLETE", null, null, "OFF", STAGE_TRACKING, null, STAGE_DISCUSSION, 0));
+        stages.add(buildStageTemplate(template.getId(), STAGE_TRACKING, "后续追踪", 3,
+                "TRACKING", "HUMAN", "TRACKING_OPTIONAL", null, null, "OFF", null, null, STAGE_DISCUSSION, 0));
+        workflowStageTemplateMapper.batchInsert(stages);
+        log.info("Seeded workflow template {}", ROUNDTABLE_V2_TEMPLATE_KEY);
+    }
+
+    private void ensureBuiltInTemplates() {
+        ensureDefaultTemplateExists();
+        ensureRoundtableV2TemplateExists();
+    }
+
     public String normalizeTemplateKey(String templateKey) {
         if (!StringUtils.hasText(templateKey)) {
             return DEFAULT_TEMPLATE_KEY;
@@ -447,12 +477,12 @@ public class MeetingWorkflowService {
     }
 
     public List<AiWorkflowTemplate> listActiveTemplates() {
-        ensureDefaultTemplateExists();
+        ensureBuiltInTemplates();
         return workflowTemplateMapper.selectActiveTemplates();
     }
 
     public List<WorkflowTemplateVO> listTemplateDetails() {
-        ensureDefaultTemplateExists();
+        ensureBuiltInTemplates();
         return workflowTemplateMapper.selectAll().stream()
                 .map(this::toTemplateVO)
                 .collect(Collectors.toList());
@@ -588,6 +618,16 @@ public class MeetingWorkflowService {
         workflowRunMapper.deleteByMeetingId(meetingId);
     }
 
+    public boolean isRoundtableV2Workflow(Long meetingId) {
+        AiWorkflowRun run = workflowRunMapper.selectByMeetingId(meetingId);
+        return run != null && ROUNDTABLE_V2_TEMPLATE_KEY.equals(run.getTemplateKey());
+    }
+
+    /** Both roundtable templates share the discussion → conclusion → tracking stage handling. */
+    private static boolean isRoundtableTemplateKey(String templateKey) {
+        return DEFAULT_TEMPLATE_KEY.equals(templateKey) || ROUNDTABLE_V2_TEMPLATE_KEY.equals(templateKey);
+    }
+
     public boolean isDefaultRoundtableWorkflow(Long meetingId) {
         AiWorkflowRun run = workflowRunMapper.selectByMeetingId(meetingId);
         return run == null || DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey());
@@ -630,7 +670,7 @@ public class MeetingWorkflowService {
             return;
         }
         workflowRunMapper.updateStatus(run.getId(), WorkflowRunStatusEnum.ACTIVE.getCode(), null);
-        if (DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+        if (isRoundtableTemplateKey(run.getTemplateKey())) {
             activateDefaultRoundtableDiscussion(run, WorkflowRunStatusEnum.ACTIVE.getCode(), null);
             return;
         }
@@ -639,7 +679,7 @@ public class MeetingWorkflowService {
 
     public List<AiMeetingMember> resolveMembersForCurrentStage(Long meetingId, List<AiMeetingMember> members) {
         AiWorkflowRun run = workflowRunMapper.selectByMeetingId(meetingId);
-        if (run == null || DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+        if (run == null || isRoundtableTemplateKey(run.getTemplateKey())) {
             return members;
         }
         AiWorkflowStageRun currentStage = workflowStageRunMapper.selectLatestByMeetingAndStageKey(meetingId, run.getCurrentStageKey());
@@ -699,7 +739,7 @@ public class MeetingWorkflowService {
         if (run == null) {
             return;
         }
-        if (DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+        if (isRoundtableTemplateKey(run.getTemplateKey())) {
             workflowRunMapper.incrementReopenCount(run.getId());
             activateDefaultRoundtableDiscussion(run, WorkflowRunStatusEnum.REOPENED.getCode(), null);
             return;
@@ -713,7 +753,7 @@ public class MeetingWorkflowService {
 
     public void submitCurrentStage(Long meetingId, WorkflowStageSubmitRequest request) {
         AiWorkflowRun run = requireWorkflowRun(meetingId);
-        if (DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+        if (isRoundtableTemplateKey(run.getTemplateKey())) {
             throw new IllegalStateException("默认圆桌会议不使用手工阶段提交接口");
         }
         AiWorkflowStageRun currentStage = requireCurrentStageRun(meetingId, run.getCurrentStageKey());
@@ -1677,7 +1717,7 @@ public class MeetingWorkflowService {
 
     public void markReviewedEvidenceBlocked(Long meetingId, String reason) {
         AiWorkflowRun run = workflowRunMapper.selectByMeetingId(meetingId);
-        if (run != null && DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+        if (run != null && isRoundtableTemplateKey(run.getTemplateKey())) {
             workflowRunMapper.updateStatus(run.getId(), WorkflowRunStatusEnum.ACTIVE.getCode(), reason);
         }
     }
@@ -1687,7 +1727,7 @@ public class MeetingWorkflowService {
         if (run == null) {
             return;
         }
-        if (DEFAULT_TEMPLATE_KEY.equals(run.getTemplateKey())) {
+        if (isRoundtableTemplateKey(run.getTemplateKey())) {
             activateDefaultRoundtableDiscussion(run, WorkflowRunStatusEnum.REOPENED.getCode(), blockedReason);
             return;
         }
@@ -1707,7 +1747,7 @@ public class MeetingWorkflowService {
     }
 
     private AiWorkflowTemplate resolveTemplate(String requestedTemplateKey) {
-        ensureDefaultTemplateExists();
+        ensureBuiltInTemplates();
         String key = normalizeTemplateKey(requestedTemplateKey);
         AiWorkflowTemplate template = workflowTemplateMapper.selectByKey(key);
         if (template != null) {
@@ -2069,7 +2109,7 @@ public class MeetingWorkflowService {
     }
 
     private AiWorkflowTemplate resolveTemplateByRequestedKey(String requestedTemplateKey) {
-        ensureDefaultTemplateExists();
+        ensureBuiltInTemplates();
         if (StringUtils.hasText(requestedTemplateKey)) {
             AiWorkflowTemplate requested = workflowTemplateMapper.selectByKey(requestedTemplateKey.trim().toLowerCase());
             if (requested == null) {

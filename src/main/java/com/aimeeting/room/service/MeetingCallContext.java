@@ -7,6 +7,9 @@ package com.aimeeting.room.service;
  */
 public final class MeetingCallContext {
 
+    public static final String ISSUE_CARD = "issue_card";
+    public static final String DIVERGENCE = "divergence";
+    public static final String DIVERGENCE_REWRITE = "divergence_rewrite";
     public static final String EVIDENCE_PLAN = "evidence_plan";
     public static final String EVIDENCE_SEARCH = "evidence_search";
     public static final String SPEECH = "speech";

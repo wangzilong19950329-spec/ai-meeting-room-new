@@ -70,6 +70,7 @@ public class MeetingRoomService {
     @Autowired private NotificationService notificationService;
     @Autowired private AiModelProperties aiModelProperties;
     @Autowired(required = false) private MeetingCallLogService meetingCallLogService;
+    @Autowired(required = false) private RoundtableV2Service roundtableV2Service;
 
     @Autowired
     @Qualifier("meetingExecutor")
@@ -163,6 +164,10 @@ public class MeetingRoomService {
             throw new IllegalStateException("会议状态不允许启动: status=" + room.getStatus());
 
         boolean reviewed = reviewedEvidenceService != null && reviewedEvidenceService.isEnabled();
+        boolean roundtableV2 = workflowService.isRoundtableV2Workflow(meetingId);
+        if (roundtableV2 && !reviewed) {
+            throw new IllegalStateException("圆桌 v2 需要先开启审核搜索（AI_MEETING_REVIEWED_SEARCH_ENABLED=true）");
+        }
         if (reviewed) reviewedSearchLedgerSchemaInitializer.requireReady();
 
         if (MeetingStatusEnum.PAUSED.getCode().equals(room.getStatus())
@@ -200,7 +205,11 @@ public class MeetingRoomService {
             if (reviewed) {
                 workflowService.ensureWorkflowForMeeting(room, null);
             }
-            if (workflowService.isDefaultRoundtableWorkflow(meetingId)) {
+            if (roundtableV2) {
+                workflowService.activateMeetingWorkflow(meetingId);
+                Long capturedEpoch = runEpoch;
+                meetingExecutor.submit(() -> roundtableV2Service.run(meetingId, capturedEpoch));
+            } else if (workflowService.isDefaultRoundtableWorkflow(meetingId)) {
                 workflowService.activateMeetingWorkflow(meetingId);
                 Long capturedEpoch = runEpoch;
                 meetingExecutor.submit(() -> runMeetingFlow(meetingId, capturedEpoch));
@@ -412,6 +421,7 @@ public class MeetingRoomService {
         // 会议自身的子数据
         scoreLogMapper.deleteByMeetingId(meetingId);
         if (meetingCallLogService != null) meetingCallLogService.deleteByMeetingId(meetingId);
+        if (roundtableV2Service != null) roundtableV2Service.deleteByMeetingId(meetingId);
         clusterMapper.deleteByMeetingId(meetingId);
         voteMapper.deleteByMeetingId(meetingId);
         opinionMapper.deleteByMeetingId(meetingId);

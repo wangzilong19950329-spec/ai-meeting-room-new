@@ -304,6 +304,19 @@ CREATE TABLE IF NOT EXISTS `ai_meeting_call_log` (
     KEY `idx_call_log_meeting` (`meeting_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会议模型与审核搜索调用记账';
 
+-- 圆桌 v2 阶段产物检查点
+CREATE TABLE IF NOT EXISTS `ai_meeting_v2_record` (
+    `id` BIGINT NOT NULL AUTO_INCREMENT,
+    `meeting_id` BIGINT NOT NULL,
+    `kind` VARCHAR(24) NOT NULL,
+    `member_id` BIGINT NOT NULL DEFAULT 0,
+    `payload` MEDIUMTEXT NOT NULL,
+    `run_epoch` BIGINT NULL,
+    `gmt_create` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uk_v2_record` (`meeting_id`, `kind`, `member_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='圆桌 v2 阶段产物检查点';
+
 -- 投票记录
 CREATE TABLE `ai_meeting_vote` (
     `id`            BIGINT        NOT NULL AUTO_INCREMENT COMMENT '主键',

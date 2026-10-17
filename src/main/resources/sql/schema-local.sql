@@ -871,3 +871,14 @@ CREATE TABLE IF NOT EXISTS ai_meeting_call_log (
     gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_call_log_meeting ON ai_meeting_call_log(meeting_id);
+
+CREATE TABLE IF NOT EXISTS ai_meeting_v2_record (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    meeting_id BIGINT NOT NULL,
+    kind VARCHAR(24) NOT NULL,
+    member_id BIGINT DEFAULT 0 NOT NULL,
+    payload CLOB NOT NULL,
+    run_epoch BIGINT,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    CONSTRAINT uk_v2_record UNIQUE (meeting_id, kind, member_id)
+);
