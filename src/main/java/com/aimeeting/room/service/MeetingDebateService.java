@@ -286,6 +286,19 @@ public class MeetingDebateService {
                                                                Map<String, MeetingReviewedEvidenceService.ReviewedEvidence> reviewedCache,
                                                                Long expectedRunEpoch,
                                                                ReviewedAttemptTrace attemptTrace) {
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, roundNumber, member.getId(), MeetingCallContext.EVIDENCE_PLAN)) {
+            return prepareReviewedRoundEvidenceInScope(meetingId, member, roundNumber, eastmoneyCache,
+                    reviewedCache, expectedRunEpoch, attemptTrace);
+        }
+    }
+
+    private ReviewedRoundEvidence prepareReviewedRoundEvidenceInScope(Long meetingId, AiMeetingMember member,
+                                                                      int roundNumber,
+                                                                      Map<String, EastmoneyMarketDataService.MarketDataBundle> eastmoneyCache,
+                                                                      Map<String, MeetingReviewedEvidenceService.ReviewedEvidence> reviewedCache,
+                                                                      Long expectedRunEpoch,
+                                                                      ReviewedAttemptTrace attemptTrace) {
         Integer meetingStatusAtStart = requireReviewedMeetingStatus(meetingId);
         if (!reviewedRunMatches(meetingId, expectedRunEpoch)) {
             throw new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_RUN_STALE");
@@ -461,7 +474,11 @@ public class MeetingDebateService {
                                                                                 ReviewedAttemptTrace attemptTrace) {
         assertReviewedContext(meetingId, expectedStatus, expectedRunEpoch,
                 roundNumber, asOf, contextOpinionId);
-        if (reviewedSearchLedgerService == null) return reviewedEvidenceService.search(exactQuestion);
+        if (reviewedSearchLedgerService == null) {
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.EVIDENCE_SEARCH)) {
+                return reviewedEvidenceService.search(exactQuestion);
+            }
+        }
         MeetingReviewedSearchGap gap = reviewedSearchLedgerService.findOrCreateGap(meetingId, roundNumber,
                 asOf, exactQuestion);
         attemptTrace.failedGapId = gap.getId();
@@ -501,7 +518,7 @@ public class MeetingDebateService {
             throw notSubmitted;
         }
         MeetingReviewedEvidenceService.ReviewedEvidence reviewed;
-        try {
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.EVIDENCE_SEARCH)) {
             reviewed = reviewedEvidenceService.search(gap.getRequestId(), exactQuestion, asOf,
                     timeoutMs);
         } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
@@ -600,6 +617,14 @@ public class MeetingDebateService {
 
     private AiMeetingOpinion generateReviewedOpinion(Long meetingId, AiMeetingMember member,
                                                      int roundNumber, ReviewedRoundEvidence evidence) {
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, roundNumber, member.getId(), MeetingCallContext.SPEECH)) {
+            return generateReviewedOpinionInScope(meetingId, member, roundNumber, evidence);
+        }
+    }
+
+    private AiMeetingOpinion generateReviewedOpinionInScope(Long meetingId, AiMeetingMember member,
+                                                            int roundNumber, ReviewedRoundEvidence evidence) {
         if (supportsBuiltInSearch(member.getModelType())) {
             throw new MeetingReviewedEvidenceService.EvidenceRejected("MODEL_SEARCH_CANNOT_BE_DISABLED");
         }
@@ -647,8 +672,10 @@ public class MeetingDebateService {
             assertReviewedContext(meetingId, evidence.meetingStatusAtStart, evidence.expectedRunEpoch,
                     evidence.roundNumber, evidence.asOf, evidence.contextOpinionId);
             numberRewrites = 1;
-            result = callReviewedSpeaker(member, systemPrompt,
-                    context + "\n\n" + ReviewedNumberGate.rewriteInstruction(numbers));
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.SPEECH_REWRITE)) {
+                result = callReviewedSpeaker(member, systemPrompt,
+                        context + "\n\n" + ReviewedNumberGate.rewriteInstruction(numbers));
+            }
             parsed = parseReviewedSpeech(result, evidence);
             numbers = ReviewedNumberGate.audit(parsed[1], numberCorpora[0], numberCorpora[1], stockSymbol);
             if (numbers.hasUnsupported()) {
@@ -2092,6 +2119,13 @@ public class MeetingDebateService {
     }
 
     private AiMeetingOpinion generateOpinionWithRetry(Long meetingId, AiMeetingMember member, int roundNumber) {
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, roundNumber, member.getId(), MeetingCallContext.SPEECH)) {
+            return generateOpinionWithRetryInScope(meetingId, member, roundNumber);
+        }
+    }
+
+    private AiMeetingOpinion generateOpinionWithRetryInScope(Long meetingId, AiMeetingMember member, int roundNumber) {
         AiMeetingOpinion opinion = generateOpinion(meetingId, member, roundNumber);
         if (opinion != null && opinion.getContent() != null && !opinion.getContent().isBlank()) {
             return opinion;

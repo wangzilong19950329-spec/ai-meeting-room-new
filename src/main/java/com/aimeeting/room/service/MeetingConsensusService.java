@@ -86,7 +86,8 @@ public class MeetingConsensusService {
             String primaryModelType = reviewed ? member.getModelType()
                     : orchestrator.resolveNonSearchModelType(member.getModelType());
             String response;
-            try {
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                    meetingId, roundNumber, member.getId(), MeetingCallContext.VOTE)) {
                 response = reviewed
                         ? orchestrator.callModelStrict(primaryModelType, systemPrompt, prompt, null)
                         : orchestrator.callModel(primaryModelType, systemPrompt, prompt);
@@ -101,7 +102,10 @@ public class MeetingConsensusService {
                 if (fallbackModelType != null && !fallbackModelType.isBlank() && !fallbackModelType.equals(primaryModelType)) {
                     log.warn("Vote generation fallback for member {} from {} to {}",
                             member.getMemberName(), primaryModelType, fallbackModelType);
-                    response = orchestrator.callModel(fallbackModelType, systemPrompt, prompt);
+                    try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                            meetingId, roundNumber, member.getId(), MeetingCallContext.VOTE)) {
+                        response = orchestrator.callModel(fallbackModelType, systemPrompt, prompt);
+                    }
                 }
             }
             if (response == null || response.isBlank()) {
@@ -295,11 +299,15 @@ public class MeetingConsensusService {
                 : orchestrator.resolveOperationalMeetingModelType(meetingId);
 
         String prompt = orchestrator.buildClusterPrompt(meetingId, roundNumber);
-        String response = reviewed
-                ? orchestrator.callModelStrict(meetingModelType,
-                    "你是文本聚类专家，请对以下投票立场进行语义聚类，相似观点归为同一组。", prompt, 800)
-                : orchestrator.callModel(meetingModelType,
-                    "你是文本聚类专家，请对以下投票立场进行语义聚类，相似观点归为同一组。", prompt, 800);
+        String response;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, roundNumber, null, MeetingCallContext.CLUSTER)) {
+            response = reviewed
+                    ? orchestrator.callModelStrict(meetingModelType,
+                        "你是文本聚类专家，请对以下投票立场进行语义聚类，相似观点归为同一组。", prompt, 800)
+                    : orchestrator.callModel(meetingModelType,
+                        "你是文本聚类专家，请对以下投票立场进行语义聚类，相似观点归为同一组。", prompt, 800);
+        }
         if (response == null || response.isBlank()) {
             if (reviewed) throw new IllegalStateException("meeting_cluster_output_unavailable");
             return;

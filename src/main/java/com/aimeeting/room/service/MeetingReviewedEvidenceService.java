@@ -9,6 +9,7 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -29,6 +30,9 @@ public class MeetingReviewedEvidenceService {
     private final String endpoint;
     private final String token;
     private final OkHttpClient client;
+
+    @Autowired(required = false)
+    private MeetingCallLogService callLog;
 
     public MeetingReviewedEvidenceService(
             @Value("${AI_MEETING_REVIEWED_SEARCH_ENABLED:false}") boolean enabled,
@@ -57,6 +61,33 @@ public class MeetingReviewedEvidenceService {
     }
 
     public ReviewedEvidence search(String requestId, String question, String asOf, long timeoutMs) {
+        long started = System.nanoTime();
+        String status = "ERROR";
+        try {
+            ReviewedEvidence reviewed = searchOnce(requestId, question, asOf, timeoutMs);
+            status = reviewed.packet == null ? "UNKNOWN" : reviewed.packet.getString("status");
+            return reviewed;
+        } catch (EvidenceRejected rejected) {
+            status = rejected.getMessage();
+            throw rejected;
+        } finally {
+            recordSearch(started, status);
+        }
+    }
+
+    /** GEN-10 runs on the web account pool, so only time and outcome are recorded, never tokens. */
+    private void recordSearch(long startedNanos, String status) {
+        if (callLog == null) return;
+        try {
+            callLog.record(MeetingCallLogService.CHANNEL_GEN10, "gen10",
+                    (System.nanoTime() - startedNanos) / 1_000_000L, status,
+                    null, null, null, null, null);
+        } catch (RuntimeException accountingFailure) {
+            // Usage accounting must never change a reviewed search outcome.
+        }
+    }
+
+    private ReviewedEvidence searchOnce(String requestId, String question, String asOf, long timeoutMs) {
         if (!enabled) throw new EvidenceRejected("REVIEWED_SEARCH_DISABLED");
         if (token == null || token.isBlank()) throw new EvidenceRejected("REVIEWED_SEARCH_TOKEN_MISSING");
         if (requestId == null || !requestId.matches("meeting-[A-Za-z0-9-]{1,80}")) {

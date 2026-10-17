@@ -396,6 +396,44 @@ class MeetingDebateReviewedLedgerIntegrationTest {
         assertEquals(0, numbers.getIntValue("checkedCount"));
     }
 
+    @Test
+    void reviewedTurnCallsCarryMeetingRoundMemberAndStage() {
+        Fixture fixture = new Fixture();
+        List<MeetingCallContext.Frame> frames = new ArrayList<>();
+        when(fixture.orchestrator.callModelStrict(eq("deepseek-chat"), anyString(), anyString(), eq(500)))
+                .thenAnswer(invocation -> {
+                    frames.add(MeetingCallContext.current());
+                    return "{\"need\":true,\"needs\":[{\"id\":\"public-fact\","
+                            + "\"question\":\"截至2026年10月中国2025年GDP总量是多少？\","
+                            + "\"eastmoneyFields\":[],\"webSearch\":true,\"sourceFocus\":[]}]}";
+                });
+        when(fixture.reviewed.search(anyString(), anyString(), anyString(), anyLong()))
+                .thenAnswer(invocation -> {
+                    frames.add(MeetingCallContext.current());
+                    return acceptedPacket(invocation.getArgument(0), invocation.getArgument(1),
+                            invocation.getArgument(2), "该指数市盈率为25");
+                });
+        List<ChatResult> replies = new ArrayList<>(List.of(speech("该指数PE 30。"), speech("该指数PE 25。")));
+        when(fixture.orchestrator.callModelExStrict(eq("deepseek-chat"), anyString(), anyString()))
+                .thenAnswer(invocation -> {
+                    frames.add(MeetingCallContext.current());
+                    return replies.remove(0);
+                });
+
+        assertEquals(1, fixture.newDebateService().executeDebateRound(meetingId, 1).size());
+
+        assertEquals(List.of(MeetingCallContext.EVIDENCE_PLAN, MeetingCallContext.EVIDENCE_SEARCH,
+                        MeetingCallContext.SPEECH, MeetingCallContext.SPEECH_REWRITE),
+                frames.stream().map(frame -> frame == null ? null : frame.stage)
+                        .collect(java.util.stream.Collectors.toList()));
+        for (MeetingCallContext.Frame frame : frames) {
+            assertEquals(meetingId, frame.meetingId);
+            assertEquals(1, frame.round);
+            assertEquals(13L, frame.memberId);
+        }
+        assertEquals(null, MeetingCallContext.current());
+    }
+
     private static ChatResult speech(String reply) {
         return new ChatResult("{\"q\":[],\"e\":[]}\n==REPLY==\n" + reply);
     }

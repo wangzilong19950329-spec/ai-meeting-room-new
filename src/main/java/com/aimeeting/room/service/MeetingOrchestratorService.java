@@ -47,6 +47,9 @@ public class MeetingOrchestratorService {
     @Autowired
     private ModelRegistryStore modelRegistryStore;
 
+    @Autowired(required = false)
+    private MeetingCallLogService callLog;
+
     public String resolveMeetingModelType(Long meetingId) {
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
         for (AiMeetingMember member : members) {
@@ -148,8 +151,10 @@ public class MeetingOrchestratorService {
             MeetingDeepSeekWebBridgeService.RouteDecision decision =
                     meetingDeepSeekWebBridgeService.routeDecision(modelType);
             if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.BRIDGE) {
-                return meetingDeepSeekWebBridgeService.chatWithoutSearch(
-                        modelType, systemPrompt, userPrompt, maxTokens);
+                long started = System.nanoTime();
+                return recordBridgeCall(modelType, systemPrompt, userPrompt, started,
+                        meetingDeepSeekWebBridgeService.chatWithoutSearch(
+                                modelType, systemPrompt, userPrompt, maxTokens));
             }
             if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.FAIL_CLOSED) {
                 return meetingDeepSeekWebBridgeService.failClosedResult(modelType);
@@ -179,12 +184,34 @@ public class MeetingOrchestratorService {
         MeetingDeepSeekWebBridgeService.RouteDecision decision =
                 meetingDeepSeekWebBridgeService.routeDecision(modelType);
         if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.BRIDGE) {
-            return meetingDeepSeekWebBridgeService.chat(modelType, systemPrompt, userPrompt, maxTokens);
+            long started = System.nanoTime();
+            return recordBridgeCall(modelType, systemPrompt, userPrompt, started,
+                    meetingDeepSeekWebBridgeService.chat(modelType, systemPrompt, userPrompt, maxTokens));
         }
         if (decision == MeetingDeepSeekWebBridgeService.RouteDecision.FAIL_CLOSED) {
             return meetingDeepSeekWebBridgeService.failClosedResult(modelType);
         }
         return null;
+    }
+
+    /** The web bridge reports no token usage, so only characters and time are recorded. */
+    private ChatResult recordBridgeCall(String modelType, String systemPrompt, String userPrompt,
+                                        long startedNanos, ChatResult result) {
+        if (callLog == null) return result;
+        try {
+            String status = result == null ? "no_result"
+                    : result.modelStatus != null ? result.modelStatus
+                    : result.content != null && !result.content.isBlank() ? "success" : "blank_content";
+            int promptChars = (systemPrompt == null ? 0 : systemPrompt.length())
+                    + (userPrompt == null ? 0 : userPrompt.length());
+            Integer completionChars = result == null || result.content == null ? null : result.content.length();
+            callLog.record(MeetingCallLogService.CHANNEL_WEB_BRIDGE, modelType,
+                    (System.nanoTime() - startedNanos) / 1_000_000L, status,
+                    null, null, null, promptChars, completionChars);
+        } catch (RuntimeException accountingFailure) {
+            log.warn("Web bridge usage could not be recorded: {}", accountingFailure.getMessage());
+        }
+        return result;
     }
 
     private String bridgeContent(ChatResult bridgeResult) {

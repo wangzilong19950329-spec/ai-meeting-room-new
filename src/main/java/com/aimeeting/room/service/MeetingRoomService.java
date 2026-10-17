@@ -69,6 +69,7 @@ public class MeetingRoomService {
     @Autowired private MeetingWorkflowService workflowService;
     @Autowired private NotificationService notificationService;
     @Autowired private AiModelProperties aiModelProperties;
+    @Autowired(required = false) private MeetingCallLogService meetingCallLogService;
 
     @Autowired
     @Qualifier("meetingExecutor")
@@ -206,7 +207,8 @@ public class MeetingRoomService {
             } else {
                 Long capturedEpoch = runEpoch;
                 meetingExecutor.submit(() -> {
-                    try {
+                    try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                            meetingId, null, null, MeetingCallContext.OTHER)) {
                         workflowService.activateMeetingWorkflow(meetingId);
                     } catch (Exception e) {
                         log.error("Workflow activation error, meetingId={}", meetingId, e);
@@ -409,6 +411,7 @@ public class MeetingRoomService {
         workflowService.purgeWorkflowAndTrackingData(meetingId);
         // 会议自身的子数据
         scoreLogMapper.deleteByMeetingId(meetingId);
+        if (meetingCallLogService != null) meetingCallLogService.deleteByMeetingId(meetingId);
         clusterMapper.deleteByMeetingId(meetingId);
         voteMapper.deleteByMeetingId(meetingId);
         opinionMapper.deleteByMeetingId(meetingId);
@@ -530,20 +533,33 @@ public class MeetingRoomService {
     }
 
     public void submitWorkflowStage(Long meetingId, WorkflowStageSubmitRequest request) {
-        workflowService.submitCurrentStage(meetingId, request);
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, null, null, MeetingCallContext.OTHER)) {
+            workflowService.submitCurrentStage(meetingId, request);
+        }
     }
 
     public void reviewWorkflowStage(Long meetingId, WorkflowStageReviewRequest request) {
-        workflowService.reviewCurrentStage(meetingId, request);
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, null, null, MeetingCallContext.OTHER)) {
+            workflowService.reviewCurrentStage(meetingId, request);
+        }
     }
 
     public void retryWorkflowAutoStage(Long meetingId) {
-        workflowService.retryCurrentAutoStage(meetingId);
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, null, null, MeetingCallContext.OTHER)) {
+            workflowService.retryCurrentAutoStage(meetingId);
+        }
     }
 
     // ---- 内部流程 ----
 
     private void runMeetingFlow(Long meetingId, Long expectedEpoch) {
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, null, null, MeetingCallContext.OTHER)) {
+            runMeetingFlowInScope(meetingId, expectedEpoch);
+        }
+    }
+
+    private void runMeetingFlowInScope(Long meetingId, Long expectedEpoch) {
         try {
             AiMeetingRoom room = roomMapper.selectById(meetingId);
             if (room == null) {
@@ -686,13 +702,13 @@ public class MeetingRoomService {
             if (reviewed && hasRoundSummary(roomMapper.selectById(meetingId), round)) return;
             String meetingModelType = reviewed ? orchestrator.resolveMeetingModelType(meetingId)
                     : orchestrator.resolveOperationalMeetingModelType(meetingId);
-            String summaryText = reviewed
+            String summaryText = inCallStage(meetingId, round, MeetingCallContext.ROUND_SUMMARY, () -> reviewed
                     ? orchestrator.callModelStrict(meetingModelType,
                         "你是会议记录员，请用一到两句话（100字以内）概括本轮讨论的核心分歧和主要共识，输出纯文本。",
                         orchestrator.buildRoundSummaryPrompt(meetingId, round), 220)
                     : orchestrator.callModel(meetingModelType,
                         "你是会议记录员，请用一到两句话（100字以内）概括本轮讨论的核心分歧和主要共识，输出纯文本。",
-                        orchestrator.buildRoundSummaryPrompt(meetingId, round), 220);
+                        orchestrator.buildRoundSummaryPrompt(meetingId, round), 220));
             if (summaryText == null || summaryText.isBlank()) return;
             if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
 
@@ -776,13 +792,18 @@ public class MeetingRoomService {
         String reviewedSummaryPrompt = reviewed
                 ? orchestrator.buildSummaryPrompt(meetingId, result.getConclusion()) + reviewedAttendance
                 : null;
+        Integer finalRound = existing.getCurrentRound();
         String summary = reviewed
                 ? gateFinalText(finalEvidence,
-                    orchestrator.callModelStrict(meetingModelType, summarySystem, reviewedSummaryPrompt, null),
-                    rewrite -> orchestrator.callModelStrict(meetingModelType, summarySystem,
-                            reviewedSummaryPrompt + "\n\n" + rewrite, null))
-                : orchestrator.callModel(meetingModelType, summarySystem,
-                    orchestrator.buildSummaryPrompt(meetingId));
+                    inCallStage(meetingId, finalRound, MeetingCallContext.SUMMARY,
+                            () -> orchestrator.callModelStrict(meetingModelType, summarySystem,
+                                    reviewedSummaryPrompt, null)),
+                    rewrite -> inCallStage(meetingId, finalRound, MeetingCallContext.SUMMARY_REWRITE,
+                            () -> orchestrator.callModelStrict(meetingModelType, summarySystem,
+                                    reviewedSummaryPrompt + "\n\n" + rewrite, null)))
+                : inCallStage(meetingId, finalRound, MeetingCallContext.SUMMARY,
+                    () -> orchestrator.callModel(meetingModelType, summarySystem,
+                            orchestrator.buildSummaryPrompt(meetingId)));
         if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
         if (summary != null) {
             if (reviewed) {
@@ -797,17 +818,19 @@ public class MeetingRoomService {
                 ? orchestrator.buildDecisionArtifactPrompt(meetingId, finalConclusion)
                         + reviewedAttendance + "\n只输出 JSON，不要 Markdown，不要代码块。"
                 : null;
-        String decisionArtifact = reviewed
-                ? orchestrator.callModelStrict(meetingModelType, artifactSystem, reviewedArtifactPrompt, null)
-                : orchestrator.callModel(meetingModelType, artifactSystem,
-                    orchestrator.buildDecisionArtifactPrompt(meetingId));
+        String decisionArtifact = inCallStage(meetingId, finalRound, MeetingCallContext.DECISION_CARD,
+                () -> reviewed
+                        ? orchestrator.callModelStrict(meetingModelType, artifactSystem, reviewedArtifactPrompt, null)
+                        : orchestrator.callModel(meetingModelType, artifactSystem,
+                            orchestrator.buildDecisionArtifactPrompt(meetingId)));
         if (reviewed && !isMeetingInProgress(meetingId, expectedEpoch)) return;
         String artifactJson = reviewed
                 ? gateDecisionArtifact(finalEvidence,
                     buildDecisionArtifactJsonStrict(meetingId, finalConclusion, summary, decisionArtifact),
                     rewrite -> buildDecisionArtifactJsonStrict(meetingId, finalConclusion, summary,
-                            orchestrator.callModelStrict(meetingModelType, artifactSystem,
-                                    reviewedArtifactPrompt + "\n\n" + rewrite, null)))
+                            inCallStage(meetingId, finalRound, MeetingCallContext.DECISION_CARD_REWRITE,
+                                    () -> orchestrator.callModelStrict(meetingModelType, artifactSystem,
+                                            reviewedArtifactPrompt + "\n\n" + rewrite, null))))
                 : buildDecisionArtifactJson(meetingId, result.getConclusion(), summary, decisionArtifact);
 
         AiMeetingRoom conclusionContext = roomMapper.selectById(meetingId);
@@ -847,6 +870,12 @@ public class MeetingRoomService {
         AiMeetingRoom concluded = roomMapper.selectById(meetingId);
         notificationService.sendMeetingConclusion(
                 concluded.getTitle(), result.getConclusion());
+    }
+
+    private <T> T inCallStage(Long meetingId, Integer round, String stage, java.util.function.Supplier<T> call) {
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, round, null, stage)) {
+            return call.get();
+        }
     }
 
     /** Asks the model once to drop unsupported numbers, then masks whatever is still unsupported. */

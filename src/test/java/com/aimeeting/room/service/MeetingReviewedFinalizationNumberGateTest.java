@@ -113,6 +113,50 @@ class MeetingReviewedFinalizationNumberGateTest {
         assertEquals("跟踪营收是否达到[未核验]", card.getValue().getNextActions().get(0));
     }
 
+    @Test
+    void finalizationCallsAreTaggedByStage() {
+        Fixture fixture = new Fixture();
+        List<String> stages = new java.util.ArrayList<>();
+        List<String> summaries = new java.util.ArrayList<>(List.of("营收120亿元。", "营收100亿元。"));
+        when(fixture.orchestrator.callModelStrict(eq("deepseek-chat"), anyString(), startsWith("总结提示"),
+                nullable(Integer.class))).thenAnswer(invocation -> {
+                    stages.add(stageNow(MEETING));
+                    return summaries.remove(0);
+                });
+        when(fixture.orchestrator.callModelStrict(eq("deepseek-chat"), anyString(), startsWith("卡片提示"),
+                nullable(Integer.class))).thenAnswer(invocation -> {
+                    stages.add(stageNow(MEETING));
+                    return CARD_OK;
+                });
+
+        fixture.finalize("看多，资料充分");
+
+        assertEquals(List.of(MeetingCallContext.SUMMARY, MeetingCallContext.SUMMARY_REWRITE,
+                MeetingCallContext.DECISION_CARD), stages);
+    }
+
+    @Test
+    void roundSummaryIsTaggedWithItsStage() {
+        Fixture fixture = new Fixture();
+        when(fixture.orchestrator.buildRoundSummaryPrompt(MEETING, 1)).thenReturn("轮摘要提示");
+        List<String> stages = new java.util.ArrayList<>();
+        when(fixture.orchestrator.callModelStrict(eq("deepseek-chat"), anyString(), eq("轮摘要提示"), eq(220)))
+                .thenAnswer(invocation -> {
+                    stages.add(stageNow(MEETING));
+                    return "本轮摘要";
+                });
+
+        ReflectionTestUtils.invokeMethod(fixture.service, "generateAndSaveRoundSummary", MEETING, 1, EPOCH);
+
+        assertEquals(List.of(MeetingCallContext.ROUND_SUMMARY), stages);
+    }
+
+    private static String stageNow(long meetingId) {
+        MeetingCallContext.Frame frame = MeetingCallContext.current();
+        if (frame == null || frame.meetingId == null || frame.meetingId != meetingId) return null;
+        return frame.stage;
+    }
+
     private static final class Fixture {
         private final AiMeetingRoom room = new AiMeetingRoom();
         private final AiMeetingRoomMapper rooms = mock(AiMeetingRoomMapper.class);

@@ -159,6 +159,63 @@ class MeetingConsensusReviewedModeTest {
                 () -> service.clusterVotePositions(7L, 1, 2L));
     }
 
+    @Test
+    void votesAndClusteringAreTaggedWithMeetingRoundMemberAndStage() {
+        MeetingConsensusService service = new MeetingConsensusService();
+        AiMeetingVoteMapper votes = mock(AiMeetingVoteMapper.class);
+        AiMeetingOpinionMapper opinions = mock(AiMeetingOpinionMapper.class);
+        AiMeetingMemberMapper members = mock(AiMeetingMemberMapper.class);
+        MeetingOrchestratorService orchestrator = mock(MeetingOrchestratorService.class);
+        MeetingReviewedEvidenceService reviewed = mock(MeetingReviewedEvidenceService.class);
+        ReflectionTestUtils.setField(service, "voteMapper", votes);
+        ReflectionTestUtils.setField(service, "opinionMapper", opinions);
+        ReflectionTestUtils.setField(service, "memberMapper", members);
+        ReflectionTestUtils.setField(service, "orchestrator", orchestrator);
+        ReflectionTestUtils.setField(service, "reviewedEvidenceService", reviewed);
+        ReflectionTestUtils.setField(service, "reviewedConsensusWriter", mock(MeetingReviewedConsensusWriter.class));
+        ReflectionTestUtils.setField(service, "clusterMapper",
+                mock(com.aimeeting.room.dao.AiMeetingConclusionClusterMapper.class));
+        ReflectionTestUtils.setField(service, "aiModelProperties", new com.aimeeting.room.config.AiModelProperties());
+        when(reviewed.isEnabled()).thenReturn(true);
+        AiMeetingMember member = new AiMeetingMember();
+        member.setId(3L);
+        member.setMemberName("技术分析师");
+        member.setModelType("selected-model");
+        when(members.selectByMeetingId(7L)).thenReturn(List.of(member));
+        when(opinions.selectByMeetingIdAndRound(7L, 1)).thenReturn(List.of(reviewedStatement(3L)));
+        when(votes.selectByMeetingIdAndRound(7L, 1)).thenReturn(Collections.emptyList(), List.of(vote(3L)));
+        when(orchestrator.buildVotePrompt(7L, 3L)).thenReturn("vote prompt");
+        when(orchestrator.resolveMeetingModelType(7L)).thenReturn("selected-model");
+        when(orchestrator.buildClusterPrompt(7L, 1)).thenReturn("cluster prompt");
+        java.util.List<MeetingCallContext.Frame> frames = new java.util.ArrayList<>();
+        when(orchestrator.callModelStrict(eq("selected-model"), anyString(), eq("vote prompt"), eq(null)))
+                .thenAnswer(invocation -> {
+                    frames.add(MeetingCallContext.current());
+                    return "{\"position\":\"支持\",\"confidence\":0.8,\"reasoning\":\"依据\"}";
+                });
+        when(orchestrator.callModelStrict(eq("selected-model"), anyString(), eq("cluster prompt"), eq(800)))
+                .thenAnswer(invocation -> {
+                    frames.add(MeetingCallContext.current());
+                    return "[{\"clusterLabel\":\"支持\",\"memberIds\":[3]}]";
+                });
+
+        service.conductVoting(7L, 1, 2L);
+        try {
+            service.clusterVotePositions(7L, 1, 2L);
+        } catch (RuntimeException afterTheModelCall) {
+            // Only the attribution of the model call matters here.
+        }
+
+        assertEquals(2, frames.size());
+        assertEquals(MeetingCallContext.VOTE, frames.get(0) == null ? null : frames.get(0).stage);
+        assertEquals(3L, frames.get(0).memberId);
+        assertEquals(MeetingCallContext.CLUSTER, frames.get(1) == null ? null : frames.get(1).stage);
+        for (MeetingCallContext.Frame frame : frames) {
+            assertEquals(7L, frame.meetingId);
+            assertEquals(1, frame.round);
+        }
+    }
+
     private static AiMeetingOpinion reviewedStatement(long memberId) {
         AiMeetingOpinion opinion = new AiMeetingOpinion();
         opinion.setMemberId(memberId);

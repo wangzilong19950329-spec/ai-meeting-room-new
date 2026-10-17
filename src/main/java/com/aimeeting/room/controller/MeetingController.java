@@ -5,6 +5,7 @@ import com.aimeeting.room.dto.ContributionResult;
 import com.aimeeting.room.dto.MeetingCreateRequest;
 import com.aimeeting.room.dto.MeetingDetailVO;
 import com.aimeeting.room.dto.MeetingReviewedTurnRetryRequest;
+import com.aimeeting.room.dto.MeetingUsageVO;
 import com.aimeeting.room.dto.SkillFileVO;
 import com.aimeeting.room.dto.TrackingItemCreateRequest;
 import com.aimeeting.room.dto.TrackingItemUpdateRequest;
@@ -16,6 +17,7 @@ import com.aimeeting.room.dto.WorkflowTemplateVO;
 import com.aimeeting.room.entity.AiMeetingScoreLog;
 import com.aimeeting.room.entity.AiWorkflowTemplate;
 import com.aimeeting.room.entity.MeetingReviewedTurnSkip;
+import com.aimeeting.room.service.MeetingCallLogService;
 import com.aimeeting.room.service.MeetingRoomService;
 import com.aimeeting.room.service.MeetingScoreService;
 import com.aimeeting.room.service.SkillFileService;
@@ -54,6 +56,9 @@ public class MeetingController {
 
     @Autowired
     private MeetingScoreService meetingScoreService;
+
+    @Autowired
+    private MeetingCallLogService meetingCallLogService;
 
     @Autowired
     private SkillFileService skillFileService;
@@ -109,6 +114,12 @@ public class MeetingController {
         MeetingDetailVO vo = meetingRoomService.getMeetingDetail(id);
         if (vo == null) return ApiResponse.fail(404, "会议不存在");
         return ApiResponse.ok(vo);
+    }
+
+    /** 本场会议的模型与审核搜索消耗：合计和按环节汇总 */
+    @GetMapping("/meetings/{id}/usage")
+    public ApiResponse<MeetingUsageVO> getMeetingUsage(@PathVariable Long id) {
+        return ApiResponse.ok(meetingCallLogService.usage(id));
     }
 
     /** 查询用户的会议列表 */

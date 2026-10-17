@@ -852,3 +852,22 @@ CREATE TABLE IF NOT EXISTS stock_watch_price_failure_ledger (
 CREATE INDEX IF NOT EXISTS idx_sw_pf_ledger_pending ON stock_watch_price_failure_ledger(rule_version, status);
 CREATE INDEX IF NOT EXISTS idx_sw_pf_ledger_controls ON stock_watch_price_failure_ledger(matched_signal_id, sample_role);
 CREATE INDEX IF NOT EXISTS idx_sw_pf_ledger_control_reconcile ON stock_watch_price_failure_ledger(rule_version, sample_role, controls_finalized, id);
+
+CREATE TABLE IF NOT EXISTS ai_meeting_call_log (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    meeting_id BIGINT NOT NULL,
+    round_number INT,
+    member_id BIGINT,
+    stage VARCHAR(32) NOT NULL,
+    channel VARCHAR(16) NOT NULL,
+    model VARCHAR(128),
+    status VARCHAR(64),
+    duration_ms BIGINT NOT NULL,
+    prompt_tokens INT,
+    completion_tokens INT,
+    cache_hit_tokens INT,
+    prompt_chars INT,
+    completion_chars INT,
+    gmt_create TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_call_log_meeting ON ai_meeting_call_log(meeting_id);

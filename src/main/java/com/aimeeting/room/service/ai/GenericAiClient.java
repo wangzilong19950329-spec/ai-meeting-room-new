@@ -3,6 +3,7 @@ package com.aimeeting.room.service.ai;
 import com.aimeeting.room.config.ModelEntry;
 import com.aimeeting.room.config.ModelRegistryStore;
 import com.aimeeting.room.dto.ChatResult;
+import com.aimeeting.room.service.MeetingCallLogService;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
@@ -48,6 +49,9 @@ public class GenericAiClient implements AiModelClient {
 
     @Autowired
     private WebSearchService webSearch;
+
+    @Autowired(required = false)
+    private MeetingCallLogService callLog;
 
     @Override
     public boolean supports(String modelType) {
@@ -173,9 +177,12 @@ public class GenericAiClient implements AiModelClient {
                 .header("Content-Type", "application/json")
                 .post(RequestBody.create(body.toJSONString(), JSON_TYPE))
                 .build();
+        long started = System.nanoTime();
         try (Response response = httpClient.newCall(request).execute()) {
             String responseBody = response.body() != null ? response.body().string() : "";
             log.info("API response code={} bodyLen={}", response.code(), responseBody.length());
+            recordCall(modelId, started, response.isSuccessful() ? "success" : "http_" + response.code(),
+                    body, responseBody);
             if (!response.isSuccessful()) {
                 log.warn("API error {} url={} body={}", response.code(), url, responseBody);
                 return null;
@@ -183,7 +190,20 @@ public class GenericAiClient implements AiModelClient {
             return responseBody;
         } catch (Exception e) {
             log.warn("API call failed url={} error={}", url, e.getMessage());
+            recordCall(modelId, started, "call_failed", body, null);
             return null;
+        }
+    }
+
+    /** Usage accounting is best-effort and must never change the outcome of a model call. */
+    private void recordCall(String model, long startedNanos, String status, JSONObject requestBody,
+                            String responseBody) {
+        if (callLog == null) return;
+        try {
+            callLog.recordApiCall(model, (System.nanoTime() - startedNanos) / 1_000_000L, status,
+                    requestBody, responseBody);
+        } catch (RuntimeException accountingFailure) {
+            log.warn("Model call usage could not be recorded: {}", accountingFailure.getMessage());
         }
     }
 
@@ -211,8 +231,11 @@ public class GenericAiClient implements AiModelClient {
                 .post(RequestBody.create(body.toJSONString(), JSON_TYPE))
                 .build();
 
+        long started = System.nanoTime();
         try (Response response = httpClient.newCall(request).execute()) {
             String responseBody = response.body().string();
+            recordCall(entry.getModelId(), started, response.isSuccessful() ? "success" : "http_" + response.code(),
+                    body, responseBody);
             if (!response.isSuccessful()) {
                 log.warn("Claude API error {}: {}", response.code(), responseBody);
                 return null;
@@ -226,6 +249,7 @@ public class GenericAiClient implements AiModelClient {
             return null;
         } catch (Exception e) {
             log.warn("Claude call failed ({}), using mock for model={}", e.getMessage(), entry.getModelId());
+            recordCall(entry.getModelId(), started, "call_failed", body, null);
             return null;
         }
     }
@@ -342,8 +366,11 @@ public class GenericAiClient implements AiModelClient {
                 .build();
 
         for (int attempt = 1; attempt <= EXPERIMENTAL_SEARCH_MAX_ATTEMPTS; attempt++) {
+            long started = System.nanoTime();
             try (Response response = experimentalSearchClient.newCall(request).execute()) {
                 String responseBody = response.body() != null ? response.body().string() : "";
+                recordCall(entry.getModelId(), started, response.isSuccessful() ? "success" : "http_" + response.code(),
+                        body, responseBody);
                 if (!response.isSuccessful()) {
                     log.warn("Experimental DeepSeek search API error attempt {}/{} {}: {}",
                             attempt, EXPERIMENTAL_SEARCH_MAX_ATTEMPTS, response.code(), responseBody);
