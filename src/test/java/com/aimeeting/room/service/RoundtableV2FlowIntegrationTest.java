@@ -237,6 +237,63 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void factIdsInsideReasonTextAreNotTreatedAsNegativeNumbers() {
+        Fixture fixture = new Fixture();
+        String cited = answer("A", "排产数据缺失（G-1），营收见F-1", "G-1", "A", "订单待核（L-1）", "L-1");
+        fixture.answers("甲", cited);
+        fixture.answers("乙", cited);
+        fixture.answers("丙", cited);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals(0, fixture.calls.stream().filter(call -> call.startsWith("divergence_rewrite")).count(),
+                fixture.calls.toString());
+        assertEquals(3, fixture.calls.stream().filter(call -> call.startsWith("divergence:")).count(), fixture.calls.toString());
+        for (Object item : view.getFinalAnswers()) {
+            JSONObject finalAnswer = (JSONObject) item;
+            assertTrue(!finalAnswer.getBooleanValue("fallback"), finalAnswer.toJSONString());
+        }
+    }
+
+    @Test
+    void rewrittenAnswerKeepsTheReasonForTheRewrite() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("C", "营收稳健", "F-1", "A", "需求偏强", "L-1"),
+                answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject first = answerOf(view, "甲");
+        assertTrue(!first.getBooleanValue("skipped"), first.toJSONString());
+        assertTrue(first.getString("rewriteReason") != null && !first.getString("rewriteReason").isBlank(),
+                first.toJSONString());
+        assertTrue(answerOf(view, "乙").getString("rewriteReason") == null, answerOf(view, "乙").toJSONString());
+    }
+
+    @Test
+    void consensusRestingMostlyOnGapsIsMarkedAsEvidenceThin() {
+        Fixture fixture = new Fixture();
+        String gapDriven = answer("A", "关税影响未能核实，暂按中性", "G-1", "A", "营收稳健", "F-1");
+        fixture.answers("甲", gapDriven);
+        fixture.answers("乙", gapDriven);
+        fixture.answers("丙", gapDriven);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        JSONArray conclusions = controller.getRoundtableV2(meetingId).getData().getResult().getJSONArray("conclusions");
+        assertTrue(conclusions.getJSONObject(0).getBooleanValue("evidenceThin"), conclusions.toJSONString());
+        assertTrue(!conclusions.getJSONObject(1).getBooleanValue("evidenceThin"), conclusions.toJSONString());
+        ArgumentCaptor<String> conclusion = ArgumentCaptor.forClass(String.class);
+        verify(fixture.writer).concludeIfCurrent(eq(meetingId), eq(EPOCH), anyInt(), anyInt(),
+                nullable(String.class), anyString(), anyString(), conclusion.capture(), any(Date.class));
+        assertEquals(1, conclusion.getValue().split("证据不足的共识", -1).length - 1, conclusion.getValue());
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
@@ -468,7 +525,7 @@ class RoundtableV2FlowIntegrationTest {
         assertEquals("F-1", firstFact.getString("id"));
         assertEquals("东方财富", firstFact.getString("source"));
         assertTrue(firstFact.getBooleanValue("singleSource"), firstFact.toJSONString());
-        assertTrue(view.getFacts().toJSONString().contains("22.5倍"), view.getFacts().toJSONString());
+        assertTrue(view.getFacts().toJSONString().contains("22.50倍"), view.getFacts().toJSONString());
         assertTrue(view.getFacts().toJSONString().contains("近60个交易日涨跌幅"), view.getFacts().toJSONString());
         assertTrue(!answerOf(view, "甲").getBooleanValue("skipped"), answerOf(view, "甲").toJSONString());
         assertTrue(answerOf(view, "甲").toJSONString().contains("22.5倍，"), answerOf(view, "甲").toJSONString());
@@ -575,6 +632,74 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void eastmoneyHistoryIsRetriedOnceBeforeGivingUp() {
+        Fixture fixture = stockFixtureWithHistory();
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt()))
+                .thenThrow(new IllegalStateException("unexpected end of stream")).thenReturn(history());
+        String valid = withOutcome(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getOutcomeQuestion() != null, view.getFacts().toJSONString());
+        assertEquals("东方财富", factWhoseQuestionContains(view, "历史参照").getString("source"));
+    }
+
+    @Test
+    void historyFallsBackToTencentAndTheFactNamesItsSource() {
+        Fixture fixture = stockFixtureWithHistory();
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt()))
+                .thenThrow(new IllegalStateException("unexpected end of stream"));
+        when(fixture.eastmoney.fetchTencentDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(history());
+        String valid = withOutcome(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getOutcomeQuestion() != null, view.getFacts().toJSONString());
+        JSONObject reference = factWhoseQuestionContains(view, "历史参照");
+        assertEquals("腾讯证券", reference.getString("source"));
+        assertTrue(reference.getString("statement").contains("腾讯前复权日K"), reference.toJSONString());
+    }
+
+    @Test
+    void stockFactsAreRoundedToTwoDecimalsWithPlainDates() {
+        Fixture fixture = stockFixtureWithHistory();
+        EastmoneyMarketDataService.MarketDataBundle bundle = stockBundle();
+        Map<String, Object> valuation = new java.util.LinkedHashMap<>();
+        valuation.put("tradeDate", "2026-10-16 00:00:00");
+        valuation.put("peTtm", new java.math.BigDecimal("15.07936443"));
+        valuation.put("pePercentile1y", new java.math.BigDecimal("0.3846153846"));
+        valuation.put("pbMrq", new java.math.BigDecimal("3.37876797"));
+        valuation.put("pbPercentile1y", new java.math.BigDecimal("0.3846153846"));
+        bundle.getPayload().put("valuation", valuation);
+        bundle.getPayload().put("financials", List.of(Map.of("reportDate", "2026-06-30 00:00:00",
+                "revenue", new java.math.BigDecimal("276917000000"),
+                "revenueYoyPct", new java.math.BigDecimal("54.800369148545"),
+                "netProfit", new java.math.BigDecimal("43284000000"),
+                "netProfitYoyPct", new java.math.BigDecimal("41.983941749454"))));
+        when(fixture.eastmoney.buildBundle("300750", "sz", "DAY")).thenReturn(bundle);
+        String valid = withOutcome(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        String facts = controller.getRoundtableV2(meetingId).getData().getFacts().toJSONString();
+        assertTrue(facts.contains("市盈率TTM（2026-10-16）：15.08倍"), facts);
+        assertTrue(facts.contains("市盈率TTM近一年分位（2026-10-16，0%为近一年最低）：0.38%"), facts);
+        assertTrue(facts.contains("营业总收入同比（报告期 2026-06-30）：54.80%"), facts);
+        assertTrue(!facts.contains("00:00:00"), facts);
+    }
+
+    @Test
     void outcomeProbabilitiesNotSummingToOneAreRewrittenOnce() {
         Fixture fixture = stockFixtureWithHistory();
         String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
@@ -635,7 +760,12 @@ class RoundtableV2FlowIntegrationTest {
         fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,\"horizonTradingDays\":60,"
                 + "\"stock\":{\"symbol\":\"300750\",\"market\":\"sz\"}");
         when(fixture.eastmoney.buildBundle("300750", "sz", "DAY")).thenReturn(stockBundle());
-        // Closes alternate 100/102: daily volatility ≈ 1.98%, so σ over 60 days ≈ 15.4% → bounds 8% and 23%.
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(history());
+        return fixture;
+    }
+
+    /** Closes alternate 100/102: daily volatility ≈ 1.98%, so σ over 60 days ≈ 15.4% → bounds 8% and 23%. */
+    private static List<Map<String, Object>> history() {
         List<Map<String, Object>> history = new ArrayList<>();
         for (int i = 0; i < 400; i++) {
             Map<String, Object> bar = new java.util.LinkedHashMap<>();
@@ -643,8 +773,15 @@ class RoundtableV2FlowIntegrationTest {
             bar.put("close", new java.math.BigDecimal(i % 2 == 0 ? "100" : "102"));
             history.add(bar);
         }
-        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(history);
-        return fixture;
+        return history;
+    }
+
+    private static JSONObject factWhoseQuestionContains(RoundtableV2ViewVO view, String text) {
+        for (Object item : view.getFacts()) {
+            JSONObject fact = (JSONObject) item;
+            if (fact.getString("question") != null && fact.getString("question").contains(text)) return fact;
+        }
+        throw new AssertionError("no fact about " + text + " in " + view.getFacts());
     }
 
     private static String withOutcome(String answerJson, String reason, double... probabilities) {

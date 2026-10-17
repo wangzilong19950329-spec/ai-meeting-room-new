@@ -63,12 +63,20 @@ public class StockMeetingDomain implements MeetingDomain {
         int horizon = issueCard.getIntValue("horizonTradingDays");
         String label = "历史参照数据（" + stock.getString("symbol") + "." + stock.getString("market")
                 + "，展望" + horizon + "个交易日）";
+        // Eastmoney's history endpoint drops connections now and then: retry once, then use Tencent and say so.
+        String source = "东方财富";
         List<Map<String, Object>> history;
         try {
-            history = eastmoney.fetchDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
-        } catch (RuntimeException unavailable) {
-            facts.add(gap(label, "EASTMONEY_HISTORY_UNAVAILABLE: " + unavailable.getMessage()));
-            return new DomainEvidence(facts, null);
+            history = eastmoneyHistory(stock);
+        } catch (RuntimeException eastmoneyDown) {
+            try {
+                history = eastmoney.fetchTencentDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
+                source = "腾讯证券";
+            } catch (RuntimeException tencentDown) {
+                facts.add(gap(label, "EASTMONEY_HISTORY_UNAVAILABLE: " + eastmoneyDown.getMessage()
+                        + "; TENCENT: " + tencentDown.getMessage()));
+                return new DomainEvidence(facts, null);
+            }
         }
         List<BigDecimal> closes = new ArrayList<>();
         String baseDate = null;
@@ -83,13 +91,21 @@ public class StockMeetingDomain implements MeetingDomain {
             facts.add(gap(label, "HISTORY_TOO_SHORT: " + closes.size() + " bars"));
             return new DomainEvidence(facts, null);
         }
-        facts.add(referenceFact(closes, horizon));
+        facts.add(referenceFact(closes, horizon, source));
         return new DomainEvidence(facts, outcomeQuestion(closes, horizon,
                 baseDate == null ? issueCard.getString("asOf") : baseDate));
     }
 
     /** Reference class: the distribution of every rolling horizon-day return in the available history. */
-    private static JSONObject referenceFact(List<BigDecimal> closes, int horizon) {
+    private List<Map<String, Object>> eastmoneyHistory(JSONObject stock) {
+        try {
+            return eastmoney.fetchDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
+        } catch (RuntimeException firstFailure) {
+            return eastmoney.fetchDailyHistory(stock.getString("symbol"), stock.getString("market"), HISTORY_BARS);
+        }
+    }
+
+    private static JSONObject referenceFact(List<BigDecimal> closes, int horizon, String source) {
         List<Double> returns = new ArrayList<>();
         for (int i = 0; i + horizon < closes.size(); i++) {
             returns.add(closes.get(i + horizon).doubleValue() / closes.get(i).doubleValue() - 1);
@@ -97,7 +113,7 @@ public class StockMeetingDomain implements MeetingDomain {
         java.util.Collections.sort(returns);
         long up = returns.stream().filter(value -> value > 0).count();
         String label = "历史参照（近" + closes.size() + "个交易日，滚动" + horizon
-                + "个交易日涨跌幅，程序按东财前复权日K计算）";
+                + "个交易日涨跌幅，程序按" + ("腾讯证券".equals(source) ? "腾讯" : "东财") + "前复权日K计算）";
         String statement = label + "：P10 " + pct(percentile(returns, 0.10)) + "，P25 " + pct(percentile(returns, 0.25))
                 + "，P50 " + pct(percentile(returns, 0.50)) + "，P75 " + pct(percentile(returns, 0.75))
                 + "，P90 " + pct(percentile(returns, 0.90)) + "，上涨占比 " + pct((double) up / returns.size());
@@ -105,7 +121,7 @@ public class StockMeetingDomain implements MeetingDomain {
         fact.put("tier", "F");
         fact.put("question", label);
         fact.put("statement", statement);
-        fact.put("source", "东方财富");
+        fact.put("source", source);
         fact.put("singleSource", true);
         fact.put("referenceClass", true);
         return fact;
@@ -178,7 +194,7 @@ public class StockMeetingDomain implements MeetingDomain {
         }
         List<JSONObject> facts = new ArrayList<>();
         Map<String, Object> indicators = map(payload.get("technicalIndicators"));
-        String asOf = text(indicators.get("asOfDate"));
+        String asOf = day(text(indicators.get("asOfDate")));
         BigDecimal close = decimal(indicators.get("close"));
         add(facts, "收盘价（" + asOf + "，前复权日K）", close, "元", asOf);
         Map<String, Object> detail = map(payload.get("stockDetail"));
@@ -186,17 +202,18 @@ public class StockMeetingDomain implements MeetingDomain {
         add(facts, "总市值（" + asOf + "）", scaled(decimal(detail.get("marketCap"))), "亿元", asOf);
 
         Map<String, Object> valuation = map(payload.get("valuation"));
-        String valuationDate = text(valuation.get("tradeDate"));
+        String valuationDate = day(text(valuation.get("tradeDate")));
         add(facts, "市盈率TTM（" + valuationDate + "）", decimal(valuation.get("peTtm")), "倍", valuationDate);
-        add(facts, "市盈率TTM近一年分位（" + valuationDate + "）", decimal(valuation.get("pePercentile1y")), "%", valuationDate);
+        add(facts, "市盈率TTM近一年分位（" + valuationDate + "，0%为近一年最低）",
+                decimal(valuation.get("pePercentile1y")), "%", valuationDate);
         add(facts, "市净率MRQ（" + valuationDate + "）", decimal(valuation.get("pbMrq")), "倍", valuationDate);
-        add(facts, "市净率MRQ近一年分位（" + valuationDate + "）", decimal(valuation.get("pbPercentile1y")), "%", valuationDate);
+        add(facts, "市净率MRQ近一年分位（" + valuationDate + "，0%为近一年最低）",
+                decimal(valuation.get("pbPercentile1y")), "%", valuationDate);
 
         Object financials = payload.get("financials");
         if (financials instanceof List && !((List<?>) financials).isEmpty()) {
             Map<String, Object> latest = map(((List<?>) financials).get(0));
-            String period = text(latest.get("reportDate"));
-            if (period != null && period.length() > 10) period = period.substring(0, 10);
+            String period = day(text(latest.get("reportDate")));
             add(facts, "营业总收入（报告期 " + period + "，累计）", scaled(decimal(latest.get("revenue"))), "亿元", period);
             add(facts, "营业总收入同比（报告期 " + period + "）", decimal(latest.get("revenueYoyPct")), "%", period);
             add(facts, "归母净利润（报告期 " + period + "，累计）", scaled(decimal(latest.get("netProfit"))), "亿元", period);
@@ -252,18 +269,25 @@ public class StockMeetingDomain implements MeetingDomain {
         return null;
     }
 
+    /** Values are shown with two decimals; members cite what they see, and the number gate matches by rounding. */
     private static void add(List<JSONObject> facts, String label, BigDecimal value, String unit, String period) {
         if (value == null || period == null) return;
+        String shown = value.setScale(2, RoundingMode.HALF_UP).toPlainString();
         JSONObject fact = new JSONObject(true);
         fact.put("tier", "F");
         fact.put("question", label);
-        fact.put("statement", label + "：" + value.toPlainString() + unit);
-        fact.put("value", value.toPlainString());
+        fact.put("statement", label + "：" + shown + unit);
+        fact.put("value", shown);
         fact.put("unit", unit);
         fact.put("period", period);
         fact.put("source", "东方财富");
         fact.put("singleSource", true);
         facts.add(fact);
+    }
+
+    /** "2026-10-16 00:00:00" → "2026-10-16". */
+    private static String day(String date) {
+        return date != null && date.length() > 10 ? date.substring(0, 10) : date;
     }
 
     private static JSONObject gap(String question, String reason) {

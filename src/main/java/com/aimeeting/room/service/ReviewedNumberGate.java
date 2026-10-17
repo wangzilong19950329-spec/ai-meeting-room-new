@@ -47,6 +47,8 @@ final class ReviewedNumberGate {
             Pattern.compile("[（(]\\s*\\d{1,2}\\s*[)）]"),
             // Periods and durations
             Pattern.compile("\\d+\\s*个?\\s*(?:交易日|工作日|自然日|月|周|星期|天|日|年|小时|分钟|季度)"),
+            // Fact ids from the roundtable fact base, such as F-9 or G-2 (not negative numbers)
+            Pattern.compile("(?<![A-Za-z])[FLG]-\\d+(?!\\d)"),
             // Stock codes
             Pattern.compile("(?i)(?<![a-z0-9])(?:sh|sz|bj)[._-]?\\d{6}(?!\\d)"),
             Pattern.compile("(?i)(?<!\\d)\\d{6}[._-]?(?:sh|sz|bj)(?![a-z])"),

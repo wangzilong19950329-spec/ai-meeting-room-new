@@ -259,6 +259,15 @@ public class EastmoneyMarketDataService {
         return fetchKlines(symbol, normalizeMarket(market, symbol), 101, bars);
     }
 
+    /** Forward-adjusted daily bars from Tencent, the fallback when Eastmoney's history endpoint fails (sh/sz only). */
+    public List<Map<String, Object>> fetchTencentDailyHistory(String symbol, String market, int bars) {
+        String normalized = normalizeMarket(market, symbol);
+        if (!("sh".equals(normalized) || "sz".equals(normalized))) {
+            throw new IllegalStateException("tencent_history_unsupported_market:" + normalized);
+        }
+        return fetchTencentKlines(symbol, normalized, bars, true, null, "eastmoney_history_failed");
+    }
+
     private List<Map<String, Object>> fetchCanonicalDailyKlines(String symbol,
                                                                  String market,
                                                                  int limit,

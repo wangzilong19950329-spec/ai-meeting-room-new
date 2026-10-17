@@ -286,44 +286,44 @@
 			"period":"2026-10-16",
 			"tier":"F",
 			"question":"市盈率TTM（2026-10-16）",
-			"statement":"市盈率TTM（2026-10-16）：22.5倍",
+			"statement":"市盈率TTM（2026-10-16）：22.50倍",
 			"singleSource":true,
 			"id":"F-4",
 			"source":"东方财富",
-			"value":"22.5"
+			"value":"22.50"
 		},
 		{
 			"unit":"%",
 			"period":"2026-10-16",
 			"tier":"F",
-			"question":"市盈率TTM近一年分位（2026-10-16）",
-			"statement":"市盈率TTM近一年分位（2026-10-16）：35.0%",
+			"question":"市盈率TTM近一年分位（2026-10-16，0%为近一年最低）",
+			"statement":"市盈率TTM近一年分位（2026-10-16，0%为近一年最低）：35.00%",
 			"singleSource":true,
 			"id":"F-5",
 			"source":"东方财富",
-			"value":"35.0"
+			"value":"35.00"
 		},
 		{
 			"unit":"倍",
 			"period":"2026-10-16",
 			"tier":"F",
 			"question":"市净率MRQ（2026-10-16）",
-			"statement":"市净率MRQ（2026-10-16）：4.8倍",
+			"statement":"市净率MRQ（2026-10-16）：4.80倍",
 			"singleSource":true,
 			"id":"F-6",
 			"source":"东方财富",
-			"value":"4.8"
+			"value":"4.80"
 		},
 		{
 			"unit":"%",
 			"period":"2026-10-16",
 			"tier":"F",
-			"question":"市净率MRQ近一年分位（2026-10-16）",
-			"statement":"市净率MRQ近一年分位（2026-10-16）：40.0%",
+			"question":"市净率MRQ近一年分位（2026-10-16，0%为近一年最低）",
+			"statement":"市净率MRQ近一年分位（2026-10-16，0%为近一年最低）：40.00%",
 			"singleSource":true,
 			"id":"F-7",
 			"source":"东方财富",
-			"value":"40.0"
+			"value":"40.00"
 		},
 		{
 			"unit":"亿元",
@@ -341,11 +341,11 @@
 			"period":"2026-06-30",
 			"tier":"F",
 			"question":"营业总收入同比（报告期 2026-06-30）",
-			"statement":"营业总收入同比（报告期 2026-06-30）：8.5%",
+			"statement":"营业总收入同比（报告期 2026-06-30）：8.50%",
 			"singleSource":true,
 			"id":"F-9",
 			"source":"东方财富",
-			"value":"8.5"
+			"value":"8.50"
 		},
 		{
 			"unit":"亿元",
@@ -363,11 +363,11 @@
 			"period":"2026-06-30",
 			"tier":"F",
 			"question":"归母净利润同比（报告期 2026-06-30）",
-			"statement":"归母净利润同比（报告期 2026-06-30）：12.3%",
+			"statement":"归母净利润同比（报告期 2026-06-30）：12.30%",
 			"singleSource":true,
 			"id":"F-11",
 			"source":"东方财富",
-			"value":"12.3"
+			"value":"12.30"
 		},
 		{
 			"unit":"%",

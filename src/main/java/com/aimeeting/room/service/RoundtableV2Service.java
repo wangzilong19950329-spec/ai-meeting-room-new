@@ -461,6 +461,7 @@ public class RoundtableV2Service {
         String[] corpora = corpora(facts, card);
         Set<String> factIds = factIds(facts);
         Answer parsed;
+        String rewriteReason = null;
         try {
             try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
                     meetingId, 1, member.getId(), MeetingCallContext.DIVERGENCE)) {
@@ -468,6 +469,7 @@ public class RoundtableV2Service {
                         card, factIds, corpora);
             }
             if (parsed.error != null) {
+                rewriteReason = parsed.error;
                 try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
                         meetingId, 1, member.getId(), MeetingCallContext.DIVERGENCE_REWRITE)) {
                     parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system,
@@ -494,6 +496,8 @@ public class RoundtableV2Service {
             record.put("skipped", false);
             record.put("answers", parsed.answers);
         }
+        // Why the first version was rejected, so a rewrite can be traced afterwards.
+        if (rewriteReason != null) record.put("rewriteReason", rewriteReason);
         return save(meetingId, ANSWER, member.getId(), epoch, record);
     }
 
@@ -912,6 +916,7 @@ public class RoundtableV2Service {
             parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system, prompt),
                     card, factIds, corpora);
         }
+        String rewriteReason = parsed.error;
         if (parsed.error != null) {
             try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
                     meetingId, 1, member.getId(), MeetingCallContext.REESTIMATE_REWRITE)) {
@@ -930,6 +935,7 @@ public class RoundtableV2Service {
             record.put("fallback", false);
             record.put("answers", parsed.answers);
         }
+        if (rewriteReason != null) record.put("rewriteReason", rewriteReason);
         return save(meetingId, kind, member.getId(), epoch, record);
     }
 
@@ -1317,6 +1323,7 @@ public class RoundtableV2Service {
                 line.put("optionLabel", optionLabel(question, topOption));
                 line.put("support", support);
                 line.put("members", byOption.get(topOption));
+                if (evidenceThin(byOption.get(topOption))) line.put("evidenceThin", true);
                 conclusions.add(line);
             } else {
                 JSONObject line = questionLine(question, total);
@@ -1341,6 +1348,26 @@ public class RoundtableV2Service {
         summary.put("insufficient", insufficient);
         if (outcome != null) summary.put("outcome", outcome);
         return summary;
+    }
+
+    /**
+     * A consensus is evidence-thin when at least half of its supporters' reasons cite no verified (F) or
+     * low-confidence (L) fact: members agreed mostly because the evidence was missing, not because it was there.
+     */
+    private static boolean evidenceThin(JSONArray supporters) {
+        int reasons = 0;
+        int unbacked = 0;
+        for (Object item : supporters) {
+            JSONArray list = ((JSONObject) item).getJSONArray("reasons");
+            for (int i = 0; list != null && i < list.size(); i++) {
+                reasons++;
+                JSONArray ids = list.getJSONObject(i).getJSONArray("factIds");
+                boolean backed = ids != null && ids.stream()
+                        .anyMatch(id -> String.valueOf(id).startsWith("F-") || String.valueOf(id).startsWith("L-"));
+                if (!backed) unbacked++;
+            }
+        }
+        return reasons > 0 && unbacked * 2 >= reasons;
     }
 
     private static List<JSONObject> answeredOnly(JSONArray answers) {
@@ -1455,7 +1482,8 @@ public class RoundtableV2Service {
         for (Object item : result.getJSONArray("conclusions")) {
             JSONObject line = (JSONObject) item;
             conclusionLines.add(line.getString("title") + " → " + line.getString("optionLabel")
-                    + "（" + line.getIntValue("support") + "/" + line.getIntValue("total") + "）");
+                    + "（" + line.getIntValue("support") + "/" + line.getIntValue("total")
+                    + (line.getBooleanValue("evidenceThin") ? "，证据不足的共识：多数理由只引用了资料缺口" : "") + "）");
         }
         List<String> disputeLines = new ArrayList<>();
         for (Object item : result.getJSONArray("disputes")) {

@@ -69,12 +69,14 @@
         <div class="v2-item-head">
           <el-tag size="small" effect="plain">{{ item.questionId }}</el-tag>
           <span class="v2-item-title">{{ item.title }}</span>
-          <el-tag size="small" type="success">{{ item.optionLabel }}</el-tag>
+          <el-tag size="small" :type="item.evidenceThin ? 'info' : 'success'">{{ item.optionLabel }}</el-tag>
           <span class="v2-muted">{{ item.supportText }}</span>
+          <el-tag v-if="item.evidenceThin" size="small" type="warning">证据不足</el-tag>
           <el-tag v-if="item.resolvedAfterDispute" size="small" type="warning" effect="plain">
             首轮有分歧，交锋或补证后形成共识<template v-if="item.typeLabel">（原为{{ item.typeLabel }}）</template>
           </el-tag>
         </div>
+        <div v-if="item.evidenceThin" class="v2-thin">{{ item.evidenceThinText }}</div>
         <div v-if="item.crux" class="v2-crux">关键分歧点：{{ item.crux }}</div>
         <MemberReasons :members="item.members" :facts="factById" />
       </div>
@@ -259,6 +261,7 @@ const MemberReasons = defineComponent({
 .v2-item + .v2-item { border-top: 1px dashed #eef1f6; }
 .v2-item-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .v2-item-title { font-weight: 600; }
+.v2-thin { font-size: 13px; color: #b88230; background: #fdf6ec; border-radius: 6px; padding: 4px 10px; }
 .v2-crux { font-size: 13px; background: #f4f4f5; border-radius: 6px; padding: 4px 10px; }
 .v2-topup { font-size: 13px; }
 .v2-topup-fact { margin-left: 4px; }

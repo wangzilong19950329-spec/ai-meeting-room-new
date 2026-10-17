@@ -241,3 +241,12 @@ test('members without a valid answer are listed with the reason', () => {
   ])
   assert.deepEqual(buildRoundtableV2View(sample, null).skippedMembers, [])
 })
+
+test('a consensus resting mostly on evidence gaps is flagged with an explanation', () => {
+  const v2 = clone(sample)
+  v2.result.conclusions[0].evidenceThin = true
+  const flagged = buildRoundtableV2View(v2, null).conclusions[0]
+  assert.equal(flagged.evidenceThin, true)
+  assert.equal(flagged.evidenceThinText, '证据不足的共识：多数理由只引用了资料缺口，一致不代表被证实')
+  assert.equal(buildRoundtableV2View(sample, null).conclusions[0].evidenceThin, false)
+})

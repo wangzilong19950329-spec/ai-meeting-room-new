@@ -227,6 +227,8 @@ function conclusion(line) {
     optionLabel: line.optionLabel,
     supportText: `${line.support}/${line.total} 人`,
     resolvedAfterDispute: resolved,
+    evidenceThin: Boolean(line.evidenceThin),
+    evidenceThinText: line.evidenceThin ? '证据不足的共识：多数理由只引用了资料缺口，一致不代表被证实' : '',
     typeLabel: resolved && line.type ? (DISPUTE_TYPES[line.type] || [line.type])[0] : '',
     crux: line.crux || '',
     members: memberRows(line.members)
