@@ -228,7 +228,7 @@ public class StockWatchAnalysisTaskService {
         responseEnvelope.put("bridgeTargetId", bridgeTargetId);
         responseEnvelope.put("conversationUrl", conversationUrl);
         String responseEnvelopeJson = JSON.toJSONString(responseEnvelope);
-        transition(reservation, Collections.singletonList("SUBMITTED"), "RESPONSE_RECEIVED",
+        transition(reservation, Arrays.asList("SUBMITTED", "UNKNOWN"), "RESPONSE_RECEIVED",
                 rawResponse, responseEnvelopeJson, contentStatus, completionReason, providerStatus, null);
     }
 
@@ -290,7 +290,7 @@ public class StockWatchAnalysisTaskService {
             throw new IllegalArgumentException("analysis_task_existing_reservation_required");
         }
         String target = "UNKNOWN".equalsIgnoreCase(terminalStatus) ? "UNKNOWN" : "FAILED";
-        transition(reservation, Arrays.asList("RESERVED", "SUBMITTED"), target,
+        transition(reservation, Arrays.asList("RESERVED", "SUBMITTED", "UNKNOWN"), target,
                 reservation.getTask().getRawResponse(), reservation.getTask().getResponseEnvelopeJson(),
                 reservation.getTask().getContentStatus(), reservation.getTask().getCompletionReason(),
                 "ABANDONED_" + target, error);
@@ -345,9 +345,8 @@ public class StockWatchAnalysisTaskService {
     public boolean shouldMarkUnknown(Throwable error) {
         Throwable current = error;
         while (current != null) {
-            if (current instanceof StockWatchBridgeHttpException
-                    && ((StockWatchBridgeHttpException) current).isProviderOutcomeUnknown()) {
-                return true;
+            if (current instanceof StockWatchBridgeHttpException) {
+                return ((StockWatchBridgeHttpException) current).isProviderOutcomeUnknown();
             }
             current = current.getCause();
         }
@@ -481,14 +480,17 @@ public class StockWatchAnalysisTaskService {
         }
 
         public boolean isTerminalFailure() {
-            return !newSubmission && ("UNKNOWN".equals(task.getStatus())
-                    || "INVALID_RESPONSE".equals(task.getStatus())
+            return !newSubmission && ("INVALID_RESPONSE".equals(task.getStatus())
                     || "FAILED".equals(task.getStatus())
                     || "PROJECTION_INVALID".equals(task.getStatus()));
         }
 
         public boolean isInProgress() {
-            return !newSubmission && ("RESERVED".equals(task.getStatus()) || "SUBMITTED".equals(task.getStatus()));
+            return !newSubmission && ("RESERVED".equals(task.getStatus())
+                    || "SUBMITTED".equals(task.getStatus())
+                    || "UNKNOWN".equals(task.getStatus())
+                    || "RESPONSE_RECEIVED".equals(task.getStatus())
+                    || "PROJECTION_FAILED".equals(task.getStatus()));
         }
 
         public String refusalReason() {

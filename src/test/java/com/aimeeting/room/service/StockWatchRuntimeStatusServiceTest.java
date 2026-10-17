@@ -64,12 +64,13 @@ class StockWatchRuntimeStatusServiceTest {
         jdbcTemplate.execute("CREATE TABLE stock_watch_analysis_demand ("
                 + "symbol VARCHAR(16), market VARCHAR(8), status VARCHAR(32), "
                 + "not_before TIMESTAMP, deadline_at TIMESTAMP, lease_until TIMESTAMP, "
-                + "error_message VARCHAR(255), provider_submit_count INT)");
+                + "error_message VARCHAR(255), provider_submit_count INT, gmt_modify TIMESTAMP)");
         jdbcTemplate.execute("CREATE TABLE stock_watch_alert_delivery_obligation ("
                 + "symbol VARCHAR(16), market VARCHAR(8), initial_status VARCHAR(32), supplement_status VARCHAR(32), "
                 + "initial_attempt_count INT, supplement_attempt_count INT, "
                 + "initial_next_attempt_at TIMESTAMP, supplement_next_attempt_at TIMESTAMP, "
                 + "initial_error VARCHAR(255), supplement_error VARCHAR(255))");
+        createAnalysisTaskTable(jdbcTemplate);
         Instant now = Instant.now();
         insertDemand(jdbcTemplate, "PENDING", now.minusSeconds(60), now.plusSeconds(3600), null);
         insertDemand(jdbcTemplate, "PENDING", now.plusSeconds(600), now.plusSeconds(3600), null);
@@ -93,6 +94,56 @@ class StockWatchRuntimeStatusServiceTest {
         assertEquals(1, breakdown.get("submitted"));
     }
 
+    @Test
+    void policyRuntimeUsesLatestCanonicalTaskAndDegradesOnRecentFailures() {
+        StockWatchTechnicalAnalysisService technicalAnalysisService = mock(StockWatchTechnicalAnalysisService.class);
+        when(technicalAnalysisService.status()).thenReturn(Map.of(
+                "enabled", true,
+                "running", false,
+                "lastRunStatus", "never"
+        ));
+        StockWatchAnalysisSchedulerOwnershipService ownershipService =
+                mock(StockWatchAnalysisSchedulerOwnershipService.class);
+        when(ownershipService.snapshot()).thenReturn(Map.of("mode", "POLICY"));
+        JdbcTemplate jdbcTemplate = new JdbcTemplate(new DriverManagerDataSource(
+                "jdbc:h2:mem:runtime-status-failures;MODE=MySQL;DB_CLOSE_DELAY=-1", "sa", ""));
+        jdbcTemplate.execute("CREATE TABLE stock_watch_analysis_demand ("
+                + "symbol VARCHAR(16), market VARCHAR(8), status VARCHAR(32), "
+                + "not_before TIMESTAMP, deadline_at TIMESTAMP, lease_until TIMESTAMP, "
+                + "error_message VARCHAR(255), provider_submit_count INT, gmt_modify TIMESTAMP)");
+        jdbcTemplate.execute("CREATE TABLE stock_watch_alert_delivery_obligation ("
+                + "symbol VARCHAR(16), market VARCHAR(8), initial_status VARCHAR(32), supplement_status VARCHAR(32), "
+                + "initial_attempt_count INT, supplement_attempt_count INT, "
+                + "initial_next_attempt_at TIMESTAMP, supplement_next_attempt_at TIMESTAMP, "
+                + "initial_error VARCHAR(255), supplement_error VARCHAR(255))");
+        createAnalysisTaskTable(jdbcTemplate);
+        Timestamp now = Timestamp.from(Instant.now());
+        jdbcTemplate.update("INSERT INTO stock_watch_analysis_task "
+                        + "(id,purpose,symbol,market,status,submitted_at,completed_at,gmt_modify) VALUES (?,?,?,?,?,?,?,?)",
+                1499L, "stock-analysis-response-v6", "300750", "sz", "FAILED", now, now, now);
+        jdbcTemplate.update("INSERT INTO stock_watch_analysis_demand "
+                        + "(symbol,market,status,not_before,deadline_at,lease_until,error_message,provider_submit_count,gmt_modify) "
+                        + "VALUES (?,?,?,?,?,?,?,?,?)",
+                "300750", "sz", "DEAD_LETTER", now, now, null, "terminal", 1, now);
+
+        StockWatchRuntimeStatusService service = new StockWatchRuntimeStatusService(
+                technicalAnalysisService, ownershipService, jdbcTemplate);
+        ReflectionTestUtils.setField(service, "bridgeUrl", "http://127.0.0.1:8791/search");
+
+        Map<String, Object> status = service.current("300750", "sz");
+
+        assertEquals("DEGRADED", status.get("status"));
+        assertEquals("FAILED", status.get("lastRunStatus"));
+        Map<?, ?> latestTask = (Map<?, ?>) status.get("latestAnalysisTask");
+        assertEquals(1499L, ((Number) latestTask.get("id")).longValue());
+        Map<?, ?> recent = (Map<?, ?>) status.get("recentOutcomeBreakdown");
+        assertEquals(1, recent.get("failedTasks"));
+        assertEquals(1, recent.get("deadLetterDemands"));
+        List<?> warnings = (List<?>) status.get("warnings");
+        assertTrue(warnings.contains("recent_analysis_task_failures"));
+        assertTrue(warnings.contains("recent_analysis_demand_dead_letters"));
+    }
+
     private void insertDemand(JdbcTemplate jdbcTemplate,
                               String status,
                               Instant notBefore,
@@ -103,5 +154,11 @@ class StockWatchRuntimeStatusServiceTest {
                         + "VALUES (?,?,?,?,?,?,NULL,0)",
                 "002979", "sz", status, Timestamp.from(notBefore), Timestamp.from(deadlineAt),
                 leaseUntil == null ? null : Timestamp.from(leaseUntil));
+    }
+
+    private void createAnalysisTaskTable(JdbcTemplate jdbcTemplate) {
+        jdbcTemplate.execute("CREATE TABLE stock_watch_analysis_task ("
+                + "id BIGINT PRIMARY KEY, purpose VARCHAR(64), symbol VARCHAR(16), market VARCHAR(8), "
+                + "status VARCHAR(32), submitted_at TIMESTAMP, completed_at TIMESTAMP, gmt_modify TIMESTAMP)");
     }
 }

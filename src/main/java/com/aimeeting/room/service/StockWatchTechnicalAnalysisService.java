@@ -290,7 +290,7 @@ public class StockWatchTechnicalAnalysisService {
                         persistAbandonedTaskFromIdentity(reservation, "FAILED",
                                 "stale_reserved_reconciled_without_provider_submission");
                         terminalized++;
-                    } else if ("SUBMITTED".equals(status)) {
+                    } else if ("SUBMITTED".equals(status) || "UNKNOWN".equals(status)) {
                         BridgeLedgerLookup lookup = lookupBridgeLedger(reservation);
                         if (lookup.result != null) {
                             analysisTaskService.markResponseReceived(reservation, lookup.result.answerText,
@@ -299,7 +299,7 @@ public class StockWatchTechnicalAnalysisService {
                             recoverPreparedTaskWithTerminalFallback(reservation);
                             recovered++;
                         } else if (lookup.isTerminalWithoutResult()) {
-                            persistAbandonedTaskFromIdentity(reservation, "UNKNOWN",
+                            persistAbandonedTaskFromIdentity(reservation, "FAILED",
                                     "stale_submitted_reconciled_without_replayable_result:" + lookup.status
                                             + (StringUtils.hasText(lookup.error) ? ":" + lookup.error : ""));
                             terminalized++;
@@ -726,7 +726,9 @@ public class StockWatchTechnicalAnalysisService {
             return persistAbandonedTask(taskReservation, ref, stockName, sourceTradeDate, runSlot,
                     periodType, window.key, "FAILED", "stale_reserved_before_provider_submission");
         }
-        if (!taskReservation.isNewSubmission() && "SUBMITTED".equals(taskReservation.getTask().getStatus())) {
+        if (!taskReservation.isNewSubmission()
+                && ("SUBMITTED".equals(taskReservation.getTask().getStatus())
+                || "UNKNOWN".equals(taskReservation.getTask().getStatus()))) {
             BridgeLedgerLookup lookup = lookupBridgeLedger(taskReservation);
             if (lookup.result != null) {
                 analysisTaskService.markResponseReceived(taskReservation, lookup.result.answerText,
@@ -734,8 +736,10 @@ public class StockWatchTechnicalAnalysisService {
                         lookup.result.targetId, lookup.result.finalUrl);
             } else if (lookup.isTerminalWithoutResult()) {
                 return persistAbandonedTask(taskReservation, ref, stockName, sourceTradeDate, runSlot,
-                        periodType, window.key, "UNKNOWN", "provider_outcome_not_retriable:" + lookup.status
+                        periodType, window.key, "FAILED", "provider_outcome_not_retriable:" + lookup.status
                                 + (StringUtils.hasText(lookup.error) ? ":" + lookup.error : ""));
+            } else {
+                throw new PendingProviderOutcomeException(taskReservation.getTask().getId(), null);
             }
         }
         StockWatchTechnicalAnalysis existingTaskResult = resolveExistingTaskResult(taskReservation);
@@ -936,7 +940,9 @@ public class StockWatchTechnicalAnalysisService {
                 }
                 throw new IllegalStateException("analysis_projection_failed:" + diagnosticMessage(e), e);
             }
-            if (taskReservation.isNewSubmission() && isAmbiguousProviderOutcome(e)) {
+            if (taskReservation.isNewSubmission()
+                    && !analysisTaskService.shouldMarkInvalid(e)
+                    && isAmbiguousProviderOutcome(e)) {
                 try {
                     analysisTaskService.markUnknown(taskReservation,
                             bridgeResult == null ? null : bridgeResult.answerText,
@@ -1157,7 +1163,8 @@ public class StockWatchTechnicalAnalysisService {
         record.setDataSnapshotJson(frozen == null ? "{}" : frozen.dataSnapshotJson);
         record.setRawResponse(text(reservation.getTask().getRawResponse(), ""));
         record.setPromptHash(reservation.getTask().getRequestDigest());
-        record.setProvider("SUBMITTED".equals(reservation.getTask().getStatus())
+        record.setProvider(("SUBMITTED".equals(reservation.getTask().getStatus())
+                || "UNKNOWN".equals(reservation.getTask().getStatus()))
                 ? "deepseek_web_bridge" : "local_task_guard");
         record.setErrorMessage(error);
         record.setContextCharsDelta(record.getRawResponse().length());
@@ -1529,10 +1536,12 @@ public class StockWatchTechnicalAnalysisService {
             bridgeResult.contentStatus = text(result.get("contentStatus"), "");
             bridgeResult.completionReason = text(result.get("completionReason"), "");
             if ("incomplete".equalsIgnoreCase(bridgeResult.contentStatus)) {
-                throw new IllegalStateException("DeepSeek 网页回答未完整生成，completionReason=" + bridgeResult.completionReason);
+                throw new ModelResponseSchemaException(
+                        "DeepSeek 网页回答未完整生成，completionReason=" + bridgeResult.completionReason);
             }
             if (!StringUtils.hasText(bridgeResult.answerText)) {
-                throw new IllegalStateException("DeepSeek 网页未返回分析正文，状态=" + bridgeResult.contentStatus);
+                throw new ModelResponseSchemaException(
+                        "DeepSeek 网页未返回分析正文，状态=" + bridgeResult.contentStatus);
             }
             return bridgeResult;
         }
@@ -4363,9 +4372,11 @@ public class StockWatchTechnicalAnalysisService {
     private boolean isAmbiguousProviderOutcome(Exception error) {
         Throwable current = error;
         while (current != null) {
-            if (current instanceof StockWatchBridgeHttpException
-                    && ((StockWatchBridgeHttpException) current).isProviderOutcomeUnknown()) {
-                return true;
+            if (current instanceof StockWatchBridgeHttpException) {
+                return ((StockWatchBridgeHttpException) current).isProviderOutcomeUnknown();
+            }
+            if (current instanceof ModelResponseSchemaException) {
+                return false;
             }
             if (current instanceof java.net.SocketTimeoutException
                     || current instanceof java.io.InterruptedIOException) {
@@ -4870,7 +4881,7 @@ public class StockWatchTechnicalAnalysisService {
         }
 
         boolean isTerminalWithoutResult() {
-            return Arrays.asList("UNKNOWN", "NOT_FOUND", "FAILED_PRE_SUBMIT", "INVALID",
+            return Arrays.asList("NOT_FOUND", "FAILED_PRE_SUBMIT", "INVALID",
                             "EVICTED_SUCCESS", "DIGEST_MISMATCH", "SUCCESS_WITHOUT_RESPONSE")
                     .contains(status);
         }

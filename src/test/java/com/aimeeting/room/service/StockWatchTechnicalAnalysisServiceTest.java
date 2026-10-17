@@ -86,6 +86,18 @@ class StockWatchTechnicalAnalysisServiceTest {
     }
 
     @Test
+    void explicitPreSubmitBridgeTimeoutIsNotAmbiguous() {
+        StockWatchBridgeHttpException error = StockWatchBridgeHttpException.fromResponse(
+                "bridge",
+                429,
+                "{\"ok\":false,\"error\":\"bridge_queue_timeout\","
+                        + "\"providerOutcomeUnknown\":false,\"retrySafe\":true}");
+
+        Boolean ambiguous = ReflectionTestUtils.invokeMethod(service, "isAmbiguousProviderOutcome", error);
+        assertFalse(Boolean.TRUE.equals(ambiguous));
+    }
+
+    @Test
     void bridgeRequestsUseConfiguredBearerAuthentication() {
         ReflectionTestUtils.setField(service, "bridgeApiKey", "technical-bridge-secret");
 

@@ -39,8 +39,14 @@ public class StockWatchRuntimeStatusService {
         result.put("analysisMode", text(ownership.get("mode"), "UNKNOWN"));
         result.put("provider", "DeepSeek 网页");
         result.put("providerVersionState", StringUtils.hasText(bridgeUrl) ? "CONFIGURED" : "UNCONFIGURED");
-        result.put("lastRunAt", technical.get("lastRunAt"));
-        result.put("lastRunStatus", text(technical.get("lastRunStatus"), "unknown"));
+        Map<String, Object> latestTask = latestAnalysisTask(normalizedSymbol, normalizedMarket, warnings);
+        boolean policyOwned = "POLICY".equalsIgnoreCase(text(ownership.get("mode"), ""));
+        result.put("lastRunAt", policyOwned && latestTask != null
+                ? latestTask.get("updatedAt") : technical.get("lastRunAt"));
+        result.put("lastRunStatus", policyOwned && latestTask != null
+                ? text(latestTask.get("status"), "unknown")
+                : text(technical.get("lastRunStatus"), "unknown"));
+        result.put("latestAnalysisTask", latestTask);
         result.put("nextDueAt", nextDueAt(normalizedSymbol, normalizedMarket, warnings));
         Map<String, Object> pendingJobBreakdown = pendingJobBreakdown(normalizedSymbol, normalizedMarket, warnings);
         result.put("pendingJobs", pendingJobBreakdown == null ? null : pendingJobBreakdown.get("total"));
@@ -49,10 +55,65 @@ public class StockWatchRuntimeStatusService {
         result.put("expiredPendingJobs", pendingJobBreakdown == null ? null : pendingJobBreakdown.get("expiredPending"));
         result.put("retryJobs", retryJobs(normalizedSymbol, normalizedMarket, warnings));
         result.put("retryPolicy", retryPolicy(normalizedSymbol, normalizedMarket, warnings));
+        result.put("recentOutcomeBreakdown", recentOutcomeBreakdown(
+                normalizedSymbol, normalizedMarket, warnings));
         result.put("schedulerOwnership", ownership);
         result.put("warnings", warnings);
         result.put("status", warnings.isEmpty() ? "VALID" : "DEGRADED");
         return result;
+    }
+
+    private Map<String, Object> latestAnalysisTask(String symbol,
+                                                   String market,
+                                                   List<String> warnings) {
+        String filter = stockFilter(symbol, market, "AND");
+        List<Map<String, Object>> rows = safeRows(
+                "SELECT id,status,submitted_at,completed_at,gmt_modify FROM stock_watch_analysis_task "
+                        + "WHERE purpose IN ('stock-analysis-response-v5','stock-analysis-response-v6') "
+                        + filter + " ORDER BY id DESC LIMIT 1",
+                params(symbol, market), warnings, "latest_analysis_task_unavailable");
+        if (rows == null || rows.isEmpty()) return null;
+        Map<String, Object> row = rows.get(0);
+        Map<String, Object> task = new LinkedHashMap<>();
+        task.put("id", row.get("id"));
+        task.put("status", text(row.get("status"), "UNKNOWN"));
+        task.put("submittedAt", instant(row.get("submitted_at")));
+        task.put("completedAt", instant(row.get("completed_at")));
+        task.put("updatedAt", instant(row.get("gmt_modify")));
+        return task;
+    }
+
+    private Map<String, Object> recentOutcomeBreakdown(String symbol,
+                                                        String market,
+                                                        List<String> warnings) {
+        Timestamp cutoff = Timestamp.from(Instant.now().minusSeconds(24L * 60L * 60L));
+        Object[] queryParams = recentParams(cutoff, symbol, market);
+        String taskFilter = stockFilter(symbol, market, "AND");
+        String demandFilter = stockFilter(symbol, market, "AND");
+        Integer failedTasks = safeCount(
+                "SELECT COUNT(*) FROM stock_watch_analysis_task "
+                        + "WHERE gmt_modify>=? AND purpose IN ('stock-analysis-response-v5','stock-analysis-response-v6') "
+                        + "AND status IN ('FAILED','INVALID_RESPONSE','PROJECTION_INVALID') " + taskFilter,
+                queryParams, warnings, "recent_analysis_task_failures_unavailable");
+        Integer recoveringTasks = safeCount(
+                "SELECT COUNT(*) FROM stock_watch_analysis_task "
+                        + "WHERE gmt_modify>=? AND purpose IN ('stock-analysis-response-v5','stock-analysis-response-v6') "
+                        + "AND status='UNKNOWN' " + taskFilter,
+                queryParams, warnings, "recent_analysis_recovery_unavailable");
+        Integer deadLetters = safeCount(
+                "SELECT COUNT(*) FROM stock_watch_analysis_demand WHERE gmt_modify>=? AND status='DEAD_LETTER' "
+                        + demandFilter,
+                queryParams, warnings, "recent_analysis_dead_letters_unavailable");
+        if (failedTasks == null || recoveringTasks == null || deadLetters == null) return null;
+        if (failedTasks > 0) warnings.add("recent_analysis_task_failures");
+        if (recoveringTasks > 0) warnings.add("analysis_tasks_waiting_recovery");
+        if (deadLetters > 0) warnings.add("recent_analysis_demand_dead_letters");
+        Map<String, Object> breakdown = new LinkedHashMap<>();
+        breakdown.put("windowHours", 24);
+        breakdown.put("failedTasks", failedTasks);
+        breakdown.put("recoveringTasks", recoveringTasks);
+        breakdown.put("deadLetterDemands", deadLetters);
+        return breakdown;
     }
 
     private Map<String, Object> retryPolicy(String symbol, String market, List<String> warnings) {
@@ -228,6 +289,13 @@ public class StockWatchRuntimeStatusService {
             return new Object[0];
         }
         return new Object[]{symbol, market};
+    }
+
+    private Object[] recentParams(Timestamp cutoff, String symbol, String market) {
+        if (!StringUtils.hasText(symbol) || !StringUtils.hasText(market)) {
+            return new Object[]{cutoff};
+        }
+        return new Object[]{cutoff, symbol, market};
     }
 
     private boolean bool(Object raw) {

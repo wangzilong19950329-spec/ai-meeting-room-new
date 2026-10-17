@@ -14,6 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -94,5 +95,61 @@ class StockWatchAnalysisTaskServiceTest {
         assertTrue(service.shouldMarkUnknown(error));
         assertEquals("provider_outcome_unknown", error.getErrorCode());
         assertFalse(error.getRetrySafe());
+    }
+
+    @Test
+    void explicitPreSubmitBridgeTimeoutIsNotMarkedUnknown() {
+        StockWatchAnalysisTaskService service = new StockWatchAnalysisTaskService(
+                mock(StockWatchAnalysisTaskMapper.class),
+                mock(StockWatchAnalysisObservationIdentityMapper.class),
+                mock(StockWatchV6RuntimeGate.class));
+        StockWatchBridgeHttpException error = StockWatchBridgeHttpException.fromResponse(
+                "bridge",
+                429,
+                "{\"ok\":false,\"error\":\"bridge_queue_timeout\","
+                        + "\"providerOutcomeUnknown\":false,\"retrySafe\":true}");
+
+        assertFalse(service.shouldMarkUnknown(error));
+        assertEquals("bridge_queue_timeout", error.getErrorCode());
+        assertTrue(error.getRetrySafe());
+    }
+
+    @Test
+    void incompleteBridgeResponseIsClassifiedAsInvalidBeforeTimeoutWording() {
+        StockWatchAnalysisTaskService service = new StockWatchAnalysisTaskService(
+                mock(StockWatchAnalysisTaskMapper.class),
+                mock(StockWatchAnalysisObservationIdentityMapper.class),
+                mock(StockWatchV6RuntimeGate.class));
+        IllegalStateException error = new IllegalStateException(
+                "DeepSeek 网页回答未完整生成，completionReason=timeout_incomplete_json");
+
+        assertTrue(service.shouldMarkInvalid(error));
+    }
+
+    @Test
+    void unknownTaskRemainsRecoverableAndAcceptsLateBridgeResponse() {
+        StockWatchAnalysisTaskMapper taskMapper = mock(StockWatchAnalysisTaskMapper.class);
+        StockWatchAnalysisTaskService service = new StockWatchAnalysisTaskService(
+                taskMapper,
+                mock(StockWatchAnalysisObservationIdentityMapper.class),
+                mock(StockWatchV6RuntimeGate.class));
+        StockWatchAnalysisTask task = new StockWatchAnalysisTask();
+        task.setId(1499L);
+        task.setSubmissionKey("stock-analysis-slot-v1:sz:300750:DAY:2026-10-16:13:00");
+        task.setRequestDigest("frozen-digest");
+        task.setStatus("UNKNOWN");
+        task.setRowVersion(3L);
+        StockWatchAnalysisTaskService.Reservation reservation =
+                StockWatchAnalysisTaskService.Reservation.existing(task, "frozen-digest");
+        when(taskMapper.transition(eq(1499L), eq(3L), any(), eq("RESPONSE_RECEIVED"),
+                anyString(), anyString(), anyString(), anyString(), anyString(), anyString(),
+                eq("RECOVERED_FROM_BRIDGE_LEDGER"), any(), any())).thenReturn(1);
+
+        service.markResponseReceived(reservation, "{\"stance\":\"中性\"}", "complete", "done",
+                "RECOVERED_FROM_BRIDGE_LEDGER", "target-1", "https://chat.deepseek.com/a");
+
+        assertTrue(reservation.isInProgress());
+        assertFalse(reservation.isTerminalFailure());
+        assertEquals("RESPONSE_RECEIVED", reservation.getTask().getStatus());
     }
 }

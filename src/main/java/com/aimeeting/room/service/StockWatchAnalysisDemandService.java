@@ -377,7 +377,7 @@ public class StockWatchAnalysisDemandService {
                     ? null : taskMapper.selectById(demand.getAnalysisTaskId());
             if (task != null && terminal(task.getStatus())) {
                 deadLetter(demand, "targeted_analysis_terminal:" + task.getStatus());
-            } else if (demand.getDeadlineAt() != null && !demand.getDeadlineAt().after(now)) {
+            } else if (task == null && demand.getDeadlineAt() != null && !demand.getDeadlineAt().after(now)) {
                 deadLetter(demand, "targeted_analysis_deadline_elapsed");
             }
         }
@@ -505,12 +505,13 @@ public class StockWatchAnalysisDemandService {
 
     private boolean inProgress(String status) {
         return "RESERVED".equals(status) || "SUBMITTED".equals(status)
-                || "RESPONSE_RECEIVED".equals(status) || "PROJECTION_FAILED".equals(status);
+                || "UNKNOWN".equals(status) || "RESPONSE_RECEIVED".equals(status)
+                || "PROJECTION_FAILED".equals(status);
     }
 
     private boolean terminal(String status) {
-        return "UNKNOWN".equals(status) || "INVALID_RESPONSE".equals(status)
-                || "FAILED".equals(status) || "PROJECTION_INVALID".equals(status);
+        return "INVALID_RESPONSE".equals(status) || "FAILED".equals(status)
+                || "PROJECTION_INVALID".equals(status);
     }
 
     private boolean terminalDispatchBlocker(String error) {

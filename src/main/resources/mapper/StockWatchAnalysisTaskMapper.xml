@@ -47,7 +47,8 @@
 
     <select id="selectRecoverableBefore" resultMap="BaseResultMap">
         SELECT * FROM stock_watch_analysis_task
-        WHERE status IN ('RESERVED', 'SUBMITTED', 'RESPONSE_RECEIVED', 'PROJECTION_FAILED')
+        WHERE purpose IN ('stock-analysis-response-v5', 'stock-analysis-response-v6')
+          AND status IN ('RESERVED', 'SUBMITTED', 'UNKNOWN', 'RESPONSE_RECEIVED', 'PROJECTION_FAILED')
           AND gmt_modify &lt;= #{before}
         ORDER BY gmt_modify ASC, id ASC
         LIMIT #{limit}

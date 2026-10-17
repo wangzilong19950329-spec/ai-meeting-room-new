@@ -5,6 +5,7 @@ import com.aimeeting.room.dao.StockWatchAnalysisDemandMapper;
 import com.aimeeting.room.dao.StockWatchAnalysisTaskMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
 import com.aimeeting.room.entity.StockWatchAnalysisDemand;
+import com.aimeeting.room.entity.StockWatchAnalysisTask;
 import com.aimeeting.room.entity.StockWatchItem;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -202,6 +203,25 @@ class StockWatchAnalysisDemandServiceTest {
         verify(demandMapper, never()).reserveProviderSubmission(any(), anyString());
         verify(demandMapper).releaseForRetry(eq(1L), anyString(), any(Date.class),
                 startsWith("unified_analysis_submit_retry:bridge_down"));
+    }
+
+    @Test
+    void submittedDemandWaitsForUnknownTaskRecoveryPastDeadline() {
+        StockWatchAnalysisDemand demand = anomalyDemand("SUBMITTED");
+        demand.setAnalysisTaskId(1499L);
+        demand.setDeadlineAt(new Date(System.currentTimeMillis() - 60_000L));
+        StockWatchAnalysisTask task = new StockWatchAnalysisTask();
+        task.setId(1499L);
+        task.setStatus("UNKNOWN");
+        when(demandMapper.selectDispatchable(any(Date.class), eq(1))).thenReturn(Collections.emptyList());
+        when(demandMapper.selectSubmitted(20)).thenReturn(List.of(demand));
+        when(analysisMapper.selectByAnalysisTaskId(1499L)).thenReturn(null);
+        when(taskMapper.selectById(1499L)).thenReturn(task);
+
+        service.reconcile();
+
+        verify(demandMapper, never()).markDeadLetter(eq(1L), anyString());
+        verify(obligationMapper, never()).markSupplementDeadLetterByDemand(eq(1L), anyString());
     }
 
     private StockWatchItem item(String symbol, String market, String mode, Integer intervalMinutes, Long version) {
