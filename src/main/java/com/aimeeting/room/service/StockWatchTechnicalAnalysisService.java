@@ -1124,7 +1124,9 @@ public class StockWatchTechnicalAnalysisService {
                                                               String terminalStatus,
                                                               String error) {
         StockWatchTechnicalAnalysis existing = analysisMapper.selectByAnalysisTaskId(reservation.getTask().getId());
-        if (existing != null) return existing;
+        if (existing != null) {
+            return analysisProjectionService.projectAbandoned(reservation, existing, terminalStatus, error);
+        }
         FrozenProjection frozen = null;
         try {
             frozen = restoreFrozenProjection(reservation);

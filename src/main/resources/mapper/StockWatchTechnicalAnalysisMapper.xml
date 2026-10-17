@@ -84,6 +84,29 @@
          #{provider}, #{bridgeTargetId}, #{conversationUrl}, #{contextCharsDelta}, #{errorMessage})
     </insert>
 
+    <update id="updateRecovered">
+        UPDATE stock_watch_technical_analysis
+        SET session_id = #{sessionId}, symbol = #{symbol}, market = #{market}, stock_name = #{stockName},
+            analysis_date = #{analysisDate}, run_slot = #{runSlot}, period_type = #{periodType}, period_key = #{periodKey},
+            source_record_ids = #{sourceRecordIds}, evidence_signal_json = #{evidenceSignalJson},
+            main_force_intent_json = #{mainForceIntentJson}, main_force_intent_status = #{mainForceIntentStatus},
+            main_force_intent_warnings_json = #{mainForceIntentWarningsJson}, status = #{status}, stance = #{stance},
+            tone = #{tone}, confidence = #{confidence}, title = #{title}, conclusion = #{conclusion},
+            evidence_json = #{evidenceJson}, missing_data_json = #{missingDataJson}, data_snapshot_json = #{dataSnapshotJson},
+            raw_response = #{rawResponse}, prompt_hash = #{promptHash}, provider = #{provider},
+            bridge_target_id = #{bridgeTargetId}, conversation_url = #{conversationUrl},
+            context_chars_delta = #{contextCharsDelta}, error_message = #{errorMessage}
+        WHERE id = #{id} AND analysis_task_id = #{analysisTaskId} AND status = 'ERROR'
+    </update>
+
+    <update id="updateAbandonedDiagnostic">
+        UPDATE stock_watch_technical_analysis
+        SET main_force_intent_status = #{mainForceIntentStatus},
+            main_force_intent_warnings_json = #{mainForceIntentWarningsJson},
+            error_message = #{errorMessage}
+        WHERE id = #{id} AND analysis_task_id = #{analysisTaskId} AND status = 'ERROR'
+    </update>
+
     <select id="selectById" resultMap="BaseResultMap">
         SELECT <include refid="AnalysisSelectColumns"/>
         FROM stock_watch_technical_analysis t

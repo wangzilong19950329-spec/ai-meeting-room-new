@@ -1,6 +1,7 @@
 package com.aimeeting.room.service;
 
 import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSON;
 import com.aimeeting.room.dao.StockWatchTechnicalAnalysisMapper;
 import com.aimeeting.room.dao.StockWatchTechnicalSessionMapper;
 import com.aimeeting.room.entity.StockWatchTechnicalAnalysis;
@@ -66,8 +67,22 @@ public class StockWatchAnalysisProjectionService {
                     reservation.getTask().getId(), record.getSymbol(),
                     record.getMarket(), validatedIntent);
         }
-        if (analysisMapper.insert(record) != 1) {
-            throw new IllegalStateException("analysis_projection_insert_failed");
+        StockWatchTechnicalAnalysis existing = analysisMapper.selectByAnalysisTaskId(
+                reservation.getTask().getId());
+        if (existing == null) {
+            if (analysisMapper.insert(record) != 1) {
+                throw new IllegalStateException("analysis_projection_insert_failed");
+            }
+        } else {
+            if (reservation.isNewSubmission() || !reservation.hasReusableResponse()
+                    || !"ERROR".equals(existing.getStatus())) {
+                throw new IllegalStateException("analysis_projection_existing_record_conflict:"
+                        + reservation.getTask().getId());
+            }
+            record.setId(existing.getId());
+            if (analysisMapper.updateRecovered(record) != 1) {
+                throw new IllegalStateException("analysis_projection_recovery_update_failed");
+            }
         }
         predictionService.savePredictionsStrict(record.getId(), record.getSymbol(), record.getMarket(),
                 record.getStockName(), forecastDate, sourcePrice, forecasts, inputSnapshotJson,
@@ -147,8 +162,20 @@ public class StockWatchAnalysisProjectionService {
             throw new IllegalStateException("analysis_abandoned_projection_requires_existing_submission");
         }
         analysisTaskService.markAbandoned(reservation, terminalStatus, error);
-        if (analysisMapper.insert(record) != 1) {
-            throw new IllegalStateException("analysis_abandoned_projection_insert_failed");
+        StockWatchTechnicalAnalysis existing = analysisMapper.selectByAnalysisTaskId(
+                reservation.getTask().getId());
+        if (existing == null) {
+            if (analysisMapper.insert(record) != 1) {
+                throw new IllegalStateException("analysis_abandoned_projection_insert_failed");
+            }
+        } else {
+            existing.setMainForceIntentStatus("TASK_" + terminalStatus);
+            existing.setMainForceIntentWarningsJson(JSON.toJSONString(java.util.Collections.singletonList(error)));
+            existing.setErrorMessage(error);
+            if (analysisMapper.updateAbandonedDiagnostic(existing) != 1) {
+                throw new IllegalStateException("analysis_abandoned_projection_update_failed");
+            }
+            record = existing;
         }
         return record;
     }

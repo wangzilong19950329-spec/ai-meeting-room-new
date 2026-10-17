@@ -11,6 +11,10 @@ import java.util.List;
 public interface StockWatchTechnicalAnalysisMapper {
     int insert(StockWatchTechnicalAnalysis record);
 
+    int updateRecovered(StockWatchTechnicalAnalysis record);
+
+    int updateAbandonedDiagnostic(StockWatchTechnicalAnalysis record);
+
     StockWatchTechnicalAnalysis selectById(@Param("id") Long id);
 
     StockWatchTechnicalAnalysis selectByAnalysisTaskId(@Param("analysisTaskId") Long analysisTaskId);
