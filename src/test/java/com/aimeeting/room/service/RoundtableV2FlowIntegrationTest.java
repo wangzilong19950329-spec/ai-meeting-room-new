@@ -160,11 +160,94 @@ class RoundtableV2FlowIntegrationTest {
         fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
         fixture.service.run(meetingId, EPOCH);
 
-        verify(fixture.orchestrator, times(4)).callModelStrict(anyString(), anyString(), anyString(),
+        // moderator 1 + first-round answers 3 + red team on the leading consensus 1 + re-estimates 3
+        verify(fixture.orchestrator, times(8)).callModelStrict(anyString(), anyString(), anyString(),
                 nullable(Integer.class));
         verify(fixture.reviewed, times(3)).search(anyString(), anyString(), anyString(), anyLong());
         verify(fixture.writer, times(2)).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
                 nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+    }
+
+    @Test
+    void crossExamRedTeamAndReestimateDriveTheFinalSummary() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "2025年营收：100亿元，增长稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "订单规模80亿元，增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+        fixture.finalAnswers("乙", withChangeReason(answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"),
+                "Q2", "质询后认可需求偏强"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject dispute = view.getAgenda().getJSONArray("disputes").getJSONObject(0);
+        assertEquals("Q2", dispute.getString("questionId"));
+        assertEquals("甲", dispute.getJSONObject("a").getString("memberName"));
+        assertEquals("乙", dispute.getJSONObject("b").getString("memberName"));
+        assertEquals("丙", view.getRedTeam().getString("memberName"));
+        assertEquals("Q1", view.getRedTeam().getString("questionId"));
+        assertEquals(1, view.getCrossExams().size());
+        assertTrue(view.getCrossExams().getJSONObject(0).getString("question").length() > 0);
+        assertTrue(view.getCrossExams().getJSONObject(0).getString("reply").length() > 0);
+        assertTrue(fixture.calls.containsAll(List.of("cross_exam:甲", "cross_exam:乙", "red_team:丙",
+                "reestimate:甲", "reestimate:乙", "reestimate:丙")), fixture.calls.toString());
+        assertEquals(3, view.getFinalAnswers().size());
+
+        assertEquals(2, view.getResult().getJSONArray("conclusions").size());
+        assertEquals(0, view.getResult().getJSONArray("disputes").size());
+        JSONArray changes = view.getResult().getJSONArray("changes");
+        assertEquals(1, changes.size());
+        assertEquals("乙", changes.getJSONObject(0).getString("memberName"));
+        assertEquals("Q2", changes.getJSONObject(0).getString("questionId"));
+        assertEquals("B", changes.getJSONObject(0).getString("from"));
+        assertEquals("A", changes.getJSONObject(0).getString("to"));
+        assertEquals("质询后认可需求偏强", changes.getJSONObject(0).getString("reason"));
+    }
+
+    @Test
+    void crossExamQuestionWithUnsourcedNumberIsRewrittenOnceThenDropped() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+        fixture.crossExam("甲", "营收已到150亿元，你的判断站不住。", "营收已到150亿元，你的判断站不住。");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getCrossExams().getJSONObject(0).getBooleanValue("failed"),
+                view.getCrossExams().toJSONString());
+        assertTrue(!fixture.calls.contains("cross_exam:乙"), fixture.calls.toString());
+        assertTrue(fixture.calls.contains("reestimate:乙"), fixture.calls.toString());
+    }
+
+    @Test
+    void invalidReestimateFallsBackToTheFirstRoundAnswer() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+        fixture.finalAnswers("丙", "不是 JSON", "还是不是 JSON");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject third = null;
+        for (Object item : view.getFinalAnswers()) {
+            if ("丙".equals(((JSONObject) item).getString("memberName"))) third = (JSONObject) item;
+        }
+        assertTrue(third != null && third.getBooleanValue("fallback"), view.getFinalAnswers().toJSONString());
+        assertEquals(1, view.getResult().getJSONArray("disputes").size());
+        assertEquals(3, view.getResult().getIntValue("answeredCount"));
+    }
+
+    private static String withChangeReason(String answerJson, String questionId, String reason) {
+        JSONObject root = JSON.parseObject(answerJson);
+        for (Object item : root.getJSONArray("answers")) {
+            JSONObject answer = (JSONObject) item;
+            if (questionId.equals(answer.getString("questionId"))) answer.put("changeReason", reason);
+        }
+        return root.toJSONString();
     }
 
     private static String answer(String q1Option, String q1Reason, String q1Fact,
@@ -216,6 +299,9 @@ class RoundtableV2FlowIntegrationTest {
         private final MeetingWorkflowService workflow = mock(MeetingWorkflowService.class);
         private final List<String> moderatorReplies = new ArrayList<>();
         private final Map<String, List<String>> memberReplies = new HashMap<>();
+        private final Map<String, List<String>> finalReplies = new HashMap<>();
+        private final Map<String, List<String>> crossExamReplies = new HashMap<>();
+        private final List<String> calls = new ArrayList<>();
         private final RoundtableV2Service service = new RoundtableV2Service();
 
         private Fixture() {
@@ -259,16 +345,28 @@ class RoundtableV2FlowIntegrationTest {
             when(orchestrator.callModelStrict(anyString(), anyString(), anyString(), nullable(Integer.class)))
                     .thenAnswer(invocation -> {
                         String system = invocation.getArgument(1);
+                        MeetingCallContext.Frame frame = MeetingCallContext.current();
+                        String stage = frame == null ? "none" : frame.stage.replace("_rewrite", "");
                         if (system.contains("主持人")) {
+                            calls.add(stage + ":主持人");
                             return moderatorReplies.isEmpty() ? CARD : moderatorReplies.remove(0);
                         }
-                        for (Map.Entry<String, List<String>> entry : memberReplies.entrySet()) {
-                            if (system.contains("「" + entry.getKey() + "」")) {
-                                List<String> replies = entry.getValue();
-                                return replies.size() > 1 ? replies.remove(0) : replies.get(0);
-                            }
+                        String name = memberIn(system);
+                        calls.add(stage + ":" + name);
+                        switch (stage) {
+                            case MeetingCallContext.DIVERGENCE:
+                                return next(memberReplies.get(name));
+                            case MeetingCallContext.REESTIMATE:
+                                List<String> finals = finalReplies.get(name);
+                                return finals != null ? next(finals) : last(memberReplies.get(name));
+                            case MeetingCallContext.CROSS_EXAM:
+                                List<String> exam = crossExamReplies.get(name);
+                                return exam != null ? next(exam) : name + "：请说明你的判断依据哪条事实。";
+                            case MeetingCallContext.RED_TEAM:
+                                return "若下一季度需求转弱，这条结论最可能失效。";
+                            default:
+                                throw new IllegalStateException("unexpected model call: " + stage + " " + system);
                         }
-                        throw new IllegalStateException("unexpected model call: " + system);
                     });
             ReflectionTestUtils.setField(service, "roomMapper", rooms);
             ReflectionTestUtils.setField(service, "memberMapper", members);
@@ -283,6 +381,29 @@ class RoundtableV2FlowIntegrationTest {
 
         private void answers(String memberName, String... replies) {
             memberReplies.put(memberName, new ArrayList<>(List.of(replies)));
+        }
+
+        private void finalAnswers(String memberName, String... replies) {
+            finalReplies.put(memberName, new ArrayList<>(List.of(replies)));
+        }
+
+        private void crossExam(String memberName, String... replies) {
+            crossExamReplies.put(memberName, new ArrayList<>(List.of(replies)));
+        }
+
+        private String memberIn(String system) {
+            for (String name : List.of("甲", "乙", "丙")) {
+                if (system.contains("「" + name + "」")) return name;
+            }
+            throw new IllegalStateException("unknown speaker: " + system);
+        }
+
+        private String next(List<String> replies) {
+            return replies.size() > 1 ? replies.remove(0) : replies.get(0);
+        }
+
+        private String last(List<String> replies) {
+            return replies.get(replies.size() - 1);
         }
     }
 

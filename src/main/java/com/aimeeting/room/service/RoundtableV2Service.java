@@ -45,6 +45,12 @@ public class RoundtableV2Service {
     static final String FACT_BASE = "FACT_BASE";
     static final String ANSWER = "ANSWER";
     static final String RESULT = "RESULT";
+    static final String AGENDA = "AGENDA";
+    static final String CROSS_EXAM = "CROSS_EXAM_";
+    static final String RED_TEAM = "RED_TEAM";
+    static final String FINAL_ANSWER = "FINAL_ANSWER";
+    /** At most this many of the most split sub-questions are cross-examined. */
+    private static final int MAX_CROSS_EXAMS = 2;
 
     private static final ZoneId MARKET_ZONE = ZoneId.of("Asia/Shanghai");
     private static final long SEARCH_TIMEOUT_MS = TimeUnit.MINUTES.toMillis(13);
@@ -83,6 +89,10 @@ public class RoundtableV2Service {
             else if (FACT_BASE.equals(record.getKind())) view.setFacts(JSON.parseArray(record.getPayload()));
             else if (ANSWER.equals(record.getKind())) view.getAnswers().add(JSON.parseObject(record.getPayload()));
             else if (RESULT.equals(record.getKind())) view.setResult(JSON.parseObject(record.getPayload()));
+            else if (AGENDA.equals(record.getKind())) view.setAgenda(JSON.parseObject(record.getPayload()));
+            else if (record.getKind().startsWith(CROSS_EXAM)) view.getCrossExams().add(JSON.parseObject(record.getPayload()));
+            else if (RED_TEAM.equals(record.getKind())) view.setRedTeam(JSON.parseObject(record.getPayload()));
+            else if (FINAL_ANSWER.equals(record.getKind())) view.getFinalAnswers().add(JSON.parseObject(record.getPayload()));
         }
         return view;
     }
@@ -98,12 +108,38 @@ public class RoundtableV2Service {
         if (activeRoom(meetingId, epoch) == null) return;
         JSONArray facts = factBase(meetingId, epoch, card);
         if (facts == null) return;
+        List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
+        Map<Long, AiMeetingMember> membersById = new LinkedHashMap<>();
         JSONArray answers = new JSONArray();
-        for (AiMeetingMember member : memberMapper.selectByMeetingId(meetingId)) {
+        for (AiMeetingMember member : members) {
             if (activeRoom(meetingId, epoch) == null) return;
+            membersById.put(member.getId(), member);
             answers.add(answer(meetingId, epoch, card, facts, member));
         }
-        JSONObject result = result(meetingId, epoch, card, facts, answers);
+        JSONObject agenda = agenda(meetingId, epoch, card, answers);
+        JSONArray disputes = agenda.getJSONArray("disputes");
+        JSONArray crossExams = new JSONArray();
+        for (int i = 0; i < disputes.size(); i++) {
+            if (activeRoom(meetingId, epoch) == null) return;
+            crossExams.add(crossExam(meetingId, epoch, i + 1, card, facts, disputes.getJSONObject(i),
+                    membersById, answers));
+        }
+        JSONObject redTeam = null;
+        if (agenda.getJSONObject("redTeam") != null) {
+            if (activeRoom(meetingId, epoch) == null) return;
+            redTeam = redTeam(meetingId, epoch, card, facts, agenda.getJSONObject("redTeam"), membersById);
+        }
+        JSONArray finalAnswers = answers;
+        if (!disputes.isEmpty() || redTeam != null) {
+            finalAnswers = new JSONArray();
+            for (Object item : answers) {
+                if (activeRoom(meetingId, epoch) == null) return;
+                JSONObject first = (JSONObject) item;
+                finalAnswers.add(finalAnswer(meetingId, epoch, card, facts, answers, crossExams, redTeam,
+                        first, membersById.get(first.getLong("memberId"))));
+            }
+        }
+        JSONObject result = result(meetingId, epoch, card, facts, finalAnswers, answers);
         conclude(meetingId, epoch, card, facts, result);
     }
 
@@ -307,9 +343,7 @@ public class RoundtableV2Service {
     private JSONObject answer(Long meetingId, Long epoch, JSONObject card, JSONArray facts, AiMeetingMember member) {
         JSONObject stored = loadObject(meetingId, ANSWER, member.getId());
         if (stored != null) return stored;
-        String system = "你是「" + member.getMemberName() + "」，参加一场圆桌研判。你的分析视角："
-                + firstNonBlank(member.getPersona(), "独立分析") + "\n"
-                + "你只能依据问题卡和事实底稿独立作答，看不到其他议员的观点。只输出 JSON。";
+        String system = memberSystem(member) + "你只能依据问题卡和事实底稿独立作答，看不到其他议员的观点。只输出 JSON。";
         String prompt = answerPrompt(card, facts);
         String[] corpora = corpora(facts);
         Set<String> factIds = factIds(facts);
@@ -339,6 +373,11 @@ public class RoundtableV2Service {
         return save(meetingId, ANSWER, member.getId(), epoch, record);
     }
 
+    private static String memberSystem(AiMeetingMember member) {
+        return "你是「" + member.getMemberName() + "」，参加一场圆桌研判。你的分析视角："
+                + firstNonBlank(member.getPersona(), "独立分析") + "\n";
+    }
+
     private String callQuietly(String model, String system, String prompt) {
         try {
             return orchestrator.callModelStrict(model, system, prompt, null);
@@ -348,6 +387,16 @@ public class RoundtableV2Service {
     }
 
     private static String answerPrompt(JSONObject card, JSONArray facts) {
+        StringBuilder sb = new StringBuilder(cardAndFacts(card, facts));
+        sb.append("\n【作答要求】对每个子问题各选一个选项；每个选择给 1–3 条理由，每条理由注明引用的事实编号；")
+                .append("再写一个会推翻你判断的信号（falsifier）。理由里的数字只能来自上面的事实，")
+                .append("低置信事实可以用，但它没有经过交叉核实。\n");
+        sb.append("只输出 JSON：{\"answers\":[{\"questionId\":\"Q1\",\"optionId\":\"A\",")
+                .append("\"reasons\":[{\"text\":\"\",\"factIds\":[\"F-1\"]}],\"falsifier\":\"\"}]}");
+        return sb.toString();
+    }
+
+    private static String cardAndFacts(JSONObject card, JSONArray facts) {
         StringBuilder sb = new StringBuilder();
         sb.append("【问题卡】\n议题：").append(card.getString("topic"));
         if (!blank(card.getString("horizon"))) sb.append("；展望期：").append(card.getString("horizon"));
@@ -376,11 +425,6 @@ public class RoundtableV2Service {
             }
             sb.append("\n");
         }
-        sb.append("\n【作答要求】对每个子问题各选一个选项；每个选择给 1–3 条理由，每条理由注明引用的事实编号；")
-                .append("再写一个会推翻你判断的信号（falsifier）。理由里的数字只能来自上面的事实，")
-                .append("低置信事实可以用，但它没有经过交叉核实。\n");
-        sb.append("只输出 JSON：{\"answers\":[{\"questionId\":\"Q1\",\"optionId\":\"A\",")
-                .append("\"reasons\":[{\"text\":\"\",\"factIds\":[\"F-1\"]}],\"falsifier\":\"\"}]}");
         return sb.toString();
     }
 
@@ -431,11 +475,15 @@ public class RoundtableV2Service {
             String falsifier = answer.getString("falsifier");
             String gatedFalsifier = blank(falsifier) ? null : gateNumbers(falsifier, corpora);
             if (!blank(falsifier) && gatedFalsifier == null) return Answer.invalid(unsupportedNumbers(falsifier, corpora));
+            String changeReason = answer.getString("changeReason");
+            String gatedChange = blank(changeReason) ? null : gateNumbers(changeReason, corpora);
+            if (!blank(changeReason) && gatedChange == null) return Answer.invalid(unsupportedNumbers(changeReason, corpora));
             JSONObject clean = new JSONObject(true);
             clean.put("questionId", questionId);
             clean.put("optionId", optionId);
             clean.put("reasons", cleanReasons);
             clean.put("falsifier", gatedFalsifier);
+            if (gatedChange != null) clean.put("changeReason", gatedChange);
             normalized.add(clean);
         }
         if (!byQuestion.isEmpty()) return Answer.invalid("回答了问题卡里没有的子问题 " + byQuestion.keySet());
@@ -475,11 +523,299 @@ public class RoundtableV2Service {
         return ids;
     }
 
+    // ---- P3 agenda (program only) ----
+
+    /** Picks the most split disputes with one representative per leading side, and the leading consensus. */
+    private JSONObject agenda(Long meetingId, Long epoch, JSONObject card, JSONArray answers) {
+        JSONObject stored = loadObject(meetingId, AGENDA, MEETING_LEVEL);
+        if (stored != null) return stored;
+        JSONObject firstRound = summarize(card, answers);
+        List<JSONObject> disputes = firstRound.getJSONArray("disputes").toJavaList(JSONObject.class);
+        disputes.sort((left, right) -> Double.compare(topShare(left), topShare(right)));
+        JSONArray chosen = new JSONArray();
+        for (JSONObject dispute : disputes.subList(0, Math.min(MAX_CROSS_EXAMS, disputes.size()))) {
+            List<JSONObject> positions = dispute.getJSONArray("positions").toJavaList(JSONObject.class);
+            positions.sort((left, right) -> Integer.compare(
+                    right.getJSONArray("members").size(), left.getJSONArray("members").size()));
+            JSONObject entry = new JSONObject(true);
+            entry.put("questionId", dispute.getString("questionId"));
+            entry.put("title", dispute.getString("title"));
+            entry.put("a", side(positions.get(0)));
+            entry.put("b", side(positions.get(1)));
+            chosen.add(entry);
+        }
+        JSONObject redTeam = null;
+        JSONObject leading = null;
+        for (Object item : firstRound.getJSONArray("conclusions")) {
+            JSONObject conclusion = (JSONObject) item;
+            if (leading == null || conclusion.getIntValue("support") > leading.getIntValue("support")) leading = conclusion;
+        }
+        if (leading != null) {
+            JSONArray supporters = leading.getJSONArray("members");
+            JSONObject devil = supporters.getJSONObject(supporters.size() - 1);
+            redTeam = new JSONObject(true);
+            redTeam.put("questionId", leading.getString("questionId"));
+            redTeam.put("title", leading.getString("title"));
+            redTeam.put("optionId", leading.getString("optionId"));
+            redTeam.put("optionLabel", leading.getString("optionLabel"));
+            redTeam.put("memberId", devil.get("memberId"));
+            redTeam.put("memberName", devil.getString("memberName"));
+        }
+        JSONObject agenda = new JSONObject(true);
+        agenda.put("disputes", chosen);
+        agenda.put("redTeam", redTeam);
+        return save(meetingId, AGENDA, MEETING_LEVEL, epoch, agenda);
+    }
+
+    private static double topShare(JSONObject dispute) {
+        int top = 0;
+        for (Object position : dispute.getJSONArray("positions")) {
+            top = Math.max(top, ((JSONObject) position).getJSONArray("members").size());
+        }
+        return dispute.getIntValue("total") == 0 ? 1.0 : (double) top / dispute.getIntValue("total");
+    }
+
+    private static JSONObject side(JSONObject position) {
+        JSONObject first = position.getJSONArray("members").getJSONObject(0);
+        JSONObject side = new JSONObject(true);
+        side.put("memberId", first.get("memberId"));
+        side.put("memberName", first.getString("memberName"));
+        side.put("optionId", position.getString("optionId"));
+        side.put("optionLabel", position.getString("optionLabel"));
+        side.put("reasons", first.getJSONArray("reasons"));
+        return side;
+    }
+
+    // ---- P5 paired cross-examination and consensus red team ----
+
+    private JSONObject crossExam(Long meetingId, Long epoch, int index, JSONObject card, JSONArray facts,
+                                 JSONObject dispute, Map<Long, AiMeetingMember> membersById, JSONArray answers) {
+        JSONObject stored = loadObject(meetingId, CROSS_EXAM + index, MEETING_LEVEL);
+        if (stored != null) return stored;
+        JSONObject a = dispute.getJSONObject("a");
+        JSONObject b = dispute.getJSONObject("b");
+        AiMeetingMember asker = membersById.get(a.getLong("memberId"));
+        AiMeetingMember answerer = membersById.get(b.getLong("memberId"));
+        String[] corpora = corpora(facts);
+        String topic = "子问题 " + dispute.getString("questionId") + " " + dispute.getString("title");
+        JSONObject record = new JSONObject(true);
+        record.put("questionId", dispute.getString("questionId"));
+        record.put("title", dispute.getString("title"));
+        record.put("a", a);
+        record.put("b", b);
+        String question = gatedText(meetingId, asker, MeetingCallContext.CROSS_EXAM, MeetingCallContext.CROSS_EXAM_REWRITE,
+                memberSystem(asker), cardAndFacts(card, facts) + "\n【质询任务】" + topic + "：你选择了「"
+                        + a.getString("optionLabel") + "」，「" + b.getString("memberName") + "」选择了「"
+                        + b.getString("optionLabel") + "」。对方公开的理由：\n" + reasonsText(b.getJSONArray("reasons"))
+                        + "请针对对方理由中最关键的证据或推理漏洞提出一个质询，不超过 200 字。"
+                        + "数字只能来自事实底稿。直接输出质询内容。", corpora);
+        if (question == null) {
+            record.put("failed", true);
+            record.put("reason", "质询内容含有资料里找不到来源的数字，重写后仍不合格");
+            return save(meetingId, CROSS_EXAM + index, MEETING_LEVEL, epoch, record);
+        }
+        record.put("question", question);
+        String reply = gatedText(meetingId, answerer, MeetingCallContext.CROSS_EXAM, MeetingCallContext.CROSS_EXAM_REWRITE,
+                memberSystem(answerer), cardAndFacts(card, facts) + "\n【回应质询】" + topic + "：你选择了「"
+                        + b.getString("optionLabel") + "」。「" + a.getString("memberName") + "」对你的质询：\n"
+                        + question + "\n请正面回应：承认、修正或反驳，并说明依据，不超过 200 字。"
+                        + "数字只能来自事实底稿。直接输出回应内容。", corpora);
+        record.put("failed", false);
+        if (reply == null) {
+            record.put("replyFailed", true);
+        } else {
+            record.put("reply", reply);
+        }
+        return save(meetingId, CROSS_EXAM + index, MEETING_LEVEL, epoch, record);
+    }
+
+    private JSONObject redTeam(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONObject target,
+                               Map<Long, AiMeetingMember> membersById) {
+        JSONObject stored = loadObject(meetingId, RED_TEAM, MEETING_LEVEL);
+        if (stored != null) return stored;
+        AiMeetingMember member = membersById.get(target.getLong("memberId"));
+        String argument = gatedText(meetingId, member, MeetingCallContext.RED_TEAM, MeetingCallContext.RED_TEAM_REWRITE,
+                memberSystem(member), cardAndFacts(card, facts) + "\n【红队任务】多数议员在子问题 "
+                        + target.getString("questionId") + " " + target.getString("title") + " 上选择了「"
+                        + target.getString("optionLabel") + "」。请站在反方论证这条结论最可能错在哪里："
+                        + "列出 1–2 个最可能的失败原因，并说明需要什么证据才能确认或排除，不超过 250 字。"
+                        + "数字只能来自事实底稿。直接输出论证内容。", corpora(facts));
+        JSONObject record = new JSONObject(true);
+        record.putAll(target);
+        record.put("failed", argument == null);
+        if (argument != null) record.put("argument", argument);
+        return save(meetingId, RED_TEAM, MEETING_LEVEL, epoch, record);
+    }
+
+    /** Same policy as member answers: one rewrite for unsourced numbers, then the turn is dropped (null). */
+    private String gatedText(Long meetingId, AiMeetingMember member, String stage, String rewriteStage,
+                             String system, String prompt, String[] corpora) {
+        String reply;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, 1, member.getId(), stage)) {
+            reply = callQuietly(member.getModelType(), system, prompt);
+        }
+        String gated = blank(reply) ? null : gateNumbers(reply.trim(), corpora);
+        if (gated != null) return gated;
+        String why = blank(reply) ? "没有输出内容" : unsupportedNumbers(reply, corpora);
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, 1, member.getId(), rewriteStage)) {
+            reply = callQuietly(member.getModelType(), system, prompt + "\n\n【上一版不合格】" + why);
+        }
+        return blank(reply) ? null : gateNumbers(reply.trim(), corpora);
+    }
+
+    private static String reasonsText(JSONArray reasons) {
+        StringBuilder sb = new StringBuilder();
+        for (Object item : reasons) {
+            JSONObject reason = (JSONObject) item;
+            sb.append("- ").append(reason.getString("text"));
+            JSONArray cited = reason.getJSONArray("factIds");
+            if (cited != null && !cited.isEmpty()) sb.append("（").append(String.join("、", cited.toJavaList(String.class))).append("）");
+            sb.append("\n");
+        }
+        return sb.toString();
+    }
+
+    // ---- P6 anonymous re-estimate ----
+
+    private JSONObject finalAnswer(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONArray answers,
+                                   JSONArray crossExams, JSONObject redTeam, JSONObject first, AiMeetingMember member) {
+        JSONObject stored = loadObject(meetingId, FINAL_ANSWER, member.getId());
+        if (stored != null) return stored;
+        JSONObject record = new JSONObject(true);
+        record.put("memberId", member.getId());
+        record.put("memberName", member.getMemberName());
+        if (first.getBooleanValue("skipped")) {
+            record.put("skipped", true);
+            record.put("reason", "首轮作答无效，未参加再估");
+            return save(meetingId, FINAL_ANSWER, member.getId(), epoch, record);
+        }
+        String system = memberSystem(member) + "这是匿名再估：你能看到其他人选择的分布和交锋记录，但看不到是谁选的。只输出 JSON。";
+        String prompt = answerPrompt(card, facts) + "\n\n【再估任务】" + reestimateContext(card, answers, crossExams, redTeam, first)
+                + "请重新作答全部子问题，格式同上；如果某题改了选项，在该题加 changeReason 说明原因。";
+        String[] corpora = corpora(facts);
+        Set<String> factIds = factIds(facts);
+        Answer parsed;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, 1, member.getId(), MeetingCallContext.REESTIMATE)) {
+            parsed = parseAnswer(callQuietly(member.getModelType(), system, prompt), card, factIds, corpora);
+        }
+        if (parsed.error != null) {
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                    meetingId, 1, member.getId(), MeetingCallContext.REESTIMATE_REWRITE)) {
+                parsed = parseAnswer(callQuietly(member.getModelType(), system,
+                        prompt + "\n\n【上一版作答不合格】" + parsed.error + "。请按要求重新输出完整 JSON。"),
+                        card, factIds, corpora);
+            }
+        }
+        record.put("skipped", false);
+        if (parsed.error != null) {
+            // A failed re-estimate must not erase a valid first-round position.
+            record.put("fallback", true);
+            record.put("reason", parsed.error);
+            record.put("answers", first.getJSONArray("answers"));
+        } else {
+            record.put("fallback", false);
+            record.put("answers", parsed.answers);
+        }
+        return save(meetingId, FINAL_ANSWER, member.getId(), epoch, record);
+    }
+
+    private static String reestimateContext(JSONObject card, JSONArray answers, JSONArray crossExams,
+                                            JSONObject redTeam, JSONObject first) {
+        StringBuilder sb = new StringBuilder("你的首轮选择：");
+        for (Object item : first.getJSONArray("answers")) {
+            JSONObject choice = (JSONObject) item;
+            sb.append(choice.getString("questionId")).append("=").append(choice.getString("optionId")).append("；");
+        }
+        sb.append("\n各子问题的匿名分布：\n");
+        for (Object item : card.getJSONArray("subQuestions")) {
+            JSONObject question = (JSONObject) item;
+            List<String> counts = new ArrayList<>();
+            for (Object optionItem : question.getJSONArray("options")) {
+                JSONObject option = (JSONObject) optionItem;
+                int count = 0;
+                for (Object answerItem : answers) {
+                    JSONObject answer = (JSONObject) answerItem;
+                    if (answer.getBooleanValue("skipped")) continue;
+                    for (Object choice : answer.getJSONArray("answers")) {
+                        JSONObject json = (JSONObject) choice;
+                        if (question.getString("id").equals(json.getString("questionId"))
+                                && option.getString("id").equals(json.getString("optionId"))) count++;
+                    }
+                }
+                counts.add(option.getString("id") + " " + option.getString("label") + " " + count + " 人");
+            }
+            sb.append(question.getString("id")).append(" ").append(question.getString("title")).append("：")
+                    .append(String.join(" / ", counts)).append("\n");
+        }
+        sb.append("【交锋记录】\n");
+        for (Object item : crossExams) {
+            JSONObject exam = (JSONObject) item;
+            sb.append(exam.getString("questionId")).append(" ").append(exam.getString("title")).append("：");
+            if (exam.getBooleanValue("failed")) {
+                sb.append("质询未能完成。\n");
+                continue;
+            }
+            sb.append("质询：").append(exam.getString("question")).append("\n回应：")
+                    .append(exam.getString("reply") == null ? "未回应" : exam.getString("reply")).append("\n");
+        }
+        if (redTeam != null && !redTeam.getBooleanValue("failed")) {
+            sb.append("【红队对「").append(redTeam.getString("title")).append("：").append(redTeam.getString("optionLabel"))
+                    .append("」的反方论证】\n").append(redTeam.getString("argument")).append("\n");
+        }
+        return sb.toString();
+    }
+
     // ---- P7 program summary ----
 
-    private JSONObject result(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONArray answers) {
+    /** The summary is built from the re-estimated answers; first-round answers only feed the change log. */
+    private JSONObject result(Long meetingId, Long epoch, JSONObject card, JSONArray facts,
+                              JSONArray finalAnswers, JSONArray firstAnswers) {
         JSONObject stored = loadObject(meetingId, RESULT, MEETING_LEVEL);
         if (stored != null) return stored;
+        JSONObject result = summarize(card, finalAnswers);
+        JSONArray openQuestions = new JSONArray();
+        for (Object item : facts) {
+            JSONObject fact = (JSONObject) item;
+            if ("G".equals(fact.getString("tier"))) openQuestions.add(fact.getString("question"));
+        }
+        result.put("openQuestions", openQuestions);
+        result.put("changes", changes(firstAnswers, finalAnswers));
+        return save(meetingId, RESULT, MEETING_LEVEL, epoch, result);
+    }
+
+    private static JSONArray changes(JSONArray firstAnswers, JSONArray finalAnswers) {
+        Map<String, String> firstChoice = new LinkedHashMap<>();
+        for (Object item : firstAnswers) {
+            JSONObject answer = (JSONObject) item;
+            if (answer.getBooleanValue("skipped")) continue;
+            for (Object choice : answer.getJSONArray("answers")) {
+                JSONObject json = (JSONObject) choice;
+                firstChoice.put(answer.get("memberId") + "|" + json.getString("questionId"), json.getString("optionId"));
+            }
+        }
+        JSONArray changes = new JSONArray();
+        for (Object item : finalAnswers) {
+            JSONObject answer = (JSONObject) item;
+            if (answer.getBooleanValue("skipped") || answer.getBooleanValue("fallback")) continue;
+            for (Object choice : answer.getJSONArray("answers")) {
+                JSONObject json = (JSONObject) choice;
+                String before = firstChoice.get(answer.get("memberId") + "|" + json.getString("questionId"));
+                if (before == null || before.equals(json.getString("optionId"))) continue;
+                JSONObject change = new JSONObject(true);
+                change.put("memberId", answer.get("memberId"));
+                change.put("memberName", answer.getString("memberName"));
+                change.put("questionId", json.getString("questionId"));
+                change.put("from", before);
+                change.put("to", json.getString("optionId"));
+                change.put("reason", json.getString("changeReason"));
+                changes.add(change);
+            }
+        }
+        return changes;
+    }
+
+    private JSONObject summarize(JSONObject card, JSONArray answers) {
         List<JSONObject> answered = new ArrayList<>();
         int skipped = 0;
         for (Object item : answers) {
@@ -544,19 +880,13 @@ public class RoundtableV2Service {
                 disputes.add(line);
             }
         }
-        JSONArray openQuestions = new JSONArray();
-        for (Object item : facts) {
-            JSONObject fact = (JSONObject) item;
-            if ("G".equals(fact.getString("tier"))) openQuestions.add(fact.getString("question"));
-        }
-        JSONObject result = new JSONObject(true);
-        result.put("answeredCount", total);
-        result.put("skippedCount", skipped);
-        result.put("conclusions", conclusions);
-        result.put("disputes", disputes);
-        result.put("insufficient", insufficient);
-        result.put("openQuestions", openQuestions);
-        return save(meetingId, RESULT, MEETING_LEVEL, epoch, result);
+        JSONObject summary = new JSONObject(true);
+        summary.put("answeredCount", total);
+        summary.put("skippedCount", skipped);
+        summary.put("conclusions", conclusions);
+        summary.put("disputes", disputes);
+        summary.put("insufficient", insufficient);
+        return summary;
     }
 
     private static JSONObject questionLine(JSONObject question, int total) {
