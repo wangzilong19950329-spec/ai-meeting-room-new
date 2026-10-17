@@ -250,3 +250,42 @@ test('a consensus resting mostly on evidence gaps is flagged with an explanation
   assert.equal(flagged.evidenceThinText, '证据不足的共识：多数理由只引用了资料缺口，一致不代表被证实')
   assert.equal(buildRoundtableV2View(sample, null).conclusions[0].evidenceThin, false)
 })
+
+const judgement = {
+  status: 'JUDGED', baseDate: '2026-10-16', baseClose: 102, endDate: '2027-01-13', endClose: 112.2,
+  horizonTradingDays: 60, returnPct: 10.0, observedOptionId: 'D', observedLabel: '上涨8%–23%', source: '东方财富',
+  pooled: { rps: 0.1416, brier: 0.8356 }, uniform: { rps: 0.15, brier: 0.8 },
+  members: [
+    { memberId: 21, memberName: '甲', rps: 0.095, brier: 0.76 },
+    { memberId: 22, memberName: '乙', rps: 0.295, brier: 1.16 },
+    { memberId: 23, memberName: '丙', rps: 0.095, brier: 0.76 }
+  ],
+  judgedAt: '2027-01-13T08:00:00Z'
+}
+
+test('before expiry the outcome section says when and how it will be judged', () => {
+  const view = buildRoundtableV2View(sample, null)
+  assert.equal(view.judgement, null)
+  assert.equal(view.judgementPendingText, '起点 2026-10-16 之后第 60 个交易日收盘后，由程序判定实际涨跌落在哪一档并给每个人打分')
+  const general = clone(sample)
+  general.outcomeQuestion = null
+  general.result.outcome = undefined
+  assert.equal(buildRoundtableV2View(general, null).judgementPendingText, '')
+})
+
+test('after expiry the review shows the actual move, the pooled score against a uniform guess and each member', () => {
+  const v2 = clone(sample)
+  v2.outcomeJudgement = judgement
+  const review = buildRoundtableV2View(v2, null).judgement
+  assert.equal(review.returnText, '+10.00%')
+  assert.equal(review.observedLabel, '上涨8%–23%')
+  assert.equal(review.priceText, '2026-10-16 收盘 102 → 2027-01-13 收盘 112.2（东方财富前复权，60 个交易日）')
+  assert.equal(review.pooledRpsText, '0.1416')
+  assert.equal(review.uniformRpsText, '0.1500')
+  assert.equal(review.verdictText, '合议分布优于均匀猜测')
+  assert.deepEqual(review.members.map(m => [m.memberName, m.rpsText, m.brierText, m.beatsUniform]), [
+    ['甲', '0.0950', '0.7600', true],
+    ['丙', '0.0950', '0.7600', true],
+    ['乙', '0.2950', '1.1600', false]
+  ])
+})

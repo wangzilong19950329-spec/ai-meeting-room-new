@@ -63,6 +63,8 @@ export function buildRoundtableV2View(v2, usage) {
     facts,
     factCounts: countTiers(facts),
     outcome: outcome(result?.outcome),
+    judgement: judgementView(v2.outcomeJudgement),
+    judgementPendingText: judgementPending(v2),
     conclusions: (result?.conclusions || []).map(conclusion),
     disputes: (result?.disputes || []).map(line => dispute(line, factById)),
     insufficient: (result?.insufficient || []).map(line => ({ title: line.title, reason: line.reason })),
@@ -197,6 +199,42 @@ function outcome(summary) {
       falsifier: member.falsifier
     }))
   }
+}
+
+function judgementPending(v2) {
+  const question = v2.outcomeQuestion
+  if (v2.outcomeJudgement?.status === 'JUDGED' || !question?.baseDate || !question.horizonTradingDays) return ''
+  return `起点 ${question.baseDate} 之后第 ${question.horizonTradingDays} 个交易日收盘后，由程序判定实际涨跌落在哪一档并给每个人打分`
+}
+
+function judgementView(verdict) {
+  if (verdict?.status !== 'JUDGED') return null
+  const uniform = Number(verdict.uniform?.rps)
+  const pooled = Number(verdict.pooled?.rps)
+  const comparison = pooled < uniform ? '优于' : pooled > uniform ? '不如' : '持平于'
+  return {
+    returnText: `${verdict.returnPct > 0 ? '+' : ''}${Number(verdict.returnPct).toFixed(2)}%`,
+    observedLabel: verdict.observedLabel,
+    priceText: `${verdict.baseDate} 收盘 ${verdict.baseClose} → ${verdict.endDate} 收盘 ${verdict.endClose}`
+      + `（${verdict.source}前复权，${verdict.horizonTradingDays} 个交易日）`,
+    pooledRpsText: score(pooled),
+    pooledBrierText: score(verdict.pooled?.brier),
+    uniformRpsText: score(uniform),
+    uniformBrierText: score(verdict.uniform?.brier),
+    verdictText: comparison === '持平于' ? '合议分布与均匀猜测持平' : `合议分布${comparison}均匀猜测`,
+    members: [...(verdict.members || [])]
+      .sort((a, b) => Number(a.rps) - Number(b.rps))
+      .map(member => ({
+        memberName: member.memberName,
+        rpsText: score(member.rps),
+        brierText: score(member.brier),
+        beatsUniform: Number(member.rps) < uniform
+      }))
+  }
+}
+
+function score(value) {
+  return Number(value).toFixed(4)
 }
 
 function percent(probability) {

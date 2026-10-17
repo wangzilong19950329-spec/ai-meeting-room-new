@@ -59,6 +59,27 @@
           <div v-if="member.falsifier" class="v2-muted">证伪信号：{{ member.falsifier }}</div>
         </div>
       </div>
+      <div v-if="!view.judgement && view.judgementPendingText" class="v2-muted v2-pending">到期复盘：{{ view.judgementPendingText }}</div>
+    </section>
+
+    <!-- 到期复盘 -->
+    <section v-if="view.judgement" class="v2-section">
+      <div class="v2-title">到期复盘</div>
+      <div class="v2-judge-head">
+        实际涨跌 <strong>{{ view.judgement.returnText }}</strong>，落在「{{ view.judgement.observedLabel }}」
+        <el-tag size="small" :type="view.judgement.verdictText.includes('优于') ? 'success' : 'warning'">{{ view.judgement.verdictText }}</el-tag>
+      </div>
+      <div class="v2-muted">{{ view.judgement.priceText }}</div>
+      <div class="v2-muted">RPS 衡量概率分布离实际结果有多远，0 为完全命中，越低越好；Brier 为辅助参考。</div>
+      <el-table :data="[
+        { name: '合议分布（等权）', rps: view.judgement.pooledRpsText, brier: view.judgement.pooledBrierText },
+        { name: '均匀猜测（基准）', rps: view.judgement.uniformRpsText, brier: view.judgement.uniformBrierText },
+        ...view.judgement.members.map(m => ({ name: m.memberName + (m.beatsUniform ? '' : '（不如基准）'), rps: m.rpsText, brier: m.brierText }))
+      ]" size="small" class="v2-judge-table">
+        <el-table-column prop="name" label="预测" />
+        <el-table-column prop="rps" label="RPS" width="110" />
+        <el-table-column prop="brier" label="Brier" width="110" />
+      </el-table>
     </section>
 
     <!-- 结论清单 -->
@@ -255,6 +276,9 @@ const MemberReasons = defineComponent({
 .v2-bar-row.mode .v2-bar-fill { background: #409eff; }
 .v2-bar-row.mode .v2-bar-label, .v2-bar-row.mode .v2-bar-value { font-weight: 700; }
 .v2-bar-value { text-align: right; }
+.v2-pending { margin-top: 8px; }
+.v2-judge-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
+.v2-judge-table { margin-top: 8px; }
 .v2-minority { margin-top: 10px; padding: 8px 12px; background: #fdf6ec; border-radius: 8px; font-size: 13px; }
 .v2-minority-head { font-weight: 600; color: #b88230; margin-bottom: 4px; }
 .v2-item { padding: 8px 0; display: flex; flex-direction: column; gap: 6px; }
