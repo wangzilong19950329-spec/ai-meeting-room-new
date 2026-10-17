@@ -18,9 +18,9 @@
             </div>
             <div class="header-meta">
               <span><el-icon><User /></el-icon> {{ meeting.members?.length || 0 }} 位成员</span>
-              <span><el-icon><Refresh /></el-icon> 第 {{ meeting.currentRound || 0 }} / {{ meeting.totalRounds || 0 }} 轮</span>
+              <span v-if="!isRoundtableV2"><el-icon><Refresh /></el-icon> 第 {{ meeting.currentRound || 0 }} / {{ meeting.totalRounds || 0 }} 轮</span>
               <span v-if="[1, 6].includes(meeting.status)" class="live-indicator">
-                <i class="live-dot"></i> 讨论中 · {{ meeting.opinions?.length || 0 }} 条消息
+                <i class="live-dot"></i> 讨论中<template v-if="!isRoundtableV2"> · {{ meeting.opinions?.length || 0 }} 条消息</template>
               </span>
             </div>
           </div>
@@ -46,7 +46,7 @@
           </div>
         </div>
 
-        <div v-if="[1, 6].includes(meeting.status)" class="progress-wrap">
+        <div v-if="[1, 6].includes(meeting.status) && !isRoundtableV2" class="progress-wrap">
           <el-progress :percentage="progressPct" :stroke-width="5" striped striped-flow status="striped" />
         </div>
 
@@ -61,6 +61,13 @@
           </div>
         </div>
       </el-card>
+
+      <template v-if="isRoundtableV2">
+        <RoundtableV2Result v-if="roundtableV2View" :view="roundtableV2View" />
+        <el-card v-else-if="[1, 6].includes(meeting.status)" shadow="never" class="header-card">
+          <span class="v2-waiting">主持人正在拟定问题卡…</span>
+        </el-card>
+      </template>
 
       <el-row :gutter="16">
 
@@ -536,7 +543,7 @@
                     {{ m.role === 1 ? '主持人' : '参与者' }}
                   </el-tag>
                 </div>
-                <div v-if="[1, 6].includes(meeting.status)" class="speech-count">
+                <div v-if="[1, 6].includes(meeting.status) && !isRoundtableV2" class="speech-count">
                   已发言 {{ memberSpeechCount(m.id) }} 次
                 </div>
               </div>
@@ -1372,6 +1379,8 @@ import { meetingApi } from '@/api/meeting'
 import { getWorkflowSkillMeta } from '@/config/workflowSkills'
 import WorkflowCanvasView from '@/components/WorkflowCanvasView.vue'
 import MarkdownView from '@/components/MarkdownView.vue'
+import RoundtableV2Result from '@/components/RoundtableV2Result.vue'
+import { buildRoundtableV2View } from '@/modules/roundtable-v2/runtime/roundtableV2View.mjs'
 
 const route = useRoute()
 const meetingId = route.params.id
@@ -1554,24 +1563,30 @@ const canSubmitWorkflowStage = computed(() => {
   const t = workflowSummary.value?.currentStageType
   return !!workflowSummary.value
     && workflowStageIsActive.value
-    && !isDefaultWorkflow.value
+    && !isRoundtableWorkflow.value
     && ['ANALYSIS', 'DEBATE', 'TRACKING'].includes(t)
 })
 const canReviewWorkflowStage = computed(() => {
   const t = workflowSummary.value?.currentStageType
-  return !!workflowSummary.value && !isDefaultWorkflow.value
+  return !!workflowSummary.value && !isRoundtableWorkflow.value
     && workflowStageIsActive.value
     && ['REVIEW', 'APPROVAL'].includes(t)
     && workflowSummary.value?.currentStageReviewRequired !== 0
 })
 const canRetryWorkflowStage = computed(() =>
   !!workflowSummary.value
-    && !isDefaultWorkflow.value
+    && !isRoundtableWorkflow.value
     && workflowStageIsActive.value
     && workflowSummary.value?.currentStageRetryable
 )
 const showWorkflowActionPanel = computed(() => canSubmitWorkflowStage.value || canReviewWorkflowStage.value || canRetryWorkflowStage.value)
 const isDefaultWorkflow = computed(() => workflowSummary.value?.templateKey === 'default-roundtable')
+// 圆桌 v2 由程序编排，和默认圆桌一样没有人工提交/审核环节；结果在 v2 结果卡里展示。
+const isRoundtableV2 = computed(() => workflowSummary.value?.templateKey === 'roundtable-v2')
+const isRoundtableWorkflow = computed(() => isDefaultWorkflow.value || isRoundtableV2.value)
+const roundtableV2 = ref(null)
+const meetingUsage = ref(null)
+const roundtableV2View = computed(() => buildRoundtableV2View(roundtableV2.value, meetingUsage.value))
 // 使用流程模板（非默认圆桌辩论）时：隐藏“讨论过程”，其余模块全宽平铺。
 const isWorkflowTemplateMode = computed(() => !!workflowSummary.value && !isDefaultWorkflow.value)
 const workflowActionPlaceholder = computed(() => {
@@ -1940,6 +1955,7 @@ async function loadDetail(silent = false) {
     newIds.value = added
 
     meeting.value = data
+    if (data?.workflow?.templateKey === 'roundtable-v2') await loadRoundtableV2()
     if (data?.workflow?.nodes?.length) {
       const existing = data.workflow.nodes.find(node => node.stageKey === selectedWorkflowNodeKey.value)
       if (!existing) {
@@ -1960,6 +1976,12 @@ async function loadDetail(silent = false) {
       setTimeout(() => { newIds.value = new Set() }, 2500)
     }
   } finally { if (!silent) loading.value = false }
+}
+
+async function loadRoundtableV2() {
+  const [v2, usage] = await Promise.allSettled([meetingApi.getRoundtableV2(meetingId), meetingApi.getUsage(meetingId)])
+  if (v2.status === 'fulfilled') roundtableV2.value = v2.value.data
+  if (usage.status === 'fulfilled') meetingUsage.value = usage.value.data
 }
 
 function scrollToBottom() {
@@ -2129,6 +2151,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 <style scoped>
 .meeting-detail { display: flex; flex-direction: column; gap: 14px; }
 .header-card, .chat-card, .members-card, .contrib-card { border-radius: 12px; }
+.v2-waiting { color: #8492a6; font-size: 13px; }
 .meeting-secondary { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .meeting-secondary-pair {
   display: grid;

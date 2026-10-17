@@ -498,6 +498,32 @@ class RoundtableV2FlowIntegrationTest {
         assertTrue(view.getResult().get("outcome") == null, view.getResult().toJSONString());
     }
 
+    /** Runs a meeting that touches every section and writes the API payload as the frontend's test sample. */
+    @Test
+    void richMeetingProducesEverySectionOfTheFrontendSample() throws Exception {
+        Fixture fixture = stockFixtureWithHistory();
+        // Q1 is a first-round consensus (red team target); Q2 splits, and 丙 moves to 乙's side after cross-examination.
+        String agree = answer("A", "市盈率22.5倍，处于近一年较低分位", "F-4", "A", "订单需求偏强", "L-1");
+        String split = answer("A", "营收同比8.5%，增速一般", "F-9", "B", "订单规模80亿元，增速放缓", "L-1");
+        fixture.answers("甲", withOutcome(agree, "下跌8%–23%的可能性不高", 0, 0.1, 0.5, 0.3, 0.1));
+        fixture.answers("乙", withOutcome(split, "估值不低", 0.1, 0.5, 0.3, 0.1, 0));
+        fixture.answers("丙", withOutcome(agree, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+        fixture.finalAnswers("丙", withOutcome(withChangeReason(
+                answer("A", "市盈率22.5倍，处于近一年较低分位", "F-4", "B", "订单增速放缓", "L-1"),
+                "Q2", "质询后认为订单增速放缓的证据更扎实"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        java.nio.file.Path sample = java.nio.file.Paths.get("target", "roundtable-v2-sample.json");
+        java.nio.file.Files.writeString(sample, JSON.toJSONString(view, true));
+        JSONObject result = view.getResult();
+        assertTrue(view.getOutcomeQuestion() != null && result.getJSONObject("outcome") != null);
+        assertEquals(1, result.getJSONArray("changes").size());
+        assertEquals("INTERPRETATION", result.getJSONArray("disputes").getJSONObject(0).getString("type"));
+        assertTrue(!view.getCrossExams().isEmpty() && view.getRedTeam() != null);
+    }
+
     private Fixture stockFixtureWithHistory() {
         Fixture fixture = new Fixture();
         fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,\"horizonTradingDays\":60,"
