@@ -323,7 +323,7 @@ const MemberReasons = defineComponent({
 .v2-bar-row.mode .v2-bar-label, .v2-bar-row.mode .v2-bar-value { font-weight: 700; }
 .v2-bar-value { text-align: right; }
 .v2-pending { margin-top: 8px; }
-.v2-solo-row { padding: 6px 0; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.v2-solo-row { padding: 6px 0; font-size: 13px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .v2-solo-row + .v2-solo-row { border-top: 1px dashed #eef1f6; }
 .v2-solo-sides { display: flex; flex-wrap: wrap; gap: 4px 24px; }
 .v2-solo-error { margin-top: 6px; font-size: 13px; color: #c45656; }
