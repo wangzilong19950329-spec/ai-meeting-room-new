@@ -27,4 +27,6 @@ public class RoundtableV2ViewVO {
     private JSONObject result;
     /** The judged outcome and forecast scores, once the horizon has passed. */
     private JSONObject outcomeJudgement;
+    /** The one-pass answer of a single analyst on the same card and fact base, made on request as a control. */
+    private JSONObject solo;
 }

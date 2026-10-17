@@ -856,6 +856,97 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void soloAnalystAnswersTheSameCardAndFactBaseInOnePassAndIsStoredOnce() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "需求偏弱", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.soloReplies.add(answer("B", "营收增速放缓", "F-1", "B", "订单待核", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+        JSONObject before = controller.getRoundtableV2(meetingId).getData().getResult();
+
+        JSONObject solo = fixture.service.solo(meetingId);
+        JSONObject again = fixture.service.solo(meetingId);
+
+        assertTrue(!solo.getBooleanValue("skipped"), solo.toJSONString());
+        assertEquals("单人分析", solo.getString("memberName"));
+        assertEquals("deepseek-chat", solo.getString("modelType"));
+        assertEquals(JSON.parseObject(solo.toJSONString()), JSON.parseObject(again.toJSONString()));
+        assertEquals(1, fixture.calls.stream().filter("solo:单人"::equals).count(), fixture.calls.toString());
+        // Same evidence as the members had before the meeting, nothing from the discussion.
+        String prompt = fixture.soloPrompts.get(0);
+        assertTrue(prompt.contains("F-1") && prompt.contains("L-1") && !prompt.contains("质询"), prompt);
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals(JSON.parseObject(solo.toJSONString()), JSON.parseObject(view.getSolo().toJSONString()));
+        assertEquals(before.toJSONString(), view.getResult().toJSONString());
+    }
+
+    @Test
+    void soloIsRefusedBeforeTheMeetingHasASummary() {
+        Fixture fixture = new Fixture();
+        fixture.down.add("divergence:甲");
+        fixture.down.add("divergence:乙");
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+
+        IllegalStateException refused = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.solo(meetingId));
+
+        assertTrue(refused.getMessage().contains("结束"), refused.getMessage());
+        assertEquals(0, fixture.calls.stream().filter(call -> call.startsWith("solo")).count());
+    }
+
+    @Test
+    void soloWithUnsourcedNumbersIsRewrittenOnceAndNotStoredWhenStillInvalid() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.soloReplies.add(answer("A", "营收增长37%", "F-1", "A", "需求偏强", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+
+        IllegalStateException failed = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.solo(meetingId));
+
+        assertTrue(failed.getMessage().contains("37%"), failed.getMessage());
+        assertEquals(2, fixture.calls.stream().filter(call -> call.startsWith("solo")).count(), fixture.calls.toString());
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getSolo() == null);
+    }
+
+    @Test
+    void soloModelDownIsReportedAndNothingIsStored() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+        fixture.down.add("solo:单人");
+
+        IllegalStateException failed = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.solo(meetingId));
+
+        assertTrue(failed.getMessage().contains("模型调用失败"), failed.getMessage());
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getSolo() == null);
+    }
+
+    @Test
+    void expiryJudgementScoresTheSoloAnalystNextToThePooledForecast() {
+        Fixture fixture = judgedStockMeeting();
+        fixture.soloReplies.add(withOutcome(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"),
+                "需求稳定", 0, 0.2, 0.3, 0.4, 0.1));
+        fixture.service.solo(meetingId);
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(60, "112.2"));
+        RoundtableV2OutcomeJudge judge = new RoundtableV2OutcomeJudge(records, List.of(new StockMeetingDomain(fixture.eastmoney)));
+
+        JSONObject verdict = judge.judge(meetingId);
+
+        // Observed D: cumulative (0, .2, .5, .9) vs (0, 0, 0, 1) → RPS .075; Brier .04 + .09 + .36 + .01 = .50.
+        assertEquals(0.075, verdict.getJSONObject("solo").getDoubleValue("rps"), 0.0001);
+        assertEquals(0.5, verdict.getJSONObject("solo").getDoubleValue("brier"), 0.0001);
+        assertEquals(3, verdict.getJSONArray("members").size());
+    }
+
+    @Test
     void outcomeProbabilitiesNotSummingToOneAreRewrittenOnce() {
         Fixture fixture = stockFixtureWithHistory();
         String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
@@ -1088,6 +1179,8 @@ class RoundtableV2FlowIntegrationTest {
         private final List<String> calls = new ArrayList<>();
         private final List<String> classifyReplies = new ArrayList<>();
         private final List<String> moderatorPrompts = new ArrayList<>();
+        private final List<String> soloReplies = new ArrayList<>();
+        private final List<String> soloPrompts = new ArrayList<>();
         /** "stage:name" entries whose model call fails as if the provider were down. */
         private final java.util.Set<String> down = new java.util.HashSet<>();
         private final RoundtableV2Service service = new RoundtableV2Service();
@@ -1147,6 +1240,14 @@ class RoundtableV2FlowIntegrationTest {
                                         : classifyReplies.size() > 1 ? classifyReplies.remove(0) : classifyReplies.get(0);
                             }
                             return moderatorReplies.isEmpty() ? card : moderatorReplies.remove(0);
+                        }
+                        if (system.contains("综合分析师")) {
+                            calls.add(stage + ":单人");
+                            soloPrompts.add(invocation.getArgument(2));
+                            if (down.contains(stage + ":单人")) {
+                                throw new IllegalStateException("meeting_selected_model_unavailable");
+                            }
+                            return next(soloReplies);
                         }
                         String name = memberIn(system);
                         calls.add(stage + ":" + name);

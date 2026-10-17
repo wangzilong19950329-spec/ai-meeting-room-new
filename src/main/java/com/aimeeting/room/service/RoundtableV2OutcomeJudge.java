@@ -65,7 +65,8 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
         if (MeetingDomain.OutcomeObservation.UNAVAILABLE.equals(observed.status)) {
             return verdict("UNAVAILABLE", observed.reason);
         }
-        return save(meetingId, scored(question, result, finalAnswers(meetingId), observed));
+        return save(meetingId, scored(question, result, finalAnswers(meetingId),
+                load(meetingId, RoundtableV2Service.SOLO), observed));
     }
 
     @Override
@@ -92,7 +93,7 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
     }
 
     private static JSONObject scored(JSONObject question, JSONObject result, List<JSONObject> answers,
-                                     MeetingDomain.OutcomeObservation observed) {
+                                     JSONObject solo, MeetingDomain.OutcomeObservation observed) {
         JSONArray options = question.getJSONArray("options");
         double returnPct = observed.endClose.divide(observed.baseClose, 10, RoundingMode.HALF_UP)
                 .subtract(BigDecimal.ONE).doubleValue() * 100;
@@ -132,6 +133,9 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
             members.add(member);
         }
         verdict.put("members", members);
+        // The on-request single analyst, scored the same way when it exists.
+        double[] soloForecast = solo == null ? null : forecastOf(solo, question.getString("id"), options);
+        if (soloForecast != null) verdict.put("solo", scores(soloForecast, hit));
         verdict.put("judgedAt", Instant.now().toString());
         return verdict;
     }

@@ -133,6 +133,16 @@ public class MeetingController {
         return ApiResponse.ok(roundtableV2Service.view(id));
     }
 
+    /** 圆桌 v2：按需生成单人对照（同模型、同问题卡和会前底稿，一次作答），只对已结束的会议有效，只存一份 */
+    @PostMapping("/meetings/{id}/roundtable-v2/solo")
+    public ApiResponse<com.alibaba.fastjson.JSONObject> createRoundtableV2Solo(@PathVariable Long id) {
+        try {
+            return ApiResponse.ok(roundtableV2Service.solo(id));
+        } catch (IllegalStateException refused) {
+            return ApiResponse.fail(refused.getMessage());
+        }
+    }
+
     /** 查询用户的会议列表 */
     @GetMapping("/meetings")
     public ApiResponse<List<MeetingDetailVO>> listMeetings(@RequestParam Long creatorId) {

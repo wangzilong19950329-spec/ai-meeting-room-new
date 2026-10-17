@@ -56,6 +56,7 @@ public class RoundtableV2Service {
     static final String CLASSIFY = "CLASSIFY";
     static final String TOP_UP = "TOP_UP";
     static final String OUTCOME = "OUTCOME_Q";
+    static final String SOLO = "SOLO";
     private static final String PROBABILITY = "PROBABILITY";
     private static final int DEFAULT_HORIZON_TRADING_DAYS = 60;
     /** A member is in the minority when any interval differs from the pooled probability by this much. */
@@ -95,6 +96,55 @@ public class RoundtableV2Service {
         }
     }
 
+    /**
+     * On request, a single analyst answers the same card and pre-meeting fact base in one pass with the
+     * moderator's model: a control for whether the roundtable adds anything. It never changes the meeting.
+     * Only a valid answer is stored; failures are reported so the request can simply be repeated.
+     */
+    public JSONObject solo(Long meetingId) {
+        JSONObject stored = loadObject(meetingId, SOLO, MEETING_LEVEL);
+        if (stored != null) return stored;
+        AiMeetingV2Record summary = recordMapper.selectOne(meetingId, RESULT, MEETING_LEVEL);
+        AiMeetingV2Record factBase = recordMapper.selectOne(meetingId, FACT_BASE, MEETING_LEVEL);
+        if (summary == null || factBase == null) throw new IllegalStateException("会议还没有结束，暂不能生成单人对照");
+        JSONObject card = withOutcome(loadObject(meetingId, ISSUE_CARD, MEETING_LEVEL),
+                loadObject(meetingId, OUTCOME, MEETING_LEVEL));
+        JSONArray facts = JSON.parseArray(factBase.getPayload());
+        String model = orchestrator.resolveMeetingModelType(meetingId);
+        String system = "你是一位综合分析师，独立完成这份研判：同时考虑基本面、估值、资金与技术、行业与宏观和主要风险，"
+                + "自己权衡正反两面后给出结论。你只能依据问题卡和事实底稿作答。只输出 JSON。";
+        String prompt = answerPrompt(card, facts);
+        String[] corpora = corpora(facts, card);
+        Set<String> factIds = factIds(facts);
+        Answer parsed;
+        String rewriteReason = null;
+        try {
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(meetingId, 1, null, MeetingCallContext.SOLO)) {
+                parsed = parseAnswer(call(model, "单人分析", system, prompt), card, factIds, corpora);
+            }
+            if (parsed.error != null) {
+                rewriteReason = parsed.error;
+                try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                        meetingId, 1, null, MeetingCallContext.SOLO_REWRITE)) {
+                    parsed = parseAnswer(call(model, "单人分析", system,
+                            prompt + "\n\n【上一版作答不合格】" + parsed.error + "。请按要求重新输出完整 JSON。"),
+                            card, factIds, corpora);
+                }
+            }
+        } catch (ModelUnavailable unavailable) {
+            throw new IllegalStateException(unavailable.getMessage());
+        }
+        if (parsed.error != null) throw new IllegalStateException("单人答卷重写后仍不合格：" + parsed.error);
+        JSONObject record = new JSONObject(true);
+        record.put("memberName", "单人分析");
+        record.put("modelType", model);
+        record.put("skipped", false);
+        record.put("answers", parsed.answers);
+        if (rewriteReason != null) record.put("rewriteReason", rewriteReason);
+        record.put("generatedAt", java.time.Instant.now().toString());
+        return save(meetingId, SOLO, MEETING_LEVEL, summary.getRunEpoch(), record);
+    }
+
     public RoundtableV2ViewVO view(Long meetingId) {
         RoundtableV2ViewVO view = new RoundtableV2ViewVO();
         List<AiMeetingV2Record> stored = recordMapper.selectByMeetingId(meetingId);
@@ -113,6 +163,7 @@ public class RoundtableV2Service {
             else if (CLASSIFY.equals(record.getKind())) view.setClassification(JSON.parseObject(record.getPayload()));
             else if (TOP_UP.equals(record.getKind())) view.setTopUp(JSON.parseObject(record.getPayload()));
             else if (OUTCOME.equals(record.getKind())) view.setOutcomeQuestion(JSON.parseObject(record.getPayload()));
+            else if (SOLO.equals(record.getKind())) view.setSolo(JSON.parseObject(record.getPayload()));
             else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
