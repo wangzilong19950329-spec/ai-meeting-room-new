@@ -16,6 +16,8 @@ public final class MeetingCallContext {
     public static final String RED_TEAM_REWRITE = "red_team_rewrite";
     public static final String REESTIMATE = "reestimate";
     public static final String REESTIMATE_REWRITE = "reestimate_rewrite";
+    public static final String CLASSIFY = "classify";
+    public static final String CLASSIFY_REWRITE = "classify_rewrite";
     public static final String EVIDENCE_PLAN = "evidence_plan";
     public static final String EVIDENCE_SEARCH = "evidence_search";
     public static final String SPEECH = "speech";

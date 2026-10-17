@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -49,6 +50,13 @@ public class RoundtableV2Service {
     static final String CROSS_EXAM = "CROSS_EXAM_";
     static final String RED_TEAM = "RED_TEAM";
     static final String FINAL_ANSWER = "FINAL_ANSWER";
+    static final String SECOND_ROUND = "_2";
+    static final String SECOND_CROSS_EXAM = "CROSS_EXAM_R2_";
+    static final String CLASSIFY = "CLASSIFY";
+    static final String TOP_UP = "TOP_UP";
+    /** Evidence top-up for fact disputes is capped per meeting. */
+    private static final int TOP_UP_BUDGET = 3;
+    private static final Set<String> DISPUTE_TYPES = Set.of("FACT", "INTERPRETATION", "ASSUMPTION", "RISK_PREFERENCE");
     /** At most this many of the most split sub-questions are cross-examined. */
     private static final int MAX_CROSS_EXAMS = 2;
 
@@ -90,9 +98,13 @@ public class RoundtableV2Service {
             else if (ANSWER.equals(record.getKind())) view.getAnswers().add(JSON.parseObject(record.getPayload()));
             else if (RESULT.equals(record.getKind())) view.setResult(JSON.parseObject(record.getPayload()));
             else if (AGENDA.equals(record.getKind())) view.setAgenda(JSON.parseObject(record.getPayload()));
+            else if (record.getKind().startsWith(SECOND_CROSS_EXAM)) view.getSecondCrossExams().add(JSON.parseObject(record.getPayload()));
             else if (record.getKind().startsWith(CROSS_EXAM)) view.getCrossExams().add(JSON.parseObject(record.getPayload()));
             else if (RED_TEAM.equals(record.getKind())) view.setRedTeam(JSON.parseObject(record.getPayload()));
+            else if ((FINAL_ANSWER + SECOND_ROUND).equals(record.getKind())) view.getSecondFinalAnswers().add(JSON.parseObject(record.getPayload()));
             else if (FINAL_ANSWER.equals(record.getKind())) view.getFinalAnswers().add(JSON.parseObject(record.getPayload()));
+            else if (CLASSIFY.equals(record.getKind())) view.setClassification(JSON.parseObject(record.getPayload()));
+            else if (TOP_UP.equals(record.getKind())) view.setTopUp(JSON.parseObject(record.getPayload()));
         }
         return view;
     }
@@ -116,31 +128,65 @@ public class RoundtableV2Service {
             membersById.put(member.getId(), member);
             answers.add(answer(meetingId, epoch, card, facts, member));
         }
-        JSONObject agenda = agenda(meetingId, epoch, card, answers);
-        JSONArray disputes = agenda.getJSONArray("disputes");
-        JSONArray crossExams = new JSONArray();
-        for (int i = 0; i < disputes.size(); i++) {
+        JSONArray firstCrossExams = new JSONArray();
+        JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams);
+        if (finalAnswers == null) return;
+
+        JSONArray remaining = summarize(card, finalAnswers).getJSONArray("disputes");
+        JSONObject classification = null;
+        JSONObject topUp = null;
+        JSONArray allFacts = facts;
+        int loops = 1;
+        if (!remaining.isEmpty()) {
             if (activeRoom(meetingId, epoch) == null) return;
-            crossExams.add(crossExam(meetingId, epoch, i + 1, card, facts, disputes.getJSONObject(i),
-                    membersById, answers));
+            classification = classify(meetingId, epoch, card, facts, remaining, firstCrossExams);
+            topUp = topUp(meetingId, epoch, card, facts, classification);
+            if (topUp == null) return;
+            allFacts = new JSONArray();
+            allFacts.addAll(facts);
+            allFacts.addAll(topUp.getJSONArray("added"));
+            Set<String> reopened = reopenedByEvidence(topUp);
+            if (!reopened.isEmpty()) {
+                JSONArray secondRound = deliberate(meetingId, epoch, 2, card, allFacts, finalAnswers, membersById,
+                        reopened, new JSONArray());
+                if (secondRound == null) return;
+                finalAnswers = secondRound;
+                loops = 2;
+            }
+        }
+        JSONObject result = result(meetingId, epoch, card, allFacts, finalAnswers, answers, classification, topUp, loops);
+        conclude(meetingId, epoch, card, allFacts, result);
+    }
+
+    /**
+     * One deliberation round: agenda, paired cross-examination, (first round only) the consensus red team,
+     * then the anonymous re-estimate. Returns the answers after the round, or null if the meeting stopped.
+     */
+    private JSONArray deliberate(Long meetingId, Long epoch, int round, JSONObject card, JSONArray facts,
+                                 JSONArray previous, Map<Long, AiMeetingMember> membersById,
+                                 Set<String> onlyQuestions, JSONArray crossExamsOut) {
+        JSONObject agenda = agenda(meetingId, epoch, round, card, previous, onlyQuestions);
+        JSONArray disputes = agenda.getJSONArray("disputes");
+        for (int i = 0; i < disputes.size(); i++) {
+            if (activeRoom(meetingId, epoch) == null) return null;
+            String kind = (round == 1 ? CROSS_EXAM : SECOND_CROSS_EXAM) + (i + 1);
+            crossExamsOut.add(crossExam(meetingId, epoch, kind, card, facts, disputes.getJSONObject(i), membersById));
         }
         JSONObject redTeam = null;
         if (agenda.getJSONObject("redTeam") != null) {
-            if (activeRoom(meetingId, epoch) == null) return;
+            if (activeRoom(meetingId, epoch) == null) return null;
             redTeam = redTeam(meetingId, epoch, card, facts, agenda.getJSONObject("redTeam"), membersById);
         }
-        JSONArray finalAnswers = answers;
-        if (!disputes.isEmpty() || redTeam != null) {
-            finalAnswers = new JSONArray();
-            for (Object item : answers) {
-                if (activeRoom(meetingId, epoch) == null) return;
-                JSONObject first = (JSONObject) item;
-                finalAnswers.add(finalAnswer(meetingId, epoch, card, facts, answers, crossExams, redTeam,
-                        first, membersById.get(first.getLong("memberId"))));
-            }
+        if (disputes.isEmpty() && redTeam == null) return previous;
+        JSONArray after = new JSONArray();
+        String kind = round == 1 ? FINAL_ANSWER : FINAL_ANSWER + SECOND_ROUND;
+        for (Object item : previous) {
+            if (activeRoom(meetingId, epoch) == null) return null;
+            JSONObject before = (JSONObject) item;
+            after.add(finalAnswer(meetingId, epoch, kind, card, facts, previous, crossExamsOut, redTeam,
+                    before, membersById.get(before.getLong("memberId"))));
         }
-        JSONObject result = result(meetingId, epoch, card, facts, finalAnswers, answers);
-        conclude(meetingId, epoch, card, facts, result);
+        return after;
     }
 
     // ---- P0 issue card ----
@@ -526,11 +572,14 @@ public class RoundtableV2Service {
     // ---- P3 agenda (program only) ----
 
     /** Picks the most split disputes with one representative per leading side, and the leading consensus. */
-    private JSONObject agenda(Long meetingId, Long epoch, JSONObject card, JSONArray answers) {
-        JSONObject stored = loadObject(meetingId, AGENDA, MEETING_LEVEL);
+    private JSONObject agenda(Long meetingId, Long epoch, int round, JSONObject card, JSONArray answers,
+                              Set<String> onlyQuestions) {
+        String kind = round == 1 ? AGENDA : AGENDA + SECOND_ROUND;
+        JSONObject stored = loadObject(meetingId, kind, MEETING_LEVEL);
         if (stored != null) return stored;
         JSONObject firstRound = summarize(card, answers);
         List<JSONObject> disputes = firstRound.getJSONArray("disputes").toJavaList(JSONObject.class);
+        if (onlyQuestions != null) disputes.removeIf(dispute -> !onlyQuestions.contains(dispute.getString("questionId")));
         disputes.sort((left, right) -> Double.compare(topShare(left), topShare(right)));
         JSONArray chosen = new JSONArray();
         for (JSONObject dispute : disputes.subList(0, Math.min(MAX_CROSS_EXAMS, disputes.size()))) {
@@ -546,7 +595,7 @@ public class RoundtableV2Service {
         }
         JSONObject redTeam = null;
         JSONObject leading = null;
-        for (Object item : firstRound.getJSONArray("conclusions")) {
+        for (Object item : round == 1 ? firstRound.getJSONArray("conclusions") : new JSONArray()) {
             JSONObject conclusion = (JSONObject) item;
             if (leading == null || conclusion.getIntValue("support") > leading.getIntValue("support")) leading = conclusion;
         }
@@ -564,7 +613,7 @@ public class RoundtableV2Service {
         JSONObject agenda = new JSONObject(true);
         agenda.put("disputes", chosen);
         agenda.put("redTeam", redTeam);
-        return save(meetingId, AGENDA, MEETING_LEVEL, epoch, agenda);
+        return save(meetingId, kind, MEETING_LEVEL, epoch, agenda);
     }
 
     private static double topShare(JSONObject dispute) {
@@ -588,9 +637,9 @@ public class RoundtableV2Service {
 
     // ---- P5 paired cross-examination and consensus red team ----
 
-    private JSONObject crossExam(Long meetingId, Long epoch, int index, JSONObject card, JSONArray facts,
-                                 JSONObject dispute, Map<Long, AiMeetingMember> membersById, JSONArray answers) {
-        JSONObject stored = loadObject(meetingId, CROSS_EXAM + index, MEETING_LEVEL);
+    private JSONObject crossExam(Long meetingId, Long epoch, String kind, JSONObject card, JSONArray facts,
+                                 JSONObject dispute, Map<Long, AiMeetingMember> membersById) {
+        JSONObject stored = loadObject(meetingId, kind, MEETING_LEVEL);
         if (stored != null) return stored;
         JSONObject a = dispute.getJSONObject("a");
         JSONObject b = dispute.getJSONObject("b");
@@ -612,7 +661,7 @@ public class RoundtableV2Service {
         if (question == null) {
             record.put("failed", true);
             record.put("reason", "质询内容含有资料里找不到来源的数字，重写后仍不合格");
-            return save(meetingId, CROSS_EXAM + index, MEETING_LEVEL, epoch, record);
+            return save(meetingId, kind, MEETING_LEVEL, epoch, record);
         }
         record.put("question", question);
         String reply = gatedText(meetingId, answerer, MeetingCallContext.CROSS_EXAM, MeetingCallContext.CROSS_EXAM_REWRITE,
@@ -626,7 +675,7 @@ public class RoundtableV2Service {
         } else {
             record.put("reply", reply);
         }
-        return save(meetingId, CROSS_EXAM + index, MEETING_LEVEL, epoch, record);
+        return save(meetingId, kind, MEETING_LEVEL, epoch, record);
     }
 
     private JSONObject redTeam(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONObject target,
@@ -677,9 +726,10 @@ public class RoundtableV2Service {
 
     // ---- P6 anonymous re-estimate ----
 
-    private JSONObject finalAnswer(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONArray answers,
-                                   JSONArray crossExams, JSONObject redTeam, JSONObject first, AiMeetingMember member) {
-        JSONObject stored = loadObject(meetingId, FINAL_ANSWER, member.getId());
+    private JSONObject finalAnswer(Long meetingId, Long epoch, String kind, JSONObject card, JSONArray facts,
+                                   JSONArray answers, JSONArray crossExams, JSONObject redTeam, JSONObject first,
+                                   AiMeetingMember member) {
+        JSONObject stored = loadObject(meetingId, kind, member.getId());
         if (stored != null) return stored;
         JSONObject record = new JSONObject(true);
         record.put("memberId", member.getId());
@@ -687,7 +737,7 @@ public class RoundtableV2Service {
         if (first.getBooleanValue("skipped")) {
             record.put("skipped", true);
             record.put("reason", "首轮作答无效，未参加再估");
-            return save(meetingId, FINAL_ANSWER, member.getId(), epoch, record);
+            return save(meetingId, kind, member.getId(), epoch, record);
         }
         String system = memberSystem(member) + "这是匿名再估：你能看到其他人选择的分布和交锋记录，但看不到是谁选的。只输出 JSON。";
         String prompt = answerPrompt(card, facts) + "\n\n【再估任务】" + reestimateContext(card, answers, crossExams, redTeam, first)
@@ -717,12 +767,12 @@ public class RoundtableV2Service {
             record.put("fallback", false);
             record.put("answers", parsed.answers);
         }
-        return save(meetingId, FINAL_ANSWER, member.getId(), epoch, record);
+        return save(meetingId, kind, member.getId(), epoch, record);
     }
 
     private static String reestimateContext(JSONObject card, JSONArray answers, JSONArray crossExams,
                                             JSONObject redTeam, JSONObject first) {
-        StringBuilder sb = new StringBuilder("你的首轮选择：");
+        StringBuilder sb = new StringBuilder("你上一轮的选择：");
         for (Object item : first.getJSONArray("answers")) {
             JSONObject choice = (JSONObject) item;
             sb.append(choice.getString("questionId")).append("=").append(choice.getString("optionId")).append("；");
@@ -766,14 +816,193 @@ public class RoundtableV2Service {
         return sb.toString();
     }
 
+    // ---- S5 dispute classification, evidence top-up and the second-round trigger ----
+
+    /**
+     * The moderator names each remaining dispute's type, crux and (for fact disputes) the question that
+     * would settle it. Invalid entries get one rewrite; whatever is still invalid stays UNCLASSIFIED.
+     */
+    private JSONObject classify(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONArray disputes,
+                                JSONArray crossExams) {
+        JSONObject stored = loadObject(meetingId, CLASSIFY, MEETING_LEVEL);
+        if (stored != null) return stored;
+        String model = orchestrator.resolveMeetingModelType(meetingId);
+        String system = "你是中立的会议主持人，负责判断分歧的根源，不表达立场。只输出 JSON。";
+        String prompt = cardAndFacts(card, facts) + "\n【仍存在的分歧】\n" + disputesText(disputes, crossExams)
+                + "\n对每条分歧判断类型：FACT（双方依据的事实不同，能靠补充证据裁决）/ INTERPRETATION（事实相同，"
+                + "权重或因果判断不同）/ ASSUMPTION（对未来的假设不同）/ RISK_PREFERENCE（判断相同，行动取向不同）。"
+                + "写出关键分歧点，格式“若……，则……；否则……”。FACT 类必须给一道能裁决它的取证题，只问一个可以核实的事实。\n"
+                + "只输出 JSON：{\"disputes\":[{\"questionId\":\"Q1\",\"type\":\"FACT\",\"crux\":\"\",\"evidenceQuestion\":\"\"}]}";
+        Set<String> expected = new LinkedHashSet<>();
+        for (Object item : disputes) expected.add(((JSONObject) item).getString("questionId"));
+        Map<String, JSONObject> valid;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.CLASSIFY)) {
+            valid = parseClassification(callQuietly(model, system, prompt), expected);
+        }
+        if (valid.size() < expected.size()) {
+            Set<String> missing = new LinkedHashSet<>(expected);
+            missing.removeAll(valid.keySet());
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.CLASSIFY_REWRITE)) {
+                Map<String, JSONObject> retried = parseClassification(callQuietly(model, system, prompt
+                        + "\n\n【上一版不合格】这些分歧缺少合格的类型、关键分歧点或取证题：" + missing
+                        + "。请重新输出全部分歧的完整 JSON。"), expected);
+                for (Map.Entry<String, JSONObject> entry : retried.entrySet()) valid.putIfAbsent(entry.getKey(), entry.getValue());
+            }
+        }
+        JSONArray classified = new JSONArray();
+        for (String questionId : expected) {
+            JSONObject entry = valid.get(questionId);
+            if (entry == null) {
+                entry = new JSONObject(true);
+                entry.put("questionId", questionId);
+                entry.put("type", "UNCLASSIFIED");
+            }
+            classified.add(entry);
+        }
+        JSONObject record = new JSONObject(true);
+        record.put("disputes", classified);
+        return save(meetingId, CLASSIFY, MEETING_LEVEL, epoch, record);
+    }
+
+    private static Map<String, JSONObject> parseClassification(String reply, Set<String> expected) {
+        Map<String, JSONObject> valid = new LinkedHashMap<>();
+        JSONObject root = parseObject(reply);
+        JSONArray entries = root == null ? null : root.getJSONArray("disputes");
+        if (entries == null) return valid;
+        for (Object item : entries) {
+            if (!(item instanceof JSONObject)) continue;
+            JSONObject entry = (JSONObject) item;
+            String questionId = entry.getString("questionId");
+            String type = entry.getString("type");
+            String crux = entry.getString("crux");
+            String evidenceQuestion = entry.getString("evidenceQuestion");
+            if (!expected.contains(questionId) || valid.containsKey(questionId) || !DISPUTE_TYPES.contains(type)
+                    || blank(crux) || !(crux.contains("若") && crux.contains("则") && crux.contains("否则"))
+                    || ("FACT".equals(type) && blank(evidenceQuestion))) continue;
+            JSONObject clean = new JSONObject(true);
+            clean.put("questionId", questionId);
+            clean.put("type", type);
+            clean.put("crux", crux.trim());
+            if ("FACT".equals(type)) clean.put("evidenceQuestion", evidenceQuestion.trim());
+            valid.put(questionId, clean);
+        }
+        return valid;
+    }
+
+    private static String disputesText(JSONArray disputes, JSONArray crossExams) {
+        StringBuilder sb = new StringBuilder();
+        for (Object item : disputes) {
+            JSONObject dispute = (JSONObject) item;
+            sb.append(dispute.getString("questionId")).append(" ").append(dispute.getString("title")).append("\n");
+            for (Object positionItem : dispute.getJSONArray("positions")) {
+                JSONObject position = (JSONObject) positionItem;
+                sb.append("  选「").append(position.getString("optionLabel")).append("」：\n");
+                for (Object memberItem : position.getJSONArray("members")) {
+                    JSONObject member = (JSONObject) memberItem;
+                    sb.append("  ").append(member.getString("memberName")).append("\n  ")
+                            .append(reasonsText(member.getJSONArray("reasons")).replace("\n", "\n  "));
+                }
+            }
+            for (Object examItem : crossExams) {
+                JSONObject exam = (JSONObject) examItem;
+                if (!dispute.getString("questionId").equals(exam.getString("questionId"))
+                        || exam.getBooleanValue("failed")) continue;
+                sb.append("  质询：").append(exam.getString("question")).append("\n  回应：")
+                        .append(exam.getString("reply") == null ? "未回应" : exam.getString("reply")).append("\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    /** Fact disputes get their evidence question searched, at most {@link #TOP_UP_BUDGET} per meeting. */
+    private JSONObject topUp(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONObject classification) {
+        JSONObject stored = loadObject(meetingId, TOP_UP, MEETING_LEVEL);
+        if (stored != null) return stored;
+        int[] next = {maxIndex(facts, "F"), maxIndex(facts, "L"), maxIndex(facts, "G")};
+        JSONArray added = new JSONArray();
+        JSONObject byQuestion = new JSONObject(true);
+        JSONArray overBudget = new JSONArray();
+        int used = 0;
+        for (Object item : classification.getJSONArray("disputes")) {
+            JSONObject entry = (JSONObject) item;
+            if (!"FACT".equals(entry.getString("type"))) continue;
+            if (used >= TOP_UP_BUDGET) {
+                overBudget.add(entry.getString("questionId"));
+                continue;
+            }
+            if (activeRoom(meetingId, epoch) == null) return null;
+            used++;
+            String question = entry.getString("evidenceQuestion");
+            JSONArray ids = new JSONArray();
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.EVIDENCE_SEARCH)) {
+                MeetingReviewedEvidenceService.ReviewedEvidence evidence =
+                        resolveEvidence(meetingId, card.getString("asOf"), question);
+                JSONArray claims = evidence.packet.getJSONArray("claims");
+                JSONArray candidates = evidence.packet.getJSONArray("provisionalClaims");
+                for (int i = 0; claims != null && i < claims.size(); i++) {
+                    JSONObject fact = fact("F-" + (++next[0]), "F", question, claims.getJSONObject(i));
+                    added.add(fact);
+                    ids.add(fact.getString("id"));
+                }
+                for (int i = 0; candidates != null && i < candidates.size(); i++) {
+                    JSONObject fact = fact("L-" + (++next[1]), "L", question, candidates.getJSONObject(i));
+                    added.add(fact);
+                    ids.add(fact.getString("id"));
+                }
+                if (ids.isEmpty()) {
+                    JSONObject gap = gapFact(++next[2], question, "N8N_" + evidence.packet.getString("status"));
+                    added.add(gap);
+                    ids.add(gap.getString("id"));
+                }
+            } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
+                JSONObject gap = gapFact(++next[2], question, rejected.getMessage());
+                added.add(gap);
+                ids.add(gap.getString("id"));
+            }
+            byQuestion.put(entry.getString("questionId"), ids);
+        }
+        JSONObject record = new JSONObject(true);
+        record.put("added", added);
+        record.put("byQuestion", byQuestion);
+        record.put("overBudget", overBudget);
+        return save(meetingId, TOP_UP, MEETING_LEVEL, epoch, record);
+    }
+
+    /** Only fact disputes whose top-up produced new F or L facts are worth a second round. */
+    private static Set<String> reopenedByEvidence(JSONObject topUp) {
+        Set<String> reopened = new LinkedHashSet<>();
+        JSONObject byQuestion = topUp.getJSONObject("byQuestion");
+        for (String questionId : byQuestion.keySet()) {
+            for (Object id : byQuestion.getJSONArray(questionId)) {
+                if (!String.valueOf(id).startsWith("G-")) reopened.add(questionId);
+            }
+        }
+        return reopened;
+    }
+
+    private static int maxIndex(JSONArray facts, String tier) {
+        int max = 0;
+        for (Object item : facts) {
+            String id = ((JSONObject) item).getString("id");
+            if (id != null && id.startsWith(tier + "-")) {
+                try { max = Math.max(max, Integer.parseInt(id.substring(tier.length() + 1))); }
+                catch (NumberFormatException ignored) { /* not a numbered fact */ }
+            }
+        }
+        return max;
+    }
+
     // ---- P7 program summary ----
 
     /** The summary is built from the re-estimated answers; first-round answers only feed the change log. */
     private JSONObject result(Long meetingId, Long epoch, JSONObject card, JSONArray facts,
-                              JSONArray finalAnswers, JSONArray firstAnswers) {
+                              JSONArray finalAnswers, JSONArray firstAnswers, JSONObject classification,
+                              JSONObject topUp, int loops) {
         JSONObject stored = loadObject(meetingId, RESULT, MEETING_LEVEL);
         if (stored != null) return stored;
         JSONObject result = summarize(card, finalAnswers);
+        annotate(result, classification, topUp);
+        result.put("loops", loops);
         JSONArray openQuestions = new JSONArray();
         for (Object item : facts) {
             JSONObject fact = (JSONObject) item;
@@ -782,6 +1011,50 @@ public class RoundtableV2Service {
         result.put("openQuestions", openQuestions);
         result.put("changes", changes(firstAnswers, finalAnswers));
         return save(meetingId, RESULT, MEETING_LEVEL, epoch, result);
+    }
+
+    /**
+     * Remaining disputes carry type, crux and status: UNRESOLVED (still split on interpretation, assumption,
+     * risk preference, or despite new evidence), UNDECIDED (a fact dispute that got no new evidence or ran
+     * out of budget) or UNCLASSIFIED. Conclusions that were disputes after the first round are marked.
+     */
+    private static void annotate(JSONObject result, JSONObject classification, JSONObject topUp) {
+        Map<String, JSONObject> byQuestion = new LinkedHashMap<>();
+        if (classification != null) {
+            for (Object item : classification.getJSONArray("disputes")) {
+                JSONObject entry = (JSONObject) item;
+                byQuestion.put(entry.getString("questionId"), entry);
+            }
+        }
+        JSONObject evidence = topUp == null ? new JSONObject() : topUp.getJSONObject("byQuestion");
+        for (Object item : result.getJSONArray("disputes")) {
+            JSONObject dispute = (JSONObject) item;
+            JSONObject entry = byQuestion.get(dispute.getString("questionId"));
+            String type = entry == null ? "UNCLASSIFIED" : entry.getString("type");
+            dispute.put("type", type);
+            if (entry != null && entry.getString("crux") != null) dispute.put("crux", entry.getString("crux"));
+            if (entry != null && entry.getString("evidenceQuestion") != null) {
+                dispute.put("evidenceQuestion", entry.getString("evidenceQuestion"));
+            }
+            JSONArray ids = evidence.getJSONArray(dispute.getString("questionId"));
+            if (ids != null) dispute.put("topUpFactIds", ids);
+            if ("UNCLASSIFIED".equals(type)) {
+                dispute.put("status", "UNCLASSIFIED");
+            } else if ("FACT".equals(type) && (ids == null
+                    || ids.stream().allMatch(id -> String.valueOf(id).startsWith("G-")))) {
+                dispute.put("status", "UNDECIDED");
+            } else {
+                dispute.put("status", "UNRESOLVED");
+            }
+        }
+        for (Object item : result.getJSONArray("conclusions")) {
+            JSONObject conclusion = (JSONObject) item;
+            JSONObject entry = byQuestion.get(conclusion.getString("questionId"));
+            if (entry == null) continue;
+            conclusion.put("resolvedAfterDispute", true);
+            conclusion.put("type", entry.getString("type"));
+            if (entry.getString("crux") != null) conclusion.put("crux", entry.getString("crux"));
+        }
     }
 
     private static JSONArray changes(JSONArray firstAnswers, JSONArray finalAnswers) {
@@ -922,7 +1195,8 @@ public class RoundtableV2Service {
                 JSONObject json = (JSONObject) position;
                 sides.add(json.getString("optionLabel") + " " + json.getJSONArray("members").size() + " 人");
             }
-            disputeLines.add(line.getString("title") + "（" + String.join("，", sides) + "）");
+            String why = line.getString("crux") == null ? "" : "；" + typeLabel(line.getString("type")) + "：" + line.getString("crux");
+            disputeLines.add(line.getString("title") + "（" + String.join("，", sides) + why + "）");
         }
         String conclusion = (conclusionLines.isEmpty() ? "未形成多方一致的结论。" : "结论：" + String.join("；", conclusionLines) + "。")
                 + (disputeLines.isEmpty() ? "" : "分歧：" + String.join("；", disputeLines) + "。");
@@ -963,6 +1237,16 @@ public class RoundtableV2Service {
         room.setConclusionTime(concludedAt);
         room.setStatus(MeetingStatusEnum.CONCLUDED.getCode());
         workflowService.markMeetingConcluded(room, trackingCard);
+    }
+
+    private static String typeLabel(String type) {
+        switch (type == null ? "" : type) {
+            case "FACT": return "事实分歧";
+            case "INTERPRETATION": return "解读分歧";
+            case "ASSUMPTION": return "假设分歧";
+            case "RISK_PREFERENCE": return "风险偏好分歧";
+            default: return "未分类分歧";
+        }
     }
 
     private static String conclusionHistory(AiMeetingRoom room, String conclusion, int round, Date at) {

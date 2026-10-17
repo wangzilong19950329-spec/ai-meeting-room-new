@@ -56,6 +56,9 @@ class RoundtableV2FlowIntegrationTest {
             + "\"evidenceQuestions\":[\"2025年营收是多少？\",\"最新订单规模是多少？\",\"海外关税影响多大？\"],"
             + "\"referenceClass\":null}";
 
+    private static final String DEFAULT_CLASSIFY = "{\"disputes\":[{\"questionId\":\"Q2\","
+            + "\"type\":\"INTERPRETATION\",\"crux\":\"若需求回暖，则偏强；否则偏弱\"}]}";
+
     private final long meetingId = UUID.randomUUID().getMostSignificantBits() & Long.MAX_VALUE;
 
     @Autowired private MeetingReviewedSearchLedgerService ledger;
@@ -241,6 +244,124 @@ class RoundtableV2FlowIntegrationTest {
         assertEquals(3, view.getResult().getIntValue("answeredCount"));
     }
 
+    @Test
+    void factDisputeWithNewEvidenceRunsASecondRoundAndResumesWithoutRepeating() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+        fixture.finalAnswers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"),
+                withChangeReason(answer("A", "营收稳健", "F-1", "A", "出货同比增长20%", "F-2"),
+                        "Q2", "补证显示出货同比增长20%"));
+        fixture.classifyReplies.add("{\"disputes\":[{\"questionId\":\"Q2\",\"type\":\"FACT\","
+                + "\"crux\":\"若最新季度出货同比为正，则需求偏强；否则偏弱\","
+                + "\"evidenceQuestion\":\"最新季度出货同比增速是多少？\"}]}");
+        doThrow(new MeetingReviewedEvidenceService.EvidenceRejected("MEETING_RUN_STALE"))
+                .doNothing()
+                .when(fixture.writer).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
+                        nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+
+        fixture.service.run(meetingId, EPOCH);
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        int callsAfterFirstRun = fixture.calls.size();
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(callsAfterFirstRun, fixture.calls.size(), "a resumed meeting must not repeat model calls");
+        verify(fixture.reviewed, times(4)).search(anyString(), anyString(), anyString(), anyLong());
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals("FACT", view.getClassification().getJSONArray("disputes").getJSONObject(0).getString("type"));
+        assertEquals("F-2", view.getTopUp().getJSONArray("added").getJSONObject(0).getString("id"));
+        assertEquals(3, view.getSecondFinalAnswers().size());
+        assertEquals(2, fixture.calls.stream().filter("cross_exam:甲"::equals).count(), fixture.calls.toString());
+        JSONObject result = view.getResult();
+        assertEquals(2, result.getIntValue("loops"));
+        assertEquals(0, result.getJSONArray("disputes").size());
+        JSONObject resolved = null;
+        for (Object item : result.getJSONArray("conclusions")) {
+            if ("Q2".equals(((JSONObject) item).getString("questionId"))) resolved = (JSONObject) item;
+        }
+        assertTrue(resolved != null && resolved.getBooleanValue("resolvedAfterDispute"), result.toJSONString());
+        assertEquals("FACT", resolved.getString("type"));
+    }
+
+    @Test
+    void nonFactDisputeIsAnnotatedAndStopsAfterOneRound() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals(1, view.getResult().getIntValue("loops"));
+        JSONObject dispute = view.getResult().getJSONArray("disputes").getJSONObject(0);
+        assertEquals("INTERPRETATION", dispute.getString("type"));
+        assertEquals("若需求回暖，则偏强；否则偏弱", dispute.getString("crux"));
+        assertEquals("UNRESOLVED", dispute.getString("status"));
+        verify(fixture.reviewed, times(3)).search(anyString(), anyString(), anyString(), anyLong());
+        assertEquals(3, fixture.calls.stream().filter(call -> call.startsWith("reestimate:")).count());
+    }
+
+    @Test
+    void evidenceTopUpStopsAtThreeQuestionsAndMarksTheRestUndecided() {
+        Fixture fixture = new Fixture();
+        fixture.card = FOUR_QUESTION_CARD;
+        fixture.answers("甲", fourAnswers("A"));
+        fixture.answers("乙", fourAnswers("B"));
+        fixture.answers("丙", fourAnswers("A"));
+        StringBuilder classify = new StringBuilder("{\"disputes\":[");
+        for (int i = 1; i <= 4; i++) {
+            if (i > 1) classify.append(",");
+            classify.append("{\"questionId\":\"Q").append(i).append("\",\"type\":\"FACT\",")
+                    .append("\"crux\":\"若事实").append(i).append("成立，则选A；否则选B\",")
+                    .append("\"evidenceQuestion\":\"补证题").append(i).append("\"}");
+        }
+        fixture.classifyReplies.add(classify.append("]}").toString());
+
+        fixture.service.run(meetingId, EPOCH);
+
+        verify(fixture.reviewed, times(6)).search(anyString(), anyString(), anyString(), anyLong());
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals(List.of("Q4"), view.getTopUp().getJSONArray("overBudget").toJavaList(String.class));
+        assertEquals(1, view.getResult().getIntValue("loops"));
+        for (Object item : view.getResult().getJSONArray("disputes")) {
+            assertEquals("UNDECIDED", ((JSONObject) item).getString("status"), item.toString());
+        }
+    }
+
+    @Test
+    void invalidClassificationLeavesDisputesUnclassifiedWithoutBlocking() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+        fixture.classifyReplies.add("{\"disputes\":[{\"questionId\":\"Q2\",\"type\":\"WHATEVER\"}]}");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals("UNCLASSIFIED", view.getResult().getJSONArray("disputes").getJSONObject(0).getString("status"));
+        assertEquals(2, fixture.calls.stream().filter("classify:主持人"::equals).count(), fixture.calls.toString());
+        verify(fixture.writer).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
+                nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+    }
+
+    private static final String FOUR_QUESTION_CARD = "{\"topic\":\"四个驱动因素\",\"subQuestions\":["
+            + "{\"id\":\"Q1\",\"title\":\"因素一\",\"options\":[{\"id\":\"A\",\"label\":\"正\"},{\"id\":\"B\",\"label\":\"负\"}]},"
+            + "{\"id\":\"Q2\",\"title\":\"因素二\",\"options\":[{\"id\":\"A\",\"label\":\"正\"},{\"id\":\"B\",\"label\":\"负\"}]},"
+            + "{\"id\":\"Q3\",\"title\":\"因素三\",\"options\":[{\"id\":\"A\",\"label\":\"正\"},{\"id\":\"B\",\"label\":\"负\"}]},"
+            + "{\"id\":\"Q4\",\"title\":\"因素四\",\"options\":[{\"id\":\"A\",\"label\":\"正\"},{\"id\":\"B\",\"label\":\"负\"}]}],"
+            + "\"evidenceQuestions\":[\"2025年营收是多少？\",\"最新订单规模是多少？\",\"海外关税影响多大？\"]}";
+
+    private static String fourAnswers(String option) {
+        JSONArray answers = new JSONArray();
+        for (int i = 1; i <= 4; i++) answers.add(answerItem("Q" + i, option, "依据营收与订单资料", "F-1"));
+        JSONObject root = new JSONObject();
+        root.put("answers", answers);
+        return root.toJSONString();
+    }
+
     private static String withChangeReason(String answerJson, String questionId, String reason) {
         JSONObject root = JSON.parseObject(answerJson);
         for (Object item : root.getJSONArray("answers")) {
@@ -298,10 +419,12 @@ class RoundtableV2FlowIntegrationTest {
         private final MeetingReviewedFinalizationWriter writer = mock(MeetingReviewedFinalizationWriter.class);
         private final MeetingWorkflowService workflow = mock(MeetingWorkflowService.class);
         private final List<String> moderatorReplies = new ArrayList<>();
+        private String card = CARD;
         private final Map<String, List<String>> memberReplies = new HashMap<>();
         private final Map<String, List<String>> finalReplies = new HashMap<>();
         private final Map<String, List<String>> crossExamReplies = new HashMap<>();
         private final List<String> calls = new ArrayList<>();
+        private final List<String> classifyReplies = new ArrayList<>();
         private final RoundtableV2Service service = new RoundtableV2Service();
 
         private Fixture() {
@@ -335,6 +458,10 @@ class RoundtableV2FlowIntegrationTest {
                     return crossChecked(invocation.getArgument(0), question, invocation.getArgument(2),
                             "2025年营收：100亿元");
                 }
+                if (question.contains("出货")) {
+                    return crossChecked(invocation.getArgument(0), question, invocation.getArgument(2),
+                            "最新季度出货同比增长20%");
+                }
                 if (question.contains("订单")) {
                     return provisional(invocation.getArgument(0), question, invocation.getArgument(2),
                             "待核验的订单规模80亿");
@@ -349,7 +476,11 @@ class RoundtableV2FlowIntegrationTest {
                         String stage = frame == null ? "none" : frame.stage.replace("_rewrite", "");
                         if (system.contains("主持人")) {
                             calls.add(stage + ":主持人");
-                            return moderatorReplies.isEmpty() ? CARD : moderatorReplies.remove(0);
+                            if (MeetingCallContext.CLASSIFY.equals(stage)) {
+                                return classifyReplies.isEmpty() ? DEFAULT_CLASSIFY
+                                        : classifyReplies.size() > 1 ? classifyReplies.remove(0) : classifyReplies.get(0);
+                            }
+                            return moderatorReplies.isEmpty() ? card : moderatorReplies.remove(0);
                         }
                         String name = memberIn(system);
                         calls.add(stage + ":" + name);
