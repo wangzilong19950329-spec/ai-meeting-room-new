@@ -81,6 +81,8 @@ public interface AiMeetingRoomMapper {
 
     List<AiMeetingRoom> selectByCreatorId(Long creatorId);
 
+    List<AiMeetingRoom> selectByStatuses(@Param("statuses") List<Integer> statuses);
+
     List<AiMeetingRoom> selectRecentConcludedByProject(@Param("creatorId") Long creatorId,
                                                        @Param("projectKey") String projectKey);
 

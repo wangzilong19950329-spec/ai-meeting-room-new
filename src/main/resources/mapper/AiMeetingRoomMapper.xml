@@ -157,6 +157,12 @@
         SELECT * FROM ai_meeting_room WHERE creator_id = #{creatorId} ORDER BY gmt_create DESC
     </select>
 
+    <select id="selectByStatuses" resultMap="BaseResultMap">
+        SELECT * FROM ai_meeting_room WHERE status IN
+        <foreach collection="statuses" item="status" open="(" separator="," close=")">#{status}</foreach>
+        ORDER BY id
+    </select>
+
     <select id="selectRecentConcludedByProject" resultMap="BaseResultMap">
         SELECT *
         FROM ai_meeting_room

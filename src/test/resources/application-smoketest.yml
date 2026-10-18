@@ -25,6 +25,9 @@ stock-watch:
 
 # 关闭后台追踪刷新调度，避免干扰冒烟测试
 ai:
+  meeting:
+    # Tests insert rooms in any status; the startup pause is exercised directly.
+    pause-interrupted-on-startup: false
   tracking:
     refresh:
       enabled: false
