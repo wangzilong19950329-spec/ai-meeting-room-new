@@ -10,6 +10,18 @@
       </div>
     </template>
 
+    <!-- 复议：来自哪场会议、新情况、每道题从上一版到这次的变化 -->
+    <el-alert v-if="view.review" type="info" :closable="false" class="v2-skipped">
+      <div>
+        {{ view.review.headerText }}
+        <router-link :to="`/meetings/${view.review.parentMeetingId}`">查看上一版</router-link>
+      </div>
+      <div v-for="fact in view.review.newFacts" :key="fact" class="v2-muted">新情况：{{ fact }}</div>
+      <div v-for="row in view.review.rows" :key="row.questionId" class="v2-muted">
+        {{ row.questionId }} {{ row.title }}：上一版 {{ row.beforeText }} → 复议 {{ row.afterText }}
+      </div>
+    </el-alert>
+
     <el-alert v-if="view.skippedMembers.length" type="warning" :closable="false" class="v2-skipped">
       <div v-for="member in view.skippedMembers" :key="member.memberName">{{ member.memberName }} 作答无效：{{ member.reason }}</div>
     </el-alert>
@@ -196,6 +208,12 @@
             </div>
           </template>
 
+          <template v-if="step.key === 'informed'">
+            <div v-for="member in step.members" :key="member.memberName" class="v2-change">
+              <strong>{{ member.memberName }}</strong>：{{ member.changeText }}
+            </div>
+          </template>
+
           <template v-if="step.key === 'reestimate'">
             <div v-for="member in step.members" :key="member.memberName" class="v2-change">
               <strong>{{ member.memberName }}</strong>：{{ member.changeText }}
@@ -245,6 +263,27 @@
           </div>
           <div v-if="interveneError" class="v2-solo-error">{{ interveneError }}</div>
         </div>
+      </div>
+    </section>
+
+    <!-- 复议：带着新情况重开已结束会议的部分子问题，生成子会议 -->
+    <section v-if="view.canReview || view.reviews.length" class="v2-section">
+      <div class="v2-title">复议</div>
+      <div v-for="item in view.reviews" :key="item.meetingId" class="v2-muted">
+        <router-link :to="`/meetings/${item.meetingId}`">会议 #{{ item.meetingId }}</router-link>：{{ item.text }}
+      </div>
+      <div v-if="view.canReview" class="v2-intervene-form">
+        <div class="v2-muted">追踪项有了关键变化时，带着新情况重开选中的子问题。这场会议的结论原样保留，到期两场各自打分。</div>
+        <el-checkbox-group v-model="reviewDraft.questionIds">
+          <el-checkbox v-for="option in view.reviewOptions" :key="option.id" :value="option.id">{{ option.id }} {{ option.title }}</el-checkbox>
+        </el-checkbox-group>
+        <el-input v-model="reviewDraft.facts" type="textarea" :rows="3" placeholder="写下自这场会议以来的新情况，一行一条，例如：三季度新增订单同比下降 15%" />
+        <el-input v-model="reviewDraft.source" size="small" placeholder="来源（可不填，默认记为用户提供）" />
+        <div class="v2-intervene-actions">
+          <el-button size="small" type="primary" plain :loading="reviewLoading" :disabled="!canSubmitReview" @click="submitReview">发起复议</el-button>
+          <span class="v2-muted">{{ view.reviewEstimateText(askableMembers.length) }}</span>
+        </div>
+        <div v-if="reviewError" class="v2-solo-error">{{ reviewError }}</div>
       </div>
     </section>
 
@@ -335,9 +374,26 @@ const props = defineProps({
   interveneLoading: { type: Boolean, default: false },
   interveneError: { type: String, default: '' },
   // Bumped by the parent after a successful submission, so the draft is cleared only then.
-  interveneVersion: { type: Number, default: 0 }
+  interveneVersion: { type: Number, default: 0 },
+  reviewLoading: { type: Boolean, default: false },
+  reviewError: { type: String, default: '' }
 })
-const emit = defineEmits(['request-solo', 'intervene'])
+const emit = defineEmits(['request-solo', 'intervene', 'review'])
+
+const reviewDraft = reactive({ questionIds: [], facts: '', source: '' })
+watch(() => props.view.reviewOptions, options => {
+  if (!reviewDraft.questionIds.length) reviewDraft.questionIds = (options || []).map(option => option.id)
+}, { immediate: true })
+const canSubmitReview = computed(() => reviewDraft.facts.trim() && reviewDraft.questionIds.length)
+
+function submitReview() {
+  const source = reviewDraft.source.trim()
+  emit('review', {
+    questionIds: reviewDraft.questionIds,
+    facts: reviewDraft.facts.split('\n').map(line => line.trim()).filter(Boolean)
+      .map(content => (source ? { content, source } : { content }))
+  })
+}
 
 const draft = reactive({ type: 'FACT', content: '', source: '', targetMemberId: null })
 const askableMembers = computed(() => props.members.filter(member => member.role !== 1))

@@ -74,6 +74,23 @@ public class StockMeetingDomain implements MeetingDomain {
         }
         String source = fetched.source;
         List<Map<String, Object>> history = fetched.bars;
+        // A review keeps the original expiry: it forecasts from the latest close over the trading days left.
+        JSONObject reviewOf = issueCard.getJSONObject("reviewOf");
+        if (reviewOf != null && reviewOf.getString("baseDate") != null) {
+            int base = -1;
+            for (int i = 0; history != null && i < history.size(); i++) {
+                if (reviewOf.getString("baseDate").equals(text(history.get(i).get("date")))) base = i;
+            }
+            if (base < 0) {
+                facts.add(gap(label, "REVIEW_BASE_DATE_MISSING: " + reviewOf.getString("baseDate")));
+                return new DomainEvidence(facts, null);
+            }
+            horizon = reviewOf.getIntValue("horizonTradingDays") - (history.size() - 1 - base);
+            if (horizon <= 0) {
+                facts.add(gap(label, "REVIEW_HORIZON_PASSED"));
+                return new DomainEvidence(facts, null);
+            }
+        }
         List<BigDecimal> closes = new ArrayList<>();
         String baseDate = null;
         for (Map<String, Object> bar : history == null ? List.<Map<String, Object>>of() : history) {

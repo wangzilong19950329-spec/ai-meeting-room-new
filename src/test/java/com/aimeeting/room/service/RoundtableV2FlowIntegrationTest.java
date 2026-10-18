@@ -1005,6 +1005,119 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void aReviewAnswersTheChosenQuestionsBlindThenAgainstTheParentAndLeavesTheParentUntouched() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "旧判断订单偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "旧判断增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "旧判断需求回暖", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+        Map<String, String> parentBefore = payloads(meetingId);
+        long childId = meetingId ^ 0x5A5AL;
+        try {
+            fixture.addChildMeeting(childId);
+            String blind = singleAnswer("Q2", "B", "新增订单转弱", "F-2");
+            fixture.answers("甲", blind);
+            fixture.answers("乙", blind);
+            fixture.answers("丙", blind);
+            String informed = withChangeReason(singleAnswer("Q2", "B", "新增订单转弱", "F-2"), "Q2",
+                    "F-2 显示需求没有回暖，当时“若需求回暖则偏强”的条件没有出现");
+            fixture.informed("甲", informed);
+            fixture.informed("乙", informed);
+            fixture.informed("丙", informed);
+
+            fixture.service.prepareReview(meetingId, childId, reviewRequest(List.of("Q2"), "三季度新增订单同比下降"));
+            int parentCalls = fixture.calls.size();
+            fixture.service.run(childId, EPOCH);
+            List<String> reviewCalls = fixture.calls.subList(parentCalls, fixture.calls.size());
+
+            RoundtableV2ViewVO view = controller.getRoundtableV2(childId).getData();
+            JSONObject card = view.getIssueCard();
+            assertEquals(List.of("Q2"), questionIds(card));
+            assertEquals(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).toString(), card.getString("asOf"));
+            assertEquals(meetingId, view.getReview().getLongValue("parentMeetingId"));
+            JSONObject added = factWithId(view.getFacts(), "F-2");
+            assertEquals("三季度新增订单同比下降", added.getString("statement"));
+            assertTrue(added.getBooleanValue("userProvided"), added.toJSONString());
+            JSONObject inherited = factWithId(view.getFacts(), "L-1");
+            assertTrue(inherited.getBooleanValue("fromParent"), inherited.toJSONString());
+            assertTrue(inherited.getString("statement").startsWith("（截至" + card.getString("asOf") + "）"),
+                    inherited.getString("statement"));
+
+            String blindPrompt = lastMemberPrompt(fixture, "divergence:甲");
+            assertFalse(blindPrompt.contains("旧判断订单偏强"), "the blind answer must not see the old one");
+            String informedPrompt = lastMemberPrompt(fixture, "review_informed:甲");
+            assertTrue(informedPrompt.contains("旧判断订单偏强") && informedPrompt.contains("若需求回暖，则偏强；否则偏弱"),
+                    informedPrompt);
+            assertEquals(3, view.getAnswers().size());
+            assertEquals(3, view.getInformedAnswers().size());
+            assertTrue(view.getInformedAnswers().getJSONObject(0).toJSONString().contains("changeReason"));
+            assertTrue(view.getResult() != null);
+            assertTrue(reviewCalls.stream().noneMatch(call -> call.startsWith("issue_card")),
+                    "the review copies the parent's card instead of asking the moderator again: " + reviewCalls);
+            assertTrue(reviewCalls.stream().noneMatch(call -> call.startsWith("research_plan")),
+                    "a review does not run member research: " + reviewCalls);
+
+            Map<String, String> parentAfter = payloads(meetingId);
+            JSONObject link = JSON.parseObject(parentAfter.remove(RoundtableV2Service.REVIEW_CHILD + ":" + childId));
+            assertEquals(childId, link.getLongValue("childMeetingId"));
+            assertEquals(parentBefore, parentAfter, "the parent's records must not change");
+            assertEquals(1, controller.getRoundtableV2(meetingId).getData().getReviews().size());
+        } finally {
+            records.deleteByMeetingId(childId);
+        }
+    }
+
+    @Test
+    void aStockReviewStartsTheOutcomeQuestionFromTheLatestCloseForTheRemainingDays() {
+        Fixture fixture = judgedStockMeeting();
+        long childId = meetingId ^ 0x6B6BL;
+        try {
+            fixture.addChildMeeting(childId);
+            when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(10, "110"));
+            String blind = withOutcome(singleAnswer("Q2", "A", "需求偏强", "F-1"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+            fixture.answers("甲", blind);
+            fixture.answers("乙", blind);
+            fixture.answers("丙", blind);
+
+            fixture.service.prepareReview(meetingId, childId, reviewRequest(List.of("Q2"), "三季度新增订单同比下降"));
+            fixture.service.run(childId, EPOCH);
+
+            RoundtableV2ViewVO view = controller.getRoundtableV2(childId).getData();
+            JSONObject outcome = view.getOutcomeQuestion();
+            assertEquals("x10", outcome.getString("baseDate"), outcome.toJSONString());
+            assertEquals(50, outcome.getIntValue("horizonTradingDays"), "60 days minus the 10 already passed");
+            assertTrue(view.getResult().getJSONObject("outcome") != null, view.getResult().toJSONString());
+            assertEquals("2026-10-16", controller.getRoundtableV2(meetingId).getData().getOutcomeQuestion().getString("baseDate"));
+        } finally {
+            records.deleteByMeetingId(childId);
+        }
+    }
+
+    @Test
+    void aReviewIsRefusedForAnUnfinishedMeetingAnUnknownQuestionOrAnOutcomeAlreadyJudged() {
+        Fixture fixture = new Fixture();
+        IllegalStateException unfinished = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.checkReview(meetingId, reviewRequest(List.of("Q2"), "新情况")));
+        assertTrue(unfinished.getMessage().contains("结束"), unfinished.getMessage());
+
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+        IllegalStateException unknown = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.checkReview(meetingId, reviewRequest(List.of("Q9"), "新情况")));
+        assertTrue(unknown.getMessage().contains("Q9"), unknown.getMessage());
+        IllegalStateException nothingNew = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.checkReview(meetingId, reviewRequest(List.of("Q2"))));
+        assertTrue(nothingNew.getMessage().contains("新情况"), nothingNew.getMessage());
+
+        records.insert(record(meetingId, RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT, "{\"status\":\"JUDGED\"}"));
+        IllegalStateException judged = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.checkReview(meetingId, reviewRequest(List.of("Q2"), "新情况")));
+        assertTrue(judged.getMessage().contains("到期"), judged.getMessage());
+    }
+
+    @Test
     void stockTopicPutsEastmoneyFactsFirstAndMembersMayCiteTheirNumbers() {
         Fixture fixture = new Fixture();
         fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,"
@@ -1688,6 +1801,54 @@ class RoundtableV2FlowIntegrationTest {
         return item;
     }
 
+    private static JSONObject reviewRequest(List<String> questionIds, String... facts) {
+        JSONObject request = new JSONObject(true);
+        request.put("questionIds", questionIds);
+        JSONArray list = new JSONArray();
+        for (String fact : facts) {
+            JSONObject item = new JSONObject(true);
+            item.put("content", fact);
+            item.put("source", "公司公告");
+            list.add(item);
+        }
+        request.put("facts", list);
+        return request;
+    }
+
+    private static String singleAnswer(String questionId, String optionId, String reason, String factId) {
+        JSONObject root = new JSONObject();
+        JSONArray answers = new JSONArray();
+        answers.add(answerItem(questionId, optionId, reason, factId));
+        root.put("answers", answers);
+        return root.toJSONString();
+    }
+
+    private static List<String> questionIds(JSONObject card) {
+        List<String> ids = new ArrayList<>();
+        for (Object item : card.getJSONArray("subQuestions")) ids.add(((JSONObject) item).getString("id"));
+        return ids;
+    }
+
+    /** kind (with ":" + member id for member-level records) → payload, for comparing a meeting's records. */
+    private Map<String, String> payloads(long id) {
+        Map<String, String> payloads = new java.util.TreeMap<>();
+        for (com.aimeeting.room.entity.AiMeetingV2Record record : records.selectByMeetingId(id)) {
+            String key = record.getMemberId() == 0 ? record.getKind() : record.getKind() + ":" + record.getMemberId();
+            payloads.put(key, record.getPayload());
+        }
+        return payloads;
+    }
+
+    private static com.aimeeting.room.entity.AiMeetingV2Record record(long id, String kind, String payload) {
+        com.aimeeting.room.entity.AiMeetingV2Record record = new com.aimeeting.room.entity.AiMeetingV2Record();
+        record.setMeetingId(id);
+        record.setKind(kind);
+        record.setMemberId(0L);
+        record.setPayload(payload);
+        record.setRunEpoch(EPOCH);
+        return record;
+    }
+
     private static JSONObject factWithId(JSONArray facts, String id) {
         for (Object item : facts) {
             if (id.equals(((JSONObject) item).getString("id"))) return (JSONObject) item;
@@ -1753,6 +1914,9 @@ class RoundtableV2FlowIntegrationTest {
         /** Runs once, during the first source check. */
         private Runnable onCheck;
         private final RoundtableV2Service service = new RoundtableV2Service();
+        private final Map<String, List<String>> informedReplies = new HashMap<>();
+        /** A second meeting on the same mocks, used as a review of the first. */
+        private final AiMeetingRoom child = new AiMeetingRoom();
 
         private Fixture() {
             room.setId(meetingId);
@@ -1838,6 +2002,9 @@ class RoundtableV2FlowIntegrationTest {
                             case MeetingCallContext.REESTIMATE:
                                 List<String> finals = finalReplies.get(name);
                                 return finals != null ? next(finals) : last(memberReplies.get(name));
+                            case MeetingCallContext.REVIEW_INFORMED:
+                                List<String> informed = informedReplies.get(name);
+                                return informed != null ? next(informed) : last(memberReplies.get(name));
                             case MeetingCallContext.CROSS_EXAM:
                                 List<String> exam = crossExamReplies.get(name);
                                 return exam != null ? next(exam) : name + "：请说明你的判断依据哪条事实。";
@@ -1899,6 +2066,38 @@ class RoundtableV2FlowIntegrationTest {
 
         private void answers(String memberName, String... replies) {
             memberReplies.put(memberName, new ArrayList<>(List.of(replies)));
+        }
+
+        private void informed(String memberName, String... replies) {
+            informedReplies.put(memberName, new ArrayList<>(List.of(replies)));
+        }
+
+        /** Registers a second running meeting with the same three member names (ids 31–33). */
+        private void addChildMeeting(long childId) {
+            child.setId(childId);
+            child.setTitle("宁德时代未来三个月走势（复议）");
+            child.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+            child.setRunEpoch(EPOCH);
+            child.setCurrentRound(0);
+            when(rooms.selectById(childId)).thenReturn(child);
+            when(rooms.updateStatusIfCurrentAndEpoch(eq(childId), anyInt(), eq(EPOCH), anyInt()))
+                    .thenAnswer(invocation -> {
+                        child.setStatus(invocation.getArgument(3));
+                        return 1;
+                    });
+            List<AiMeetingMember> seats = new ArrayList<>();
+            long id = 31L;
+            for (String name : List.of("甲", "乙", "丙")) {
+                AiMeetingMember member = new AiMeetingMember();
+                member.setId(id++);
+                member.setMeetingId(childId);
+                member.setMemberName(name);
+                member.setModelType("deepseek-chat");
+                member.setPersona(name + "的分析视角");
+                seats.add(member);
+            }
+            when(members.selectByMeetingId(childId)).thenReturn(seats);
+            when(orchestrator.resolveMeetingModelType(childId)).thenReturn("deepseek-chat");
         }
 
         private void finalAnswers(String memberName, String... replies) {

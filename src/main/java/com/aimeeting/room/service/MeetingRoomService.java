@@ -114,6 +114,22 @@ public class MeetingRoomService {
         return room.getId();
     }
 
+    /**
+     * 复议：已结束的圆桌 v2 会议，带着新情况重开选中的子问题。先校验，校验不过不复制任何东西；
+     * 通过后复制会议和议员作为子会议，写入父会议快照，然后启动子会议。父会议的记录不改。
+     */
+    public Long startReview(Long meetingId, com.alibaba.fastjson.JSONObject request) {
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        if (room == null) throw new IllegalArgumentException("会议不存在: " + meetingId);
+        if (!workflowService.isRoundtableV2Workflow(meetingId)) throw new IllegalStateException("只有圆桌 v2 会议可以复议");
+        if (!isEndedStatus(room.getStatus())) throw new IllegalStateException("会议还没结束，不能复议");
+        roundtableV2Service.checkReview(meetingId, request);
+        Long childId = cloneMeeting(meetingId, room.getTitle() + "（复议）", null);
+        roundtableV2Service.prepareReview(meetingId, childId, request);
+        startMeeting(childId);
+        return childId;
+    }
+
     /** 复制会议：复用成员配置，清空讨论，可修改主题 */
     public Long cloneMeeting(Long sourceMeetingId, String newTitle, Long creatorId) {
         AiMeetingRoom source = roomMapper.selectById(sourceMeetingId);

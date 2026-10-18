@@ -5,6 +5,7 @@ import com.aimeeting.room.dao.AiMeetingRoomMapper;
 import com.aimeeting.room.dto.TrackingItemUpdateRequest;
 import com.aimeeting.room.entity.AiMeetingRoom;
 import com.aimeeting.room.enums.MeetingStatusEnum;
+import com.alibaba.fastjson.JSONObject;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
@@ -17,6 +18,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -74,6 +76,28 @@ class MeetingRoomV2LegacyEntryTest {
         fixture.assertUntouched(MeetingStatusEnum.CONCLUDED.getCode());
     }
 
+    @Test
+    void aReviewIsOnlyStartedForAFinishedV2MeetingAndNothingIsCopiedWhenItIsRefused() {
+        Fixture running = new Fixture(MeetingStatusEnum.IN_PROGRESS.getCode());
+        assertThrows(IllegalStateException.class, () -> running.service.startReview(1L, new JSONObject()));
+        verify(running.rooms, never()).insert(any());
+
+        Fixture legacy = new Fixture(MeetingStatusEnum.CONCLUDED.getCode());
+        when(legacy.workflow.isRoundtableV2Workflow(1L)).thenReturn(false);
+        IllegalStateException notV2 = assertThrows(IllegalStateException.class,
+                () -> legacy.service.startReview(1L, new JSONObject()));
+        assertTrue(notV2.getMessage().contains("圆桌 v2"), notV2.getMessage());
+
+        Fixture concluded = new Fixture(MeetingStatusEnum.CONCLUDED.getCode());
+        org.mockito.Mockito.doThrow(new IllegalStateException("请写下自上次会议以来的新情况"))
+                .when(concluded.v2).checkReview(eq(1L), any());
+        IllegalStateException refused = assertThrows(IllegalStateException.class,
+                () -> concluded.service.startReview(1L, new JSONObject()));
+        assertTrue(refused.getMessage().contains("新情况"), refused.getMessage());
+        verify(concluded.rooms, never()).insert(any());
+        verify(concluded.v2, never()).prepareReview(anyLong(), anyLong(), any());
+    }
+
     private static final class Fixture {
         private final MeetingRoomService service = new MeetingRoomService();
         private final AiMeetingRoomMapper rooms = mock(AiMeetingRoomMapper.class);
@@ -81,6 +105,7 @@ class MeetingRoomV2LegacyEntryTest {
         private final MeetingWorkflowService workflow = mock(MeetingWorkflowService.class);
         private final MeetingReviewedEvidenceService reviewed = mock(MeetingReviewedEvidenceService.class);
         private final ExecutorService executor = mock(ExecutorService.class);
+        private final RoundtableV2Service v2 = mock(RoundtableV2Service.class);
         private final AiMeetingRoom room = new AiMeetingRoom();
 
         private Fixture(int status) {
@@ -98,6 +123,7 @@ class MeetingRoomV2LegacyEntryTest {
             ReflectionTestUtils.setField(service, "workflowService", workflow);
             ReflectionTestUtils.setField(service, "reviewedEvidenceService", reviewed);
             ReflectionTestUtils.setField(service, "meetingExecutor", executor);
+            ReflectionTestUtils.setField(service, "roundtableV2Service", v2);
         }
 
         private void assertUntouched(int status) {

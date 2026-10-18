@@ -154,6 +154,17 @@ public class MeetingController {
         }
     }
 
+    /** 圆桌 v2：复议。带着新情况重开已结束会议的部分子问题，生成并启动子会议，返回子会议 id */
+    @PostMapping("/meetings/{id}/roundtable-v2/review")
+    public ApiResponse<Long> startRoundtableV2Review(@PathVariable Long id,
+                                                     @RequestBody com.alibaba.fastjson.JSONObject request) {
+        try {
+            return ApiResponse.ok(meetingRoomService.startReview(id, request));
+        } catch (IllegalStateException refused) {
+            return ApiResponse.fail(refused.getMessage());
+        }
+    }
+
     /** 查询用户的会议列表 */
     @GetMapping("/meetings")
     public ApiResponse<List<MeetingDetailVO>> listMeetings(@RequestParam Long creatorId) {

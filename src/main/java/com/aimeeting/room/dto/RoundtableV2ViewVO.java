@@ -35,4 +35,10 @@ public class RoundtableV2ViewVO {
     private JSONArray interventions = new JSONArray();
     /** Codex checks of the cited low-confidence facts and gaps against their original sources. */
     private JSONObject sourceCheck;
+    /** For a review: the parent meeting, the questions reopened, the new information and the parent's answers. */
+    private JSONObject review;
+    /** For a reviewed meeting: each review started from it. */
+    private JSONArray reviews = new JSONArray();
+    /** For a review: each member's answer after seeing its own earlier answer (the blind one is in answers). */
+    private JSONArray informedAnswers = new JSONArray();
 }

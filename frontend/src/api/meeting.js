@@ -13,6 +13,8 @@ export const meetingApi = {
     { suppressErrorMessage: true }),
   createRoundtableV2Solo: (id) => http.post(`/meetings/${id}/roundtable-v2/solo`, null,
     { timeout: 300000, suppressErrorMessage: true }),
+  startRoundtableV2Review: (id, payload) => http.post(`/meetings/${id}/roundtable-v2/review`, payload,
+    { timeout: 60000, suppressErrorMessage: true }),
   list: (creatorId) => http.get('/meetings', { params: { creatorId } }),
   listWorkflowTemplates: () => http.get('/workflow-templates'),
   listWorkflowTemplateDetails: () => http.get('/workflow-templates/detail'),

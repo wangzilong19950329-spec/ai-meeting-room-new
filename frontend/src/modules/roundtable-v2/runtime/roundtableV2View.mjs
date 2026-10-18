@@ -90,6 +90,17 @@ export function buildRoundtableV2View(v2, usage) {
     judgement: judgementView(v2.outcomeJudgement),
     solo: soloView(v2.solo, result, card, v2.outcomeQuestion),
     canRequestSolo: Boolean(result) && !v2.solo,
+    canReview: Boolean(result) && v2.outcomeJudgement?.status !== 'JUDGED',
+    reviewOptions: (card.subQuestions || []).filter(q => q.kind !== 'PROBABILITY').map(q => ({ id: q.id, title: q.title })),
+    reviewEstimateText: (members) => `预计约 ${3 * members + 5}–${5 * members + 10} 次模型调用：`
+      + '每位议员先盲答、再对照上一版，之后照常交锋和汇总；不另做取证',
+    reviews: (v2.reviews || []).map(link => ({
+      meetingId: link.childMeetingId,
+      text: `复议 ${(link.questionIds || []).map(id => questions.get(id)?.title || id).join('、')}；新情况：`
+        + (link.facts || []).map(fact => `${fact.content}（${fact.source}）`).join('；'),
+      createdAt: link.createdAt
+    })),
+    review: reviewView(v2.review, questions, result),
     judgementPendingText: judgementPending(v2),
     conclusions: (result?.conclusions || []).map(conclusion),
     disputes: (result?.disputes || []).map(line => dispute(line, factById)),
@@ -296,13 +307,21 @@ function processView(v2, questions, research, crossExams, red) {
     },
     {
       key: 'research', title: '议员自主取证', done: answered, active: research.length > 0,
-      summaryText: research.length ? `${research.length} 位议员取证` : '没有议员追加取证',
+      summaryText: v2.review ? '复议不另做取证：沿用上一版的资料和新情况'
+        : research.length ? `${research.length} 位议员取证` : '没有议员追加取证',
       members: research
     },
     {
       key: 'answers', title: '背靠背作答', done: answered, active: answers.length > 0,
       members: answers.map(answer => answerCard(answer, questions, v2.outcomeQuestion))
     },
+    ...(v2.review ? [{
+      key: 'informed', title: '对照上一版', done: answered, active: (v2.informedAnswers || []).length > 0,
+      members: (v2.informedAnswers || []).map(informed => ({
+        memberName: informed.memberName,
+        changeText: informedText(informed, firstByMember.get(informed.memberName), questions)
+      }))
+    }] : []),
     {
       key: 'debate', title: '交锋与红队', done: finals.length > 0 || Boolean(result), active: crossExams.length > 0 || Boolean(red),
       exams: crossExams, redTeam: red
@@ -353,6 +372,38 @@ function sourceCheckRow(check, factById) {
     sourceUrl: url,
     sourceText: url ? hostOf(url) : ''
   }
+}
+
+// A review of an earlier meeting: where it came from, what was new and how each reopened question moved.
+function reviewView(review, questions, result) {
+  if (!review) return null
+  const parent = review.parentResult || {}
+  return {
+    parentMeetingId: review.parentMeetingId,
+    headerText: `这是「${review.parentTitle}」（截至 ${review.parentAsOf}）的复议`,
+    newFacts: (review.facts || []).map(fact => `${fact.content}（${fact.source}）`),
+    rows: (review.questionIds || []).map(id => ({
+      questionId: id,
+      title: questions.get(id)?.title || id,
+      beforeText: standingText(parent, id),
+      afterText: result ? standingText(result, id) : '进行中'
+    }))
+  }
+}
+
+function standingText(summary, questionId) {
+  const conclusion = (summary.conclusions || []).find(line => line.questionId === questionId)
+  if (conclusion) return `${conclusion.optionLabel}（${conclusion.support}/${conclusion.total} 人）`
+  const dispute = (summary.disputes || []).find(line => line.questionId === questionId)
+  if (dispute) return '有分歧：' + (dispute.positions || []).map(p => `${p.optionLabel} ${(p.members || []).length} 人`).join(' / ')
+  return '没有结论'
+}
+
+function informedText(informed, blind, questions) {
+  if (informed.skipped) return '未作答'
+  if (informed.fallback) return '对照无效，沿用盲答'
+  const text = changeText(informed, blind, questions)
+  return text === '维持首轮选择' ? '与盲答一致' : text
 }
 
 function answerCard(answer, questions, outcomeQuestion) {

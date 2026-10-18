@@ -60,6 +60,10 @@ public class RoundtableV2Service {
     static final String OUTCOME = "OUTCOME_Q";
     static final String SOLO = "SOLO";
     static final String SOURCE_CHECK = "SOURCE_CHECK";
+    static final String REVIEW_SOURCE = "REVIEW_SOURCE";
+    /** Stored on the parent, one per review, with the review meeting id as member id. */
+    static final String REVIEW_CHILD = "REVIEW_CHILD";
+    static final String INFORMED = "INFORMED";
     static final String RESEARCH = "RESEARCH";
     static final String HUMAN = "HUMAN_";
     private static final String QUEUED = "QUEUED";
@@ -318,6 +322,276 @@ public class RoundtableV2Service {
         }
     }
 
+    // ---- S9a review: a child meeting that reopens chosen questions with new information ----
+
+    /**
+     * A review needs a finished meeting whose outcome is not judged yet, real sub-questions and new information:
+     * without anything new there is nothing to reconsider. Throws with the reason when it cannot be done.
+     */
+    public void checkReview(Long parentId, JSONObject request) {
+        if (loadObject(parentId, RESULT, MEETING_LEVEL) == null || loadObject(parentId, ISSUE_CARD, MEETING_LEVEL) == null) {
+            throw new IllegalStateException("会议还没结束，不能复议：结论出来以后再复议");
+        }
+        JSONObject judged = loadObject(parentId, RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT, MEETING_LEVEL);
+        if (judged != null && "JUDGED".equals(judged.getString("status"))) {
+            throw new IllegalStateException("结果题已经到期判定，复议没有意义；到期后请开新会议（续会）");
+        }
+        Set<String> known = new LinkedHashSet<>();
+        for (Object item : loadObject(parentId, ISSUE_CARD, MEETING_LEVEL).getJSONArray("subQuestions")) {
+            JSONObject question = (JSONObject) item;
+            if (!isProbability(question)) known.add(question.getString("id"));
+        }
+        List<String> chosen = reviewQuestionIds(request);
+        for (String questionId : chosen) {
+            if (!known.contains(questionId)) throw new IllegalStateException("原会议没有子问题 " + questionId);
+        }
+        if (chosen.isEmpty() && loadObject(parentId, OUTCOME, MEETING_LEVEL) == null) {
+            throw new IllegalStateException("至少选一道要复议的子问题");
+        }
+        if (reviewFacts(request).isEmpty()) {
+            throw new IllegalStateException("请写下自上次会议以来的新情况：复议要有新信息才有意义");
+        }
+    }
+
+    /**
+     * Stores in the child everything it needs from the parent — card, facts as members last saw them, each
+     * member's latest answers, the cruxes and the result — so the child never reads or changes the parent again.
+     * The parent only gains a link to the child.
+     */
+    public void prepareReview(Long parentId, Long childId, JSONObject request) {
+        checkReview(parentId, request);
+        RoundtableV2ViewVO parent = view(parentId);
+        JSONArray parentFacts = new JSONArray();
+        parentFacts.addAll(parent.getFacts());
+        if (parent.getTopUp() != null && parent.getTopUp().getJSONArray("added") != null) {
+            parentFacts.addAll(withSourceChecks(parent.getTopUp().getJSONArray("added"), parent.getSourceCheck()));
+        }
+        JSONArray latest = !parent.getSecondFinalAnswers().isEmpty() ? parent.getSecondFinalAnswers()
+                : !parent.getFinalAnswers().isEmpty() ? parent.getFinalAnswers() : parent.getAnswers();
+        JSONObject cruxes = new JSONObject(true);
+        for (String list : List.of("disputes", "conclusions")) {
+            for (Object item : parent.getResult().getJSONArray(list)) {
+                JSONObject line = (JSONObject) item;
+                if (!blank(line.getString("crux"))) cruxes.put(line.getString("questionId"), line.getString("crux"));
+            }
+        }
+        JSONObject source = new JSONObject(true);
+        source.put("parentMeetingId", parentId);
+        source.put("parentTitle", parent.getIssueCard().getString("topic"));
+        source.put("parentAsOf", parent.getIssueCard().getString("asOf"));
+        source.put("questionIds", reviewQuestionIds(request));
+        source.put("facts", reviewFacts(request));
+        source.put("parentCard", parent.getIssueCard());
+        source.put("parentOutcomeQuestion", parent.getOutcomeQuestion());
+        source.put("parentFacts", parentFacts);
+        source.put("parentAnswers", latest);
+        source.put("parentCruxes", cruxes);
+        source.put("parentResult", parent.getResult());
+        source.put("createdAt", new Date());
+        save(childId, REVIEW_SOURCE, MEETING_LEVEL, null, source);
+        JSONObject link = new JSONObject(true);
+        link.put("childMeetingId", childId);
+        link.put("questionIds", reviewQuestionIds(request));
+        link.put("facts", reviewFacts(request));
+        link.put("createdAt", source.get("createdAt"));
+        save(parentId, REVIEW_CHILD, childId, null, link);
+    }
+
+    private static List<String> reviewQuestionIds(JSONObject request) {
+        List<String> ids = new ArrayList<>();
+        JSONArray list = request == null ? null : request.getJSONArray("questionIds");
+        for (int i = 0; list != null && i < list.size(); i++) {
+            String id = list.getString(i);
+            if (!blank(id) && !ids.contains(id.trim())) ids.add(id.trim());
+        }
+        return ids;
+    }
+
+    private static JSONArray reviewFacts(JSONObject request) {
+        JSONArray facts = new JSONArray();
+        JSONArray list = request == null ? null : request.getJSONArray("facts");
+        for (int i = 0; list != null && i < list.size(); i++) {
+            JSONObject item = list.getJSONObject(i);
+            if (item == null || blank(item.getString("content"))) continue;
+            JSONObject fact = new JSONObject(true);
+            fact.put("content", item.getString("content").trim());
+            fact.put("source", blank(item.getString("source")) ? "用户提供" : item.getString("source").trim());
+            facts.add(fact);
+        }
+        return facts;
+    }
+
+    /** The parent's card with only the chosen questions, dated today; the outcome question is rebuilt from today. */
+    private static JSONObject reviewCard(JSONObject review) {
+        JSONObject parentCard = review.getJSONObject("parentCard");
+        JSONObject card = new JSONObject(true);
+        card.putAll(parentCard);
+        card.put("asOf", LocalDate.now(MARKET_ZONE).toString());
+        List<String> chosen = review.getJSONArray("questionIds").toJavaList(String.class);
+        JSONArray questions = new JSONArray();
+        for (Object item : parentCard.getJSONArray("subQuestions")) {
+            if (chosen.contains(((JSONObject) item).getString("id"))) questions.add(item);
+        }
+        card.put("subQuestions", questions);
+        card.put("evidenceQuestions", new JSONArray());
+        JSONObject outcome = review.getJSONObject("parentOutcomeQuestion");
+        if (outcome != null) {
+            JSONObject reviewOf = new JSONObject(true);
+            reviewOf.put("meetingId", review.get("parentMeetingId"));
+            reviewOf.put("baseDate", outcome.getString("baseDate"));
+            reviewOf.put("horizonTradingDays", outcome.getIntValue("horizonTradingDays"));
+            card.put("reviewOf", reviewOf);
+        }
+        return card;
+    }
+
+    /**
+     * After the domain's fresh facts: every fact the parent's members saw, renumbered into this meeting and
+     * dated, then the new information as facts the user provided.
+     */
+    private static void addReviewFacts(JSONArray facts, JSONObject review, int[] next) {
+        String asOf = review.getString("parentAsOf");
+        for (Object item : review.getJSONArray("parentFacts")) {
+            JSONObject parentFact = (JSONObject) item;
+            String tier = parentFact.getString("tier");
+            JSONObject fact = new JSONObject(true);
+            fact.putAll(parentFact);
+            fact.put("id", "G".equals(tier) ? "G-" + (++next[2]) : "L".equals(tier) ? "L-" + (++next[1]) : "F-" + (++next[0]));
+            fact.put("parentFactId", parentFact.getString("id"));
+            fact.put("fromParent", true);
+            String field = "G".equals(tier) ? "question" : "statement";
+            fact.put(field, "（截至" + asOf + "）" + parentFact.getString(field));
+            facts.add(fact);
+        }
+        for (Object item : review.getJSONArray("facts")) {
+            JSONObject given = (JSONObject) item;
+            JSONObject fact = new JSONObject(true);
+            fact.put("id", "F-" + (++next[0]));
+            fact.put("tier", "F");
+            fact.put("question", "复议：自上次会议以来的新情况");
+            fact.put("statement", given.getString("content"));
+            fact.put("source", given.getString("source"));
+            fact.put("userProvided", true);
+            fact.put("askedBy", "你");
+            fact.put("reviewNew", true);
+            facts.add(fact);
+        }
+    }
+
+    /**
+     * The second step of a review answer: after answering blind, the member sees its own answer in the parent,
+     * the cruxes written then and what is new, and settles its answer, naming what changed its mind. If the
+     * settled answer is still invalid after one rewrite, the blind answer stands.
+     */
+    private JSONObject informedAnswer(Long meetingId, Long epoch, JSONObject card, JSONArray facts,
+                                      AiMeetingMember member, JSONObject blind, JSONObject review) {
+        JSONObject stored = loadObject(meetingId, INFORMED, member.getId());
+        if (stored != null) return stored;
+        String system = memberSystem(member) + "这是复议：你刚刚在看不到旧判断的情况下作答，现在对照你在上一版会议里的判断定稿。只输出 JSON。";
+        String prompt = answerPrompt(card, facts) + "\n\n【你刚才的作答（没看旧判断）】\n" + choicesText(blind, card, null)
+                + "\n【你在上一版会议（截至 " + review.getString("parentAsOf") + "）的判断】\n"
+                + parentChoicesText(review, member.getMemberName(), card)
+                + parentCruxesText(review, card) + newInformationText(facts)
+                + "\n请对照上一版重新作答全部子问题，格式同上；凡与上一版的选项或概率不同，在该题加 changeReason，"
+                + "说明是哪条新事实或上一版的哪个条件被触发。";
+        String[] corpora = corpora(facts, card);
+        Set<String> factIds = factIds(facts);
+        Answer parsed;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, 1, member.getId(), MeetingCallContext.REVIEW_INFORMED)) {
+            parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system, prompt), card, factIds, corpora);
+        }
+        String rewriteReason = parsed.error;
+        if (parsed.error != null) {
+            try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                    meetingId, 1, member.getId(), MeetingCallContext.REVIEW_INFORMED_REWRITE)) {
+                parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system,
+                        prompt + "\n\n【上一版作答不合格】" + parsed.error + "。请按要求重新输出完整 JSON。"),
+                        card, factIds, corpora);
+            }
+        }
+        JSONObject record = new JSONObject(true);
+        record.put("memberId", member.getId());
+        record.put("memberName", member.getMemberName());
+        record.put("skipped", false);
+        record.put("fallback", parsed.error != null);
+        if (parsed.error != null) record.put("reason", parsed.error);
+        record.put("answers", parsed.error != null ? blind.getJSONArray("answers") : parsed.answers);
+        if (rewriteReason != null) record.put("rewriteReason", rewriteReason);
+        return save(meetingId, INFORMED, member.getId(), epoch, record);
+    }
+
+    /** One line per answered question: the option or the probabilities, then the reasons' text. */
+    private static String choicesText(JSONObject answer, JSONObject card, JSONObject outcomeQuestion) {
+        StringBuilder sb = new StringBuilder();
+        Map<String, JSONObject> questions = new HashMap<>();
+        for (Object item : card.getJSONArray("subQuestions")) questions.put(((JSONObject) item).getString("id"), (JSONObject) item);
+        if (outcomeQuestion != null) questions.put(outcomeQuestion.getString("id"), outcomeQuestion);
+        for (Object item : answer.getJSONArray("answers")) {
+            JSONObject choice = (JSONObject) item;
+            JSONObject question = questions.get(choice.getString("questionId"));
+            sb.append(choice.getString("questionId"));
+            if (question != null) sb.append(" ").append(question.getString("title"));
+            JSONObject probabilities = choice.getJSONObject("probabilities");
+            if (probabilities != null) {
+                List<String> parts = new ArrayList<>();
+                for (String id : probabilities.keySet()) {
+                    String label = question == null ? id : optionLabel(question, id);
+                    parts.add(label + " " + Math.round(probabilities.getDoubleValue(id) * 100) + "%");
+                }
+                sb.append("：").append(String.join(" / ", parts));
+            } else {
+                sb.append("：").append(question == null ? choice.getString("optionId") : optionLabel(question, choice.getString("optionId")));
+            }
+            JSONArray reasons = choice.getJSONArray("reasons");
+            List<String> texts = new ArrayList<>();
+            for (int i = 0; reasons != null && i < reasons.size(); i++) texts.add(reasons.getJSONObject(i).getString("text"));
+            if (!texts.isEmpty()) sb.append("（理由：").append(String.join("；", texts)).append("）");
+            sb.append("\n");
+        }
+        return sb.toString();
+    }
+
+    private static String parentChoicesText(JSONObject review, String memberName, JSONObject card) {
+        Set<String> wanted = new HashSet<>();
+        for (Object item : card.getJSONArray("subQuestions")) wanted.add(((JSONObject) item).getString("id"));
+        wanted.add("OUTCOME");
+        for (Object item : review.getJSONArray("parentAnswers")) {
+            JSONObject answer = (JSONObject) item;
+            if (!memberName.equals(answer.getString("memberName")) || answer.getBooleanValue("skipped")) continue;
+            JSONObject kept = new JSONObject(true);
+            JSONArray choices = new JSONArray();
+            for (Object choice : answer.getJSONArray("answers")) {
+                if (wanted.contains(((JSONObject) choice).getString("questionId"))) choices.add(choice);
+            }
+            kept.put("answers", choices);
+            String text = choicesText(kept, review.getJSONObject("parentCard"), review.getJSONObject("parentOutcomeQuestion"));
+            JSONObject outcome = review.getJSONObject("parentOutcomeQuestion");
+            return text + (outcome == null ? "" : "（上一版结果题以 " + outcome.getString("baseDate") + " 为起点、展望 "
+                    + outcome.getIntValue("horizonTradingDays") + " 个交易日；本次结果题的起点和区间已按今天重算）\n");
+        }
+        return "上一版没有你的有效作答。\n";
+    }
+
+    private static String parentCruxesText(JSONObject review, JSONObject card) {
+        JSONObject cruxes = review.getJSONObject("parentCruxes");
+        StringBuilder sb = new StringBuilder();
+        for (Object item : card.getJSONArray("subQuestions")) {
+            String id = ((JSONObject) item).getString("id");
+            if (cruxes != null && !blank(cruxes.getString(id))) sb.append(id).append("：").append(cruxes.getString(id)).append("\n");
+        }
+        return sb.length() == 0 ? "" : "【上一版写下的关键分歧点】\n" + sb;
+    }
+
+    private static String newInformationText(JSONArray facts) {
+        StringBuilder sb = new StringBuilder();
+        for (Object item : facts) {
+            JSONObject fact = (JSONObject) item;
+            if (fact.getBooleanValue("reviewNew")) sb.append(fact.getString("id")).append(" ").append(fact.getString("statement")).append("\n");
+        }
+        return sb.length() == 0 ? "" : "【自上一版以来的新情况】\n" + sb;
+    }
+
     public RoundtableV2ViewVO view(Long meetingId) {
         RoundtableV2ViewVO view = new RoundtableV2ViewVO();
         List<AiMeetingV2Record> stored = recordMapper.selectByMeetingId(meetingId);
@@ -340,6 +614,9 @@ public class RoundtableV2Service {
             else if (RESEARCH.equals(record.getKind())) view.getResearch().add(JSON.parseObject(record.getPayload()));
             else if (record.getKind().startsWith(HUMAN)) view.getInterventions().add(JSON.parseObject(record.getPayload()));
             else if (SOURCE_CHECK.equals(record.getKind())) view.setSourceCheck(JSON.parseObject(record.getPayload()));
+            else if (REVIEW_SOURCE.equals(record.getKind())) view.setReview(JSON.parseObject(record.getPayload()));
+            else if (REVIEW_CHILD.equals(record.getKind())) view.getReviews().add(JSON.parseObject(record.getPayload()));
+            else if (INFORMED.equals(record.getKind())) view.getInformedAnswers().add(JSON.parseObject(record.getPayload()));
             else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
@@ -378,6 +655,8 @@ public class RoundtableV2Service {
         if (activeRoom(meetingId, epoch) == null) return;
         JSONArray facts = factBase(meetingId, epoch, card);
         if (facts == null) return;
+        JSONObject reviewSource = loadObject(meetingId, REVIEW_SOURCE, MEETING_LEVEL);
+        boolean isReview = reviewSource != null;
         card = withOutcome(card, loadObject(meetingId, OUTCOME, MEETING_LEVEL));
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
         Map<Long, AiMeetingMember> membersById = new LinkedHashMap<>();
@@ -394,7 +673,9 @@ public class RoundtableV2Service {
             JSONArray fromUser = applyInterventions(meetingId, epoch, card, pool, membersById, false);
             facts.addAll(fromUser);
             pool.addAll(fromUser);
-            JSONObject research = research(meetingId, epoch, card, facts, pool, member);
+            // A review starts from everything the parent found plus the new information; members do not research.
+            JSONObject research = isReview ? researchRecord(member, new JSONArray(), new JSONArray(), List.of())
+                    : research(meetingId, epoch, card, facts, pool, member);
             if (research == null) return;
             pool.addAll(research.getJSONArray("facts"));
             JSONObject answer = answer(meetingId, epoch, card, visibleFacts(facts, pool, research), member);
@@ -404,6 +685,20 @@ public class RoundtableV2Service {
         settleSkipped(meetingId, epoch, answers, unsettled);
         // From the cross-examination on, everyone works from every fact anyone found.
         facts = pool;
+        if (isReview) {
+            JSONArray informed = new JSONArray();
+            for (Object item : answers) {
+                JSONObject blind = (JSONObject) item;
+                if (blind.getBooleanValue("skipped")) {
+                    informed.add(blind);
+                    continue;
+                }
+                if (activeRoom(meetingId, epoch) == null) return;
+                informed.add(informedAnswer(meetingId, epoch, card, facts, membersById.get(blind.getLong("memberId")),
+                        blind, reviewSource));
+            }
+            answers = informed;
+        }
         facts.addAll(applyInterventions(meetingId, epoch, card, facts, membersById, true));
         if (activeRoom(meetingId, epoch) == null) return;
         JSONArray firstCrossExams = new JSONArray();
@@ -493,6 +788,8 @@ public class RoundtableV2Service {
     private JSONObject issueCard(Long meetingId, Long epoch, AiMeetingRoom room) {
         JSONObject stored = loadObject(meetingId, ISSUE_CARD, MEETING_LEVEL);
         if (stored != null) return stored;
+        JSONObject review = loadObject(meetingId, REVIEW_SOURCE, MEETING_LEVEL);
+        if (review != null) return save(meetingId, ISSUE_CARD, MEETING_LEVEL, epoch, reviewCard(review));
         String model = orchestrator.resolveMeetingModelType(meetingId);
         String system = "你是中立的会议主持人，只负责把议题拆成可以选边的子问题并列出取证题，"
                 + "不表达立场、不打分。只输出 JSON。";
@@ -614,6 +911,14 @@ public class RoundtableV2Service {
                 fact.putAll(structured);
                 facts.add(fact);
             }
+        }
+        JSONObject review = loadObject(meetingId, REVIEW_SOURCE, MEETING_LEVEL);
+        if (review != null) {
+            int[] next = {verified, provisional, gaps};
+            addReviewFacts(facts, review, next);
+            verified = next[0];
+            provisional = next[1];
+            gaps = next[2];
         }
         for (Object item : card.getJSONArray("evidenceQuestions")) {
             if (activeRoom(meetingId, epoch) == null) return null;

@@ -575,3 +575,56 @@ test('with a random-walk baseline the review compares everyone against it and st
   assert.equal(buildRoundtableV2View(older, null).judgement.randomWalkRpsText, '')
   assert.equal(buildRoundtableV2View(older, null).judgement.members[2].beatsBaseline, false)
 })
+
+test('a finished meeting offers a review of chosen questions with an estimate and lists the reviews already made', () => {
+  const v2 = clone(sample)
+  v2.reviews = [{ childMeetingId: 120, questionIds: ['Q2'], facts: [{ content: '三季度新增订单同比下降', source: '公司公告' }], createdAt: '2026-10-20T08:00:00Z' }]
+  const view = buildRoundtableV2View(v2, null)
+  assert.equal(view.canReview, true)
+  assert.deepEqual(view.reviewOptions.map(o => [o.id, o.title]), [['Q1', '业绩基本面'], ['Q2', '订单与需求']])
+  assert.equal(view.reviewEstimateText(3), '预计约 14–25 次模型调用：每位议员先盲答、再对照上一版，之后照常交锋和汇总；不另做取证')
+  assert.deepEqual(view.reviews.map(r => [r.meetingId, r.text]), [[120, '复议 订单与需求；新情况：三季度新增订单同比下降（公司公告）']])
+  const running = clone(sample)
+  running.result = null
+  assert.equal(buildRoundtableV2View(running, null).canReview, false)
+  const judged = clone(sample)
+  judged.outcomeJudgement = judgement
+  assert.equal(buildRoundtableV2View(judged, null).canReview, false)
+})
+
+test('a review shows where it came from, what was new and how each question moved from the parent', () => {
+  const v2 = clone(sample)
+  v2.review = {
+    parentMeetingId: 98, parentTitle: '宁德时代未来三个月走势', parentAsOf: '2026-10-17', questionIds: ['Q1', 'Q2'],
+    facts: [{ content: '三季度新增订单同比下降', source: '公司公告' }],
+    parentResult: {
+      conclusions: [{ questionId: 'Q1', title: '业绩基本面', optionLabel: '拖累股价', support: 2, total: 3 }],
+      disputes: [{ questionId: 'Q2', title: '订单与需求', positions: [{ optionLabel: '偏强', members: [{}, {}] }, { optionLabel: '偏弱', members: [{}] }] }]
+    }
+  }
+  v2.informedAnswers = [
+    { memberName: '甲', skipped: false, answers: [{ questionId: 'Q2', optionId: 'B', changeReason: '新订单转弱' }] },
+    { memberName: '乙', skipped: false, fallback: true, answers: [] }
+  ]
+  v2.answers = [
+    { memberName: '甲', skipped: false, answers: [{ questionId: 'Q2', optionId: 'A' }] },
+    { memberName: '乙', skipped: false, answers: [{ questionId: 'Q2', optionId: 'B' }] }
+  ]
+  const view = buildRoundtableV2View(v2, null)
+  const review = view.review
+  assert.equal(review.headerText, '这是「宁德时代未来三个月走势」（截至 2026-10-17）的复议')
+  assert.equal(review.parentMeetingId, 98)
+  assert.deepEqual(review.newFacts, ['三季度新增订单同比下降（公司公告）'])
+  assert.deepEqual(review.rows.map(r => [r.questionId, r.beforeText, r.afterText]), [
+    ['Q1', '拖累股价（2/3 人）', '支撑股价（3/3 人）'],
+    ['Q2', '有分歧：偏强 2 人 / 偏弱 1 人', '有分歧：偏强 1 人 / 偏弱 2 人']
+  ])
+  const informed = view.process.find(step => step.key === 'informed')
+  assert.equal(informed.title, '对照上一版')
+  assert.deepEqual(informed.members.map(m => [m.memberName, m.changeText]), [
+    ['甲', '订单与需求：偏强 → 偏弱（新订单转弱）'],
+    ['乙', '对照无效，沿用盲答']
+  ])
+  assert.equal(view.process.find(step => step.key === 'research').summaryText, '复议不另做取证：沿用上一版的资料和新情况')
+  assert.equal(buildRoundtableV2View(sample, null).review, null)
+})

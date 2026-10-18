@@ -66,7 +66,8 @@
         <RoundtableV2Result v-if="roundtableV2View" :view="roundtableV2View" :solo-loading="soloLoading"
           :solo-error="soloError" @request-solo="handleRequestSolo"
           :members="meeting.members || []" :intervene-loading="interveneLoading" :intervene-error="interveneError"
-          :intervene-version="interveneVersion" @intervene="handleIntervene" />
+          :intervene-version="interveneVersion" @intervene="handleIntervene"
+          :review-loading="reviewLoading" :review-error="reviewError" @review="handleReview" />
         <el-card v-else-if="[1, 6].includes(meeting.status)" shadow="never" class="header-card">
           <span class="v2-waiting">主持人正在拟定问题卡…</span>
         </el-card>
@@ -2013,6 +2014,24 @@ async function handleIntervene(payload) {
     interveneError.value = failure?.msg || failure?.message || '提交失败，可以再试一次'
   } finally {
     interveneLoading.value = false
+  }
+}
+
+const reviewLoading = ref(false)
+const reviewError = ref('')
+
+async function handleReview(payload) {
+  reviewLoading.value = true
+  reviewError.value = ''
+  try {
+    const res = await meetingApi.startRoundtableV2Review(meetingId, payload)
+    ElMessage.success('复议已开始')
+    // The page reads the meeting id once, so open the review as a fresh page.
+    window.location.assign(`/meetings/${res.data}`)
+  } catch (failure) {
+    reviewError.value = failure?.msg || failure?.message || '复议没有开始，可以再试一次'
+  } finally {
+    reviewLoading.value = false
   }
 }
 
