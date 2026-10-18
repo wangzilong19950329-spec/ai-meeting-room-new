@@ -122,6 +122,14 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
         java.util.Arrays.fill(uniform, 1.0 / options.size());
         verdict.put("pooled", scores(pooled, hit));
         verdict.put("uniform", scores(uniform, hit));
+        double[] walk = randomWalk(options, question.getDoubleValue("sigmaPct"));
+        if (walk != null) {
+            JSONObject randomWalk = scores(walk, hit);
+            JSONArray probabilities = new JSONArray();
+            for (double p : walk) probabilities.add(round(p, 4));
+            randomWalk.put("probabilities", probabilities);
+            verdict.put("randomWalk", randomWalk);
+        }
 
         JSONArray members = new JSONArray();
         for (JSONObject answer : answers) {
@@ -161,6 +169,33 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
     }
 
     /** RPS = mean squared gap between cumulative forecast and cumulative outcome; Brier = squared gap per interval. */
+    /**
+     * What a driftless random walk with the question's own σ (the horizon volatility the intervals were cut from)
+     * gives each interval: a harder baseline than equal odds, since the middle interval is the likeliest.
+     */
+    static double[] randomWalk(JSONArray options, double sigmaPct) {
+        if (!(sigmaPct > 0)) return null;
+        double[] probabilities = new double[options.size()];
+        for (int i = 0; i < options.size(); i++) {
+            JSONObject option = options.getJSONObject(i);
+            Double lower = option.getDouble("lowerPct");
+            Double upper = option.getDouble("upperPct");
+            double below = upper == null ? 1 : normalCdf(upper / sigmaPct);
+            double above = lower == null ? 0 : normalCdf(lower / sigmaPct);
+            probabilities[i] = below - above;
+        }
+        return probabilities;
+    }
+
+    /** Standard normal CDF (Abramowitz–Stegun 7.1.26, absolute error below 1.5e-7). */
+    private static double normalCdf(double z) {
+        double x = Math.abs(z) / Math.sqrt(2);
+        double t = 1 / (1 + 0.3275911 * x);
+        double erf = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+                + 0.254829592) * t * Math.exp(-x * x);
+        return z >= 0 ? 0.5 * (1 + erf) : 0.5 * (1 - erf);
+    }
+
     private static JSONObject scores(double[] forecast, int hit) {
         double cumulativeForecast = 0;
         double rps = 0;

@@ -560,3 +560,18 @@ test('a check whose quote did not support the statement, or whose second reading
   const step = buildRoundtableV2View(v2, null).process.find(s => s.key === 'verify')
   assert.deepEqual(step.checks.map(c => c.text), ['原文摘录读不出这个说法（缺少：7月末的价格），未采信', '摘录复核调用失败'])
 })
+
+test('with a random-walk baseline the review compares everyone against it and still lists the uniform guess', () => {
+  const v2 = clone(sample)
+  v2.outcomeJudgement = { ...judgement, randomWalk: { rps: 0.147, brier: 0.8082, probabilities: [0.0673, 0.2341, 0.3972, 0.2341, 0.0673] } }
+  const review = buildRoundtableV2View(v2, null).judgement
+  assert.equal(review.randomWalkRpsText, '0.1470')
+  assert.equal(review.randomWalkBrierText, '0.8082')
+  assert.equal(review.randomWalkText, '随机游走概率：6.7% / 23.4% / 39.7% / 23.4% / 6.7%')
+  assert.equal(review.verdictText, '合议分布优于随机游走基准')
+  assert.deepEqual(review.members.map(m => [m.memberName, m.beatsBaseline]), [['甲', true], ['丙', true], ['乙', false]])
+  const older = clone(sample)
+  older.outcomeJudgement = judgement
+  assert.equal(buildRoundtableV2View(older, null).judgement.randomWalkRpsText, '')
+  assert.equal(buildRoundtableV2View(older, null).judgement.members[2].beatsBaseline, false)
+})

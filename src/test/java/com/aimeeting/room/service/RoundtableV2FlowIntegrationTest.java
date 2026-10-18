@@ -1285,6 +1285,17 @@ class RoundtableV2FlowIntegrationTest {
         assertEquals(0.8356, verdict.getJSONObject("pooled").getDoubleValue("brier"), 0.001);
         assertEquals(0.15, verdict.getJSONObject("uniform").getDoubleValue("rps"), 0.0001);
         assertEquals(0.8, verdict.getJSONObject("uniform").getDoubleValue("brier"), 0.0001);
+        // A random walk with the question's own σ (15.37% over the horizon) is the harder baseline to beat.
+        assertEquals(15.37, controller.getRoundtableV2(meetingId).getData().getOutcomeQuestion()
+                .getDoubleValue("sigmaPct"), 0.001);
+        JSONObject randomWalk = verdict.getJSONObject("randomWalk");
+        double[] expected = {0.0673, 0.2341, 0.3972, 0.2341, 0.0673};
+        JSONArray probabilities = randomWalk.getJSONArray("probabilities");
+        for (int i = 0; i < expected.length; i++) {
+            assertEquals(expected[i], probabilities.getDoubleValue(i), 0.0005, randomWalk.toJSONString());
+        }
+        assertEquals(0.1470, randomWalk.getDoubleValue("rps"), 0.0005);
+        assertEquals(0.8082, randomWalk.getDoubleValue("brier"), 0.0005);
         JSONObject first = memberScore(verdict, "甲");
         assertEquals(0.095, first.getDoubleValue("rps"), 0.0001);
         assertEquals(0.76, first.getDoubleValue("brier"), 0.0001);

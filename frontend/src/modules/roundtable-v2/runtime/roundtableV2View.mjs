@@ -399,7 +399,11 @@ function judgementView(verdict) {
   if (verdict?.status !== 'JUDGED') return null
   const uniform = Number(verdict.uniform?.rps)
   const pooled = Number(verdict.pooled?.rps)
-  const comparison = pooled < uniform ? '优于' : pooled > uniform ? '不如' : '持平于'
+  // A random walk with the question's own σ is the harder baseline; meetings judged before it existed use equal odds.
+  const walk = verdict.randomWalk
+  const baseline = walk ? Number(walk.rps) : uniform
+  const baselineName = walk ? '随机游走基准' : '均匀猜测'
+  const comparison = pooled < baseline ? '优于' : pooled > baseline ? '不如' : '持平于'
   return {
     returnText: `${verdict.returnPct > 0 ? '+' : ''}${Number(verdict.returnPct).toFixed(2)}%`,
     observedLabel: verdict.observedLabel,
@@ -409,7 +413,12 @@ function judgementView(verdict) {
     pooledBrierText: score(verdict.pooled?.brier),
     uniformRpsText: score(uniform),
     uniformBrierText: score(verdict.uniform?.brier),
-    verdictText: comparison === '持平于' ? '合议分布与均匀猜测持平' : `合议分布${comparison}均匀猜测`,
+    randomWalkRpsText: walk ? score(walk.rps) : '',
+    randomWalkBrierText: walk ? score(walk.brier) : '',
+    randomWalkText: walk?.probabilities
+      ? '随机游走概率：' + walk.probabilities.map(p => `${(Number(p) * 100).toFixed(1)}%`).join(' / ')
+      : '',
+    verdictText: comparison === '持平于' ? `合议分布与${baselineName}持平` : `合议分布${comparison}${baselineName}`,
     solo: verdict.solo ? {
       rpsText: score(verdict.solo.rps),
       brierText: score(verdict.solo.brier),
@@ -422,7 +431,8 @@ function judgementView(verdict) {
         memberName: member.memberName,
         rpsText: score(member.rps),
         brierText: score(member.brier),
-        beatsUniform: Number(member.rps) < uniform
+        beatsUniform: Number(member.rps) < uniform,
+        beatsBaseline: Number(member.rps) < baseline
       }))
   }
 }

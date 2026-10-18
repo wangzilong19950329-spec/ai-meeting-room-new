@@ -64,10 +64,12 @@
       </div>
       <div class="v2-muted">{{ view.judgement.priceText }}</div>
       <div class="v2-muted">RPS 衡量概率分布离实际结果有多远，0 为完全命中，越低越好；Brier 为辅助参考。</div>
+      <div v-if="view.judgement.randomWalkText" class="v2-muted">{{ view.judgement.randomWalkText }}（假设股价按近期波动率随机游走、不带任何判断时各档的概率）</div>
       <el-table :data="[
         { name: '合议分布（等权）', rps: view.judgement.pooledRpsText, brier: view.judgement.pooledBrierText },
-        { name: '均匀猜测（基准）', rps: view.judgement.uniformRpsText, brier: view.judgement.uniformBrierText },
-        ...view.judgement.members.map(m => ({ name: m.memberName + (m.beatsUniform ? '' : '（不如基准）'), rps: m.rpsText, brier: m.brierText })),
+        ...(view.judgement.randomWalkRpsText ? [{ name: '随机游走（基准）', rps: view.judgement.randomWalkRpsText, brier: view.judgement.randomWalkBrierText }] : []),
+        { name: '均匀猜测' + (view.judgement.randomWalkRpsText ? '（参照）' : '（基准）'), rps: view.judgement.uniformRpsText, brier: view.judgement.uniformBrierText },
+        ...view.judgement.members.map(m => ({ name: m.memberName + (m.beatsBaseline ? '' : '（不如基准）'), rps: m.rpsText, brier: m.brierText })),
         ...(view.judgement.solo ? [{ name: '单人分析（对照）' + (view.judgement.solo.beatsRoundtable ? '：优于圆桌' : '：不如圆桌'), rps: view.judgement.solo.rpsText, brier: view.judgement.solo.brierText }] : [])
       ]" size="small" class="v2-judge-table">
         <el-table-column prop="name" label="预测" />
