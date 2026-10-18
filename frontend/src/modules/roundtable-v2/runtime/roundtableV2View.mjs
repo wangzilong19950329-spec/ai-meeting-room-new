@@ -70,6 +70,8 @@ export function buildRoundtableV2View(v2, usage) {
     factCounts: countTiers(facts),
     outcome: outcome(result?.outcome),
     research,
+    interventions: (v2.interventions || []).map(interventionView),
+    canIntervene: !result,
     judgement: judgementView(v2.outcomeJudgement),
     solo: soloView(v2.solo, result, card, v2.outcomeQuestion),
     canRequestSolo: Boolean(result) && !v2.solo,
@@ -135,7 +137,8 @@ function factRow(fact, fromTopUp) {
   if (fact.referenceClass) badges.push('参照类')
   if (fact.tier === 'L') badges.push('低置信')
   if (fromTopUp) badges.push('补证')
-  if (fact.askedBy) badges.push(`${fact.askedBy}查询`)
+  if (fact.userProvided) badges.push('用户提供')
+  else if (fact.askedBy) badges.push(fact.askedBy === '你' ? '你提出' : `${fact.askedBy}查询`)
   const source = fact.source || ''
   const isUrl = /^https?:\/\//i.test(source)
   return {
@@ -210,6 +213,24 @@ function outcome(summary) {
       falsifier: member.falsifier
     }))
   }
+}
+
+/** A user intervention: what was asked for, whether it has been applied yet, and what came of it. */
+function interventionView(item) {
+  const typeLabel = item.type === 'FACT' ? '补充资料' : item.type === 'SEARCH' ? '追加取证' : `向「${item.targetName}」提问`
+  const ids = item.factIds || []
+  let statusLabel = '未处理'
+  let resultText = item.note || ''
+  if (item.status === 'APPLIED') {
+    statusLabel = item.stage ? `已处理（${item.stage}）` : '已处理'
+    if (item.type === 'FACT') resultText = `已加入资料 ${ids.join('、')}`
+    else if (item.type === 'SEARCH') resultText = ids.length && ids.every(id => id.startsWith('G-')) ? `未查到（${ids.join('、')}）` : `查到 ${ids.join('、')}`
+    else resultText = item.reply || item.note || ''
+  } else if (item.status === 'QUEUED') {
+    statusLabel = item.type === 'ASK' ? '排队中：等议员都作答后处理' : '排队中：下一个环节开始前处理'
+    resultText = ''
+  }
+  return { typeLabel, content: item.content, statusLabel, resultText, applied: item.status === 'APPLIED' }
 }
 
 /** One member's own evidence questions: what an existing fact already answered and what was searched. */

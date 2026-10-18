@@ -200,6 +200,36 @@
           </template>
         </el-timeline-item>
       </el-timeline>
+
+      <!-- 人为介入：排队到下一个环节开始前处理 -->
+      <div v-if="view.canIntervene || view.interventions.length" class="v2-intervene">
+        <div class="v2-step-title">人为介入</div>
+        <div v-for="(item, i) in view.interventions" :key="i" class="v2-intervention">
+          <div class="v2-item-head">
+            <el-tag size="small" :type="item.applied ? 'success' : 'info'">{{ item.typeLabel }}</el-tag>
+            <span>{{ item.content }}</span>
+            <span class="v2-muted">{{ item.statusLabel }}</span>
+          </div>
+          <div v-if="item.resultText" class="v2-quote reply">{{ item.resultText }}</div>
+        </div>
+        <div v-if="view.canIntervene" class="v2-intervene-form">
+          <el-radio-group v-model="draft.type" size="small">
+            <el-radio-button value="FACT">补充资料</el-radio-button>
+            <el-radio-button value="SEARCH">追加取证</el-radio-button>
+            <el-radio-button value="ASK">向议员提问</el-radio-button>
+          </el-radio-group>
+          <el-select v-if="draft.type === 'ASK'" v-model="draft.targetMemberId" placeholder="选择议员" size="small" class="v2-intervene-target">
+            <el-option v-for="member in askableMembers" :key="member.id" :label="member.memberName" :value="member.id" />
+          </el-select>
+          <el-input v-model="draft.content" type="textarea" :rows="2" :placeholder="placeholder" />
+          <el-input v-if="draft.type === 'FACT'" v-model="draft.source" size="small" placeholder="来源（可选，如：公司公告、业绩会纪要）" />
+          <div class="v2-intervene-actions">
+            <el-button type="primary" size="small" :loading="interveneLoading" :disabled="!canSubmit" @click="submit">提交介入</el-button>
+            <span class="v2-muted">在下一个环节开始前处理，不打断进行中的调用；你补充的资料按已核实使用，向议员提问在大家背靠背作答之后处理。</span>
+          </div>
+          <div v-if="interveneError" class="v2-solo-error">{{ interveneError }}</div>
+        </div>
+      </div>
     </section>
 
     <!-- 单人对照：按需生成 -->
@@ -278,15 +308,41 @@
 </template>
 
 <script setup>
-import { computed, defineComponent, h } from 'vue'
+import { computed, defineComponent, h, reactive, watch } from 'vue'
 import { ElTooltip } from 'element-plus'
 
 const props = defineProps({
   view: { type: Object, required: true },
   soloLoading: { type: Boolean, default: false },
-  soloError: { type: String, default: '' }
+  soloError: { type: String, default: '' },
+  members: { type: Array, default: () => [] },
+  interveneLoading: { type: Boolean, default: false },
+  interveneError: { type: String, default: '' },
+  // Bumped by the parent after a successful submission, so the draft is cleared only then.
+  interveneVersion: { type: Number, default: 0 }
 })
-const emit = defineEmits(['request-solo'])
+const emit = defineEmits(['request-solo', 'intervene'])
+
+const draft = reactive({ type: 'FACT', content: '', source: '', targetMemberId: null })
+const askableMembers = computed(() => props.members.filter(member => member.role !== 1))
+const canSubmit = computed(() => draft.content.trim() && (draft.type !== 'ASK' || draft.targetMemberId))
+const placeholder = computed(() => ({
+  FACT: '写一条你确认可靠的资料，例如：公司三季度营收同比增长 37%',
+  SEARCH: '写一个需要查证的问题，系统会走审核搜索，例如：最新季度出货同比增速是多少？',
+  ASK: '写你想问这位议员的问题或质疑，他必须正面回应'
+})[draft.type])
+
+function submit() {
+  const payload = { type: draft.type, content: draft.content.trim() }
+  if (draft.type === 'FACT' && draft.source.trim()) payload.source = draft.source.trim()
+  if (draft.type === 'ASK') payload.targetMemberId = draft.targetMemberId
+  emit('intervene', payload)
+}
+
+watch(() => props.interveneVersion, () => {
+  draft.content = ''
+  draft.source = ''
+})
 
 function relationType(relation) {
   return ({ same: 'success', different: 'danger', disputed: 'warning', open: 'info' })[relation] || 'info'
@@ -354,6 +410,11 @@ const MemberReasons = defineComponent({
 .v2-bar-row.mode .v2-bar-label, .v2-bar-row.mode .v2-bar-value { font-weight: 700; }
 .v2-bar-value { text-align: right; }
 .v2-pending { margin-top: 8px; }
+.v2-intervene { margin-top: 8px; padding-top: 10px; border-top: 1px dashed #eef1f6; display: flex; flex-direction: column; gap: 8px; }
+.v2-intervention { font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.v2-intervene-form { display: flex; flex-direction: column; gap: 8px; }
+.v2-intervene-target { width: 200px; }
+.v2-intervene-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .v2-timeline { padding-left: 2px; margin-top: 4px; }
 .v2-step-title { font-weight: 600; color: #1f2d3d; display: flex; align-items: center; gap: 8px; }
 .v2-running { font-size: 12px; font-weight: 400; color: #409eff; }

@@ -9,6 +9,8 @@ export const meetingApi = {
   getRoundtableV2: (id) => http.get(`/meetings/${id}/roundtable-v2`, { suppressErrorMessage: true }),
   getUsage: (id) => http.get(`/meetings/${id}/usage`, { suppressErrorMessage: true }),
   // One model call (two with a rewrite), possibly through the web bridge, so it may take minutes.
+  interveneRoundtableV2: (id, payload) => http.post(`/meetings/${id}/roundtable-v2/interventions`, payload,
+    { suppressErrorMessage: true }),
   createRoundtableV2Solo: (id) => http.post(`/meetings/${id}/roundtable-v2/solo`, null,
     { timeout: 300000, suppressErrorMessage: true }),
   list: (creatorId) => http.get('/meetings', { params: { creatorId } }),

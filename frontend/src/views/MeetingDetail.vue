@@ -64,7 +64,9 @@
 
       <template v-if="isRoundtableV2">
         <RoundtableV2Result v-if="roundtableV2View" :view="roundtableV2View" :solo-loading="soloLoading"
-          :solo-error="soloError" @request-solo="handleRequestSolo" />
+          :solo-error="soloError" @request-solo="handleRequestSolo"
+          :members="meeting.members || []" :intervene-loading="interveneLoading" :intervene-error="interveneError"
+          :intervene-version="interveneVersion" @intervene="handleIntervene" />
         <el-card v-else-if="[1, 6].includes(meeting.status)" shadow="never" class="header-card">
           <span class="v2-waiting">主持人正在拟定问题卡…</span>
         </el-card>
@@ -1992,6 +1994,25 @@ async function handleRequestSolo() {
     soloError.value = failure?.msg || failure?.message || '单人对照生成失败，可以再试一次'
   } finally {
     soloLoading.value = false
+  }
+}
+
+const interveneLoading = ref(false)
+const interveneError = ref('')
+const interveneVersion = ref(0)
+
+async function handleIntervene(payload) {
+  interveneLoading.value = true
+  interveneError.value = ''
+  try {
+    await meetingApi.interveneRoundtableV2(meetingId, payload)
+    interveneVersion.value++
+    await loadRoundtableV2()
+    ElMessage.success('已提交，会在下一个环节开始前处理')
+  } catch (failure) {
+    interveneError.value = failure?.msg || failure?.message || '提交失败，可以再试一次'
+  } finally {
+    interveneLoading.value = false
   }
 }
 

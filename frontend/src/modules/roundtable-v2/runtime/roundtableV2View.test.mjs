@@ -415,3 +415,34 @@ test('a running meeting marks the stage in progress and shows research question 
   assert.equal(view.process.find(step => step.key === 'answers').running, false)
   assert.equal(view.process.find(step => step.key === 'summary').done, false)
 })
+
+test('user interventions are listed with their status and what they produced', () => {
+  const v2 = clone(sample)
+  v2.result = null
+  v2.interventions = [
+    { type: 'FACT', content: '三季度营收同比增长37%', source: '业绩说明会', status: 'APPLIED', factIds: ['F-23'], stage: '议员作答之前' },
+    { type: 'SEARCH', content: '最新季度出货同比增速是多少？', status: 'APPLIED', factIds: ['G-3'], stage: '议员作答之后' },
+    { type: 'ASK', content: '你为什么认为需求偏强？', targetName: '乙', status: 'APPLIED', reply: '乙：依据订单数据，维持原判。' },
+    { type: 'ASK', content: '订单数据从哪来？', targetName: '丙', status: 'QUEUED' },
+    { type: 'FACT', content: '补充一条', status: 'EXPIRED', note: '会议已收尾，未及处理' }
+  ]
+  const view = buildRoundtableV2View(v2, null)
+  assert.equal(view.canIntervene, true)
+  assert.deepEqual(view.interventions.map(i => [i.typeLabel, i.statusLabel, i.resultText]), [
+    ['补充资料', '已处理（议员作答之前）', '已加入资料 F-23'],
+    ['追加取证', '已处理（议员作答之后）', '未查到（G-3）'],
+    ['向「乙」提问', '已处理', '乙：依据订单数据，维持原判。'],
+    ['向「丙」提问', '排队中：等议员都作答后处理', ''],
+    ['补充资料', '未处理', '会议已收尾，未及处理']
+  ])
+  assert.equal(buildRoundtableV2View(sample, null).canIntervene, false)
+})
+
+test('facts from the user are marked as provided by the user or asked by the user', () => {
+  const v2 = clone(sample)
+  v2.facts.push({ id: 'F-23', tier: 'F', question: '用户补充', statement: '三季度营收同比增长37%', source: '业绩说明会', userProvided: true, askedBy: '你' })
+  v2.facts.push({ id: 'F-24', tier: 'F', question: '最新季度出货同比增速是多少？', statement: '出货同比增长20%', source: 'https://example.org/q', askedBy: '你' })
+  const view = buildRoundtableV2View(v2, null)
+  assert.deepEqual(view.facts.find(f => f.id === 'F-23').badges, ['用户提供'])
+  assert.deepEqual(view.facts.find(f => f.id === 'F-24').badges, ['你提出'])
+})
