@@ -24,6 +24,7 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -58,6 +59,7 @@ public class RoundtableV2Service {
     static final String TOP_UP = "TOP_UP";
     static final String OUTCOME = "OUTCOME_Q";
     static final String SOLO = "SOLO";
+    static final String SOURCE_CHECK = "SOURCE_CHECK";
     static final String RESEARCH = "RESEARCH";
     static final String HUMAN = "HUMAN_";
     private static final String QUEUED = "QUEUED";
@@ -103,6 +105,7 @@ public class RoundtableV2Service {
     @Autowired private MeetingWorkflowService workflowService;
     @Autowired private AiModelProperties aiModelProperties;
     @Autowired(required = false) private List<MeetingDomain> domains;
+    @Autowired(required = false) private CodexSourceVerifier sourceVerifier;
 
     public void run(Long meetingId, Long expectedEpoch) {
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
@@ -336,6 +339,7 @@ public class RoundtableV2Service {
             else if (SOLO.equals(record.getKind())) view.setSolo(JSON.parseObject(record.getPayload()));
             else if (RESEARCH.equals(record.getKind())) view.getResearch().add(JSON.parseObject(record.getPayload()));
             else if (record.getKind().startsWith(HUMAN)) view.getInterventions().add(JSON.parseObject(record.getPayload()));
+            else if (SOURCE_CHECK.equals(record.getKind())) view.setSourceCheck(JSON.parseObject(record.getPayload()));
             else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
@@ -358,6 +362,7 @@ public class RoundtableV2Service {
             JSONArray own = ((JSONObject) item).getJSONArray("facts");
             if (own != null) view.getFacts().addAll(own);
         }
+        view.setFacts(withSourceChecks(view.getFacts(), view.getSourceCheck()));
         return view;
     }
 
@@ -402,7 +407,8 @@ public class RoundtableV2Service {
         facts.addAll(applyInterventions(meetingId, epoch, card, facts, membersById, true));
         if (activeRoom(meetingId, epoch) == null) return;
         JSONArray firstCrossExams = new JSONArray();
-        JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams);
+        JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams,
+                "", false);
         if (finalAnswers == null) return;
 
         JSONArray remaining = summarize(card, finalAnswers).getJSONArray("disputes");
@@ -419,14 +425,27 @@ public class RoundtableV2Service {
             allFacts = new JSONArray();
             allFacts.addAll(facts);
             allFacts.addAll(topUp.getJSONArray("added"));
-            Set<String> reopened = reopenedByEvidence(topUp);
-            if (!reopened.isEmpty()) {
-                JSONArray secondRound = deliberate(meetingId, epoch, 2, card, allFacts, finalAnswers, membersById,
-                        reopened, new JSONArray());
-                if (secondRound == null) return;
-                finalAnswers = secondRound;
-                loops = 2;
-            }
+        }
+        JSONObject sourceCheck = sourceCheck(meetingId, epoch, card, allFacts, finalAnswers);
+        if (sourceCheck == null) return;
+        allFacts = withSourceChecks(allFacts, sourceCheck);
+        // Disputes whose cited facts the source settled get a second round; so does any agreed answer whose
+        // cited fact was corrected or whose cited gap was filled.
+        Set<String> disputed = new LinkedHashSet<>();
+        for (Object item : remaining) disputed.add(((JSONObject) item).getString("questionId"));
+        Set<String> reopened = topUp == null ? new LinkedHashSet<>() : reopenedByEvidence(topUp);
+        for (String questionId : questionsCiting(finalAnswers, changedFactIds(sourceCheck, false))) {
+            if (disputed.contains(questionId)) reopened.add(questionId);
+        }
+        Set<String> agreedButChanged = questionsCiting(finalAnswers, changedFactIds(sourceCheck, true));
+        agreedButChanged.removeAll(disputed);
+        boolean consensusChanged = !agreedButChanged.isEmpty();
+        if (!reopened.isEmpty() || consensusChanged) {
+            JSONArray secondRound = deliberate(meetingId, epoch, 2, card, allFacts, finalAnswers, membersById,
+                    reopened, new JSONArray(), sourceCheckNotes(sourceCheck, allFacts), consensusChanged);
+            if (secondRound == null) return;
+            finalAnswers = secondRound;
+            loops = 2;
         }
         JSONObject result = result(meetingId, epoch, card, allFacts, finalAnswers, answers, classification, topUp, loops);
         conclude(meetingId, epoch, card, allFacts, result);
@@ -435,10 +454,13 @@ public class RoundtableV2Service {
     /**
      * One deliberation round: agenda, paired cross-examination, (first round only) the consensus red team,
      * then the anonymous re-estimate. Returns the answers after the round, or null if the meeting stopped.
+     * With nothing to cross-examine the round ends without a re-estimate, unless {@code reestimateAnyway}
+     * (an agreed answer rested on a fact the source check changed).
      */
     private JSONArray deliberate(Long meetingId, Long epoch, int round, JSONObject card, JSONArray facts,
                                  JSONArray previous, Map<Long, AiMeetingMember> membersById,
-                                 Set<String> onlyQuestions, JSONArray crossExamsOut) {
+                                 Set<String> onlyQuestions, JSONArray crossExamsOut, String roundNotes,
+                                 boolean reestimateAnyway) {
         JSONObject agenda = agenda(meetingId, epoch, round, card, previous, onlyQuestions);
         JSONArray disputes = agenda.getJSONArray("disputes");
         for (int i = 0; i < disputes.size(); i++) {
@@ -451,10 +473,10 @@ public class RoundtableV2Service {
             if (activeRoom(meetingId, epoch) == null) return null;
             redTeam = redTeam(meetingId, epoch, card, facts, agenda.getJSONObject("redTeam"), membersById);
         }
-        if (disputes.isEmpty() && redTeam == null) return previous;
+        if (disputes.isEmpty() && redTeam == null && !reestimateAnyway) return previous;
         facts.addAll(applyInterventions(meetingId, epoch, card, facts, membersById, true));
         if (activeRoom(meetingId, epoch) == null) return null;
-        String notes = humanNotes(meetingId);
+        String notes = roundNotes + humanNotes(meetingId);
         JSONArray after = new JSONArray();
         String kind = round == 1 ? FINAL_ANSWER : FINAL_ANSWER + SECOND_ROUND;
         for (Object item : previous) {
@@ -1115,13 +1137,19 @@ public class RoundtableV2Service {
         for (Object item : facts) {
             JSONObject fact = (JSONObject) item;
             String tier = fact.getString("tier");
+            String checked = "F".equals(tier) ? sourceCheckStatus(fact) : null;
             sb.append(fact.getString("id")).append(" [")
-                    .append("F".equals(tier) ? "已核实" : "L".equals(tier) ? "低置信" : "缺口").append("] ");
+                    .append(CodexSourceVerifier.CONTRADICTED.equals(checked) ? "原文更正"
+                            : CodexSourceVerifier.VERIFIED.equals(checked) ? "原文核实"
+                            : "F".equals(tier) ? "已核实" : "L".equals(tier) ? "低置信" : "缺口").append("] ");
             if ("G".equals(tier)) {
                 sb.append(fact.getString("question")).append("（未能核实）");
             } else {
                 sb.append(fact.getString("statement"));
                 if (!blank(fact.getString("limitation"))) sb.append("（限制：").append(fact.getString("limitation")).append("）");
+                if (!blank(fact.getString("originalStatement"))) {
+                    sb.append("（此前的低置信说法“").append(fact.getString("originalStatement")).append("”与原文不符）");
+                }
             }
             sb.append("\n");
         }
@@ -1733,6 +1761,187 @@ public class RoundtableV2Service {
         return max;
     }
 
+    // ---- S6c source check: the third evidence tier ----
+
+    /**
+     * Every low-confidence fact and gap the members cited after the first round is checked against its
+     * original source by the local Codex API. Each check is stored as soon as it is done, so a resumed meeting
+     * goes on from the next fact. A check that fails or finds nothing leaves the fact as it was and never stops
+     * the meeting. Returns null only when the meeting stopped.
+     */
+    private JSONObject sourceCheck(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONArray answers) {
+        if (sourceVerifier == null) return new JSONObject();
+        AiMeetingV2Record row = recordMapper.selectOne(meetingId, SOURCE_CHECK, MEETING_LEVEL);
+        JSONObject record = row == null ? null : JSON.parseObject(row.getPayload());
+        if (record != null && record.getBooleanValue("done")) return record;
+        Map<String, JSONObject> byId = new LinkedHashMap<>();
+        for (Object item : facts) byId.put(((JSONObject) item).getString("id"), (JSONObject) item);
+        if (record == null) {
+            JSONArray targets = new JSONArray();
+            for (String id : citedFactIds(answers)) {
+                JSONObject fact = byId.get(id);
+                String tier = fact == null ? null : fact.getString("tier");
+                if (("L".equals(tier) || "G".equals(tier)) && !targets.contains(id)) targets.add(id);
+            }
+            JSONObject fresh = new JSONObject(true);
+            fresh.put("targets", targets);
+            fresh.put("checks", new JSONArray());
+            fresh.put("done", targets.isEmpty());
+            record = save(meetingId, SOURCE_CHECK, MEETING_LEVEL, epoch, fresh);
+            if (record.getBooleanValue("done")) return record;
+            row = recordMapper.selectOne(meetingId, SOURCE_CHECK, MEETING_LEVEL);
+        }
+        Set<String> checked = new HashSet<>();
+        for (Object item : record.getJSONArray("checks")) checked.add(((JSONObject) item).getString("factId"));
+        for (Object item : record.getJSONArray("targets")) {
+            String id = String.valueOf(item);
+            if (checked.contains(id)) continue;
+            if (activeRoom(meetingId, epoch) == null) return null;
+            JSONObject verdict = null;
+            if (byId.containsKey(id)) {
+                try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.SOURCE_CHECK)) {
+                    verdict = sourceVerifier.check(card.getString("asOf"), byId.get(id));
+                }
+            }
+            if (verdict == null) {
+                verdict = new JSONObject(true);
+                verdict.put("status", CodexSourceVerifier.UNAVAILABLE);
+                verdict.put("reason", "SOURCE_CHECK_NO_RESULT");
+            }
+            verdict.put("factId", id);
+            record.getJSONArray("checks").add(verdict);
+            recordMapper.updatePayload(row.getId(), record.toJSONString());
+        }
+        record.put("done", true);
+        recordMapper.updatePayload(row.getId(), record.toJSONString());
+        return record;
+    }
+
+    /** Every fact id the members cited, in the order they first cited it. */
+    private static List<String> citedFactIds(JSONArray answers) {
+        List<String> ids = new ArrayList<>();
+        for (JSONObject answer : answeredOnly(answers)) {
+            for (Object item : answer.getJSONArray("answers")) {
+                JSONArray reasons = ((JSONObject) item).getJSONArray("reasons");
+                for (int i = 0; reasons != null && i < reasons.size(); i++) {
+                    JSONArray factIds = reasons.getJSONObject(i).getJSONArray("factIds");
+                    for (int j = 0; factIds != null && j < factIds.size(); j++) {
+                        if (!ids.contains(factIds.getString(j))) ids.add(factIds.getString(j));
+                    }
+                }
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * Facts as members see them after the source check: a confirmed fact or a gap the source answered becomes
+     * verified in the source's own wording (the wording that passed the number check and the support reading),
+     * a contradicted claim is replaced by what the source says (the old claim is kept beside it), and a fact
+     * the check could not settle stays as it was, carrying the check so the page can say so.
+     */
+    static JSONArray withSourceChecks(JSONArray facts, JSONObject record) {
+        Map<String, JSONObject> checks = new HashMap<>();
+        JSONArray list = record == null ? null : record.getJSONArray("checks");
+        for (int i = 0; list != null && i < list.size(); i++) {
+            checks.put(list.getJSONObject(i).getString("factId"), list.getJSONObject(i));
+        }
+        if (checks.isEmpty()) return facts;
+        JSONArray checked = new JSONArray();
+        for (Object item : facts) {
+            JSONObject fact = (JSONObject) item;
+            JSONObject check = checks.get(fact.getString("id"));
+            if (check == null) {
+                checked.add(fact);
+                continue;
+            }
+            JSONObject copy = new JSONObject(true);
+            copy.putAll(fact);
+            copy.put("sourceCheck", check);
+            String status = check.getString("status");
+            boolean contradicted = CodexSourceVerifier.CONTRADICTED.equals(status);
+            if (contradicted || CodexSourceVerifier.VERIFIED.equals(status)) {
+                if (contradicted) copy.put("originalStatement", fact.getString("statement"));
+                copy.put("statement", check.getString("statement"));
+                for (String key : List.of("value", "unit", "period", "scope")) copy.remove(key);
+                copy.remove("confidenceScore");
+                copy.remove("limitation");
+                copy.put("tier", "F");
+                copy.put("source", check.getString("sourceUrl"));
+            }
+            checked.add(copy);
+        }
+        return checked;
+    }
+
+    private static String sourceCheckStatus(JSONObject fact) {
+        JSONObject check = fact.getJSONObject("sourceCheck");
+        return check == null ? null : check.getString("status");
+    }
+
+    /**
+     * Facts the source check changed. Settled means confirmed, corrected or answered; material leaves out a
+     * confirmed claim, since confirming what members already relied on gives them nothing new.
+     */
+    private static Set<String> changedFactIds(JSONObject record, boolean materialOnly) {
+        Set<String> ids = new HashSet<>();
+        JSONArray checks = record.getJSONArray("checks");
+        for (int i = 0; checks != null && i < checks.size(); i++) {
+            JSONObject check = checks.getJSONObject(i);
+            String id = check.getString("factId");
+            String status = check.getString("status");
+            if (CodexSourceVerifier.CONTRADICTED.equals(status)) ids.add(id);
+            else if (CodexSourceVerifier.VERIFIED.equals(status) && (!materialOnly || id.startsWith("G-"))) ids.add(id);
+        }
+        return ids;
+    }
+
+    private static Set<String> questionsCiting(JSONArray answers, Set<String> factIds) {
+        Set<String> questions = new LinkedHashSet<>();
+        if (factIds.isEmpty()) return questions;
+        for (JSONObject answer : answeredOnly(answers)) {
+            for (Object item : answer.getJSONArray("answers")) {
+                JSONObject choice = (JSONObject) item;
+                JSONArray reasons = choice.getJSONArray("reasons");
+                for (int i = 0; reasons != null && i < reasons.size(); i++) {
+                    JSONArray ids = reasons.getJSONObject(i).getJSONArray("factIds");
+                    if (ids != null && ids.stream().anyMatch(id -> factIds.contains(String.valueOf(id)))) {
+                        questions.add(choice.getString("questionId"));
+                    }
+                }
+            }
+        }
+        return questions;
+    }
+
+    /** What the source check changed, told to members before the second-round re-estimate. */
+    private static String sourceCheckNotes(JSONObject record, JSONArray facts) {
+        Map<String, JSONObject> byId = new HashMap<>();
+        for (Object item : facts) byId.put(((JSONObject) item).getString("id"), (JSONObject) item);
+        StringBuilder sb = new StringBuilder();
+        JSONArray checks = record.getJSONArray("checks");
+        for (int i = 0; checks != null && i < checks.size(); i++) {
+            JSONObject check = checks.getJSONObject(i);
+            String id = check.getString("factId");
+            JSONObject fact = byId.get(id);
+            String status = check.getString("status");
+            if (fact == null) continue;
+            if (CodexSourceVerifier.CONTRADICTED.equals(status)) {
+                sb.append(id).append(" 此前的低置信说法“").append(fact.getString("originalStatement"))
+                        .append("”与原文不符，原文为：").append(check.getString("statement"));
+            } else if (CodexSourceVerifier.VERIFIED.equals(status) && id.startsWith("G-")) {
+                sb.append(id).append(" 原本是缺口，原文给出：").append(check.getString("statement"));
+            } else if (CodexSourceVerifier.VERIFIED.equals(status)) {
+                sb.append(id).append(" 经原文核实无误：").append(fact.getString("statement"));
+            } else {
+                continue;
+            }
+            sb.append("（").append(check.getString("sourceUrl")).append("，").append(check.getString("publishedAt"))
+                    .append("）\n");
+        }
+        return sb.length() == 0 ? "" : "\n【原文核验】以下资料已打开原文核对，请据此重新判断：\n" + sb;
+    }
+
     // ---- P7 program summary ----
 
     /** The summary is built from the re-estimated answers; first-round answers only feed the change log. */
@@ -1745,6 +1954,7 @@ public class RoundtableV2Service {
         annotate(result, classification, topUp);
         markSettledDisputes(result, summarize(card, firstAnswers));
         markUserInfluenced(result, facts);
+        markSourceChecked(result, facts);
         result.put("loops", loops);
         JSONArray openQuestions = new JSONArray();
         for (Object item : facts) {
@@ -1819,6 +2029,37 @@ public class RoundtableV2Service {
                 }
             }
             if (cited) conclusion.put("userInfluenced", true);
+        }
+    }
+
+    /**
+     * After the source check a filled gap backs a reason like any verified fact, so evidence-thin is judged
+     * again from the checked facts; conclusions resting on a corrected fact list those facts.
+     */
+    private static void markSourceChecked(JSONObject result, JSONArray facts) {
+        Set<String> backed = new HashSet<>();
+        Set<String> corrected = new HashSet<>();
+        for (Object item : facts) {
+            JSONObject fact = (JSONObject) item;
+            if ("F".equals(fact.getString("tier")) || "L".equals(fact.getString("tier"))) backed.add(fact.getString("id"));
+            if (CodexSourceVerifier.CONTRADICTED.equals(sourceCheckStatus(fact))) corrected.add(fact.getString("id"));
+        }
+        for (Object item : result.getJSONArray("conclusions")) {
+            JSONObject conclusion = (JSONObject) item;
+            JSONArray supporters = conclusion.getJSONArray("members");
+            if (evidenceThin(supporters, backed::contains)) conclusion.put("evidenceThin", true);
+            else conclusion.remove("evidenceThin");
+            Set<String> cited = new LinkedHashSet<>();
+            for (Object supporter : supporters) {
+                JSONArray reasons = ((JSONObject) supporter).getJSONArray("reasons");
+                for (int i = 0; reasons != null && i < reasons.size(); i++) {
+                    JSONArray ids = reasons.getJSONObject(i).getJSONArray("factIds");
+                    for (int j = 0; ids != null && j < ids.size(); j++) {
+                        if (corrected.contains(ids.getString(j))) cited.add(ids.getString(j));
+                    }
+                }
+            }
+            if (!cited.isEmpty()) conclusion.put("correctedFactIds", new JSONArray(new ArrayList<>(cited)));
         }
     }
 
@@ -1949,6 +2190,10 @@ public class RoundtableV2Service {
      * low-confidence (L) fact: members agreed mostly because the evidence was missing, not because it was there.
      */
     private static boolean evidenceThin(JSONArray supporters) {
+        return evidenceThin(supporters, id -> id.startsWith("F-") || id.startsWith("L-"));
+    }
+
+    private static boolean evidenceThin(JSONArray supporters, java.util.function.Predicate<String> isBacked) {
         int reasons = 0;
         int unbacked = 0;
         for (Object item : supporters) {
@@ -1956,8 +2201,7 @@ public class RoundtableV2Service {
             for (int i = 0; list != null && i < list.size(); i++) {
                 reasons++;
                 JSONArray ids = list.getJSONObject(i).getJSONArray("factIds");
-                boolean backed = ids != null && ids.stream()
-                        .anyMatch(id -> String.valueOf(id).startsWith("F-") || String.valueOf(id).startsWith("L-"));
+                boolean backed = ids != null && ids.stream().anyMatch(id -> isBacked.test(String.valueOf(id)));
                 if (!backed) unbacked++;
             }
         }

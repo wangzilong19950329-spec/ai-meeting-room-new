@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -883,6 +884,127 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void citedLowConfidenceFactsAndGapsAreCheckedAgainstTheSourceAndACorrectionReopensTheDispute() {
+        Fixture fixture = new Fixture();
+        fixture.checkSources();
+        fixture.sourceCheck("L-1", CodexSourceVerifier.CONTRADICTED, "最新订单规模60亿元", "订单规模为60亿元");
+        fixture.sourceCheck("G-1", CodexSourceVerifier.VERIFIED, "海外关税对营收的影响约5%", "关税对营收影响约5%");
+        fixture.answers("甲", answer("A", "关税影响有限", "G-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "关税影响有限", "G-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(List.of("G-1", "L-1"), fixture.checkedFactIds, "only cited low-confidence facts and gaps");
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject check = view.getSourceCheck();
+        assertTrue(check.getBooleanValue("done"), check.toJSONString());
+        assertEquals(List.of("G-1", "L-1"), check.getJSONArray("targets").toJavaList(String.class));
+        JSONObject corrected = factWithId(view.getFacts(), "L-1");
+        assertEquals("F", corrected.getString("tier"), corrected.toJSONString());
+        assertEquals("最新订单规模60亿元", corrected.getString("statement"));
+        assertEquals("待核验的订单规模80亿", corrected.getString("originalStatement"));
+        assertEquals(CodexSourceVerifier.CONTRADICTED, corrected.getJSONObject("sourceCheck").getString("status"));
+        assertEquals("https://example.org/original", corrected.getString("source"));
+        JSONObject filled = factWithId(view.getFacts(), "G-1");
+        assertEquals("F", filled.getString("tier"), filled.toJSONString());
+        assertEquals("海外关税对营收的影响约5%", filled.getString("statement"));
+
+        assertEquals(3, view.getSecondFinalAnswers().size());
+        assertEquals(2, view.getResult().getIntValue("loops"));
+        String secondRound = lastMemberPrompt(fixture, "reestimate:甲");
+        assertTrue(secondRound.contains("L-1 [原文更正] 最新订单规模60亿元"), secondRound);
+        assertTrue(secondRound.contains("【原文核验】"), secondRound);
+        assertFalse(view.getResult().getJSONArray("openQuestions").contains("海外关税影响多大？"),
+                view.getResult().toJSONString());
+        JSONObject fundamentals = view.getResult().getJSONArray("conclusions").getJSONObject(0);
+        assertEquals("Q1", fundamentals.getString("questionId"));
+        assertFalse(fundamentals.getBooleanValue("evidenceThin"), "the gap it rested on was filled from the source");
+    }
+
+    @Test
+    void aConsensusRestingOnACorrectedFactIsReestimatedAndMarked() {
+        Fixture fixture = new Fixture();
+        fixture.checkSources();
+        fixture.sourceCheck("L-1", CodexSourceVerifier.CONTRADICTED, "最新订单规模60亿元", "订单规模为60亿元");
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "订单充足", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertTrue(fixture.calls.stream().noneMatch(call -> call.startsWith("classify")), fixture.calls.toString());
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals(3, view.getSecondFinalAnswers().size());
+        assertEquals(0, view.getSecondCrossExams().size());
+        assertEquals(2, view.getResult().getIntValue("loops"));
+        JSONObject orders = null;
+        for (Object item : view.getResult().getJSONArray("conclusions")) {
+            if ("Q2".equals(((JSONObject) item).getString("questionId"))) orders = (JSONObject) item;
+        }
+        assertTrue(orders != null, view.getResult().toJSONString());
+        assertEquals(List.of("L-1"), orders.getJSONArray("correctedFactIds").toJavaList(String.class));
+    }
+
+    @Test
+    void aFailedOrInconclusiveCheckLeavesTheFactAsItWasAndTheMeetingGoesOn() {
+        Fixture fixture = new Fixture();
+        fixture.checkSources();
+        fixture.sourceCheck("G-1", CodexSourceVerifier.NOT_FOUND, null, null);
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "关税影响有限", "G-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject unchecked = factWithId(view.getFacts(), "L-1");
+        assertEquals("L", unchecked.getString("tier"));
+        assertEquals("待核验的订单规模80亿", unchecked.getString("statement"));
+        assertEquals(CodexSourceVerifier.UNAVAILABLE, unchecked.getJSONObject("sourceCheck").getString("status"));
+        JSONObject stillGap = factWithId(view.getFacts(), "G-1");
+        assertEquals("G", stillGap.getString("tier"));
+        assertEquals(CodexSourceVerifier.NOT_FOUND, stillGap.getJSONObject("sourceCheck").getString("status"));
+        assertEquals(1, view.getResult().getIntValue("loops"));
+        assertEquals(0, view.getSecondFinalAnswers().size());
+        assertTrue(view.getResult().getJSONArray("openQuestions").contains("海外关税影响多大？"));
+        verify(fixture.writer).concludeIfCurrent(eq(meetingId), eq(EPOCH), anyInt(), anyInt(),
+                nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+    }
+
+    @Test
+    void aPausedSourceCheckResumesWithoutCheckingTheSameFactTwice() {
+        Fixture fixture = new Fixture();
+        fixture.checkSources();
+        fixture.sourceCheck("L-1", CodexSourceVerifier.VERIFIED, "公司公告称最新订单规模为80亿元", "最新订单规模为80亿元");
+        fixture.sourceCheck("G-1", CodexSourceVerifier.NOT_FOUND, null, null);
+        fixture.onCheck = () -> fixture.room.setStatus(MeetingStatusEnum.PAUSED.getCode());
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "订单需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "关税影响有限", "G-1", "B", "增速放缓", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求回暖", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(List.of("L-1"), fixture.checkedFactIds);
+        JSONObject partial = controller.getRoundtableV2(meetingId).getData().getSourceCheck();
+        assertFalse(partial.getBooleanValue("done"), partial.toJSONString());
+        assertEquals(1, partial.getJSONArray("checks").size());
+
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(List.of("L-1", "G-1"), fixture.checkedFactIds);
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertTrue(view.getSourceCheck().getBooleanValue("done"));
+        assertTrue(view.getResult() != null);
+        JSONObject confirmed = factWithId(view.getFacts(), "L-1");
+        assertEquals("F", confirmed.getString("tier"));
+        assertEquals("公司公告称最新订单规模为80亿元", confirmed.getString("statement"),
+                "a confirmed claim is shown in the source's own wording");
+        assertTrue(confirmed.get("originalStatement") == null, confirmed.toJSONString());
+    }
+
+    @Test
     void stockTopicPutsEastmoneyFactsFirstAndMembersMayCiteTheirNumbers() {
         Fixture fixture = new Fixture();
         fixture.card = CARD.replace("\"referenceClass\":null", "\"referenceClass\":null,"
@@ -1555,6 +1677,22 @@ class RoundtableV2FlowIntegrationTest {
         return item;
     }
 
+    private static JSONObject factWithId(JSONArray facts, String id) {
+        for (Object item : facts) {
+            if (id.equals(((JSONObject) item).getString("id"))) return (JSONObject) item;
+        }
+        throw new AssertionError("no fact " + id + " in " + facts.toJSONString());
+    }
+
+    private static String lastMemberPrompt(Fixture fixture, String stageAndName) {
+        String last = null;
+        for (String prompt : fixture.memberPrompts) {
+            if (prompt.startsWith(stageAndName + "|")) last = prompt;
+        }
+        if (last == null) throw new AssertionError("no prompt for " + stageAndName);
+        return last;
+    }
+
     private static List<String> factIdsAndTiers(JSONArray facts) {
         List<String> ids = new ArrayList<>();
         for (Object fact : facts) {
@@ -1597,6 +1735,12 @@ class RoundtableV2FlowIntegrationTest {
         private final List<String> soloPrompts = new ArrayList<>();
         /** "stage:name" entries whose model call fails as if the provider were down. */
         private final java.util.Set<String> down = new java.util.HashSet<>();
+        private final CodexSourceVerifier verifier = mock(CodexSourceVerifier.class);
+        /** Source-check verdicts by fact id; a fact without one gets an unavailable check. */
+        private final Map<String, JSONObject> sourceChecks = new HashMap<>();
+        private final List<String> checkedFactIds = new ArrayList<>();
+        /** Runs once, during the first source check. */
+        private Runnable onCheck;
         private final RoundtableV2Service service = new RoundtableV2Service();
 
         private Fixture() {
@@ -1705,6 +1849,41 @@ class RoundtableV2FlowIntegrationTest {
             ReflectionTestUtils.setField(service, "aiModelProperties", new AiModelProperties());
             ReflectionTestUtils.setField(service, "domains", List.of(new StockMeetingDomain(eastmoney)));
             ReflectionTestUtils.setField(service, "evidenceRetryWaitsMs", new long[]{0, 0, 0});
+        }
+
+        private void checkSources() {
+            when(verifier.check(anyString(), any(JSONObject.class))).thenAnswer(invocation -> {
+                String id = ((JSONObject) invocation.getArgument(1)).getString("id");
+                checkedFactIds.add(id);
+                if (onCheck != null) {
+                    Runnable once = onCheck;
+                    onCheck = null;
+                    once.run();
+                }
+                JSONObject verdict = sourceChecks.get(id);
+                if (verdict != null) return verdict;
+                JSONObject unavailable = new JSONObject(true);
+                unavailable.put("factId", id);
+                unavailable.put("status", CodexSourceVerifier.UNAVAILABLE);
+                unavailable.put("reason", "CODEX_HTTP_500");
+                return unavailable;
+            });
+            ReflectionTestUtils.setField(service, "sourceVerifier", verifier);
+        }
+
+        private void sourceCheck(String factId, String status, String statement, String quote) {
+            JSONObject verdict = new JSONObject(true);
+            verdict.put("factId", factId);
+            verdict.put("status", status);
+            if (statement != null) {
+                verdict.put("statement", statement);
+                verdict.put("quote", quote);
+                verdict.put("sourceUrl", "https://example.org/original");
+                verdict.put("publishedAt", "2026-09-30");
+            } else {
+                verdict.put("reason", "SOURCE_NOT_FOUND");
+            }
+            sourceChecks.put(factId, verdict);
         }
 
         private void answers(String memberName, String... replies) {

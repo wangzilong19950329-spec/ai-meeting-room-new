@@ -43,7 +43,22 @@ const STAGE_LABELS = {
   research_match: '资料比对',
   solo: '单人对照',
   solo_rewrite: '单人对照重写',
+  source_check: '原文核验',
   other: '其他'
+}
+
+const SOURCE_CHECK_LABELS = { VERIFIED: '原文核实', CONTRADICTED: '原文更正', NOT_FOUND: '原文未找到', UNAVAILABLE: '未核验' }
+const SOURCE_CHECK_REASONS = {
+  SOURCE_NOT_FOUND: '没有找到原文',
+  SOURCE_NOT_CITED: '给出的链接不在搜索结果里，未采信',
+  SOURCE_AFTER_AS_OF: '原文晚于会议截至日，未采信',
+  SOURCE_DATE_MISSING: '原文没有发布日期，未采信',
+  NUMBERS_NOT_IN_QUOTE: '说法里的数字不在原文摘录中，未采信',
+  SOURCE_PROOF_MISSING: '没有给出原文摘录或链接，未采信',
+  CODEX_REPLY_INVALID: 'Codex 回复无法解析',
+  SOURCE_CHECK_MODEL_MISSING: '没有配置 Codex 模型',
+  SOURCE_CHECK_NO_RESULT: '没有拿到核对结果',
+  SUPPORT_CHECK_FAILED: '摘录复核调用失败'
 }
 
 const UNSOURCED_NUMBERS = '含有资料里找不到来源的数字，重写后仍不合格'
@@ -136,6 +151,7 @@ function factRow(fact, fromTopUp) {
   if (fact.tier === 'F' && fact.singleSource) badges.push('东财单源')
   if (fact.referenceClass) badges.push('参照类')
   if (fact.tier === 'L') badges.push('低置信')
+  if (fact.sourceCheck) badges.push(SOURCE_CHECK_LABELS[fact.sourceCheck.status] || fact.sourceCheck.status)
   if (fromTopUp) badges.push('补证')
   if (fact.userProvided) badges.push('用户提供')
   else if (fact.askedBy) badges.push(fact.askedBy === '你' ? '你提出' : `${fact.askedBy}查询`)
@@ -155,6 +171,11 @@ function factRow(fact, fromTopUp) {
 }
 
 function factNote(fact) {
+  const check = fact.sourceCheck
+  if (check && (check.status === 'VERIFIED' || check.status === 'CONTRADICTED')) {
+    const quoted = `原文（${check.publishedAt}）：“${check.quote}”`
+    return fact.originalStatement ? `${quoted}；此前的低置信说法“${fact.originalStatement}”与原文不符` : quoted
+  }
   if (fact.tier === 'L') {
     const parts = []
     if (fact.confidenceScore != null) parts.push(`置信度 ${fact.confidenceScore}`)
@@ -290,9 +311,48 @@ function processView(v2, questions, research, crossExams, red) {
       key: 'reestimate', title: '匿名再估', done: Boolean(v2.classification) || Boolean(result), active: finals.length > 0,
       members: finals.map(final => ({ memberName: final.memberName, changeText: changeText(final, firstByMember.get(final.memberName), questions) }))
     },
+    ...(v2.sourceCheck || !result ? [verifyStep(v2)] : []),
     { key: 'summary', title: '程序汇总', done: Boolean(result), active: false }
   ]
   return steps.map(({ active, ...step }) => ({ ...step, running: !result && !step.done && active }))
+}
+
+// Members' cited low-confidence facts and gaps, each checked against its original source after the first round.
+function verifyStep(v2) {
+  const record = v2.sourceCheck
+  const factById = new Map((v2.facts || []).map(fact => [fact.id, fact]))
+  const checks = (record?.checks || []).map(check => sourceCheckRow(check, factById))
+  const targets = record?.targets || []
+  let summaryText = ''
+  if (record?.done) {
+    const count = (status) => checks.filter(check => check.status === status).length
+    summaryText = targets.length
+      ? `核对 ${targets.length} 条低置信资料和缺口：` + ['VERIFIED', 'CONTRADICTED', 'NOT_FOUND', 'UNAVAILABLE']
+        .map(status => `${SOURCE_CHECK_LABELS[status]} ${count(status)}`).join(' · ')
+      : '成员没有引用低置信资料或缺口，无需核对'
+  } else if (record) {
+    summaryText = `已核对 ${checks.length} / ${targets.length} 条`
+  }
+  return { key: 'verify', title: '原文核验', done: Boolean(record?.done) || Boolean(v2.result), active: Boolean(record), summaryText, checks }
+}
+
+function sourceCheckRow(check, factById) {
+  const definitive = check.status === 'VERIFIED' || check.status === 'CONTRADICTED'
+  const url = /^https?:\/\//i.test(check.sourceUrl || '') ? check.sourceUrl : null
+  const reason = String(check.reason || '')
+  return {
+    factId: check.factId,
+    status: check.status,
+    question: factById.get(check.factId)?.question || '',
+    statusLabel: SOURCE_CHECK_LABELS[check.status] || check.status,
+    text: definitive ? check.statement || ''
+      : reason === 'QUOTE_DOES_NOT_SUPPORT' ? `原文摘录读不出这个说法（缺少：${check.missing || '未说明'}），未采信`
+        : SOURCE_CHECK_REASONS[reason] || (reason.startsWith('CODEX_') ? 'Codex 调用失败' : reason),
+    quote: definitive ? check.quote || '' : '',
+    publishedAt: check.publishedAt || '',
+    sourceUrl: url,
+    sourceText: url ? hostOf(url) : ''
+  }
 }
 
 function answerCard(answer, questions, outcomeQuestion) {
@@ -454,6 +514,7 @@ function conclusion(line) {
     resolvedAfterDispute: resolved,
     evidenceThin: Boolean(line.evidenceThin),
     evidenceThinText: line.evidenceThin ? '证据不足的共识：多数理由只引用了资料缺口，一致不代表被证实' : '',
+    correctedText: line.correctedFactIds?.length ? `所引 ${line.correctedFactIds.join('、')} 经原文更正，已据此重新评估` : '',
     typeLabel: resolved && line.type ? (DISPUTE_TYPES[line.type] || [line.type])[0] : '',
     crux: line.crux || '',
     members: memberRows(line.members)
@@ -534,6 +595,10 @@ function progress(v2) {
     ['交锋与红队', finalAnswers.length > 0 || result, crossExams ? `${crossExams} 场质询` : ''],
     ['匿名再估', Boolean(v2.classification) || result, finalAnswers.length ? `${finalAnswers.length} 人已再估` : ''],
     ['分歧分类与补证', result, ''],
+    ...(v2.sourceCheck || !result
+      ? [['原文核验', Boolean(v2.sourceCheck?.done) || result,
+          v2.sourceCheck ? `${(v2.sourceCheck.checks || []).length}/${(v2.sourceCheck.targets || []).length} 条` : '']]
+      : []),
     ['程序汇总', result, '']
   ]
   return steps.map(([label, done, detail]) => ({ label, done, detail }))

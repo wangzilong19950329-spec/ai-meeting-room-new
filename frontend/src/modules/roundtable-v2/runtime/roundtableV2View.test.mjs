@@ -209,6 +209,7 @@ test('a meeting still running shows which stages are done and no summary yet', (
     ['交锋与红队', false],
     ['匿名再估', false],
     ['分歧分类与补证', false],
+    ['原文核验', false],
     ['程序汇总', false]
   ])
   assert.equal(view.progress[3].detail, '2 人已作答')
@@ -451,4 +452,111 @@ test('a gap left after repeated search outages says so', () => {
   const v2 = clone(sample)
   v2.facts.push({ id: 'G-9', tier: 'G', question: '半年报存货是多少？', reason: 'RETRIES_EXHAUSTED_N8N_REVIEW_ERROR', askedBy: '甲' })
   assert.equal(buildRoundtableV2View(v2, null).facts.find(f => f.id === 'G-9').note, '审核搜索多次重试仍失败')
+})
+
+const checkedFacts = () => [
+  {
+    id: 'L-7', tier: 'F', question: '最新订单规模是多少？', statement: '最新订单规模60亿元',
+    originalStatement: '待核验的订单规模80亿', source: 'https://www.cninfo.com.cn/a.pdf',
+    sourceCheck: { factId: 'L-7', status: 'CONTRADICTED', statement: '最新订单规模60亿元', quote: '订单规模为60亿元', sourceUrl: 'https://www.cninfo.com.cn/a.pdf', publishedAt: '2026-09-30' }
+  },
+  {
+    id: 'G-7', tier: 'F', question: '海外关税影响多大？', statement: '海外关税对营收影响约5%', source: 'https://example.org/tariff',
+    sourceCheck: { factId: 'G-7', status: 'VERIFIED', statement: '海外关税对营收影响约5%', quote: '关税对营收影响约5%', sourceUrl: 'https://example.org/tariff', publishedAt: '2026-10-09' }
+  },
+  {
+    id: 'L-8', tier: 'L', question: '库存周期在哪个阶段？', statement: '库存处于去化尾声', confidenceScore: 0.25,
+    sourceCheck: { factId: 'L-8', status: 'UNAVAILABLE', reason: 'CODEX_HTTP_500' }
+  },
+  {
+    id: 'G-8', tier: 'G', question: '半年报存货是多少？', reason: 'N8N_REVIEW_UNVERIFIED',
+    sourceCheck: { factId: 'G-8', status: 'NOT_FOUND', reason: 'SOURCE_AFTER_AS_OF' }
+  }
+]
+
+test('facts checked against the original source say what the check found', () => {
+  const v2 = clone(sample)
+  v2.facts.push(...checkedFacts())
+  const view = buildRoundtableV2View(v2, null)
+  const corrected = view.facts.find(f => f.id === 'L-7')
+  assert.equal(corrected.tierLabel, '已核实')
+  assert.deepEqual(corrected.badges, ['原文更正'])
+  assert.equal(corrected.note, '原文（2026-09-30）：“订单规模为60亿元”；此前的低置信说法“待核验的订单规模80亿”与原文不符')
+  assert.equal(corrected.sourceUrl, 'https://www.cninfo.com.cn/a.pdf')
+  const filled = view.facts.find(f => f.id === 'G-7')
+  assert.deepEqual(filled.badges, ['原文核实'])
+  assert.equal(filled.note, '原文（2026-10-09）：“关税对营收影响约5%”')
+  const unchecked = view.facts.find(f => f.id === 'L-8')
+  assert.deepEqual(unchecked.badges, ['低置信', '未核验'])
+  assert.equal(unchecked.note, '置信度 0.25')
+  const notFound = view.facts.find(f => f.id === 'G-8')
+  assert.deepEqual(notFound.badges, ['原文未找到'])
+  assert.equal(notFound.note, '审核搜索未能核实')
+})
+
+test('the source check is a stage of the process that lists each fact and what the source said', () => {
+  const v2 = clone(sample)
+  v2.facts.push(...checkedFacts())
+  v2.sourceCheck = { targets: ['L-7', 'G-7', 'L-8', 'G-8'], done: true, checks: checkedFacts().map(f => f.sourceCheck) }
+  const view = buildRoundtableV2View(v2, null)
+  assert.deepEqual(view.process.map(step => step.key),
+    ['card', 'facts', 'research', 'answers', 'debate', 'reestimate', 'verify', 'summary'])
+  const step = view.process.find(s => s.key === 'verify')
+  assert.equal(step.title, '原文核验')
+  assert.equal(step.done, true)
+  assert.equal(step.summaryText, '核对 4 条低置信资料和缺口：原文核实 1 · 原文更正 1 · 原文未找到 1 · 未核验 1')
+  assert.deepEqual(step.checks.map(c => [c.factId, c.question, c.statusLabel, c.text]), [
+    ['L-7', '最新订单规模是多少？', '原文更正', '最新订单规模60亿元'],
+    ['G-7', '海外关税影响多大？', '原文核实', '海外关税对营收影响约5%'],
+    ['L-8', '库存周期在哪个阶段？', '未核验', 'Codex 调用失败'],
+    ['G-8', '半年报存货是多少？', '原文未找到', '原文晚于会议截至日，未采信']
+  ])
+  assert.equal(step.checks[0].quote, '订单规模为60亿元')
+  assert.equal(step.checks[0].sourceUrl, 'https://www.cninfo.com.cn/a.pdf')
+  assert.equal(step.checks[0].sourceText, 'www.cninfo.com.cn')
+})
+
+test('a running source check shows how far it got', () => {
+  const v2 = clone(sample)
+  v2.result = null
+  v2.sourceCheck = { targets: ['L-1', 'G-1', 'G-2'], done: false, checks: [{ factId: 'L-1', status: 'VERIFIED', statement: '待核验的订单规模80亿', quote: '订单规模80亿', sourceUrl: 'https://example.org/o', publishedAt: '2026-09-01' }] }
+  const step = buildRoundtableV2View(v2, null).process.find(s => s.key === 'verify')
+  assert.equal(step.done, false)
+  assert.equal(step.running, true)
+  assert.equal(step.summaryText, '已核对 1 / 3 条')
+})
+
+test('a source check with nothing to check says so, and a meeting from before the check has no such stage', () => {
+  const v2 = clone(sample)
+  v2.sourceCheck = { targets: [], done: true, checks: [] }
+  assert.equal(buildRoundtableV2View(v2, null).process.find(s => s.key === 'verify').summaryText,
+    '成员没有引用低置信资料或缺口，无需核对')
+  assert.equal(buildRoundtableV2View(sample, null).process.find(s => s.key === 'verify'), undefined)
+})
+
+test('a conclusion that rested on a corrected fact says it was re-estimated after the correction', () => {
+  const v2 = clone(sample)
+  v2.result.conclusions[0].correctedFactIds = ['L-1']
+  const flagged = buildRoundtableV2View(v2, null).conclusions[0]
+  assert.equal(flagged.correctedText, '所引 L-1 经原文更正，已据此重新评估')
+  assert.equal(buildRoundtableV2View(sample, null).conclusions[0].correctedText, '')
+})
+
+test('usage names the source check stage', () => {
+  const line = (stage) => ({ stage, calls: 1, meteredCalls: 1, unmeteredCalls: 0, promptTokens: 1, completionTokens: 1, durationMs: 1000 })
+  const view = buildRoundtableV2View(sample, { total: line(null), stages: [line('source_check')] })
+  assert.deepEqual(view.usage.stages.map(s => s.stageLabel), ['原文核验'])
+})
+
+test('a check whose quote did not support the statement, or whose second reading failed, says so', () => {
+  const v2 = clone(sample)
+  v2.sourceCheck = {
+    targets: ['G-1', 'G-2'], done: true,
+    checks: [
+      { factId: 'G-1', status: 'NOT_FOUND', reason: 'QUOTE_DOES_NOT_SUPPORT', missing: '7月末的价格' },
+      { factId: 'G-2', status: 'UNAVAILABLE', reason: 'SUPPORT_CHECK_FAILED' }
+    ]
+  }
+  const step = buildRoundtableV2View(v2, null).process.find(s => s.key === 'verify')
+  assert.deepEqual(step.checks.map(c => c.text), ['原文摘录读不出这个说法（缺少：7月末的价格），未采信', '摘录复核调用失败'])
 })

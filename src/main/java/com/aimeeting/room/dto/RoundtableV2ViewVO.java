@@ -33,4 +33,6 @@ public class RoundtableV2ViewVO {
     private JSONArray research = new JSONArray();
     /** What the user added or asked while the meeting ran, and how each was applied. */
     private JSONArray interventions = new JSONArray();
+    /** Codex checks of the cited low-confidence facts and gaps against their original sources. */
+    private JSONObject sourceCheck;
 }

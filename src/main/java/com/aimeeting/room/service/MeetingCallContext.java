@@ -35,6 +35,7 @@ public final class MeetingCallContext {
     public static final String HUMAN_REPLY_REWRITE = "human_reply_rewrite";
     public static final String SOLO = "solo";
     public static final String SOLO_REWRITE = "solo_rewrite";
+    public static final String SOURCE_CHECK = "source_check";
     public static final String OTHER = "other";
 
     private static final ThreadLocal<Frame> CURRENT = new ThreadLocal<>();

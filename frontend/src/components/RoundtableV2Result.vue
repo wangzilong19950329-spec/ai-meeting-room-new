@@ -92,6 +92,7 @@
           </el-tag>
         </div>
         <div v-if="item.evidenceThin" class="v2-thin">{{ item.evidenceThinText }}</div>
+        <div v-if="item.correctedText" class="v2-thin">{{ item.correctedText }}</div>
         <div v-if="item.crux" class="v2-crux">关键分歧点：{{ item.crux }}</div>
         <MemberReasons :members="item.members" :facts="factById" />
       </div>
@@ -197,6 +198,19 @@
             <div v-for="member in step.members" :key="member.memberName" class="v2-change">
               <strong>{{ member.memberName }}</strong>：{{ member.changeText }}
             </div>
+          </template>
+
+          <template v-if="step.key === 'verify'">
+            <details v-for="check in step.checks" :key="check.factId" class="v2-process-member">
+              <summary>
+                <el-tag size="small" effect="plain">{{ check.factId }}</el-tag>
+                <el-tag size="small" :type="badgeType(check.statusLabel)" class="v2-badge">{{ check.statusLabel }}</el-tag>
+                {{ check.question }}
+              </summary>
+              <div>{{ check.text }}</div>
+              <div v-if="check.quote" class="v2-quote">原文<template v-if="check.publishedAt">（{{ check.publishedAt }}）</template>：“{{ check.quote }}”</div>
+              <div v-if="check.sourceUrl" class="v2-muted">来源 <a :href="check.sourceUrl" target="_blank" rel="noopener noreferrer">{{ check.sourceText }}</a></div>
+            </details>
           </template>
         </el-timeline-item>
       </el-timeline>
@@ -355,7 +369,7 @@ function tierType(tier) {
 }
 
 function badgeType(badge) {
-  return ({ 低置信: 'warning', 东财单源: 'info', 补证: 'primary', 参照类: 'info' })[badge] || 'info'
+  return ({ 低置信: 'warning', 东财单源: 'info', 补证: 'primary', 参照类: 'info', 原文核实: 'success', 原文更正: 'danger' })[badge] || 'info'
 }
 
 // Fact ids in a reason; hovering shows the fact itself so every claim can be checked against the base.
