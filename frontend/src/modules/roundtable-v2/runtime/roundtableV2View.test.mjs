@@ -372,3 +372,46 @@ test('usage names the research stages', () => {
   const view = buildRoundtableV2View(sample, { total: line(null), stages: [line('research_plan'), line('research_match')] })
   assert.deepEqual(view.usage.stages.map(s => s.stageLabel), ['议员列取证题', '资料比对'])
 })
+
+test('the meeting process lists every stage in order with what each member did', () => {
+  const view = buildRoundtableV2View(sample, null)
+  assert.deepEqual(view.process.map(step => [step.key, step.title, step.done]), [
+    ['card', '问题卡', true],
+    ['facts', '共享底稿', true],
+    ['research', '议员自主取证', true],
+    ['answers', '背靠背作答', true],
+    ['debate', '交锋与红队', true],
+    ['reestimate', '匿名再估', true],
+    ['summary', '程序汇总', true]
+  ])
+  assert.equal(view.process[1].summaryText, '共享底稿 22 条：已核实 20 · 低置信 1 · 缺口 1')
+  assert.equal(view.process[2].summaryText, '没有议员追加取证')
+  const answers = view.process[3]
+  assert.deepEqual(answers.members.map(m => m.memberName), ['甲', '乙', '丙'])
+  assert.deepEqual(answers.members[0].choices.map(c => [c.questionId, c.title, c.optionLabel]), [
+    ['Q1', '业绩基本面', '支撑股价'],
+    ['Q2', '订单与需求', '偏强']
+  ])
+  assert.deepEqual(answers.members[0].choices[0].reasons, [{ text: '市盈率22.5倍，处于近一年较低分位', factIds: ['F-4'] }])
+  assert.equal(answers.members[1].outcomeText, '跌幅超过23% 10% / 下跌8%–23% 50% / 在±8%以内 30% / 上涨8%–23% 10% / 涨幅超过23% 0%')
+  assert.deepEqual(view.process[5].members.map(m => [m.memberName, m.changeText]), [
+    ['甲', '维持首轮选择'],
+    ['乙', '维持首轮选择'],
+    ['丙', '订单与需求：偏强 → 偏弱（质询后认为订单增速放缓的证据更扎实）']
+  ])
+})
+
+test('a running meeting marks the stage in progress and shows research question by question', () => {
+  const v2 = {
+    issueCard: sample.issueCard, outcomeQuestion: sample.outcomeQuestion, facts: sample.facts,
+    answers: [], crossExams: [], finalAnswers: [], secondCrossExams: [], secondFinalAnswers: [], result: null,
+    research: [{ memberName: '甲', inProgress: true, rounds: [{ round: 1, questions: [{ question: '最新季度出货同比增速是多少？', searched: ['F-23'] }] }] }]
+  }
+  const view = buildRoundtableV2View(v2, null)
+  const research = view.process.find(step => step.key === 'research')
+  assert.equal(research.done, false)
+  assert.equal(research.running, true)
+  assert.deepEqual(research.members.map(m => [m.memberName, m.summaryText]), [['甲', '进行中：第 1 轮，已问 1 题']])
+  assert.equal(view.process.find(step => step.key === 'answers').running, false)
+  assert.equal(view.process.find(step => step.key === 'summary').done, false)
+})

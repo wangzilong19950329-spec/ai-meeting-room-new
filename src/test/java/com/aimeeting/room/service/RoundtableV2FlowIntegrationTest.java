@@ -485,6 +485,36 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void researchInProgressIsVisibleBeforeTheMemberFinishes() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.researchReplies.put("甲", new ArrayList<>(List.of(
+                "{\"questions\":[\"最新季度出货同比增速是多少？\",\"海外关税对利润的影响有多大？\"]}",
+                "{\"questions\":[]}")));
+        // The user pauses the meeting while 甲's first question is being searched.
+        org.mockito.Mockito.doAnswer(invocation -> {
+            fixture.room.setStatus(MeetingStatusEnum.PAUSED.getCode());
+            return crossChecked(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2),
+                    "最新季度出货同比增长20%");
+        }).when(fixture.reviewed).search(anyString(), org.mockito.ArgumentMatchers.contains("最新季度出货"), anyString(), anyLong());
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = fixture.service.view(meetingId);
+        assertEquals(1, view.getResearch().size(), view.getResearch().toString());
+        JSONObject live = view.getResearch().getJSONObject(0);
+        assertEquals("甲", live.getString("memberName"));
+        assertTrue(live.getBooleanValue("inProgress"), live.toJSONString());
+        JSONArray lines = live.getJSONArray("rounds").getJSONObject(0).getJSONArray("questions");
+        assertEquals(1, lines.size(), live.toJSONString());
+        assertEquals("最新季度出货同比增速是多少？", lines.getJSONObject(0).getString("question"));
+        assertEquals("F-2", lines.getJSONObject(0).getJSONArray("searched").getString(0));
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));

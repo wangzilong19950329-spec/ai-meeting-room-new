@@ -60,6 +60,11 @@ public class RoundtableV2Service {
     static final String RESEARCH = "RESEARCH";
     /** A safety stop against endless follow-ups; the number of questions per round is not limited. */
     private static final int MAX_RESEARCH_ROUNDS = 3;
+    /**
+     * Research still running, per meeting and member, so the page can follow it question by question. Only
+     * a view aid: the stored RESEARCH record is the truth and replaces it once the member is done.
+     */
+    private final Map<Long, Map<Long, JSONObject>> liveResearch = new java.util.concurrent.ConcurrentHashMap<>();
     private static final java.util.regex.Pattern NON_ANSWER_OPTION =
             java.util.regex.Pattern.compile("信息不足|难以判断|无法判断|无法确定");
     /** Marks a skipped answer that is not stored until all members have been asked. */
@@ -176,6 +181,15 @@ public class RoundtableV2Service {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
         }
+        // A member still researching is shown from the live progress until its record is stored.
+        Map<Long, JSONObject> live = liveResearch.get(meetingId);
+        if (live != null) {
+            Set<Long> done = new HashSet<>();
+            for (Object item : view.getResearch()) done.add(((JSONObject) item).getLong("memberId"));
+            for (Map.Entry<Long, JSONObject> entry : live.entrySet()) {
+                if (!done.contains(entry.getKey())) view.getResearch().add(entry.getValue());
+            }
+        }
         // The fact list shows every fact: the shared base followed by each member's own research.
         for (Object item : view.getResearch()) {
             JSONArray own = ((JSONObject) item).getJSONArray("facts");
@@ -185,6 +199,7 @@ public class RoundtableV2Service {
     }
 
     public void deleteByMeetingId(Long meetingId) {
+        liveResearch.remove(meetingId);
         recordMapper.deleteByMeetingId(meetingId);
     }
 
@@ -565,6 +580,9 @@ public class RoundtableV2Service {
             asked.addAll(questions);
             Map<Integer, List<String>> existing = matchExisting(meetingId, concat(pool, own), questions);
             JSONArray lines = new JSONArray();
+            JSONObject roundRecord = new JSONObject(true);
+            roundRecord.put("round", round);
+            roundRecord.put("questions", lines);
             for (int i = 0; i < questions.size(); i++) {
                 String question = questions.get(i);
                 JSONObject line = new JSONObject(true);
@@ -585,13 +603,25 @@ public class RoundtableV2Service {
                     line.put("searched", ids);
                 }
                 lines.add(line);
+                publishLive(meetingId, member, rounds, roundRecord, own, visible);
             }
-            JSONObject roundRecord = new JSONObject(true);
-            roundRecord.put("round", round);
-            roundRecord.put("questions", lines);
             rounds.add(roundRecord);
         }
-        return save(meetingId, RESEARCH, member.getId(), epoch, researchRecord(member, rounds, own, visible));
+        JSONObject saved = save(meetingId, RESEARCH, member.getId(), epoch, researchRecord(member, rounds, own, visible));
+        Map<Long, JSONObject> live = liveResearch.get(meetingId);
+        if (live != null) live.remove(member.getId());
+        return saved;
+    }
+
+    private void publishLive(Long meetingId, AiMeetingMember member, JSONArray rounds, JSONObject current,
+                             JSONArray own, List<String> visible) {
+        JSONArray soFar = new JSONArray();
+        soFar.addAll(rounds);
+        soFar.add(current);
+        JSONObject snapshot = JSON.parseObject(JSON.toJSONString(researchRecord(member, soFar, own, visible)));
+        snapshot.put("inProgress", true);
+        liveResearch.computeIfAbsent(meetingId, id -> new java.util.concurrent.ConcurrentHashMap<>())
+                .put(member.getId(), snapshot);
     }
 
     private static JSONObject researchRecord(AiMeetingMember member, JSONArray rounds, JSONArray own, List<String> visible) {

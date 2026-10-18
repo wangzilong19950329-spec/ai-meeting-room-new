@@ -10,13 +10,6 @@
       </div>
     </template>
 
-    <!-- 进度：会议进行中才显示 -->
-    <div v-if="!view.finished" class="v2-progress">
-      <span v-for="step in view.progress" :key="step.label" class="v2-step" :class="{ done: step.done }">
-        {{ step.done ? '✓' : '○' }} {{ step.label }}<small v-if="step.detail"> · {{ step.detail }}</small>
-      </span>
-    </div>
-
     <el-alert v-if="view.skippedMembers.length" type="warning" :closable="false" class="v2-skipped">
       <div v-for="member in view.skippedMembers" :key="member.memberName">{{ member.memberName }} 作答无效：{{ member.reason }}</div>
     </el-alert>
@@ -137,38 +130,76 @@
       </div>
     </section>
 
-    <!-- 交锋与红队 -->
-    <section v-if="view.crossExams.length || view.redTeam" class="v2-section">
-      <div class="v2-title">交锋记录</div>
-      <div v-for="(exam, i) in view.crossExams" :key="i" class="v2-item">
-        <div class="v2-item-head">
-          <el-tag size="small" effect="plain">第 {{ exam.round }} 轮</el-tag>
-          <span class="v2-item-title">{{ exam.title }}</span>
-          <span class="v2-muted">{{ exam.askerName }}（{{ exam.askerOption }}）质询 {{ exam.responderName }}（{{ exam.responderOption }}）</span>
-        </div>
-        <div v-if="exam.question" class="v2-quote"><b>{{ exam.askerName }}：</b>{{ exam.question }}</div>
-        <div v-if="exam.reply" class="v2-quote reply"><b>{{ exam.responderName }}：</b>{{ exam.reply }}</div>
-        <el-alert v-if="exam.failNote" :title="exam.failNote" type="info" :closable="false" show-icon />
-      </div>
-      <div v-if="view.redTeam" class="v2-item v2-red-team">
-        <div class="v2-item-head">
-          <el-tag size="small" type="danger">红队</el-tag>
-          <span class="v2-item-title">攻击共识：{{ view.redTeam.targetText }}</span>
-          <span class="v2-muted">由 {{ view.redTeam.memberName }} 站在反方论证</span>
-        </div>
-        <div v-if="view.redTeam.argument" class="v2-quote">{{ view.redTeam.argument }}</div>
-        <el-alert v-if="view.redTeam.failNote" :title="view.redTeam.failNote" type="info" :closable="false" show-icon />
-      </div>
-    </section>
+    <!-- 会议过程：按时间顺序，每个环节谁做了什么 -->
+    <section class="v2-section">
+      <div class="v2-title">会议过程</div>
+      <el-timeline class="v2-timeline">
+        <el-timeline-item v-for="step in view.process" :key="step.key"
+          :type="step.done ? 'success' : step.running ? 'primary' : 'info'" :hollow="!step.done && !step.running">
+          <div class="v2-step-title">
+            {{ step.title }}
+            <span v-if="step.running" class="v2-running">进行中…</span>
+            <span v-else-if="!step.done" class="v2-muted">未开始</span>
+          </div>
+          <div v-if="step.summaryText && (step.done || step.running)" class="v2-muted">{{ step.summaryText }}</div>
 
-    <!-- 立场变化 -->
-    <section v-if="view.finished" class="v2-section">
-      <div class="v2-title">匿名再估后的立场变化</div>
-      <div v-if="!view.changes.length" class="v2-empty">再估后没有人改变立场</div>
-      <div v-for="(change, i) in view.changes" :key="i" class="v2-change">
-        <strong>{{ change.memberName }}</strong> 在「{{ change.questionTitle }}」上
-        从「{{ change.fromLabel }}」改为「{{ change.toLabel }}」<span v-if="change.reason">：{{ change.reason }}</span>
-      </div>
+          <template v-if="step.key === 'research'">
+            <details v-for="member in step.members" :key="member.memberName" class="v2-process-member" :open="step.running">
+              <summary><strong>{{ member.memberName }}</strong>：{{ member.summaryText }}</summary>
+              <div v-for="(q, i) in member.questions" :key="i" class="v2-muted">· {{ q.question }} —— {{ q.sourceText }}</div>
+            </details>
+          </template>
+
+          <template v-if="step.key === 'answers'">
+            <details v-for="member in step.members" :key="member.memberName" class="v2-process-member">
+              <summary>
+                <strong>{{ member.memberName }}</strong>：
+                <span v-if="member.skipped" class="v2-solo-error">作答无效</span>
+                <template v-else>{{ member.choices.map(c => `${c.questionId} ${c.optionLabel}`).join(' · ') }}</template>
+              </summary>
+              <div v-if="member.skipped" class="v2-muted">{{ member.reasonText }}</div>
+              <div v-for="choice in member.choices" :key="choice.questionId" class="v2-process-choice">
+                <div><el-tag size="small" effect="plain">{{ choice.questionId }}</el-tag> {{ choice.title }}：<b>{{ choice.optionLabel }}</b></div>
+                <div class="v2-members">
+                  <div class="v2-member">
+                    <template v-for="(reason, i) in choice.reasons" :key="i">{{ reason.text }}<FactRefs :ids="reason.factIds" :facts="factById" />；</template>
+                    <span v-if="choice.falsifier" class="v2-muted">证伪信号：{{ choice.falsifier }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-if="member.outcomeText" class="v2-muted">结果概率：{{ member.outcomeText }}</div>
+            </details>
+          </template>
+
+          <template v-if="step.key === 'debate'">
+            <div v-for="(exam, i) in step.exams" :key="i" class="v2-item">
+              <div class="v2-item-head">
+                <el-tag size="small" effect="plain">第 {{ exam.round }} 轮</el-tag>
+                <span class="v2-item-title">{{ exam.title }}</span>
+                <span class="v2-muted">{{ exam.askerName }}（{{ exam.askerOption }}）质询 {{ exam.responderName }}（{{ exam.responderOption }}）</span>
+              </div>
+              <div v-if="exam.question" class="v2-quote"><b>{{ exam.askerName }}：</b>{{ exam.question }}</div>
+              <div v-if="exam.reply" class="v2-quote reply"><b>{{ exam.responderName }}：</b>{{ exam.reply }}</div>
+              <el-alert v-if="exam.failNote" :title="exam.failNote" type="info" :closable="false" show-icon />
+            </div>
+            <div v-if="step.redTeam" class="v2-item v2-red-team">
+              <div class="v2-item-head">
+                <el-tag size="small" type="danger">红队</el-tag>
+                <span class="v2-item-title">攻击共识：{{ step.redTeam.targetText }}</span>
+                <span class="v2-muted">由 {{ step.redTeam.memberName }} 站在反方论证</span>
+              </div>
+              <div v-if="step.redTeam.argument" class="v2-quote">{{ step.redTeam.argument }}</div>
+              <el-alert v-if="step.redTeam.failNote" :title="step.redTeam.failNote" type="info" :closable="false" show-icon />
+            </div>
+          </template>
+
+          <template v-if="step.key === 'reestimate'">
+            <div v-for="member in step.members" :key="member.memberName" class="v2-change">
+              <strong>{{ member.memberName }}</strong>：{{ member.changeText }}
+            </div>
+          </template>
+        </el-timeline-item>
+      </el-timeline>
     </section>
 
     <!-- 单人对照：按需生成 -->
@@ -227,13 +258,6 @@
               <template v-else-if="fact.sourceText">来源 {{ fact.sourceText }}</template>
               <template v-if="fact.note"><template v-if="fact.sourceText"> · </template>{{ fact.note }}</template>
             </div>
-          </div>
-        </div>
-        <div v-if="view.research.length" class="v2-research">
-          <div class="v2-research-head">议员自主取证（作答前按各自视角查的资料，交锋起全员可见）</div>
-          <div v-for="member in view.research" :key="member.memberName" class="v2-research-member">
-            <strong>{{ member.memberName }}</strong>：{{ member.summaryText }}
-            <div v-for="(q, i) in member.questions" :key="i" class="v2-muted">· {{ q.question }} —— {{ q.sourceText }}</div>
           </div>
         </div>
         <div v-if="view.openQuestions.length" class="v2-open">
@@ -330,8 +354,12 @@ const MemberReasons = defineComponent({
 .v2-bar-row.mode .v2-bar-label, .v2-bar-row.mode .v2-bar-value { font-weight: 700; }
 .v2-bar-value { text-align: right; }
 .v2-pending { margin-top: 8px; }
-.v2-research { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #eef1f6; font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
-.v2-research-head { font-weight: 600; color: #606266; }
+.v2-timeline { padding-left: 2px; margin-top: 4px; }
+.v2-step-title { font-weight: 600; color: #1f2d3d; display: flex; align-items: center; gap: 8px; }
+.v2-running { font-size: 12px; font-weight: 400; color: #409eff; }
+.v2-process-member { font-size: 13px; margin-top: 6px; }
+.v2-process-member summary { cursor: pointer; line-height: 1.7; }
+.v2-process-choice { margin: 4px 0 4px 12px; }
 .v2-solo-row { padding: 6px 0; font-size: 13px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .v2-solo-row + .v2-solo-row { border-top: 1px dashed #eef1f6; }
 .v2-solo-sides { display: flex; flex-wrap: wrap; gap: 4px 24px; }

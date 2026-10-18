@@ -59,6 +59,8 @@ export function buildRoundtableV2View(v2, usage) {
     ...(v2.crossExams || []).map(exam => crossExam(exam, 1)),
     ...(v2.secondCrossExams || []).map(exam => crossExam(exam, 2))
   ]
+  const research = (v2.research || []).map(researchView)
+  const red = redTeam(v2.redTeam)
 
   return {
     finished: Boolean(result),
@@ -67,7 +69,7 @@ export function buildRoundtableV2View(v2, usage) {
     facts,
     factCounts: countTiers(facts),
     outcome: outcome(result?.outcome),
-    research: (v2.research || []).map(researchView),
+    research,
     judgement: judgementView(v2.outcomeJudgement),
     solo: soloView(v2.solo, result, card, v2.outcomeQuestion),
     canRequestSolo: Boolean(result) && !v2.solo,
@@ -76,7 +78,8 @@ export function buildRoundtableV2View(v2, usage) {
     disputes: (result?.disputes || []).map(line => dispute(line, factById)),
     insufficient: (result?.insufficient || []).map(line => ({ title: line.title, reason: line.reason })),
     crossExams,
-    redTeam: redTeam(v2.redTeam),
+    redTeam: red,
+    process: processView(v2, questions, research, crossExams, red),
     changes: (result?.changes || []).map(change => changeRow(change, questions)),
     openQuestions: result?.openQuestions || [],
     skippedMembers: (v2.answers || []).filter(answer => answer.skipped)
@@ -218,13 +221,90 @@ function researchView(record) {
       : `新查 → ${(line.searched || []).join('、')}${(line.searched || []).every(id => id.startsWith('G-')) ? '（未查到）' : ''}`
   })))
   const reused = questions.filter(q => q.sourceText.startsWith('复用')).length
-  return {
-    memberName: record.memberName,
-    summaryText: questions.length
-      ? `问了 ${questions.length} 题：复用已有资料 ${reused} 题，新查 ${questions.length - reused} 题`
-      : '没有追加取证',
-    questions
-  }
+  let summaryText = questions.length
+    ? `问了 ${questions.length} 题：复用已有资料 ${reused} 题，新查 ${questions.length - reused} 题`
+    : '没有追加取证'
+  if (record.inProgress) summaryText = `进行中：第 ${(record.rounds || []).length} 轮，已问 ${questions.length} 题`
+  return { memberName: record.memberName, summaryText, questions }
+}
+
+/**
+ * The meeting in the order it happened: what each stage produced and what each member did in it. A stage
+ * is running when it has started and is not done while the meeting has no summary yet.
+ */
+function processView(v2, questions, research, crossExams, red) {
+  const card = v2.issueCard
+  const answers = v2.answers || []
+  const finals = v2.finalAnswers || []
+  const result = v2.result
+  const answered = Boolean(v2.agenda) || finals.length > 0 || Boolean(result)
+  const shared = (v2.facts || []).filter(fact => !fact.askedBy)
+  const counts = countTiers(shared.map(fact => ({ tier: fact.tier })))
+  const firstByMember = new Map(answers.map(answer => [answer.memberName, answer]))
+  const steps = [
+    {
+      key: 'card', title: '问题卡', done: true, active: true,
+      summaryText: `${(card.subQuestions || []).filter(q => q.kind !== 'PROBABILITY').length} 道子问题，`
+        + `${(card.evidenceQuestions || []).length} 道共享取证题`
+    },
+    {
+      key: 'facts', title: '共享底稿', done: shared.length > 0, active: false,
+      summaryText: `共享底稿 ${shared.length} 条：已核实 ${counts.F} · 低置信 ${counts.L} · 缺口 ${counts.G}`
+    },
+    {
+      key: 'research', title: '议员自主取证', done: answered, active: research.length > 0,
+      summaryText: research.length ? `${research.length} 位议员取证` : '没有议员追加取证',
+      members: research
+    },
+    {
+      key: 'answers', title: '背靠背作答', done: answered, active: answers.length > 0,
+      members: answers.map(answer => answerCard(answer, questions, v2.outcomeQuestion))
+    },
+    {
+      key: 'debate', title: '交锋与红队', done: finals.length > 0 || Boolean(result), active: crossExams.length > 0 || Boolean(red),
+      exams: crossExams, redTeam: red
+    },
+    {
+      key: 'reestimate', title: '匿名再估', done: Boolean(v2.classification) || Boolean(result), active: finals.length > 0,
+      members: finals.map(final => ({ memberName: final.memberName, changeText: changeText(final, firstByMember.get(final.memberName), questions) }))
+    },
+    { key: 'summary', title: '程序汇总', done: Boolean(result), active: false }
+  ]
+  return steps.map(({ active, ...step }) => ({ ...step, running: !result && !step.done && active }))
+}
+
+function answerCard(answer, questions, outcomeQuestion) {
+  if (answer.skipped) return { memberName: answer.memberName, skipped: true, reasonText: answer.reason || '', choices: [], outcomeText: '' }
+  const items = answer.answers || []
+  const choices = items.filter(item => item.optionId).map(item => {
+    const question = questions.get(item.questionId)
+    return {
+      questionId: item.questionId,
+      title: question?.title || item.questionId,
+      optionLabel: question?.labels.get(item.optionId) || item.optionId,
+      reasons: reasons(item.reasons),
+      falsifier: item.falsifier || ''
+    }
+  })
+  const outcome = items.find(item => item.probabilities)
+  const outcomeText = outcome && outcomeQuestion
+    ? (outcomeQuestion.options || []).map(o => `${o.label} ${Math.round(Number(outcome.probabilities[o.id] || 0) * 100)}%`).join(' / ')
+    : ''
+  return { memberName: answer.memberName, skipped: false, reasonText: '', choices, outcomeText }
+}
+
+function changeText(final, first, questions) {
+  if (final.skipped) return '未参加再估'
+  if (final.fallback) return '再估无效，沿用首轮'
+  const before = new Map((first?.answers || []).map(item => [item.questionId, item.optionId]))
+  const changes = (final.answers || []).filter(item => item.optionId && before.get(item.questionId) && before.get(item.questionId) !== item.optionId)
+    .map(item => {
+      const question = questions.get(item.questionId)
+      const label = (id) => question?.labels.get(id) || id
+      return `${question?.title || item.questionId}：${label(before.get(item.questionId))} → ${label(item.optionId)}`
+        + (item.changeReason ? `（${item.changeReason}）` : '')
+    })
+  return changes.length ? changes.join('；') : '维持首轮选择'
 }
 
 function judgementPending(v2) {
