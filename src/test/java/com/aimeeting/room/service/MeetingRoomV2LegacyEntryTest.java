@@ -62,6 +62,7 @@ class MeetingRoomV2LegacyEntryTest {
         fixture.service.updateTrackingItem(7L, request);
 
         verify(fixture.workflow).updateTrackingItem(7L, "CHANGED", "假设被证伪", null);
+        verify(fixture.v2).suggestReview(1L, 7L, "海外关税", "假设被证伪");
         fixture.assertUntouched(MeetingStatusEnum.CONCLUDED.getCode());
     }
 
@@ -72,7 +73,8 @@ class MeetingRoomV2LegacyEntryTest {
         IllegalStateException refused = assertThrows(IllegalStateException.class,
                 () -> fixture.service.reopenMeetingFromTrackingSignal(1L, 7L, "海外关税", "关键变化", "说明", null));
 
-        assertTrue(refused.getMessage().contains("圆桌 v2"), refused.getMessage());
+        assertTrue(refused.getMessage().contains("圆桌 v2") && refused.getMessage().contains("建议复议"), refused.getMessage());
+        verify(fixture.v2).suggestReview(1L, 7L, "海外关税", "说明");
         fixture.assertUntouched(MeetingStatusEnum.CONCLUDED.getCode());
     }
 

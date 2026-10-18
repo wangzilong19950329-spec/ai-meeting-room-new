@@ -133,7 +133,11 @@ public class StockMeetingDomain implements MeetingDomain {
         }
         if (base < 0) return OutcomeObservation.unavailable("起点 " + baseDate + " 不在" + fetched.source + "日K序列中");
         int elapsed = bars.size() - 1 - base;
-        if (elapsed < horizon) return OutcomeObservation.notDue(elapsed);
+        if (elapsed < horizon) {
+            return OutcomeObservation.notDue(elapsed, baseDate, decimal(bars.get(base).get("close")),
+                    text(bars.get(bars.size() - 1).get("date")), decimal(bars.get(bars.size() - 1).get("close")),
+                    fetched.source);
+        }
         Map<String, Object> end = bars.get(base + horizon);
         BigDecimal baseClose = decimal(bars.get(base).get("close"));
         BigDecimal endClose = decimal(end.get("close"));

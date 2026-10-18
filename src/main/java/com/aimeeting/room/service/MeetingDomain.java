@@ -78,6 +78,12 @@ public interface MeetingDomain {
             return new OutcomeObservation(NOT_DUE, elapsed, null, null, null, null, null, null);
         }
 
+        /** Not due yet, with the latest close so far (endDate/endClose) for watching the move before expiry. */
+        public static OutcomeObservation notDue(int elapsed, String baseDate, BigDecimal baseClose,
+                                                String latestDate, BigDecimal latestClose, String source) {
+            return new OutcomeObservation(NOT_DUE, elapsed, baseDate, baseClose, latestDate, latestClose, source, null);
+        }
+
         public static OutcomeObservation unavailable(String reason) {
             return new OutcomeObservation(UNAVAILABLE, 0, null, null, null, null, null, reason);
         }

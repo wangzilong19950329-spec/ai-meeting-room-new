@@ -101,6 +101,7 @@ export function buildRoundtableV2View(v2, usage) {
       createdAt: link.createdAt
     })),
     review: reviewView(v2.review, questions, result),
+    reviewHints: reviewHints(v2),
     judgementPendingText: judgementPending(v2),
     conclusions: (result?.conclusions || []).map(conclusion),
     disputes: (result?.disputes || []).map(line => dispute(line, factById)),
@@ -375,6 +376,15 @@ function sourceCheckRow(check, factById) {
     sourceUrl: url,
     sourceText: url ? hostOf(url) : ''
   }
+}
+
+// Why a review may be worth it now; a suggestion is settled by a review started after it, or by the expiry.
+function reviewHints(v2) {
+  if (!v2.result || v2.outcomeJudgement?.status === 'JUDGED') return []
+  const latestReview = Math.max(0, ...(v2.reviews || []).map(link => Date.parse(link.createdAt) || 0))
+  return (v2.reviewHints || [])
+    .filter(hint => (Date.parse(hint.at) || 0) > latestReview)
+    .map(hint => ({ label: hint.kind === 'PRICE' ? '走势偏离' : '追踪项变化', text: hint.text }))
 }
 
 // A review of an earlier meeting: where it came from, what was new and how each reopened question moved.

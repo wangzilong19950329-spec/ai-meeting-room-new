@@ -644,3 +644,17 @@ test('a settled answer that changed the blind one without a reason says the blin
   const informed = buildRoundtableV2View(v2, null).process.find(step => step.key === 'informed')
   assert.deepEqual(informed.members.map(m => m.changeText), ['与盲答一致（订单与需求：改了盲答却说不出理由，保留盲答）'])
 })
+
+test('suggestions to review are listed until a review is started after them', () => {
+  const v2 = clone(sample)
+  v2.reviewHints = [
+    { kind: 'PRICE', text: '截至 2026-11-02 收盘 120，自 2026-10-16 收盘 102 起 +17.65%，约 2.8 个标准差', at: '2026-11-02T08:00:00Z' },
+    { kind: 'TRACKING', text: '追踪项「海外关税」有关键变化：美国加征关税正式落地', at: '2026-11-05T08:00:00Z' }
+  ]
+  v2.reviews = [{ childMeetingId: 120, questionIds: ['Q2'], facts: [], createdAt: '2026-11-03T08:00:00Z' }]
+  const view = buildRoundtableV2View(v2, null)
+  assert.deepEqual(view.reviewHints.map(h => [h.label, h.text]), [['追踪项变化', '追踪项「海外关税」有关键变化：美国加征关税正式落地']])
+  const judged = clone(v2)
+  judged.outcomeJudgement = judgement
+  assert.deepEqual(buildRoundtableV2View(judged, null).reviewHints, [])
+})

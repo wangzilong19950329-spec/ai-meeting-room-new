@@ -544,8 +544,8 @@ public class MeetingRoomService {
         }
         // The old flow must not run a v2 meeting; the item update itself is kept.
         if (workflowService.isRoundtableV2Workflow(result.getMeetingId())) {
-            log.info("Tracking item {} changed; v2 meeting {} is not reopened by the old flow",
-                    result.getTrackingItemId(), result.getMeetingId());
+            roundtableV2Service.suggestReview(result.getMeetingId(), result.getTrackingItemId(),
+                    result.getTrackingItemTitle(), result.getNote());
             return;
         }
         resumeMeetingFromTracking(
@@ -565,7 +565,8 @@ public class MeetingRoomService {
                                                 String note,
                                                 String evidenceRef) {
         if (meetingId != null && workflowService.isRoundtableV2Workflow(meetingId)) {
-            throw new IllegalStateException("圆桌 v2 会议不能用旧流程重开");
+            roundtableV2Service.suggestReview(meetingId, trackingItemId, trackingItemTitle, note);
+            throw new IllegalStateException("圆桌 v2 会议不能用旧流程重开；已在会议页标出「建议复议」，请到会议页发起复议");
         }
         resumeMeetingFromTracking(meetingId, trackingItemId, trackingItemTitle, resumeReason, note, evidenceRef);
     }

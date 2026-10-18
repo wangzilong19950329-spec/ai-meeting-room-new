@@ -64,6 +64,8 @@ public class RoundtableV2Service {
     /** Stored on the parent, one per review, with the review meeting id as member id. */
     static final String REVIEW_CHILD = "REVIEW_CHILD";
     static final String INFORMED = "INFORMED";
+    /** Why a review may be worth it: member id 0 for a price move, the tracking item id for a key change. */
+    static final String REVIEW_HINT = "REVIEW_HINT";
     static final String RESEARCH = "RESEARCH";
     static final String HUMAN = "HUMAN_";
     private static final String QUEUED = "QUEUED";
@@ -646,6 +648,22 @@ public class RoundtableV2Service {
         return sb.length() == 0 ? "" : "【自上一版以来的新情况】\n" + sb;
     }
 
+    /** A tracking item reported a key change: the meeting is marked as worth a review, with the latest note. */
+    public void suggestReview(Long meetingId, Long trackingItemId, String title, String note) {
+        JSONObject hint = new JSONObject(true);
+        hint.put("kind", "TRACKING");
+        hint.put("trackingItemId", trackingItemId);
+        hint.put("text", "追踪项「" + title + "」有关键变化" + (blank(note) ? "" : "：" + note.trim()));
+        hint.put("at", new Date());
+        long memberId = trackingItemId == null ? -1L : trackingItemId;
+        AiMeetingV2Record existing = recordMapper.selectOne(meetingId, REVIEW_HINT, memberId);
+        if (existing != null) {
+            recordMapper.updatePayload(existing.getId(), hint.toJSONString());
+        } else {
+            save(meetingId, REVIEW_HINT, memberId, null, hint);
+        }
+    }
+
     public RoundtableV2ViewVO view(Long meetingId) {
         RoundtableV2ViewVO view = new RoundtableV2ViewVO();
         List<AiMeetingV2Record> stored = recordMapper.selectByMeetingId(meetingId);
@@ -671,6 +689,7 @@ public class RoundtableV2Service {
             else if (REVIEW_SOURCE.equals(record.getKind())) view.setReview(JSON.parseObject(record.getPayload()));
             else if (REVIEW_CHILD.equals(record.getKind())) view.getReviews().add(JSON.parseObject(record.getPayload()));
             else if (INFORMED.equals(record.getKind())) view.getInformedAnswers().add(JSON.parseObject(record.getPayload()));
+            else if (REVIEW_HINT.equals(record.getKind())) view.getReviewHints().add(JSON.parseObject(record.getPayload()));
             else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
@@ -2768,7 +2787,8 @@ public class RoundtableV2Service {
             spec.setDescription("到期后由程序用前复权日K判定实际涨跌落在哪一档，并给合议分布和每位议员打分（RPS 为主，Brier 为辅）");
             spec.setOwnerType("SYSTEM");
             spec.setAutoRefresh(true);
-            spec.setNextCheckAt(expiry);
+            // Checked daily until expiry, so a move well beyond expectation can suggest a review in time.
+            spec.setNextCheckAt(Date.from(LocalDate.now(MARKET_ZONE).plusDays(1).atTime(16, 0).atZone(MARKET_ZONE).toInstant()));
             spec.setDueAt(expiry);
             specs.add(spec);
         }

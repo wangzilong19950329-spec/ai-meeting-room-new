@@ -272,6 +272,10 @@
       <div v-for="item in view.reviews" :key="item.meetingId" class="v2-muted">
         <router-link :to="`/meetings/${item.meetingId}`">会议 #{{ item.meetingId }}</router-link>：{{ item.text }}
       </div>
+      <div v-for="hint in view.reviewHints" :key="hint.text" class="v2-thin">
+        <el-tag size="small" type="warning">建议复议 · {{ hint.label }}</el-tag> {{ hint.text }}
+        <el-button v-if="view.canReview" size="small" link type="primary" @click="useHint(hint)">带入新情况</el-button>
+      </div>
       <div v-if="view.canReview" class="v2-intervene-form">
         <div class="v2-muted">追踪项有了关键变化时，带着新情况重开选中的子问题。这场会议的结论原样保留，到期两场各自打分。</div>
         <el-checkbox-group v-model="reviewDraft.questionIds">
@@ -385,6 +389,10 @@ watch(() => props.view.reviewOptions, options => {
   if (!reviewDraft.questionIds.length) reviewDraft.questionIds = (options || []).map(option => option.id)
 }, { immediate: true })
 const canSubmitReview = computed(() => reviewDraft.facts.trim() && reviewDraft.questionIds.length)
+
+function useHint(hint) {
+  reviewDraft.facts = reviewDraft.facts.trim() ? `${reviewDraft.facts.trim()}\n${hint.text}` : hint.text
+}
 
 function submitReview() {
   const source = reviewDraft.source.trim()

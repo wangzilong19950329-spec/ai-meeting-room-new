@@ -41,4 +41,6 @@ public class RoundtableV2ViewVO {
     private JSONArray reviews = new JSONArray();
     /** For a review: each member's answer after seeing its own earlier answer (the blind one is in answers). */
     private JSONArray informedAnswers = new JSONArray();
+    /** Why a review may be worth it now: a key change in a tracking item, or a price move well beyond expectation. */
+    private JSONArray reviewHints = new JSONArray();
 }

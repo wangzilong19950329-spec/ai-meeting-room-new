@@ -1392,10 +1392,13 @@ class RoundtableV2FlowIntegrationTest {
         assertTrue(expiry.getTitle().startsWith("结果到期判定："), expiry.getTitle());
         assertTrue(expiry.isAutoRefresh());
         assertEquals("SYSTEM", expiry.getOwnerType());
-        // 60 trading days ≈ 84 calendar days after the base close, checked after the 15:00 close.
+        // 60 trading days ≈ 84 calendar days after the base close, checked after the 15:00 close; until then it is
+        // checked every day from tomorrow, so a large move can suggest a review.
         Date expected = Date.from(java.time.LocalDate.parse("2026-10-16").plusDays(84).atTime(16, 0)
                 .atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
-        assertEquals(expected, expiry.getNextCheckAt());
+        Date tomorrow = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1).atTime(16, 0)
+                .atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
+        assertEquals(tomorrow, expiry.getNextCheckAt());
         assertEquals(expected, expiry.getDueAt());
     }
 
@@ -1479,6 +1482,43 @@ class RoundtableV2FlowIntegrationTest {
         assertEquals("JUDGED", controller.getRoundtableV2(meetingId).getData().getOutcomeJudgement().getString("status"));
         assertEquals("JUDGED", judge.judge(meetingId).getString("status"));
         verify(fixture.eastmoney, times(1)).fetchDailyHistory(eq("300750"), eq("sz"), anyInt());
+    }
+
+    @Test
+    void aLargeMoveBeforeExpirySuggestsAReviewOnceAndASmallOneDoesNot() {
+        Fixture fixture = judgedStockMeeting();
+        RoundtableV2OutcomeJudge judge = new RoundtableV2OutcomeJudge(records, List.of(new StockMeetingDomain(fixture.eastmoney)));
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(10, "103"));
+
+        assertEquals("NOT_DUE", judge.judge(meetingId).getString("status"));
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getReviewHints().isEmpty());
+
+        // 102 → 120 in 10 of 60 days: +17.65% against σ·√(10/60) ≈ 6.27% is about 2.8 standard deviations.
+        when(fixture.eastmoney.fetchDailyHistory(eq("300750"), eq("sz"), anyInt())).thenReturn(historyAfterBase(10, "120"));
+        JSONObject pending = judge.judge(meetingId);
+        judge.judge(meetingId);
+
+        assertEquals("NOT_DUE", pending.getString("status"));
+        assertEquals(2.81, pending.getDoubleValue("z"), 0.02);
+        JSONArray hints = controller.getRoundtableV2(meetingId).getData().getReviewHints();
+        assertEquals(1, hints.size(), hints.toJSONString());
+        JSONObject hint = hints.getJSONObject(0);
+        assertEquals("PRICE", hint.getString("kind"));
+        assertTrue(hint.getString("text").contains("+17.65%") && hint.getString("text").contains("2.8 个标准差"),
+                hint.getString("text"));
+    }
+
+    @Test
+    void aKeyChangeInATrackingItemSuggestsAReviewWithTheLatestNote() {
+        Fixture fixture = judgedStockMeeting();
+
+        fixture.service.suggestReview(meetingId, 7L, "海外关税", "美国宣布加征关税");
+        fixture.service.suggestReview(meetingId, 7L, "海外关税", "美国加征关税正式落地");
+
+        JSONArray hints = controller.getRoundtableV2(meetingId).getData().getReviewHints();
+        assertEquals(1, hints.size(), hints.toJSONString());
+        assertEquals("TRACKING", hints.getJSONObject(0).getString("kind"));
+        assertEquals("追踪项「海外关税」有关键变化：美国加征关税正式落地", hints.getJSONObject(0).getString("text"));
     }
 
     @Test

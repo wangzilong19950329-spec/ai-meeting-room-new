@@ -60,6 +60,7 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
             pending.put("elapsedTradingDays", observed.elapsedTradingDays);
             pending.put("horizonTradingDays", question.getIntValue("horizonTradingDays"));
             pending.put("baseDate", question.getString("baseDate"));
+            watchMove(meetingId, question, observed, pending);
             return pending;
         }
         if (MeetingDomain.OutcomeObservation.UNAVAILABLE.equals(observed.status)) {
@@ -278,6 +279,48 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
     private JSONObject load(Long meetingId, String kind) {
         AiMeetingV2Record record = recordMapper.selectOne(meetingId, kind, MEETING_LEVEL);
         return record == null ? null : JSON.parseObject(record.getPayload());
+    }
+
+    /** A move this many standard deviations from the start, before expiry, suggests a review. */
+    static final double REVIEW_Z = 1.5;
+
+    /**
+     * Before expiry the move so far is compared with the volatility the intervals were cut from, scaled to the
+     * days elapsed. Beyond {@link #REVIEW_Z} the meeting is marked once as worth a review; nothing is run.
+     */
+    private void watchMove(Long meetingId, JSONObject question, MeetingDomain.OutcomeObservation observed,
+                           JSONObject pending) {
+        double sigmaPct = question.getDoubleValue("sigmaPct");
+        int horizon = question.getIntValue("horizonTradingDays");
+        if (observed.elapsedTradingDays < 1 || !(sigmaPct > 0) || horizon <= 0 || observed.baseClose == null
+                || observed.endClose == null || observed.baseClose.signum() <= 0) return;
+        double returnPct = observed.endClose.divide(observed.baseClose, 10, RoundingMode.HALF_UP)
+                .subtract(BigDecimal.ONE).doubleValue() * 100;
+        double z = returnPct / (sigmaPct * Math.sqrt((double) observed.elapsedTradingDays / horizon));
+        pending.put("returnPct", round(returnPct, 2));
+        pending.put("z", round(z, 2));
+        if (Math.abs(z) < REVIEW_Z || recordMapper.selectOne(meetingId, RoundtableV2Service.REVIEW_HINT, MEETING_LEVEL) != null) {
+            return;
+        }
+        JSONObject hint = new JSONObject(true);
+        hint.put("kind", "PRICE");
+        hint.put("text", "截至 " + observed.endDate + " 收盘 " + observed.endClose + "，自 " + observed.baseDate + " 收盘 "
+                + observed.baseClose + " 起 " + (returnPct > 0 ? "+" : "") + String.format("%.2f", returnPct) + "%，约 "
+                + String.format("%.1f", Math.abs(z)) + " 个标准差（按 " + observed.elapsedTradingDays
+                + " 个交易日的预期波动），超出预期，建议复议");
+        hint.put("returnPct", round(returnPct, 2));
+        hint.put("z", round(z, 2));
+        hint.put("at", new Date());
+        AiMeetingV2Record record = new AiMeetingV2Record();
+        record.setMeetingId(meetingId);
+        record.setKind(RoundtableV2Service.REVIEW_HINT);
+        record.setMemberId(MEETING_LEVEL);
+        record.setPayload(JSON.toJSONString(hint));
+        try {
+            recordMapper.insert(record);
+        } catch (DuplicateKeyException alreadyMarked) {
+            // Marked by a concurrent check.
+        }
     }
 
     /** First verdict wins; a concurrent judgment returns what is already stored. */
