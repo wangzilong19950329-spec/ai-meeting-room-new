@@ -31,4 +31,6 @@ public class RoundtableV2ViewVO {
     private JSONObject solo;
     /** Each member's own evidence questions: what was reused from existing facts and what was searched. */
     private JSONArray research = new JSONArray();
+    /** What the user added or asked while the meeting ran, and how each was applied. */
+    private JSONArray interventions = new JSONArray();
 }

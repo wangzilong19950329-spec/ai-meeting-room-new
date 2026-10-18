@@ -31,6 +31,8 @@ public final class MeetingCallContext {
     public static final String DECISION_CARD_REWRITE = "decision_card_rewrite";
     public static final String RESEARCH_PLAN = "research_plan";
     public static final String RESEARCH_MATCH = "research_match";
+    public static final String HUMAN_REPLY = "human_reply";
+    public static final String HUMAN_REPLY_REWRITE = "human_reply_rewrite";
     public static final String SOLO = "solo";
     public static final String SOLO_REWRITE = "solo_rewrite";
     public static final String OTHER = "other";

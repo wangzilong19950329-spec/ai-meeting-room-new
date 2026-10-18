@@ -16,4 +16,7 @@ public interface AiMeetingV2RecordMapper {
     List<AiMeetingV2Record> selectByMeetingId(@Param("meetingId") Long meetingId);
 
     int deleteByMeetingId(@Param("meetingId") Long meetingId);
+
+    /** Only for records whose state changes, such as a queued user intervention once it is applied. */
+    int updatePayload(@Param("id") Long id, @Param("payload") String payload);
 }

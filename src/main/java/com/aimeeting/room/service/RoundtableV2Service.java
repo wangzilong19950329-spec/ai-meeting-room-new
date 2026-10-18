@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -58,6 +59,10 @@ public class RoundtableV2Service {
     static final String OUTCOME = "OUTCOME_Q";
     static final String SOLO = "SOLO";
     static final String RESEARCH = "RESEARCH";
+    static final String HUMAN = "HUMAN_";
+    private static final String QUEUED = "QUEUED";
+    private static final String APPLIED = "APPLIED";
+    private static final String EXPIRED = "EXPIRED";
     /** A safety stop against endless follow-ups; the number of questions per round is not limited. */
     private static final int MAX_RESEARCH_ROUNDS = 3;
     /**
@@ -157,6 +162,156 @@ public class RoundtableV2Service {
         return save(meetingId, SOLO, MEETING_LEVEL, summary.getRunEpoch(), record);
     }
 
+    /**
+     * Queues a user intervention: a fact (trusted as verified), a question for reviewed search, or a question
+     * to one member. The running meeting applies it at the next stage boundary; nothing in flight is interrupted.
+     */
+    public JSONObject intervene(Long meetingId, JSONObject request) {
+        AiMeetingRoom room = roomMapper.selectById(meetingId);
+        if (room == null) throw new IllegalStateException("会议不存在");
+        Integer status = room.getStatus();
+        if (status != null && (status == MeetingStatusEnum.CONCLUDED.getCode()
+                || status == MeetingStatusEnum.VERIFIED_VALID.getCode()
+                || status == MeetingStatusEnum.VERIFIED_INVALID.getCode()
+                || status == MeetingStatusEnum.CANCELLED.getCode())) {
+            throw new IllegalStateException("会议已结束，暂不支持介入");
+        }
+        String type = request == null || request.getString("type") == null ? "" : request.getString("type").trim().toUpperCase();
+        String content = request == null ? null : request.getString("content");
+        if (!List.of("FACT", "SEARCH", "ASK").contains(type)) {
+            throw new IllegalStateException("介入类型只能是补充资料、追加取证或向议员提问");
+        }
+        if (blank(content)) throw new IllegalStateException("介入内容不能为空");
+        JSONObject item = new JSONObject(true);
+        item.put("type", type);
+        item.put("content", content.trim());
+        if ("FACT".equals(type) && !blank(request.getString("source"))) item.put("source", request.getString("source").trim());
+        if ("ASK".equals(type)) {
+            Long target = request.getLong("targetMemberId");
+            AiMeetingMember member = null;
+            for (AiMeetingMember candidate : memberMapper.selectByMeetingId(meetingId)) {
+                if (candidate.getId().equals(target)) member = candidate;
+            }
+            if (member == null) throw new IllegalStateException("请选择本场会议里要提问的议员");
+            item.put("targetMemberId", member.getId());
+            item.put("targetName", member.getMemberName());
+        }
+        item.put("status", QUEUED);
+        item.put("createdAt", java.time.Instant.now().toString());
+        String kind = HUMAN + UUID.randomUUID().toString().substring(0, 8);
+        item.put("kind", kind);
+        AiMeetingV2Record record = new AiMeetingV2Record();
+        record.setMeetingId(meetingId);
+        record.setKind(kind);
+        record.setMemberId(MEETING_LEVEL);
+        record.setPayload(JSON.toJSONString(item));
+        record.setRunEpoch(room.getRunEpoch());
+        recordMapper.insert(record);
+        return item;
+    }
+
+    /**
+     * Applies queued interventions at a stage boundary and returns the facts they added. Questions to members
+     * wait until everyone has answered back to back, so a hint never breaks the independent first answers.
+     */
+    private JSONArray applyInterventions(Long meetingId, Long epoch, JSONObject card, JSONArray pool,
+                                         Map<Long, AiMeetingMember> membersById, boolean afterAnswers) {
+        JSONArray added = new JSONArray();
+        List<AiMeetingV2Record> records = recordMapper.selectByMeetingId(meetingId);
+        int[] next = {maxIndex(pool, "F"), maxIndex(pool, "L"), maxIndex(pool, "G")};
+        for (AiMeetingV2Record record : records == null ? List.<AiMeetingV2Record>of() : records) {
+            if (!record.getKind().startsWith(HUMAN)) continue;
+            JSONObject item = JSON.parseObject(record.getPayload());
+            if (!QUEUED.equals(item.getString("status"))) continue;
+            String type = item.getString("type");
+            if ("ASK".equals(type) && !afterAnswers) continue;
+            if (activeRoom(meetingId, epoch) == null) return added;
+            JSONArray now = concat(pool, added);
+            if ("FACT".equals(type)) {
+                JSONObject fact = new JSONObject(true);
+                fact.put("id", "F-" + (++next[0]));
+                fact.put("tier", "F");
+                fact.put("question", "用户补充");
+                fact.put("statement", item.getString("content"));
+                fact.put("source", firstNonBlank(item.getString("source"), "用户提供"));
+                fact.put("userProvided", true);
+                fact.put("askedBy", "你");
+                added.add(fact);
+                item.put("facts", List.of(fact));
+                item.put("factIds", List.of(fact.getString("id")));
+            } else if ("SEARCH".equals(type)) {
+                JSONArray found = searchFor(meetingId, card, item.getString("content"), "你", null, next);
+                added.addAll(found);
+                item.put("facts", found);
+                List<String> ids = new ArrayList<>();
+                for (Object fact : found) ids.add(((JSONObject) fact).getString("id"));
+                item.put("factIds", ids);
+            } else {
+                AiMeetingMember member = membersById.get(item.getLong("targetMemberId"));
+                if (member == null) {
+                    item.put("status", EXPIRED);
+                    item.put("note", "这位议员不在本场会议中");
+                    recordMapper.updatePayload(record.getId(), JSON.toJSONString(item));
+                    continue;
+                }
+                String reply = gatedText(meetingId, member, MeetingCallContext.HUMAN_REPLY,
+                        MeetingCallContext.HUMAN_REPLY_REWRITE, memberSystem(member),
+                        cardAndFacts(card, now) + "\n【用户向你提问】" + item.getString("content")
+                                + "\n请正面回答：承认、修正或反驳，并说明依据，不超过 250 字。数字只能来自事实底稿。直接输出回答。",
+                        corpora(now, card));
+                if (reply != null) item.put("reply", reply);
+                else item.put("note", "回答含有资料里找不到来源的数字，重写后仍不合格");
+            }
+            item.put("status", APPLIED);
+            item.put("appliedAt", java.time.Instant.now().toString());
+            item.put("stage", afterAnswers ? "议员作答之后" : "议员作答之前");
+            recordMapper.updatePayload(record.getId(), JSON.toJSONString(item));
+        }
+        return added;
+    }
+
+    /** Facts added by interventions applied in an earlier run, so a resumed meeting keeps them. */
+    private JSONArray appliedInterventionFacts(Long meetingId) {
+        JSONArray facts = new JSONArray();
+        List<AiMeetingV2Record> records = recordMapper.selectByMeetingId(meetingId);
+        for (AiMeetingV2Record record : records == null ? List.<AiMeetingV2Record>of() : records) {
+            if (!record.getKind().startsWith(HUMAN)) continue;
+            JSONObject item = JSON.parseObject(record.getPayload());
+            if (APPLIED.equals(item.getString("status")) && item.getJSONArray("facts") != null) {
+                facts.addAll(item.getJSONArray("facts"));
+            }
+        }
+        return facts;
+    }
+
+    /** Questions the user put to members and their answers, for everyone's anonymous re-estimate. */
+    private String humanNotes(Long meetingId) {
+        StringBuilder sb = new StringBuilder();
+        List<AiMeetingV2Record> records = recordMapper.selectByMeetingId(meetingId);
+        for (AiMeetingV2Record record : records == null ? List.<AiMeetingV2Record>of() : records) {
+            if (!record.getKind().startsWith(HUMAN)) continue;
+            JSONObject item = JSON.parseObject(record.getPayload());
+            if (!"ASK".equals(item.getString("type")) || !APPLIED.equals(item.getString("status"))) continue;
+            sb.append("用户问「").append(item.getString("targetName")).append("」：").append(item.getString("content"))
+                    .append("\n「").append(item.getString("targetName")).append("」答：")
+                    .append(firstNonBlank(item.getString("reply"), "（未能给出合格回答）")).append("\n");
+        }
+        return sb.length() == 0 ? "" : "\n【用户的提问与议员回应】\n" + sb;
+    }
+
+    /** Interventions still queued when the meeting concludes are kept visible but marked as not applied. */
+    private void expireInterventions(Long meetingId) {
+        List<AiMeetingV2Record> records = recordMapper.selectByMeetingId(meetingId);
+        for (AiMeetingV2Record record : records == null ? List.<AiMeetingV2Record>of() : records) {
+            if (!record.getKind().startsWith(HUMAN)) continue;
+            JSONObject item = JSON.parseObject(record.getPayload());
+            if (!QUEUED.equals(item.getString("status"))) continue;
+            item.put("status", EXPIRED);
+            item.put("note", "会议已收尾，未及处理");
+            recordMapper.updatePayload(record.getId(), JSON.toJSONString(item));
+        }
+    }
+
     public RoundtableV2ViewVO view(Long meetingId) {
         RoundtableV2ViewVO view = new RoundtableV2ViewVO();
         List<AiMeetingV2Record> stored = recordMapper.selectByMeetingId(meetingId);
@@ -177,6 +332,7 @@ public class RoundtableV2Service {
             else if (OUTCOME.equals(record.getKind())) view.setOutcomeQuestion(JSON.parseObject(record.getPayload()));
             else if (SOLO.equals(record.getKind())) view.setSolo(JSON.parseObject(record.getPayload()));
             else if (RESEARCH.equals(record.getKind())) view.getResearch().add(JSON.parseObject(record.getPayload()));
+            else if (record.getKind().startsWith(HUMAN)) view.getInterventions().add(JSON.parseObject(record.getPayload()));
             else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
@@ -190,7 +346,11 @@ public class RoundtableV2Service {
                 if (!done.contains(entry.getKey())) view.getResearch().add(entry.getValue());
             }
         }
-        // The fact list shows every fact: the shared base followed by each member's own research.
+        // The fact list shows every fact: the shared base, what the user added, then each member's research.
+        for (Object item : view.getInterventions()) {
+            JSONArray fromUser = ((JSONObject) item).getJSONArray("facts");
+            if (fromUser != null) view.getFacts().addAll(fromUser);
+        }
         for (Object item : view.getResearch()) {
             JSONArray own = ((JSONObject) item).getJSONArray("facts");
             if (own != null) view.getFacts().addAll(own);
@@ -217,10 +377,15 @@ public class RoundtableV2Service {
         List<JSONObject> unsettled = new ArrayList<>();
         // Every fact found so far: the shared base, then each member's own research in member order.
         JSONArray pool = new JSONArray();
+        facts = concat(facts, appliedInterventionFacts(meetingId));
         pool.addAll(facts);
         for (AiMeetingMember member : members) {
             if (activeRoom(meetingId, epoch) == null) return;
             membersById.put(member.getId(), member);
+            // What the user added so far is shared with every member who has not answered yet.
+            JSONArray fromUser = applyInterventions(meetingId, epoch, card, pool, membersById, false);
+            facts.addAll(fromUser);
+            pool.addAll(fromUser);
             JSONObject research = research(meetingId, epoch, card, facts, pool, member);
             if (research == null) return;
             pool.addAll(research.getJSONArray("facts"));
@@ -231,6 +396,8 @@ public class RoundtableV2Service {
         settleSkipped(meetingId, epoch, answers, unsettled);
         // From the cross-examination on, everyone works from every fact anyone found.
         facts = pool;
+        facts.addAll(applyInterventions(meetingId, epoch, card, facts, membersById, true));
+        if (activeRoom(meetingId, epoch) == null) return;
         JSONArray firstCrossExams = new JSONArray();
         JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams);
         if (finalAnswers == null) return;
@@ -242,6 +409,7 @@ public class RoundtableV2Service {
         int loops = 1;
         if (!remaining.isEmpty()) {
             if (activeRoom(meetingId, epoch) == null) return;
+            facts.addAll(applyInterventions(meetingId, epoch, card, facts, membersById, true));
             classification = classify(meetingId, epoch, card, facts, remaining, firstCrossExams);
             topUp = topUp(meetingId, epoch, card, facts, classification);
             if (topUp == null) return;
@@ -281,13 +449,16 @@ public class RoundtableV2Service {
             redTeam = redTeam(meetingId, epoch, card, facts, agenda.getJSONObject("redTeam"), membersById);
         }
         if (disputes.isEmpty() && redTeam == null) return previous;
+        facts.addAll(applyInterventions(meetingId, epoch, card, facts, membersById, true));
+        if (activeRoom(meetingId, epoch) == null) return null;
+        String notes = humanNotes(meetingId);
         JSONArray after = new JSONArray();
         String kind = round == 1 ? FINAL_ANSWER : FINAL_ANSWER + SECOND_ROUND;
         for (Object item : previous) {
             if (activeRoom(meetingId, epoch) == null) return null;
             JSONObject before = (JSONObject) item;
             after.add(finalAnswer(meetingId, epoch, kind, card, facts, previous, crossExamsOut, redTeam,
-                    before, membersById.get(before.getLong("memberId"))));
+                    before, membersById.get(before.getLong("memberId")), notes));
         }
         return after;
     }
@@ -593,7 +764,7 @@ public class RoundtableV2Service {
                     for (String id : reused) if (!visible.contains(id)) visible.add(id);
                 } else {
                     if (activeRoom(meetingId, epoch) == null) return null;
-                    JSONArray found = searchFor(meetingId, card, question, member, next);
+                    JSONArray found = searchFor(meetingId, card, question, member.getMemberName(), member.getId(), next);
                     own.addAll(found);
                     JSONArray ids = new JSONArray();
                     for (Object item : found) {
@@ -711,10 +882,10 @@ public class RoundtableV2Service {
     }
 
     /** Reviewed search for one member question; new facts continue the meeting's F/L/G numbering. */
-    private JSONArray searchFor(Long meetingId, JSONObject card, String question, AiMeetingMember member, int[] next) {
+    private JSONArray searchFor(Long meetingId, JSONObject card, String question, String askedBy, Long memberId, int[] next) {
         JSONArray found = new JSONArray();
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
-                meetingId, 1, member.getId(), MeetingCallContext.EVIDENCE_SEARCH)) {
+                meetingId, 1, memberId, MeetingCallContext.EVIDENCE_SEARCH)) {
             MeetingReviewedEvidenceService.ReviewedEvidence evidence = resolveEvidence(meetingId, card.getString("asOf"), question);
             JSONArray claims = evidence.packet.getJSONArray("claims");
             JSONArray candidates = evidence.packet.getJSONArray("provisionalClaims");
@@ -728,7 +899,7 @@ public class RoundtableV2Service {
         } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
             found.add(gapFact(++next[2], question, rejected.getMessage()));
         }
-        for (Object item : found) ((JSONObject) item).put("askedBy", member.getMemberName());
+        for (Object item : found) ((JSONObject) item).put("askedBy", askedBy);
         return found;
     }
 
@@ -1219,7 +1390,7 @@ public class RoundtableV2Service {
 
     private JSONObject finalAnswer(Long meetingId, Long epoch, String kind, JSONObject card, JSONArray facts,
                                    JSONArray answers, JSONArray crossExams, JSONObject redTeam, JSONObject first,
-                                   AiMeetingMember member) {
+                                   AiMeetingMember member, String humanNotes) {
         JSONObject stored = loadObject(meetingId, kind, member.getId());
         if (stored != null) return stored;
         JSONObject record = new JSONObject(true);
@@ -1232,7 +1403,7 @@ public class RoundtableV2Service {
         }
         String system = memberSystem(member) + "这是匿名再估：你能看到其他人选择的分布和交锋记录，但看不到是谁选的。只输出 JSON。";
         String prompt = answerPrompt(card, facts) + "\n\n【再估任务】" + reestimateContext(card, answers, crossExams, redTeam, first)
-                + "请重新作答全部子问题，格式同上；如果某题改了选项，在该题加 changeReason 说明原因。";
+                + humanNotes + "请重新作答全部子问题，格式同上；如果某题改了选项，在该题加 changeReason 说明原因。";
         String[] corpora = corpora(facts, card);
         Set<String> factIds = factIds(facts);
         Answer parsed;
@@ -1509,6 +1680,7 @@ public class RoundtableV2Service {
         JSONObject result = summarize(card, finalAnswers);
         annotate(result, classification, topUp);
         markSettledDisputes(result, summarize(card, firstAnswers));
+        markUserInfluenced(result, facts);
         result.put("loops", loops);
         JSONArray openQuestions = new JSONArray();
         for (Object item : facts) {
@@ -1561,6 +1733,28 @@ public class RoundtableV2Service {
             conclusion.put("resolvedAfterDispute", true);
             conclusion.put("type", entry.getString("type"));
             if (entry.getString("crux") != null) conclusion.put("crux", entry.getString("crux"));
+        }
+    }
+
+    /** Conclusions whose supporters cite something the user added or had searched are marked as such. */
+    private static void markUserInfluenced(JSONObject result, JSONArray facts) {
+        Set<String> fromUser = new HashSet<>();
+        for (Object item : facts) {
+            JSONObject fact = (JSONObject) item;
+            if (fact.getBooleanValue("userProvided") || "你".equals(fact.getString("askedBy"))) fromUser.add(fact.getString("id"));
+        }
+        if (fromUser.isEmpty()) return;
+        for (Object item : result.getJSONArray("conclusions")) {
+            JSONObject conclusion = (JSONObject) item;
+            boolean cited = false;
+            for (Object supporter : conclusion.getJSONArray("members")) {
+                JSONArray reasons = ((JSONObject) supporter).getJSONArray("reasons");
+                for (int i = 0; reasons != null && i < reasons.size(); i++) {
+                    JSONArray ids = reasons.getJSONObject(i).getJSONArray("factIds");
+                    if (ids != null && ids.stream().anyMatch(id -> fromUser.contains(String.valueOf(id)))) cited = true;
+                }
+            }
+            if (cited) conclusion.put("userInfluenced", true);
         }
     }
 
@@ -1814,6 +2008,7 @@ public class RoundtableV2Service {
     private void conclude(Long meetingId, Long epoch, JSONObject card, JSONArray facts, JSONObject result) {
         AiMeetingRoom room = activeRoom(meetingId, epoch);
         if (room == null) return;
+        expireInterventions(meetingId);
         List<String> conclusionLines = new ArrayList<>();
         for (Object item : result.getJSONArray("conclusions")) {
             JSONObject line = (JSONObject) item;

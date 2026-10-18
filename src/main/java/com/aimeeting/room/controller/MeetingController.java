@@ -133,6 +133,17 @@ public class MeetingController {
         return ApiResponse.ok(roundtableV2Service.view(id));
     }
 
+    /** 圆桌 v2：人为介入（补充资料 FACT / 追加取证 SEARCH / 向议员提问 ASK），排队到下一个环节开始前处理 */
+    @PostMapping("/meetings/{id}/roundtable-v2/interventions")
+    public ApiResponse<com.alibaba.fastjson.JSONObject> interveneRoundtableV2(@PathVariable Long id,
+                                                                            @RequestBody com.alibaba.fastjson.JSONObject request) {
+        try {
+            return ApiResponse.ok(roundtableV2Service.intervene(id, request));
+        } catch (IllegalStateException refused) {
+            return ApiResponse.fail(refused.getMessage());
+        }
+    }
+
     /** 圆桌 v2：按需生成单人对照（同模型、同问题卡和会前底稿，一次作答），只对已结束的会议有效，只存一份 */
     @PostMapping("/meetings/{id}/roundtable-v2/solo")
     public ApiResponse<com.alibaba.fastjson.JSONObject> createRoundtableV2Solo(@PathVariable Long id) {

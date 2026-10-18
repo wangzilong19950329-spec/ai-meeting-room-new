@@ -515,6 +515,88 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void userFactIsTrustedAndSeenByEveryMemberWhoAnswersAfterIt() {
+        Fixture fixture = new Fixture();
+        String cites = answer("A", "三季度营收同比增长37%", "F-2", "A", "需求偏强", "L-1");
+        fixture.answers("甲", cites);
+        fixture.answers("乙", cites);
+        fixture.answers("丙", cites);
+        fixture.service.intervene(meetingId, intervention("FACT", "公司三季度营收同比增长37%", "公司业绩说明会纪要", null));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject fact = factWhoseQuestionContains(view, "用户补充");
+        assertEquals("F-2", fact.getString("id"));
+        assertEquals("F", fact.getString("tier"));
+        assertTrue(fact.getBooleanValue("userProvided"), fact.toJSONString());
+        assertEquals("公司业绩说明会纪要", fact.getString("source"));
+        JSONObject first = answerOf(view, "甲");
+        assertTrue(!first.getBooleanValue("skipped") && first.getString("rewriteReason") == null, first.toJSONString());
+        assertTrue(memberPrompt(fixture, "divergence:甲").contains("营收同比增长37%"));
+        JSONObject applied = view.getInterventions().getJSONObject(0);
+        assertEquals("APPLIED", applied.getString("status"));
+        assertEquals(List.of("F-2"), applied.getJSONArray("factIds").toJavaList(String.class));
+        assertTrue(view.getResult().getJSONArray("conclusions").getJSONObject(0).getBooleanValue("userInfluenced"));
+    }
+
+    @Test
+    void userQuestionIsSearchedThroughReviewedSearch() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.service.intervene(meetingId, intervention("SEARCH", "最新季度出货同比增速是多少？", null, null));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        verify(fixture.reviewed, times(1)).search(anyString(), org.mockito.ArgumentMatchers.contains("出货"),
+                anyString(), anyLong());
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject found = factWhoseQuestionContains(view, "最新季度出货同比增速");
+        assertEquals("你", found.getString("askedBy"));
+        assertEquals("APPLIED", view.getInterventions().getJSONObject(0).getString("status"));
+    }
+
+    @Test
+    void aQuestionToAMemberIsAnsweredAfterTheAnswersAndHeardInTheReestimate() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.service.intervene(meetingId, intervention("ASK", "你为什么认为需求偏强？", null, 22L));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        // Asked before the meeting ran, answered only once every member had answered back to back.
+        assertTrue(fixture.calls.indexOf("human_reply:乙") > fixture.calls.indexOf("divergence:丙"), fixture.calls.toString());
+        JSONObject applied = controller.getRoundtableV2(meetingId).getData().getInterventions().getJSONObject(0);
+        assertEquals("APPLIED", applied.getString("status"));
+        assertEquals("乙", applied.getString("targetName"));
+        assertTrue(applied.getString("reply").contains("维持原判"), applied.toJSONString());
+        String reestimate = memberPrompt(fixture, "reestimate:甲");
+        assertTrue(reestimate.contains("你为什么认为需求偏强") && reestimate.contains("维持原判"), reestimate);
+    }
+
+    @Test
+    void interventionAfterTheMeetingEndedIsRefused() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.service.run(meetingId, EPOCH);
+        fixture.room.setStatus(MeetingStatusEnum.CONCLUDED.getCode());
+
+        IllegalStateException refused = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                () -> fixture.service.intervene(meetingId, intervention("FACT", "补充一条", null, null)));
+
+        assertTrue(refused.getMessage().contains("已结束"), refused.getMessage());
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
@@ -1263,6 +1345,15 @@ class RoundtableV2FlowIntegrationTest {
         throw new AssertionError("no " + stageAndName + " call in " + fixture.calls);
     }
 
+    private static JSONObject intervention(String type, String content, String source, Long targetMemberId) {
+        JSONObject request = new JSONObject(true);
+        request.put("type", type);
+        request.put("content", content);
+        if (source != null) request.put("source", source);
+        if (targetMemberId != null) request.put("targetMemberId", targetMemberId);
+        return request;
+    }
+
     private static JSONObject factWhoseQuestionContains(RoundtableV2ViewVO view, String text) {
         for (Object item : view.getFacts()) {
             JSONObject fact = (JSONObject) item;
@@ -1485,6 +1576,8 @@ class RoundtableV2FlowIntegrationTest {
                             case MeetingCallContext.CROSS_EXAM:
                                 List<String> exam = crossExamReplies.get(name);
                                 return exam != null ? next(exam) : name + "：请说明你的判断依据哪条事实。";
+                            case MeetingCallContext.HUMAN_REPLY:
+                                return name + "：我的判断依据是订单数据，维持原判。";
                             case MeetingCallContext.RED_TEAM:
                                 return "若下一季度需求转弱，这条结论最可能失效。";
                             default:

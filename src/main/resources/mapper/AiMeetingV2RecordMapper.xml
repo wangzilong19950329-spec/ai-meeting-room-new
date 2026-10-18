@@ -25,6 +25,10 @@
         SELECT * FROM ai_meeting_v2_record WHERE meeting_id = #{meetingId} ORDER BY id
     </select>
 
+    <update id="updatePayload">
+        UPDATE ai_meeting_v2_record SET payload = #{payload} WHERE id = #{id}
+    </update>
+
     <delete id="deleteByMeetingId">
         DELETE FROM ai_meeting_v2_record WHERE meeting_id = #{meetingId}
     </delete>
