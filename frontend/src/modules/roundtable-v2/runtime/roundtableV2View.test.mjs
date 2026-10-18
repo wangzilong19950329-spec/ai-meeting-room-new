@@ -628,3 +628,10 @@ test('a review shows where it came from, what was new and how each question move
   assert.equal(view.process.find(step => step.key === 'research').summaryText, '复议不另做取证：沿用上一版的资料和新情况')
   assert.equal(buildRoundtableV2View(sample, null).review, null)
 })
+
+test('a review header gives the trading days left to the original expiry, not the original horizon', () => {
+  const v2 = clone(sample)
+  v2.issueCard = { ...v2.issueCard, reviewOf: { meetingId: 96, baseDate: '2026-10-16', horizonTradingDays: 60 } }
+  v2.outcomeQuestion = { ...v2.outcomeQuestion, baseDate: '2026-10-30', horizonTradingDays: 50 }
+  assert.equal(buildRoundtableV2View(v2, null).header.horizonText, '剩余 50 个交易日（到期日与上一版相同）')
+})

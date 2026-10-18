@@ -80,7 +80,7 @@ export function buildRoundtableV2View(v2, usage) {
   return {
     finished: Boolean(result),
     progress: progress(v2),
-    header: header(card),
+    header: header(card, v2.outcomeQuestion),
     facts,
     factCounts: countTiers(facts),
     outcome: outcome(result?.outcome),
@@ -124,11 +124,14 @@ export function buildRoundtableV2View(v2, usage) {
   }
 }
 
-function header(card) {
+function header(card, outcomeQuestion) {
   const days = card.horizonTradingDays
-  const horizonText = card.horizon
-    ? card.horizon + (days && !card.horizon.includes('交易日') ? `（${days} 个交易日）` : '')
-    : (days ? `${days} 个交易日` : '')
+  // A review keeps the original expiry, so what matters is the trading days left from its own start.
+  const horizonText = card.reviewOf && outcomeQuestion?.horizonTradingDays
+    ? `剩余 ${outcomeQuestion.horizonTradingDays} 个交易日（到期日与上一版相同）`
+    : card.horizon
+      ? card.horizon + (days && !card.horizon.includes('交易日') ? `（${days} 个交易日）` : '')
+      : (days ? `${days} 个交易日` : '')
   const stock = card.stock
   return {
     topic: card.topic,
