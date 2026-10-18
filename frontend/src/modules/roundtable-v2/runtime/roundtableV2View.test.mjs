@@ -446,3 +446,9 @@ test('facts from the user are marked as provided by the user or asked by the use
   assert.deepEqual(view.facts.find(f => f.id === 'F-23').badges, ['用户提供'])
   assert.deepEqual(view.facts.find(f => f.id === 'F-24').badges, ['你提出'])
 })
+
+test('a gap left after repeated search outages says so', () => {
+  const v2 = clone(sample)
+  v2.facts.push({ id: 'G-9', tier: 'G', question: '半年报存货是多少？', reason: 'RETRIES_EXHAUSTED_N8N_REVIEW_ERROR', askedBy: '甲' })
+  assert.equal(buildRoundtableV2View(v2, null).facts.find(f => f.id === 'G-9').note, '审核搜索多次重试仍失败')
+})

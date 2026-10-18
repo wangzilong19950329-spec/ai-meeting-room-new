@@ -65,6 +65,9 @@ public class RoundtableV2Service {
     private static final String EXPIRED = "EXPIRED";
     /** A safety stop against endless follow-ups; the number of questions per round is not limited. */
     private static final int MAX_RESEARCH_ROUNDS = 3;
+    /** Waits before re-asking reviewed search after an outage; then the meeting pauses. Tests set zeros. */
+    private long[] evidenceRetryWaitsMs = {60_000L, 180_000L, 300_000L};
+    private static final String RETRY_EXHAUSTED = "RETRY_EXHAUSTED:";
     /**
      * Research still running, per meeting and member, so the page can follow it question by question. Only
      * a view aid: the stored RESEARCH record is the truth and replaces it once the member is done.
@@ -616,11 +619,66 @@ public class RoundtableV2Service {
         return save(meetingId, FACT_BASE, MEETING_LEVEL, epoch, facts);
     }
 
+    /**
+     * An outage of the search service (review error, unknown outcome, HTTP error) is never recorded as "not
+     * found": the question is re-asked after a wait, then the meeting pauses and a resume searches it again.
+     * Only if it still fails after a resume is it given up as a gap. "Searched but not verified" is a gap at once.
+     */
     private MeetingReviewedEvidenceService.ReviewedEvidence resolveEvidence(Long meetingId, String asOf,
                                                                             String question) {
+        for (int attempt = 0; ; attempt++) {
+            try {
+                return resolveEvidenceOnce(meetingId, asOf, question);
+            } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
+                String code = rejected.getMessage();
+                if ("REVIEWED_SEARCH_DISABLED".equals(code) || "REVIEWED_SEARCH_TOKEN_MISSING".equals(code)) {
+                    throw new Blocked("审核搜索没有启用或配置不全（" + code + "），会议暂停");
+                }
+                if (!isSearchOutage(code)) throw rejected;
+                if (attempt < evidenceRetryWaitsMs.length) {
+                    pauseQuietly(evidenceRetryWaitsMs[attempt]);
+                    continue;
+                }
+                MeetingReviewedSearchGap gap = reviewedSearchLedgerService.findOrCreateGap(
+                        meetingId, FACT_BASE_ROUND, asOf, question);
+                if (gap.getStatusReason() != null && gap.getStatusReason().startsWith(RETRY_EXHAUSTED)) {
+                    reviewedSearchLedgerService.claimPendingGap(gap.getId());
+                    reviewedSearchLedgerService.markRejected(gap.getId(), "RETRIES_EXHAUSTED_" + code);
+                    throw new MeetingReviewedEvidenceService.EvidenceRejected("RETRIES_EXHAUSTED_" + code);
+                }
+                reviewedSearchLedgerService.requeue(gap.getId(), RETRY_EXHAUSTED + code);
+                throw new Blocked("审核搜索暂时不可用（" + code + "），重试 " + attempt + " 次仍失败，会议暂停；"
+                        + "恢复后会重新查询「" + question + "」");
+            }
+        }
+    }
+
+    private static boolean isSearchOutage(String code) {
+        return code != null && (code.equals("N8N_REVIEW_ERROR") || code.equals("N8N_OUTCOME_UNKNOWN")
+                || code.equals("PROVIDER_OUTCOME_UNKNOWN") || code.startsWith("N8N_HTTP_"));
+    }
+
+    private static void pauseQuietly(long millis) {
+        if (millis <= 0) return;
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new Blocked("等待审核搜索恢复时被中断，会议暂停");
+        }
+    }
+
+    private MeetingReviewedEvidenceService.ReviewedEvidence resolveEvidenceOnce(Long meetingId, String asOf,
+                                                                                String question) {
         MeetingReviewedSearchGap gap = reviewedSearchLedgerService.findOrCreateGap(
                 meetingId, FACT_BASE_ROUND, asOf, question);
         if (isAccepted(gap)) return accepted(gap, question);
+        // An outage recorded by an earlier run (or older code) is retried, not treated as an answer.
+        if (!MeetingReviewedSearchLedgerService.PENDING.equals(gap.getStatus()) && gap.getStatusReason() != null
+                && isSearchOutage(gap.getStatusReason())) {
+            reviewedSearchLedgerService.requeue(gap.getId(), gap.getStatusReason());
+            gap = reviewedSearchLedgerService.findGapById(gap.getId());
+        }
         if (!MeetingReviewedSearchLedgerService.PENDING.equals(gap.getStatus())) {
             throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_GAP_" + gap.getStatus());
         }
@@ -633,14 +691,14 @@ public class RoundtableV2Service {
         try {
             reviewed = reviewedEvidenceService.search(gap.getRequestId(), question, asOf, SEARCH_TIMEOUT_MS);
         } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
-            if ("N8N_OUTCOME_UNKNOWN".equals(rejected.getMessage())) {
-                reviewedSearchLedgerService.markUnknown(gap.getId(), rejected.getMessage());
+            if (isSearchOutage(rejected.getMessage())) {
+                reviewedSearchLedgerService.requeue(gap.getId(), keepExhaustedMarker(gap, rejected.getMessage()));
             } else {
                 reviewedSearchLedgerService.markRejected(gap.getId(), rejected.getMessage());
             }
             throw rejected;
         } catch (RuntimeException unknown) {
-            reviewedSearchLedgerService.markUnknown(gap.getId(), "PROVIDER_OUTCOME_UNKNOWN");
+            reviewedSearchLedgerService.requeue(gap.getId(), keepExhaustedMarker(gap, "N8N_OUTCOME_UNKNOWN"));
             throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_OUTCOME_UNKNOWN", unknown);
         }
         boolean persisted = "CROSS_CHECKED".equals(reviewed.packet.getString("status"))
@@ -648,6 +706,12 @@ public class RoundtableV2Service {
                 : reviewedSearchLedgerService.markLowConfidence(gap.getId(), reviewed.packet.toJSONString());
         if (!persisted) throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_PACKET_NOT_PERSISTED");
         return reviewed;
+    }
+
+    /** A question that already used up its retries once keeps that mark, so the next exhaustion gives it up. */
+    private static String keepExhaustedMarker(MeetingReviewedSearchGap gap, String code) {
+        String previous = gap.getStatusReason();
+        return previous != null && previous.startsWith(RETRY_EXHAUSTED) ? previous : code;
     }
 
     private static boolean isAccepted(MeetingReviewedSearchGap gap) {

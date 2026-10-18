@@ -168,6 +168,7 @@ function factNote(fact) {
 function gapReasonLabel(reason) {
   const code = String(reason || '')
   if (!code) return '未取到资料'
+  if (code.startsWith('RETRIES_EXHAUSTED')) return '审核搜索多次重试仍失败'
   if (code === 'N8N_REVIEW_UNVERIFIED' || code === 'N8N_UNVERIFIED') return '审核搜索未能核实'
   if (code === 'N8N_REVIEW_PARTIAL' || code === 'N8N_PARTIAL') return '审核搜索仅部分核实'
   if (/^N8N_(REVIEW_ERROR|ERROR|HTTP_|OUTCOME_UNKNOWN)/.test(code)) return '审核搜索出错'

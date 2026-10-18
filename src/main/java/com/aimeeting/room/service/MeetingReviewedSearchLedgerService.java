@@ -206,6 +206,11 @@ public class MeetingReviewedSearchLedgerService {
         return gapId != null && mapper.markRejected(gapId, reasonCode(reason)) == 1;
     }
 
+    /** An outage, not an answer: the question goes back to PENDING (same request ID) so it is searched again. */
+    public boolean requeue(Long gapId, String reason) {
+        return gapId != null && mapper.requeueGap(gapId, reasonCode(reason)) == 1;
+    }
+
     @Transactional
     public int deleteByMeetingId(Long meetingId) {
         if (meetingId == null) return 0;

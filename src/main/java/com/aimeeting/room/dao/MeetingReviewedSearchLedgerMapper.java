@@ -48,6 +48,8 @@ public interface MeetingReviewedSearchLedgerMapper {
 
     int markRejected(@Param("gapId") Long gapId, @Param("reason") String reason);
 
+    int requeueGap(@Param("gapId") Long gapId, @Param("reason") String reason);
+
     int deletePlansByMeetingId(@Param("meetingId") Long meetingId);
 
     int deleteGapsByMeetingId(@Param("meetingId") Long meetingId);

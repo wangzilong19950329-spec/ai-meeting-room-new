@@ -39,7 +39,9 @@ public class StockMeetingDomain implements MeetingDomain {
     public String issueCardHint() {
         return "如果议题针对一只 A 股个股，在 stock 字段给出 {\"symbol\":\"300750\",\"market\":\"sz\"}（6 位代码，市场为 sh/sz/bj），"
                 + "否则 stock 写 null。给出股票时，系统会自动提供东方财富结构化数据：收盘价、当日涨跌幅、总市值、"
-                + "市盈率与市净率及其近一年分位、最近一期营业总收入与归母净利润及同比、近 5/20/60 个交易日涨跌幅、"
+                + "市盈率与市净率及其近一年分位、最近一期营业总收入与归母净利润及同比、扣非归母净利润、"
+                + "加权净资产收益率、销售毛利率与净利率、经营现金流净额占营收比例、资产负债率（比率附上一报告期）、"
+                + "近 5/20/60 个交易日涨跌幅、"
                 + "距近 60 个交易日最高价回撤、相对 MA20/MA60 偏离、20 日历史波动率。取证题不要再问这些。"
                 + "给出股票时，程序还会自动生成“未来 N 个交易日收益率”的结果区间题，子问题不要再问股价涨跌方向或幅度，"
                 + "只拆推动走势的驱动因素。";
@@ -271,6 +273,16 @@ public class StockMeetingDomain implements MeetingDomain {
             add(facts, "营业总收入同比（报告期 " + period + "）", decimal(latest.get("revenueYoyPct")), "%", period);
             add(facts, "归母净利润（报告期 " + period + "，累计）", scaled(decimal(latest.get("netProfit"))), "亿元", period);
             add(facts, "归母净利润同比（报告期 " + period + "）", decimal(latest.get("netProfitYoyPct")), "%", period);
+            add(facts, "扣非归母净利润（报告期 " + period + "，累计）", scaled(decimal(latest.get("netProfitExNonRecurring"))),
+                    "亿元", period);
+            // Ratios carry the previous report period, so members can see the direction without searching.
+            Map<String, Object> previous = ((List<?>) financials).size() > 1 ? map(((List<?>) financials).get(1)) : Map.of();
+            String previousPeriod = day(text(previous.get("reportDate")));
+            addRatio(facts, "加权净资产收益率", "roePct", latest, previous, period, previousPeriod);
+            addRatio(facts, "销售毛利率", "grossMarginPct", latest, previous, period, previousPeriod);
+            addRatio(facts, "销售净利率", "netMarginPct", latest, previous, period, previousPeriod);
+            addRatio(facts, "经营现金流净额占营收比例", "cashToRevenuePct", latest, previous, period, previousPeriod);
+            addRatio(facts, "资产负债率", "debtRatioPct", latest, previous, period, previousPeriod);
         }
 
         add(facts, "近5个交易日涨跌幅（截至 " + asOf + "）", decimal(indicators.get("return5Pct")), "%", asOf);
@@ -336,6 +348,19 @@ public class StockMeetingDomain implements MeetingDomain {
         fact.put("source", "东方财富");
         fact.put("singleSource", true);
         facts.add(fact);
+    }
+
+    private static void addRatio(List<JSONObject> facts, String name, String key, Map<String, Object> latest,
+                                 Map<String, Object> previous, String period, String previousPeriod) {
+        BigDecimal value = decimal(latest.get(key));
+        if (value == null || period == null) return;
+        add(facts, name + "（报告期 " + period + "）", value, "%", period);
+        BigDecimal before = decimal(previous.get(key));
+        if (before != null && previousPeriod != null) {
+            JSONObject fact = facts.get(facts.size() - 1);
+            fact.put("statement", fact.getString("statement") + "（上一报告期 " + previousPeriod + "："
+                    + before.setScale(2, RoundingMode.HALF_UP).toPlainString() + "%）");
+        }
     }
 
     /** "2026-10-16 00:00:00" → "2026-10-16". */

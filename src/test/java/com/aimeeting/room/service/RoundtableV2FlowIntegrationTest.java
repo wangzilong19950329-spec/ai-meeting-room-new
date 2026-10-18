@@ -597,6 +597,78 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void aGen10OutageIsRetriedInsteadOfBecomingAGap() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        int[] attempts = {0};
+        org.mockito.Mockito.doAnswer(invocation -> {
+            if (attempts[0]++ == 0) throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_REVIEW_ERROR");
+            return crossChecked(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2), "2025年营收：100亿元");
+        }).when(fixture.reviewed).search(anyString(), org.mockito.ArgumentMatchers.contains("营收"), anyString(), anyLong());
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals("F", factWhoseQuestionContains(view, "营收").getString("tier"), view.getFacts().toJSONString());
+        assertEquals(2, attempts[0]);
+    }
+
+    @Test
+    void aPersistentOutagePausesTheMeetingAndResumeSearchesTheQuestionAgain() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        boolean[] down = {true};
+        org.mockito.Mockito.doAnswer(invocation -> {
+            if (down[0]) throw new MeetingReviewedEvidenceService.EvidenceRejected("N8N_REVIEW_ERROR");
+            return crossChecked(invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2), "2025年营收：100亿元");
+        }).when(fixture.reviewed).search(anyString(), org.mockito.ArgumentMatchers.contains("营收"), anyString(), anyLong());
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(MeetingStatusEnum.PAUSED.getCode(), fixture.room.getStatus());
+        ArgumentCaptor<String> reason = ArgumentCaptor.forClass(String.class);
+        verify(fixture.workflow).markReviewedEvidenceBlocked(eq(meetingId), reason.capture());
+        assertTrue(reason.getValue().contains("审核搜索暂时不可用") && reason.getValue().contains("营收"), reason.getValue());
+        assertTrue(controller.getRoundtableV2(meetingId).getData().getFacts().isEmpty());
+
+        down[0] = false;
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        assertEquals("F", factWhoseQuestionContains(view, "营收").getString("tier"), view.getFacts().toJSONString());
+        assertTrue(view.getResult() != null);
+    }
+
+    @Test
+    void aQuestionThatStillFailsAfterAResumeIsFinallyRecordedAsAGap() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "L-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        org.mockito.Mockito.doThrow(new MeetingReviewedEvidenceService.EvidenceRejected("N8N_REVIEW_ERROR"))
+                .when(fixture.reviewed).search(anyString(), org.mockito.ArgumentMatchers.contains("营收"), anyString(), anyLong());
+
+        fixture.service.run(meetingId, EPOCH);
+        assertEquals(MeetingStatusEnum.PAUSED.getCode(), fixture.room.getStatus());
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject gap = factWhoseQuestionContains(view, "营收");
+        assertEquals("G", gap.getString("tier"), gap.toJSONString());
+        assertTrue(gap.getString("reason").contains("RETRIES_EXHAUSTED"), gap.toJSONString());
+        assertTrue(view.getResult() != null, "the meeting goes on once the question is given up");
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
@@ -1231,6 +1303,44 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void stockFactBaseCarriesTheEastmoneyFinancialRatiosWithThePreviousPeriod() {
+        Fixture fixture = stockFixtureWithHistory();
+        EastmoneyMarketDataService.MarketDataBundle bundle = stockBundle();
+        Map<String, Object> latest = new java.util.LinkedHashMap<>();
+        latest.put("reportDate", "2026-06-30 00:00:00");
+        latest.put("revenue", new java.math.BigDecimal("178000000000"));
+        latest.put("revenueYoyPct", new java.math.BigDecimal("8.5"));
+        latest.put("netProfit", new java.math.BigDecimal("30500000000"));
+        latest.put("netProfitYoyPct", new java.math.BigDecimal("12.3"));
+        latest.put("netProfitExNonRecurring", new java.math.BigDecimal("28100000000"));
+        latest.put("roePct", new java.math.BigDecimal("9.87"));
+        latest.put("grossMarginPct", new java.math.BigDecimal("23.93"));
+        latest.put("netMarginPct", new java.math.BigDecimal("5.21"));
+        latest.put("cashToRevenuePct", new java.math.BigDecimal("12.6"));
+        latest.put("debtRatioPct", new java.math.BigDecimal("70.1"));
+        Map<String, Object> previous = new java.util.LinkedHashMap<>();
+        previous.put("reportDate", "2026-03-31 00:00:00");
+        previous.put("grossMarginPct", new java.math.BigDecimal("24.82"));
+        previous.put("debtRatioPct", new java.math.BigDecimal("71.4"));
+        bundle.getPayload().put("financials", List.of(latest, previous));
+        when(fixture.eastmoney.buildBundle("300750", "sz", "DAY")).thenReturn(bundle);
+        String valid = withOutcome(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"), "需求稳定", 0, 0.1, 0.5, 0.3, 0.1);
+        fixture.answers("甲", valid);
+        fixture.answers("乙", valid);
+        fixture.answers("丙", valid);
+
+        fixture.service.run(meetingId, EPOCH);
+
+        String facts = controller.getRoundtableV2(meetingId).getData().getFacts().toJSONString();
+        assertTrue(facts.contains("扣非归母净利润（报告期 2026-06-30，累计）：281.00亿元"), facts);
+        assertTrue(facts.contains("加权净资产收益率（报告期 2026-06-30）：9.87%"), facts);
+        assertTrue(facts.contains("销售毛利率（报告期 2026-06-30）：23.93%（上一报告期 2026-03-31：24.82%）"), facts);
+        assertTrue(facts.contains("资产负债率（报告期 2026-06-30）：70.10%（上一报告期 2026-03-31：71.40%）"), facts);
+        assertTrue(facts.contains("经营现金流净额占营收比例（报告期 2026-06-30）：12.60%"), facts);
+        assertTrue(fixture.moderatorPrompts.get(0).contains("销售毛利率"), fixture.moderatorPrompts.get(0));
+    }
+
+    @Test
     void outcomeProbabilitiesNotSummingToOneAreRewrittenOnce() {
         Fixture fixture = stockFixtureWithHistory();
         String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
@@ -1594,6 +1704,7 @@ class RoundtableV2FlowIntegrationTest {
             ReflectionTestUtils.setField(service, "workflowService", workflow);
             ReflectionTestUtils.setField(service, "aiModelProperties", new AiModelProperties());
             ReflectionTestUtils.setField(service, "domains", List.of(new StockMeetingDomain(eastmoney)));
+            ReflectionTestUtils.setField(service, "evidenceRetryWaitsMs", new long[]{0, 0, 0});
         }
 
         private void answers(String memberName, String... replies) {

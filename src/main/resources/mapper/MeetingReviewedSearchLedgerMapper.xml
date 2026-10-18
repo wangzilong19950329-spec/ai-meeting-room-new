@@ -112,6 +112,12 @@
         WHERE id = #{gapId} AND status = 'IN_FLIGHT'
     </update>
 
+    <update id="requeueGap">
+        UPDATE ai_meeting_reviewed_search_gap
+        SET status = 'PENDING', status_reason = #{reason}, gmt_modify = CURRENT_TIMESTAMP
+        WHERE id = #{gapId} AND status IN ('PENDING', 'IN_FLIGHT', 'REJECTED', 'UNKNOWN')
+    </update>
+
     <update id="markRejected">
         UPDATE ai_meeting_reviewed_search_gap
         SET status = 'REJECTED', status_reason = #{reason}, gmt_modify = CURRENT_TIMESTAMP
