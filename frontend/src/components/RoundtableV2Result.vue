@@ -229,6 +229,13 @@
             </div>
           </div>
         </div>
+        <div v-if="view.research.length" class="v2-research">
+          <div class="v2-research-head">议员自主取证（作答前按各自视角查的资料，交锋起全员可见）</div>
+          <div v-for="member in view.research" :key="member.memberName" class="v2-research-member">
+            <strong>{{ member.memberName }}</strong>：{{ member.summaryText }}
+            <div v-for="(q, i) in member.questions" :key="i" class="v2-muted">· {{ q.question }} —— {{ q.sourceText }}</div>
+          </div>
+        </div>
         <div v-if="view.openQuestions.length" class="v2-open">
           仍缺资料：{{ view.openQuestions.join('；') }}
         </div>
@@ -323,6 +330,8 @@ const MemberReasons = defineComponent({
 .v2-bar-row.mode .v2-bar-label, .v2-bar-row.mode .v2-bar-value { font-weight: 700; }
 .v2-bar-value { text-align: right; }
 .v2-pending { margin-top: 8px; }
+.v2-research { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #eef1f6; font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+.v2-research-head { font-weight: 600; color: #606266; }
 .v2-solo-row { padding: 6px 0; font-size: 13px; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
 .v2-solo-row + .v2-solo-row { border-top: 1px dashed #eef1f6; }
 .v2-solo-sides { display: flex; flex-wrap: wrap; gap: 4px 24px; }

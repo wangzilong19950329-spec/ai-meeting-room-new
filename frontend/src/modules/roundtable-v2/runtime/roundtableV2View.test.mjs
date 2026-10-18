@@ -204,13 +204,14 @@ test('a meeting still running shows which stages are done and no summary yet', (
   assert.deepEqual(view.progress.map(p => [p.label, p.done]), [
     ['问题卡', true],
     ['事实底稿', true],
+    ['议员自主取证', false],
     ['背靠背作答', false],
     ['交锋与红队', false],
     ['匿名再估', false],
     ['分歧分类与补证', false],
     ['程序汇总', false]
   ])
-  assert.equal(view.progress[2].detail, '2 人已作答')
+  assert.equal(view.progress[3].detail, '2 人已作答')
   assert.deepEqual(view.conclusions, [])
   assert.deepEqual(view.disputes, [])
   assert.equal(view.outcome, null)
@@ -333,4 +334,41 @@ test('usage names the solo control stage', () => {
   const stages = [{ stage: 'solo', calls: 1, meteredCalls: 0, unmeteredCalls: 1, promptChars: 900, completionChars: 600, durationMs: 80000 }]
   const view = buildRoundtableV2View(sample, { total: { calls: 1, meteredCalls: 0, unmeteredCalls: 1, promptChars: 900, completionChars: 600, durationMs: 80000 }, stages })
   assert.equal(view.usage.stages[0].stageLabel, '单人对照')
+})
+
+test('facts a member found are marked with who asked for them', () => {
+  const v2 = clone(sample)
+  v2.facts.push({ id: 'F-23', tier: 'F', question: '最新季度出货同比增速是多少？', statement: '最新季度出货同比增长20%', source: 'https://example.org/q', askedBy: '甲' })
+  const fact = buildRoundtableV2View(v2, null).facts.find(f => f.id === 'F-23')
+  assert.deepEqual(fact.badges, ['甲查询'])
+})
+
+test('each member research is summarised with what was reused and what was searched', () => {
+  const v2 = clone(sample)
+  v2.research = [
+    { memberName: '甲', rounds: [{ round: 1, questions: [
+      { question: '最新季度出货同比增速是多少？', searched: ['F-23'] },
+      { question: '市盈率处于什么分位？', reused: ['F-5'] }
+    ] }, { round: 2, questions: [{ question: '海外关税细则是什么？', searched: ['G-2'] }] }] },
+    { memberName: '乙', rounds: [] }
+  ]
+  assert.deepEqual(buildRoundtableV2View(v2, null).research, [
+    {
+      memberName: '甲',
+      summaryText: '问了 3 题：复用已有资料 1 题，新查 2 题',
+      questions: [
+        { question: '最新季度出货同比增速是多少？', sourceText: '新查 → F-23' },
+        { question: '市盈率处于什么分位？', sourceText: '复用 F-5' },
+        { question: '海外关税细则是什么？', sourceText: '新查 → G-2（未查到）' }
+      ]
+    },
+    { memberName: '乙', summaryText: '没有追加取证', questions: [] }
+  ])
+  assert.deepEqual(buildRoundtableV2View(sample, null).research, [])
+})
+
+test('usage names the research stages', () => {
+  const line = (stage) => ({ stage, calls: 1, meteredCalls: 1, unmeteredCalls: 0, promptTokens: 1, completionTokens: 1, durationMs: 1000 })
+  const view = buildRoundtableV2View(sample, { total: line(null), stages: [line('research_plan'), line('research_match')] })
+  assert.deepEqual(view.usage.stages.map(s => s.stageLabel), ['议员列取证题', '资料比对'])
 })

@@ -39,6 +39,8 @@ const STAGE_LABELS = {
   summary_rewrite: '总结重写',
   decision_card: '决策卡片',
   decision_card_rewrite: '决策卡片重写',
+  research_plan: '议员列取证题',
+  research_match: '资料比对',
   solo: '单人对照',
   solo_rewrite: '单人对照重写',
   other: '其他'
@@ -65,6 +67,7 @@ export function buildRoundtableV2View(v2, usage) {
     facts,
     factCounts: countTiers(facts),
     outcome: outcome(result?.outcome),
+    research: (v2.research || []).map(researchView),
     judgement: judgementView(v2.outcomeJudgement),
     solo: soloView(v2.solo, result, card, v2.outcomeQuestion),
     canRequestSolo: Boolean(result) && !v2.solo,
@@ -129,6 +132,7 @@ function factRow(fact, fromTopUp) {
   if (fact.referenceClass) badges.push('参照类')
   if (fact.tier === 'L') badges.push('低置信')
   if (fromTopUp) badges.push('补证')
+  if (fact.askedBy) badges.push(`${fact.askedBy}查询`)
   const source = fact.source || ''
   const isUrl = /^https?:\/\//i.test(source)
   return {
@@ -202,6 +206,24 @@ function outcome(summary) {
       reasons: reasons(member.reasons),
       falsifier: member.falsifier
     }))
+  }
+}
+
+/** One member's own evidence questions: what an existing fact already answered and what was searched. */
+function researchView(record) {
+  const questions = (record.rounds || []).flatMap(round => (round.questions || []).map(line => ({
+    question: line.question,
+    sourceText: line.reused
+      ? `复用 ${line.reused.join('、')}`
+      : `新查 → ${(line.searched || []).join('、')}${(line.searched || []).every(id => id.startsWith('G-')) ? '（未查到）' : ''}`
+  })))
+  const reused = questions.filter(q => q.sourceText.startsWith('复用')).length
+  return {
+    memberName: record.memberName,
+    summaryText: questions.length
+      ? `问了 ${questions.length} 题：复用已有资料 ${reused} 题，新查 ${questions.length - reused} 题`
+      : '没有追加取证',
+    questions
   }
 }
 
@@ -405,6 +427,7 @@ function progress(v2) {
   const steps = [
     ['问题卡', true, ''],
     ['事实底稿', Array.isArray(v2.facts), Array.isArray(v2.facts) ? `${v2.facts.length} 条` : ''],
+    ['议员自主取证', Boolean(v2.agenda) || finalAnswers.length > 0 || result, `${(v2.research || []).length} 人已取证`],
     ['背靠背作答', Boolean(v2.agenda) || finalAnswers.length > 0 || result, `${answers.length} 人已作答`],
     ['交锋与红队', finalAnswers.length > 0 || result, crossExams ? `${crossExams} 场质询` : ''],
     ['匿名再估', Boolean(v2.classification) || result, finalAnswers.length ? `${finalAnswers.length} 人已再估` : ''],
