@@ -1500,6 +1500,12 @@ class RoundtableV2FlowIntegrationTest {
 
         assertEquals("NOT_DUE", pending.getString("status"));
         assertEquals(2.81, pending.getDoubleValue("z"), 0.02);
+        // The next check is after tomorrow's close, never "24 hours after a check made during trading".
+        com.aimeeting.room.entity.AiMeetingTrackingItem item = new com.aimeeting.room.entity.AiMeetingTrackingItem();
+        item.setMeetingId(meetingId);
+        Date tomorrowAfterClose = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1)
+                .atTime(16, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
+        assertEquals(tomorrowAfterClose, judge.refresh(item).nextCheckAt);
         JSONArray hints = controller.getRoundtableV2(meetingId).getData().getReviewHints();
         assertEquals(1, hints.size(), hints.toJSONString());
         JSONObject hint = hints.getJSONObject(0);

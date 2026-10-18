@@ -16,7 +16,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
 
 /**
  * Judges a roundtable v2 outcome question once its horizon has passed and scores the forecasts with the
@@ -78,7 +77,9 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
     @Override
     public Check refresh(AiMeetingTrackingItem item) {
         JSONObject verdict = judge(item.getMeetingId());
-        Date tomorrow = new Date(System.currentTimeMillis() + TimeUnit.HOURS.toMillis(24));
+        // After tomorrow's close, whatever time this check ran: a check during trading would see an unsettled bar.
+        Date tomorrow = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1)
+                .atTime(16, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
         switch (verdict.getString("status")) {
             case "JUDGED":
                 return new Check("success", note(verdict), null, true);

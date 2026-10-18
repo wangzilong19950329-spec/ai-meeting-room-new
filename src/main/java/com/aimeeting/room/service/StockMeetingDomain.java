@@ -1,10 +1,15 @@
 package com.aimeeting.room.service;
 
 import com.alibaba.fastjson.JSONObject;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Clock;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -24,10 +29,21 @@ public class StockMeetingDomain implements MeetingDomain {
     private static final int VOLATILITY_WINDOW = 250;
     private static final Set<String> MARKETS = Set.of("sh", "sz", "bj");
 
-    private final EastmoneyMarketDataService eastmoney;
+    private static final ZoneId MARKET_ZONE = ZoneId.of("Asia/Shanghai");
+    /** Before this time today's daily bar may still be moving (the close is at 15:00). */
+    private static final LocalTime SETTLED = LocalTime.of(15, 30);
 
+    private final EastmoneyMarketDataService eastmoney;
+    private final Clock clock;
+
+    @Autowired
     public StockMeetingDomain(EastmoneyMarketDataService eastmoney) {
+        this(eastmoney, Clock.system(MARKET_ZONE));
+    }
+
+    StockMeetingDomain(EastmoneyMarketDataService eastmoney, Clock clock) {
         this.eastmoney = eastmoney;
+        this.clock = clock;
     }
 
     @Override
@@ -157,8 +173,23 @@ public class StockMeetingDomain implements MeetingDomain {
         }
     }
 
-    /** Eastmoney's history endpoint drops connections now and then: retry once, then use Tencent and say so. */
+    /**
+     * The daily series as of the last settled close: during trading the providers already list today's bar at
+     * the latest price, which must count neither as a finished day nor as a close.
+     */
     private History history(JSONObject stock) {
+        History fetched = fetchHistory(stock);
+        List<Map<String, Object>> bars = fetched.bars;
+        ZonedDateTime now = ZonedDateTime.now(clock).withZoneSameInstant(MARKET_ZONE);
+        if (bars != null && !bars.isEmpty() && now.toLocalTime().isBefore(SETTLED)
+                && now.toLocalDate().toString().equals(text(bars.get(bars.size() - 1).get("date")))) {
+            return new History(new ArrayList<>(bars.subList(0, bars.size() - 1)), fetched.source);
+        }
+        return fetched;
+    }
+
+    /** Eastmoney's history endpoint drops connections now and then: retry once, then use Tencent and say so. */
+    private History fetchHistory(JSONObject stock) {
         try {
             return new History(eastmoneyHistory(stock), "东方财富");
         } catch (RuntimeException eastmoneyDown) {
