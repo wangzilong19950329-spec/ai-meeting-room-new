@@ -29,4 +29,6 @@ public class RoundtableV2ViewVO {
     private JSONObject outcomeJudgement;
     /** The one-pass answer of a single analyst on the same card and fact base, made on request as a control. */
     private JSONObject solo;
+    /** Each member's own evidence questions: what was reused from existing facts and what was searched. */
+    private JSONArray research = new JSONArray();
 }

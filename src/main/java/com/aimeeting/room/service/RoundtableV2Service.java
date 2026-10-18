@@ -57,6 +57,11 @@ public class RoundtableV2Service {
     static final String TOP_UP = "TOP_UP";
     static final String OUTCOME = "OUTCOME_Q";
     static final String SOLO = "SOLO";
+    static final String RESEARCH = "RESEARCH";
+    /** A safety stop against endless follow-ups; the number of questions per round is not limited. */
+    private static final int MAX_RESEARCH_ROUNDS = 3;
+    private static final java.util.regex.Pattern NON_ANSWER_OPTION =
+            java.util.regex.Pattern.compile("信息不足|难以判断|无法判断|无法确定");
     /** Marks a skipped answer that is not stored until all members have been asked. */
     private static final String UNSETTLED = "unsettled";
     private static final String PROBABILITY = "PROBABILITY";
@@ -166,9 +171,15 @@ public class RoundtableV2Service {
             else if (TOP_UP.equals(record.getKind())) view.setTopUp(JSON.parseObject(record.getPayload()));
             else if (OUTCOME.equals(record.getKind())) view.setOutcomeQuestion(JSON.parseObject(record.getPayload()));
             else if (SOLO.equals(record.getKind())) view.setSolo(JSON.parseObject(record.getPayload()));
+            else if (RESEARCH.equals(record.getKind())) view.getResearch().add(JSON.parseObject(record.getPayload()));
             else if (RoundtableV2OutcomeJudge.OUTCOME_JUDGEMENT.equals(record.getKind())) {
                 view.setOutcomeJudgement(JSON.parseObject(record.getPayload()));
             }
+        }
+        // The fact list shows every fact: the shared base followed by each member's own research.
+        for (Object item : view.getResearch()) {
+            JSONArray own = ((JSONObject) item).getJSONArray("facts");
+            if (own != null) view.getFacts().addAll(own);
         }
         return view;
     }
@@ -189,14 +200,22 @@ public class RoundtableV2Service {
         Map<Long, AiMeetingMember> membersById = new LinkedHashMap<>();
         JSONArray answers = new JSONArray();
         List<JSONObject> unsettled = new ArrayList<>();
+        // Every fact found so far: the shared base, then each member's own research in member order.
+        JSONArray pool = new JSONArray();
+        pool.addAll(facts);
         for (AiMeetingMember member : members) {
             if (activeRoom(meetingId, epoch) == null) return;
             membersById.put(member.getId(), member);
-            JSONObject answer = answer(meetingId, epoch, card, facts, member);
+            JSONObject research = research(meetingId, epoch, card, facts, pool, member);
+            if (research == null) return;
+            pool.addAll(research.getJSONArray("facts"));
+            JSONObject answer = answer(meetingId, epoch, card, visibleFacts(facts, pool, research), member);
             if (answer.getBooleanValue(UNSETTLED)) unsettled.add(answer);
             answers.add(answer);
         }
         settleSkipped(meetingId, epoch, answers, unsettled);
+        // From the cross-examination on, everyone works from every fact anyone found.
+        facts = pool;
         JSONArray firstCrossExams = new JSONArray();
         JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams);
         if (finalAnswers == null) return;
@@ -308,7 +327,8 @@ public class RoundtableV2Service {
         }
         sb.append("【截至日期】").append(asOf).append("\n\n");
         sb.append("请把议题拆成 2–4 个子问题（推动结论的关键驱动因素），每个子问题给 2–4 个互斥选项，")
-                .append("选项要能让议员明确选边。\n");
+                .append("选项要能让议员明确选边。不要设置“信息不足”“难以判断”之类的选项：")
+                .append("证据不足时由议员在理由里说明，程序会标出证据不足的共识。\n");
         sb.append("再列出不超过 8 道需要联网核实的取证题，每题只问一个可以核实的事实，多空两方面都要覆盖；")
                 .append("只问截至日期前已经公开的信息，不要问尚未发布的数据（例如还没披露的财报）。\n");
         sb.append("如果有合适的参照类（过去的类似情况），写在 referenceClass，否则写 null。\n");
@@ -343,6 +363,10 @@ public class RoundtableV2Service {
                 if (option == null || blank(option.getString("id")) || blank(option.getString("label"))
                         || !optionIds.add(option.getString("id"))) {
                     return "子问题 " + question.getString("id") + " 的选项缺少唯一的 id 或说明";
+                }
+                if (NON_ANSWER_OPTION.matcher(option.getString("label")).find()) {
+                    return "子问题 " + question.getString("id") + " 的选项「" + option.getString("label")
+                            + "」不是一个可以选边的判断，不要设置信息不足、难以判断之类的选项";
                 }
             }
         }
@@ -505,6 +529,197 @@ public class RoundtableV2Service {
     }
 
     // ---- P2 back-to-back answers ----
+
+    // ---- P2a each member's own research ----
+
+    /**
+     * Before answering, a member asks for whatever its lens still needs, as many questions as it wants, for up
+     * to three rounds. Questions already answered by an existing fact (any member's) reuse it; only the rest
+     * go through reviewed search. Returns null when the meeting stopped.
+     */
+    private JSONObject research(Long meetingId, Long epoch, JSONObject card, JSONArray shared, JSONArray pool,
+                                AiMeetingMember member) {
+        JSONObject stored = loadObject(meetingId, RESEARCH, member.getId());
+        if (stored != null) return stored;
+        JSONArray own = new JSONArray();
+        List<String> visible = new ArrayList<>();
+        List<String> asked = new ArrayList<>();
+        JSONArray rounds = new JSONArray();
+        int[] next = {maxIndex(pool, "F"), maxIndex(pool, "L"), maxIndex(pool, "G")};
+        for (int round = 1; round <= MAX_RESEARCH_ROUNDS; round++) {
+            if (activeRoom(meetingId, epoch) == null) return null;
+            JSONArray seen = new JSONArray();
+            seen.addAll(shared);
+            for (Object item : concat(pool, own)) {
+                JSONObject fact = (JSONObject) item;
+                if (visible.contains(fact.getString("id")) && !seen.contains(fact)) seen.add(fact);
+            }
+            List<String> questions;
+            try {
+                questions = researchQuestions(meetingId, card, seen, asked, member);
+            } catch (ModelUnavailable unavailable) {
+                // Not stored: answering will hit the same failure and the meeting decides there; a resume retries.
+                return researchRecord(member, rounds, own, visible);
+            }
+            if (questions.isEmpty()) break;
+            asked.addAll(questions);
+            Map<Integer, List<String>> existing = matchExisting(meetingId, concat(pool, own), questions);
+            JSONArray lines = new JSONArray();
+            for (int i = 0; i < questions.size(); i++) {
+                String question = questions.get(i);
+                JSONObject line = new JSONObject(true);
+                line.put("question", question);
+                List<String> reused = existing.get(i + 1);
+                if (reused != null) {
+                    line.put("reused", reused);
+                    for (String id : reused) if (!visible.contains(id)) visible.add(id);
+                } else {
+                    if (activeRoom(meetingId, epoch) == null) return null;
+                    JSONArray found = searchFor(meetingId, card, question, member, next);
+                    own.addAll(found);
+                    JSONArray ids = new JSONArray();
+                    for (Object item : found) {
+                        ids.add(((JSONObject) item).getString("id"));
+                        visible.add(((JSONObject) item).getString("id"));
+                    }
+                    line.put("searched", ids);
+                }
+                lines.add(line);
+            }
+            JSONObject roundRecord = new JSONObject(true);
+            roundRecord.put("round", round);
+            roundRecord.put("questions", lines);
+            rounds.add(roundRecord);
+        }
+        return save(meetingId, RESEARCH, member.getId(), epoch, researchRecord(member, rounds, own, visible));
+    }
+
+    private static JSONObject researchRecord(AiMeetingMember member, JSONArray rounds, JSONArray own, List<String> visible) {
+        JSONObject record = new JSONObject(true);
+        record.put("memberId", member.getId());
+        record.put("memberName", member.getMemberName());
+        record.put("rounds", rounds);
+        record.put("facts", own);
+        record.put("visibleFactIds", visible);
+        return record;
+    }
+
+    private List<String> researchQuestions(Long meetingId, JSONObject card, JSONArray seen, List<String> asked,
+                                           AiMeetingMember member) {
+        String system = memberSystem(member) + "作答之前，你可以按自己的分析视角自行查资料。只输出 JSON。";
+        StringBuilder prompt = new StringBuilder(cardAndFacts(card, seen));
+        if (!asked.isEmpty()) prompt.append("\n【你已经查过的问题】\n").append(String.join("\n", asked)).append("\n");
+        prompt.append("\n【查资料】从你的分析视角出发，为了回答上面的子问题，你还需要查哪些资料？需要多少就列多少；")
+                .append("每题只问一个可以核实的事实，只问截至日期前已经公开的信息，不要重复上面已有的资料和你查过的问题。")
+                .append("已经足够就返回空数组。只输出 JSON：{\"questions\":[\"\"]}");
+        String reply;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, 1, member.getId(), MeetingCallContext.RESEARCH_PLAN)) {
+            reply = call(member.getModelType(), member.getMemberName(), system, prompt.toString());
+        }
+        JSONObject root = parseObject(reply);
+        JSONArray list = root == null ? null : root.getJSONArray("questions");
+        List<String> questions = new ArrayList<>();
+        for (int i = 0; list != null && i < list.size(); i++) {
+            String question = list.getString(i);
+            if (!blank(question) && !asked.contains(question.trim()) && !questions.contains(question.trim())) {
+                questions.add(question.trim());
+            }
+        }
+        return questions;
+    }
+
+    /**
+     * Which new questions an existing verified or low-confidence fact already answers, by 1-based index. The
+     * judgment is strict and only accepts ids of real F/L facts; anything doubtful is searched.
+     */
+    private Map<Integer, List<String>> matchExisting(Long meetingId, JSONArray pool, List<String> questions) {
+        Map<String, JSONObject> usable = new LinkedHashMap<>();
+        for (Object item : pool) {
+            JSONObject fact = (JSONObject) item;
+            String tier = fact.getString("tier");
+            if (("F".equals(tier) || "L".equals(tier)) && !blank(fact.getString("statement"))) {
+                usable.put(fact.getString("id"), fact);
+            }
+        }
+        Map<Integer, List<String>> matches = new LinkedHashMap<>();
+        if (usable.isEmpty()) return matches;
+        StringBuilder prompt = new StringBuilder("【现有资料】\n");
+        for (JSONObject fact : usable.values()) {
+            prompt.append(fact.getString("id")).append("：").append(fact.getString("statement")).append("\n");
+        }
+        prompt.append("\n【新问题】\n");
+        for (int i = 0; i < questions.size(); i++) prompt.append(i + 1).append(". ").append(questions.get(i)).append("\n");
+        prompt.append("\n对每个新问题，判断现有资料里是否已经有能直接回答它的事实：必须包含所问的具体数值、日期或名称，")
+                .append("而且时间口径一致。只有完全能回答才列出编号；拿不准就不要列。只输出 JSON：")
+                .append("{\"matches\":[{\"index\":1,\"factIds\":[\"F-1\"]}]}");
+        String system = "你是本场会议的资料管理员，只判断现有资料是否已经能直接回答新问题，不回答问题本身。只输出 JSON。";
+        String reply;
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.stage(MeetingCallContext.RESEARCH_MATCH)) {
+            reply = orchestrator.callModelStrict(orchestrator.resolveMeetingModelType(meetingId), system,
+                    prompt.toString(), null);
+        } catch (RuntimeException unavailable) {
+            return matches;  // Without a judgment everything is searched: slower, never less accurate.
+        }
+        JSONObject root = parseObject(reply);
+        JSONArray list = root == null ? null : root.getJSONArray("matches");
+        for (int i = 0; list != null && i < list.size(); i++) {
+            JSONObject match = list.getJSONObject(i);
+            if (match == null) continue;
+            int index = match.getIntValue("index");
+            JSONArray ids = match.getJSONArray("factIds");
+            if (index < 1 || index > questions.size() || ids == null || ids.isEmpty()) continue;
+            List<String> valid = new ArrayList<>();
+            boolean allReal = true;
+            for (Object id : ids) {
+                if (usable.containsKey(String.valueOf(id))) valid.add(String.valueOf(id));
+                else allReal = false;
+            }
+            if (allReal && !valid.isEmpty()) matches.put(index, valid);
+        }
+        return matches;
+    }
+
+    /** Reviewed search for one member question; new facts continue the meeting's F/L/G numbering. */
+    private JSONArray searchFor(Long meetingId, JSONObject card, String question, AiMeetingMember member, int[] next) {
+        JSONArray found = new JSONArray();
+        try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
+                meetingId, 1, member.getId(), MeetingCallContext.EVIDENCE_SEARCH)) {
+            MeetingReviewedEvidenceService.ReviewedEvidence evidence = resolveEvidence(meetingId, card.getString("asOf"), question);
+            JSONArray claims = evidence.packet.getJSONArray("claims");
+            JSONArray candidates = evidence.packet.getJSONArray("provisionalClaims");
+            for (int i = 0; claims != null && i < claims.size(); i++) {
+                found.add(fact("F-" + (++next[0]), "F", question, claims.getJSONObject(i)));
+            }
+            for (int i = 0; candidates != null && i < candidates.size(); i++) {
+                found.add(fact("L-" + (++next[1]), "L", question, candidates.getJSONObject(i)));
+            }
+            if (found.isEmpty()) found.add(gapFact(++next[2], question, "N8N_" + evidence.packet.getString("status")));
+        } catch (MeetingReviewedEvidenceService.EvidenceRejected rejected) {
+            found.add(gapFact(++next[2], question, rejected.getMessage()));
+        }
+        for (Object item : found) ((JSONObject) item).put("askedBy", member.getMemberName());
+        return found;
+    }
+
+    /** What a member answers from: the shared base, its own research and the facts reused for its questions. */
+    private static JSONArray visibleFacts(JSONArray shared, JSONArray pool, JSONObject research) {
+        JSONArray visible = new JSONArray();
+        visible.addAll(shared);
+        JSONArray ids = research.getJSONArray("visibleFactIds");
+        for (Object item : pool) {
+            JSONObject fact = (JSONObject) item;
+            if (ids != null && ids.contains(fact.getString("id")) && !visible.contains(fact)) visible.add(fact);
+        }
+        return visible;
+    }
+
+    private static JSONArray concat(JSONArray first, JSONArray second) {
+        JSONArray all = new JSONArray();
+        all.addAll(first);
+        all.addAll(second);
+        return all;
+    }
 
     /**
      * Returns the stored answer, or a new one. A member whose model cannot be reached gets an unsaved record

@@ -381,6 +381,110 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void membersSearchWhatTheirLensNeedsAndKeepItToThemselvesUntilCrossExamination() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.researchReplies.put("甲", new ArrayList<>(List.of(
+                "{\"questions\":[\"最新季度出货同比增速是多少？\"]}", "{\"questions\":[]}")));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        RoundtableV2ViewVO view = controller.getRoundtableV2(meetingId).getData();
+        JSONObject own = factWhoseQuestionContains(view, "最新季度出货同比增速");
+        assertEquals("F-2", own.getString("id"));
+        assertEquals("甲", own.getString("askedBy"));
+        assertEquals(3, view.getResearch().size(), view.getResearch().toString());
+        // Back-to-back: only the asker sees it while answering; everyone sees it from the re-estimate on.
+        assertTrue(memberPrompt(fixture, "divergence:甲").contains("出货同比增长20%"));
+        assertTrue(!memberPrompt(fixture, "divergence:乙").contains("出货同比增长20%"));
+        assertTrue(!memberPrompt(fixture, "divergence:丙").contains("出货同比增长20%"));
+        assertTrue(memberPrompt(fixture, "reestimate:乙").contains("出货同比增长20%"));
+    }
+
+    @Test
+    void evidenceThatAlreadyExistsIsReusedInsteadOfSearchedAgain() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.researchReplies.put("甲", new ArrayList<>(List.of(
+                "{\"questions\":[\"最新季度出货同比增速是多少？\"]}", "{\"questions\":[]}")));
+        fixture.researchReplies.put("乙", new ArrayList<>(List.of(
+                "{\"questions\":[\"上一季度出货量增长了多少？\"]}", "{\"questions\":[]}")));
+        // 甲's question matches nothing yet; 乙's differently worded question is answered by 甲's new F-2.
+        fixture.matchReplies.add("{\"matches\":[]}");
+        fixture.matchReplies.add("{\"matches\":[{\"index\":1,\"factIds\":[\"F-2\"]}]}");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        verify(fixture.reviewed, times(1)).search(anyString(), org.mockito.ArgumentMatchers.contains("出货"),
+                anyString(), anyLong());
+        assertTrue(memberPrompt(fixture, "divergence:乙").contains("出货同比增长20%"));
+        assertTrue(!memberPrompt(fixture, "divergence:丙").contains("出货同比增长20%"));
+    }
+
+    @Test
+    void theMatcherCannotPassOffAMissingOrGapFactAsAnAnswer() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.researchReplies.put("甲", new ArrayList<>(List.of(
+                "{\"questions\":[\"最新季度出货同比增速是多少？\",\"海外关税对利润的影响有多大？\"]}",
+                "{\"questions\":[]}")));
+        fixture.matchReplies.add("{\"matches\":[{\"index\":1,\"factIds\":[\"F-99\"]},{\"index\":2,\"factIds\":[\"G-1\"]}]}");
+
+        fixture.service.run(meetingId, EPOCH);
+
+        verify(fixture.reviewed, times(1)).search(anyString(), org.mockito.ArgumentMatchers.contains("出货"),
+                anyString(), anyLong());
+        verify(fixture.reviewed, times(2)).search(anyString(), org.mockito.ArgumentMatchers.contains("关税"),
+                anyString(), anyLong());
+    }
+
+    @Test
+    void aMemberMayAskFollowUpQuestionsForAtMostThreeRounds() {
+        Fixture fixture = new Fixture();
+        String agree = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", agree);
+        fixture.answers("乙", agree);
+        fixture.answers("丙", agree);
+        fixture.researchReplies.put("甲", new ArrayList<>(List.of(
+                "{\"questions\":[\"海外关税问题一？\",\"海外关税问题二？\"]}",
+                "{\"questions\":[\"海外关税问题三？\"]}",
+                "{\"questions\":[\"海外关税问题四？\"]}",
+                "{\"questions\":[\"海外关税问题五？\"]}")));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(3, fixture.calls.stream().filter("research_plan:甲"::equals).count(), fixture.calls.toString());
+        // One shared-base search plus every question of the three rounds, however many each round asked.
+        verify(fixture.reviewed, times(5)).search(anyString(), org.mockito.ArgumentMatchers.contains("关税"),
+                anyString(), anyLong());
+    }
+
+    @Test
+    void moderatorMayNotOfferAnInsufficientInformationOption() {
+        Fixture fixture = new Fixture();
+        fixture.moderatorReplies.add(CARD.replace("拖累股价", "信息不足，难以判断"));
+        fixture.moderatorReplies.add(CARD);
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(2, fixture.calls.stream().filter("issue_card:主持人"::equals).count(), fixture.calls.toString());
+        assertTrue(!controller.getRoundtableV2(meetingId).getData().getIssueCard().toJSONString().contains("信息不足"));
+        assertTrue(fixture.moderatorPrompts.get(0).contains("不要设置"), fixture.moderatorPrompts.get(0));
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
@@ -395,8 +499,8 @@ class RoundtableV2FlowIntegrationTest {
         fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
         fixture.service.run(meetingId, EPOCH);
 
-        // moderator 1 + first-round answers 3 + red team on the leading consensus 1 + re-estimates 3
-        verify(fixture.orchestrator, times(8)).callModelStrict(anyString(), anyString(), anyString(),
+        // moderator 1 + research plans 3 + first-round answers 3 + red team on the leading consensus 1 + re-estimates 3
+        verify(fixture.orchestrator, times(11)).callModelStrict(anyString(), anyString(), anyString(),
                 nullable(Integer.class));
         verify(fixture.reviewed, times(3)).search(anyString(), anyString(), anyString(), anyLong());
         verify(fixture.writer, times(2)).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
@@ -1122,6 +1226,13 @@ class RoundtableV2FlowIntegrationTest {
         throw new AssertionError("no score for " + memberName + " in " + verdict);
     }
 
+    private static String memberPrompt(Fixture fixture, String stageAndName) {
+        for (String entry : fixture.memberPrompts) {
+            if (entry.startsWith(stageAndName + "|")) return entry.substring(stageAndName.length() + 1);
+        }
+        throw new AssertionError("no " + stageAndName + " call in " + fixture.calls);
+    }
+
     private static JSONObject factWhoseQuestionContains(RoundtableV2ViewVO view, String text) {
         for (Object item : view.getFacts()) {
             JSONObject fact = (JSONObject) item;
@@ -1248,6 +1359,10 @@ class RoundtableV2FlowIntegrationTest {
         private final List<String> classifyReplies = new ArrayList<>();
         private final List<String> moderatorPrompts = new ArrayList<>();
         private final List<String> soloReplies = new ArrayList<>();
+        private final Map<String, List<String>> researchReplies = new HashMap<>();
+        private final List<String> matchReplies = new ArrayList<>();
+        /** "stage:name|prompt" for every member call. */
+        private final List<String> memberPrompts = new ArrayList<>();
         private final List<String> soloPrompts = new ArrayList<>();
         /** "stage:name" entries whose model call fails as if the provider were down. */
         private final java.util.Set<String> down = new java.util.HashSet<>();
@@ -1309,6 +1424,11 @@ class RoundtableV2FlowIntegrationTest {
                             }
                             return moderatorReplies.isEmpty() ? card : moderatorReplies.remove(0);
                         }
+                        if (system.contains("资料管理员")) {
+                            calls.add(stage + ":管理员");
+                            return matchReplies.isEmpty() ? "{\"matches\":[]}"
+                                    : matchReplies.size() > 1 ? matchReplies.remove(0) : matchReplies.get(0);
+                        }
                         if (system.contains("综合分析师")) {
                             calls.add(stage + ":单人");
                             soloPrompts.add(invocation.getArgument(2));
@@ -1319,10 +1439,14 @@ class RoundtableV2FlowIntegrationTest {
                         }
                         String name = memberIn(system);
                         calls.add(stage + ":" + name);
+                        memberPrompts.add(stage + ":" + name + "|" + invocation.getArgument(2));
                         if (down.contains(stage + ":" + name)) {
                             throw new IllegalStateException("meeting_selected_model_unavailable");
                         }
                         switch (stage) {
+                            case MeetingCallContext.RESEARCH_PLAN:
+                                List<String> research = researchReplies.get(name);
+                                return research == null ? "{\"questions\":[]}" : next(research);
                             case MeetingCallContext.DIVERGENCE:
                                 return next(memberReplies.get(name));
                             case MeetingCallContext.REESTIMATE:
