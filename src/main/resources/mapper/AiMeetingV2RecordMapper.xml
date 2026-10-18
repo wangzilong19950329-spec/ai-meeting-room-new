@@ -25,6 +25,11 @@
         SELECT * FROM ai_meeting_v2_record WHERE meeting_id = #{meetingId} ORDER BY id
     </select>
 
+    <select id="selectVersion" resultType="java.lang.String">
+        SELECT CONCAT(COUNT(*), '-', COALESCE(MAX(id), 0), '-', COALESCE(SUM(LENGTH(payload)), 0))
+        FROM ai_meeting_v2_record WHERE meeting_id = #{meetingId}
+    </select>
+
     <update id="updatePayload">
         UPDATE ai_meeting_v2_record SET payload = #{payload} WHERE id = #{id}
     </update>

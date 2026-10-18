@@ -1515,6 +1515,22 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void theVersionChangesWhenARecordIsAddedOrRewrittenAndStaysOtherwise() {
+        Fixture fixture = judgedStockMeeting();
+        String concluded = fixture.service.version(meetingId);
+        assertEquals(concluded, fixture.service.version(meetingId), "nothing changed, same version");
+
+        fixture.service.suggestReview(meetingId, 7L, "海外关税", "美国宣布加征关税");
+        String added = fixture.service.version(meetingId);
+        fixture.service.suggestReview(meetingId, 7L, "海外关税", "美国加征关税正式落地，税率提高");
+        String rewritten = fixture.service.version(meetingId);
+
+        assertTrue(!added.equals(concluded), added);
+        assertTrue(!rewritten.equals(added), "an updated payload must change the version too");
+        assertEquals(fixture.service.version(meetingId), controller.getRoundtableV2Version(meetingId).getData());
+    }
+
+    @Test
     void aKeyChangeInATrackingItemSuggestsAReviewWithTheLatestNote() {
         Fixture fixture = judgedStockMeeting();
 

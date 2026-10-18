@@ -1374,6 +1374,7 @@
 </template>
 
 <script setup>
+import { shouldLoadFull } from '../modules/roundtable-v2/runtime/v2Polling.mjs'
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -1990,7 +1991,7 @@ async function handleRequestSolo() {
   soloError.value = ''
   try {
     await meetingApi.createRoundtableV2Solo(meetingId)
-    await loadRoundtableV2()
+    await loadRoundtableV2(true)
   } catch (failure) {
     soloError.value = failure?.msg || failure?.message || '单人对照生成失败，可以再试一次'
   } finally {
@@ -2008,7 +2009,7 @@ async function handleIntervene(payload) {
   try {
     await meetingApi.interveneRoundtableV2(meetingId, payload)
     interveneVersion.value++
-    await loadRoundtableV2()
+    await loadRoundtableV2(true)
     ElMessage.success('已提交，会在下一个环节开始前处理')
   } catch (failure) {
     interveneError.value = failure?.msg || failure?.message || '提交失败，可以再试一次'
@@ -2035,9 +2036,18 @@ async function handleReview(payload) {
   }
 }
 
-async function loadRoundtableV2() {
+let roundtableV2Version = null
+
+// Polling asks for the version stamp first; the full view and usage are fetched only when it changed.
+async function loadRoundtableV2(force = false) {
+  let version = null
+  try { version = (await meetingApi.getRoundtableV2Version(meetingId)).data } catch {}
+  if (!shouldLoadFull(roundtableV2Version, version, force)) return
   const [v2, usage] = await Promise.allSettled([meetingApi.getRoundtableV2(meetingId), meetingApi.getUsage(meetingId)])
-  if (v2.status === 'fulfilled') roundtableV2.value = v2.value.data
+  if (v2.status === 'fulfilled') {
+    roundtableV2.value = v2.value.data
+    roundtableV2Version = version
+  }
   if (usage.status === 'fulfilled') meetingUsage.value = usage.value.data
 }
 
@@ -2048,6 +2058,8 @@ function scrollToBottom() {
 function startPolling() {
   if (pollTimer) return
   pollTimer = setInterval(async () => {
+    // A hidden page does not poll; it catches up as soon as it is shown again.
+    if (document.hidden) return
     if ([1, 6].includes(meeting.value?.status)) await loadDetail(true)
     else { clearInterval(pollTimer); pollTimer = null }
   }, 2000)
@@ -2202,7 +2214,15 @@ onMounted(async () => {
   await loadDetail()
   if ([1, 6].includes(meeting.value?.status)) startPolling()
 })
-onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
+function onVisibilityChange() {
+  if (!document.hidden && pollTimer) loadDetail(true)
+}
+document.addEventListener('visibilitychange', onVisibilityChange)
+
+onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
 </script>
 
 <style scoped>

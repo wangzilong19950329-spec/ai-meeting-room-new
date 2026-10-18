@@ -15,6 +15,9 @@ public interface AiMeetingV2RecordMapper {
 
     List<AiMeetingV2Record> selectByMeetingId(@Param("meetingId") Long meetingId);
 
+    /** "count-maxId-totalPayloadLength" of a meeting's records: changes when one is added or rewritten. */
+    String selectVersion(@Param("meetingId") Long meetingId);
+
     int deleteByMeetingId(@Param("meetingId") Long meetingId);
 
     /** Only for records whose state changes, such as a queued user intervention once it is applied. */

@@ -664,6 +664,15 @@ public class RoundtableV2Service {
         }
     }
 
+    /**
+     * A cheap stamp of everything the view shows: the stored records plus research still in progress. The page
+     * polls this and fetches the full view only when it changes.
+     */
+    public String version(Long meetingId) {
+        Map<Long, JSONObject> live = liveResearch.get(meetingId);
+        return recordMapper.selectVersion(meetingId) + "-" + (live == null ? 0 : JSON.toJSONString(live).hashCode());
+    }
+
     public RoundtableV2ViewVO view(Long meetingId) {
         RoundtableV2ViewVO view = new RoundtableV2ViewVO();
         List<AiMeetingV2Record> stored = recordMapper.selectByMeetingId(meetingId);

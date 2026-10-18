@@ -133,6 +133,12 @@ public class MeetingController {
         return ApiResponse.ok(roundtableV2Service.view(id));
     }
 
+    /** 圆桌 v2：数据版本号，页面轮询它，变了才拉全量 */
+    @GetMapping("/meetings/{id}/roundtable-v2/version")
+    public ApiResponse<String> getRoundtableV2Version(@PathVariable Long id) {
+        return ApiResponse.ok(roundtableV2Service.version(id));
+    }
+
     /** 圆桌 v2：人为介入（补充资料 FACT / 追加取证 SEARCH / 向议员提问 ASK），排队到下一个环节开始前处理 */
     @PostMapping("/meetings/{id}/roundtable-v2/interventions")
     public ApiResponse<com.alibaba.fastjson.JSONObject> interveneRoundtableV2(@PathVariable Long id,
