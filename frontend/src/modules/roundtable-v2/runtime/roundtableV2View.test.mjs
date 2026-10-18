@@ -635,3 +635,12 @@ test('a review header gives the trading days left to the original expiry, not th
   v2.outcomeQuestion = { ...v2.outcomeQuestion, baseDate: '2026-10-30', horizonTradingDays: 50 }
   assert.equal(buildRoundtableV2View(v2, null).header.horizonText, '剩余 50 个交易日（到期日与上一版相同）')
 })
+
+test('a settled answer that changed the blind one without a reason says the blind answer was kept', () => {
+  const v2 = clone(sample)
+  v2.review = { parentMeetingId: 98, parentTitle: 't', parentAsOf: '2026-10-17', questionIds: ['Q2'], facts: [], parentResult: {} }
+  v2.answers = [{ memberName: '甲', skipped: false, answers: [{ questionId: 'Q2', optionId: 'B' }] }]
+  v2.informedAnswers = [{ memberName: '甲', skipped: false, revertedToBlind: ['Q2'], answers: [{ questionId: 'Q2', optionId: 'B' }] }]
+  const informed = buildRoundtableV2View(v2, null).process.find(step => step.key === 'informed')
+  assert.deepEqual(informed.members.map(m => m.changeText), ['与盲答一致（订单与需求：改了盲答却说不出理由，保留盲答）'])
+})

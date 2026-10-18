@@ -493,13 +493,21 @@ public class RoundtableV2Service {
                 + parentChoicesText(review, member.getMemberName(), card)
                 + parentCruxesText(review, card) + newInformationText(facts)
                 + "\n请对照上一版重新作答全部子问题，格式同上；凡与上一版的选项或概率不同，在该题加 changeReason，"
-                + "说明是哪条新事实或上一版的哪个条件被触发。";
+                + "说明是哪条新事实或上一版的哪个条件被触发；与你刚才的盲答不同时也一样要写 changeReason，"
+                + "说明是什么让你改变了刚才的判断。";
         String[] corpora = corpora(facts, card);
         Set<String> factIds = factIds(facts);
         Answer parsed;
         try (MeetingCallContext.Scope ignored = MeetingCallContext.enter(
                 meetingId, 1, member.getId(), MeetingCallContext.REVIEW_INFORMED)) {
             parsed = parseAnswer(call(member.getModelType(), member.getMemberName(), system, prompt), card, factIds, corpora);
+        }
+        if (parsed.error == null) {
+            List<String> unexplained = unexplainedChanges(blind.getJSONArray("answers"), parsed.answers);
+            if (!unexplained.isEmpty()) {
+                parsed = new Answer(parsed.answers, unexplained + " 与你刚才的盲答不同，却没有写 changeReason：请说明是哪条事实或哪个条件"
+                        + "改变了刚才的判断；说不出来就保留盲答");
+            }
         }
         String rewriteReason = parsed.error;
         if (parsed.error != null) {
@@ -510,15 +518,61 @@ public class RoundtableV2Service {
                         card, factIds, corpora);
             }
         }
+        // A change from the blind answer that is still unexplained is not taken: the blind answer stands there.
+        JSONArray settled = parsed.error != null ? blind.getJSONArray("answers") : parsed.answers;
+        List<String> reverted = parsed.error != null ? List.of()
+                : unexplainedChanges(blind.getJSONArray("answers"), parsed.answers);
+        if (!reverted.isEmpty()) settled = keepBlind(blind.getJSONArray("answers"), parsed.answers, reverted);
         JSONObject record = new JSONObject(true);
         record.put("memberId", member.getId());
         record.put("memberName", member.getMemberName());
         record.put("skipped", false);
         record.put("fallback", parsed.error != null);
         if (parsed.error != null) record.put("reason", parsed.error);
-        record.put("answers", parsed.error != null ? blind.getJSONArray("answers") : parsed.answers);
+        if (!reverted.isEmpty()) record.put("revertedToBlind", reverted);
+        record.put("answers", settled);
         if (rewriteReason != null) record.put("rewriteReason", rewriteReason);
         return save(meetingId, INFORMED, member.getId(), epoch, record);
+    }
+
+    /** Probability changes this large (on any interval) count as a change that needs a reason. */
+    private static final double UNEXPLAINED_PROBABILITY_SHIFT = 0.10;
+
+    /** Questions whose settled answer differs from the blind one without a changeReason. */
+    private static List<String> unexplainedChanges(JSONArray blind, JSONArray settled) {
+        Map<String, JSONObject> before = new HashMap<>();
+        for (Object item : blind) before.put(((JSONObject) item).getString("questionId"), (JSONObject) item);
+        List<String> unexplained = new ArrayList<>();
+        for (Object item : settled) {
+            JSONObject after = (JSONObject) item;
+            JSONObject earlier = before.get(after.getString("questionId"));
+            if (earlier == null || !blank(after.getString("changeReason"))) continue;
+            boolean changed;
+            JSONObject probabilities = after.getJSONObject("probabilities");
+            if (probabilities != null && earlier.getJSONObject("probabilities") != null) {
+                changed = false;
+                for (String id : probabilities.keySet()) {
+                    double shift = Math.abs(probabilities.getDoubleValue(id)
+                            - earlier.getJSONObject("probabilities").getDoubleValue(id));
+                    if (shift >= UNEXPLAINED_PROBABILITY_SHIFT - 1e-9) changed = true;
+                }
+            } else {
+                changed = !Objects.equals(after.getString("optionId"), earlier.getString("optionId"));
+            }
+            if (changed) unexplained.add(after.getString("questionId"));
+        }
+        return unexplained;
+    }
+
+    private static JSONArray keepBlind(JSONArray blind, JSONArray settled, List<String> questionIds) {
+        Map<String, Object> before = new HashMap<>();
+        for (Object item : blind) before.put(((JSONObject) item).getString("questionId"), item);
+        JSONArray merged = new JSONArray();
+        for (Object item : settled) {
+            String questionId = ((JSONObject) item).getString("questionId");
+            merged.add(questionIds.contains(questionId) ? before.get(questionId) : item);
+        }
+        return merged;
     }
 
     /** One line per answered question: the option or the probabilities, then the reasons' text. */
@@ -1837,7 +1891,14 @@ public class RoundtableV2Service {
         StringBuilder sb = new StringBuilder("你上一轮的选择：");
         for (Object item : first.getJSONArray("answers")) {
             JSONObject choice = (JSONObject) item;
-            sb.append(choice.getString("questionId")).append("=").append(choice.getString("optionId")).append("；");
+            JSONObject probabilities = choice.getJSONObject("probabilities");
+            String picked = choice.getString("optionId");
+            if (probabilities != null) {
+                List<String> parts = new ArrayList<>();
+                for (String id : probabilities.keySet()) parts.add(id + " " + Math.round(probabilities.getDoubleValue(id) * 100) + "%");
+                picked = String.join(" / ", parts);
+            }
+            sb.append(choice.getString("questionId")).append("=").append(picked).append("；");
         }
         sb.append("\n各子问题的匿名分布：\n");
         for (Object item : card.getJSONArray("subQuestions")) {

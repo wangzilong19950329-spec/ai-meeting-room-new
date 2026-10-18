@@ -1068,6 +1068,65 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void aSettledAnswerThatQuietlyUndoesTheBlindOneIsAskedForAReasonAndOtherwiseKeepsTheBlindAnswer() {
+        Fixture fixture = new Fixture();
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "旧判断订单偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "旧判断订单偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "旧判断订单偏强", "L-1"));
+        fixture.service.run(meetingId, EPOCH);
+        long childId = meetingId ^ 0x7C7CL;
+        try {
+            fixture.addChildMeeting(childId);
+            // Blind, 甲 and 乙 now see weak orders; after seeing the old answer both drift back to "strong".
+            fixture.answers("甲", singleAnswer("Q2", "B", "新增订单转弱", "F-2"));
+            fixture.answers("乙", singleAnswer("Q2", "B", "新增订单转弱", "F-2"));
+            fixture.answers("丙", singleAnswer("Q2", "A", "订单仍偏强", "F-1"));
+            String backToOld = singleAnswer("Q2", "A", "订单仍偏强", "F-1");
+            fixture.informed("甲", backToOld);
+            fixture.informed("乙", backToOld, withChangeReason(backToOld, "Q2", "F-1 显示存量订单足以覆盖下滑，新增订单下降影响有限"));
+            fixture.informed("丙", backToOld);
+
+            fixture.service.prepareReview(meetingId, childId, reviewRequest(List.of("Q2"), "三季度新增订单同比下降"));
+            fixture.service.run(childId, EPOCH);
+
+            RoundtableV2ViewVO view = controller.getRoundtableV2(childId).getData();
+            JSONObject first = informedOf(view, "甲");
+            assertEquals("B", first.getJSONArray("answers").getJSONObject(0).getString("optionId"),
+                    "without a reason the blind answer stands: " + first);
+            assertEquals(List.of("Q2"), first.getJSONArray("revertedToBlind").toJavaList(String.class));
+            assertTrue(first.getString("rewriteReason").contains("盲答"), first.getString("rewriteReason"));
+            JSONObject second = informedOf(view, "乙");
+            assertEquals("A", second.getJSONArray("answers").getJSONObject(0).getString("optionId"), second.toJSONString());
+            assertTrue(second.get("revertedToBlind") == null, second.toJSONString());
+            JSONObject third = informedOf(view, "丙");
+            assertTrue(third.get("rewriteReason") == null, "an unchanged answer needs no reason: " + third);
+            // The fixture records a rewrite under its stage name: 甲 and 乙 are asked twice, 丙 once.
+            assertEquals(2, fixture.calls.stream().filter("review_informed:甲"::equals).count(), fixture.calls.toString());
+            assertEquals(2, fixture.calls.stream().filter("review_informed:乙"::equals).count(), fixture.calls.toString());
+            assertEquals(1, fixture.calls.stream().filter("review_informed:丙"::equals).count(), fixture.calls.toString());
+            assertTrue(lastMemberPrompt(fixture, "review_informed:甲").contains("与你刚才的盲答不同"),
+                    lastMemberPrompt(fixture, "review_informed:甲"));
+        } finally {
+            records.deleteByMeetingId(childId);
+        }
+    }
+
+    @Test
+    void theReestimateShowsTheMemberItsOwnOutcomeProbabilitiesFromTheRoundBefore() {
+        Fixture fixture = stockFixtureWithHistory();
+        String base = answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1");
+        fixture.answers("甲", withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+        fixture.answers("乙", withOutcome(answer("A", "营收稳健", "F-1", "B", "增速放缓", "L-1"), "估值偏高", 0.1, 0.5, 0.3, 0.1, 0));
+        fixture.answers("丙", withOutcome(base, "需求稳定", 0, 0.1, 0.5, 0.3, 0.1));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        String reestimate = lastMemberPrompt(fixture, "reestimate:甲");
+        assertTrue(reestimate.contains("OUTCOME=") && !reestimate.contains("OUTCOME=null"), reestimate);
+        assertTrue(reestimate.contains("C 50%"), reestimate);
+    }
+
+    @Test
     void aStockReviewStartsTheOutcomeQuestionFromTheLatestCloseForTheRemainingDays() {
         Fixture fixture = judgedStockMeeting();
         long childId = meetingId ^ 0x6B6BL;
@@ -1847,6 +1906,13 @@ class RoundtableV2FlowIntegrationTest {
         record.setPayload(payload);
         record.setRunEpoch(EPOCH);
         return record;
+    }
+
+    private static JSONObject informedOf(RoundtableV2ViewVO view, String memberName) {
+        for (Object item : view.getInformedAnswers()) {
+            if (memberName.equals(((JSONObject) item).getString("memberName"))) return (JSONObject) item;
+        }
+        throw new AssertionError("no informed answer of " + memberName);
     }
 
     private static JSONObject factWithId(JSONArray facts, String id) {

@@ -405,8 +405,10 @@ function standingText(summary, questionId) {
 function informedText(informed, blind, questions) {
   if (informed.skipped) return '未作答'
   if (informed.fallback) return '对照无效，沿用盲答'
-  const text = changeText(informed, blind, questions)
-  return text === '维持首轮选择' ? '与盲答一致' : text
+  const changed = changeText(informed, blind, questions)
+  const text = changed === '维持首轮选择' ? '与盲答一致' : changed
+  const kept = (informed.revertedToBlind || []).map(id => questions.get(id)?.title || id)
+  return kept.length ? `${text}（${kept.join('、')}：改了盲答却说不出理由，保留盲答）` : text
 }
 
 function answerCard(answer, questions, outcomeQuestion) {
