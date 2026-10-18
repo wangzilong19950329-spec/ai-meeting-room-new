@@ -77,9 +77,10 @@ public class RoundtableV2OutcomeJudge implements ProgramTrackingHandler {
     @Override
     public Check refresh(AiMeetingTrackingItem item) {
         JSONObject verdict = judge(item.getMeetingId());
-        // After tomorrow's close, whatever time this check ran: a check during trading would see an unsettled bar.
+        // After tomorrow's close (A-shares 15:00, Hong Kong 16:00), whatever time this check ran: a check during
+        // trading would see an unsettled bar.
         Date tomorrow = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1)
-                .atTime(16, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
+                .atTime(17, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
         switch (verdict.getString("status")) {
             case "JUDGED":
                 return new Check("success", note(verdict), null, true);

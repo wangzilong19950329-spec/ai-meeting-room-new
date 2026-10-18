@@ -259,10 +259,10 @@ public class EastmoneyMarketDataService {
         return fetchKlines(symbol, normalizeMarket(market, symbol), 101, bars);
     }
 
-    /** Forward-adjusted daily bars from Tencent, the fallback when Eastmoney's history endpoint fails (sh/sz only). */
+    /** Forward-adjusted daily bars from Tencent, the fallback when Eastmoney's history endpoint fails (sh/sz/hk). */
     public List<Map<String, Object>> fetchTencentDailyHistory(String symbol, String market, int bars) {
         String normalized = normalizeMarket(market, symbol);
-        if (!("sh".equals(normalized) || "sz".equals(normalized))) {
+        if (!("sh".equals(normalized) || "sz".equals(normalized) || "hk".equals(normalized))) {
             throw new IllegalStateException("tencent_history_unsupported_market:" + normalized);
         }
         return fetchTencentKlines(symbol, normalized, bars, true, null, "eastmoney_history_failed");
@@ -304,6 +304,14 @@ public class EastmoneyMarketDataService {
         JSONObject data = root.getJSONObject("data");
         JSONObject instrumentData = data == null ? null : data.getJSONObject(instrument);
         JSONArray rows = instrumentData == null ? null : instrumentData.getJSONArray(series);
+        boolean adjustedRows = adjusted;
+        if ((rows == null || rows.isEmpty()) && adjusted && instrumentData != null
+                && instrumentData.getJSONArray("day") != null && !instrumentData.getJSONArray("day").isEmpty()) {
+            // Tencent serves Hong Kong stocks only unadjusted, under "day", even when adjustment is requested.
+            rows = instrumentData.getJSONArray("day");
+            adjustedRows = false;
+            series = "day";
+        }
         if (rows == null || rows.isEmpty()) {
             throw new IllegalStateException("empty_tencent_kline:" + instrument + ":" + series);
         }
@@ -320,11 +328,12 @@ public class EastmoneyMarketDataService {
             bar.put("high", decimal(row.get(3)));
             bar.put("low", decimal(row.get(4)));
             bar.put("volume", decimal(row.get(5)));
+            bar.put("adjustment", adjustedRows ? "qfq" : "none");
             bars.add(bar);
         }
         validateCanonicalDailyKlines(bars, canonicalQuote, "tencent");
         annotateLatestTrace("series", series);
-        annotateLatestTrace("adjustment", adjusted ? "qfq" : "none");
+        annotateLatestTrace("adjustment", adjustedRows ? "qfq" : "none");
         annotateLatestTrace("fallbackReason", fallbackReason);
         annotateLatestTrace("missingFields", List.of("amount", "amplitudePct", "changePct", "change", "turnoverPct"));
         return bars;
@@ -901,6 +910,53 @@ public class EastmoneyMarketDataService {
             }
         }
         return null;
+    }
+
+    /**
+     * The latest two report periods of a Hong Kong stock from Eastmoney's HK F10 indicator table. Amounts are in
+     * the company's report currency, which the table does not state (its CURRENCY is the trading currency); the
+     * valuation fields are at the latest close the table was refreshed with.
+     */
+    public List<Map<String, Object>> fetchHongKongIndicators(String symbol) {
+        Map<String, String> params = dataCenterParams("RPT_HKF10_FN_MAININDICATOR");
+        params.put("columns", "ALL");
+        params.put("filter", "(SECUCODE=\"" + symbol + ".HK\")");
+        params.put("pageSize", "2");
+        params.put("sortColumns", "REPORT_DATE");
+        params.put("sortTypes", "-1");
+        return hongKongIndicatorRows(getJson(DATA_CENTER_URL, params));
+    }
+
+    static List<Map<String, Object>> hongKongIndicatorRows(JSONObject root) {
+        JSONObject result = root == null ? null : root.getJSONObject("result");
+        JSONArray rows = result == null ? null : result.getJSONArray("data");
+        List<Map<String, Object>> mapped = new ArrayList<>();
+        for (int i = 0; rows != null && i < rows.size(); i++) {
+            JSONObject row = rows.getJSONObject(i);
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("startDate", day(row.getString("START_DATE")));
+            item.put("reportDate", day(row.getString("REPORT_DATE")));
+            item.put("reportType", row.getString("REPORT_TYPE"));
+            item.put("revenue", row.getBigDecimal("OPERATE_INCOME"));
+            item.put("revenueYoyPct", row.getBigDecimal("OPERATE_INCOME_YOY"));
+            item.put("netProfit", row.getBigDecimal("HOLDER_PROFIT"));
+            item.put("netProfitYoyPct", row.getBigDecimal("HOLDER_PROFIT_YOY"));
+            item.put("grossMarginPct", row.getBigDecimal("GROSS_PROFIT_RATIO"));
+            item.put("netMarginPct", row.getBigDecimal("NET_PROFIT_RATIO"));
+            item.put("roePct", row.getBigDecimal("ROE_AVG"));
+            item.put("debtRatioPct", row.getBigDecimal("DEBT_ASSET_RATIO"));
+            item.put("cashToRevenuePct", row.getBigDecimal("OCF_SALES"));
+            item.put("peTtm", row.getBigDecimal("PE_TTM"));
+            item.put("pbTtm", row.getBigDecimal("PB_TTM"));
+            item.put("marketCap", row.getBigDecimal("TOTAL_MARKET_CAP"));
+            item.put("shares", row.getBigDecimal("ISSUED_COMMON_SHARES"));
+            mapped.add(item);
+        }
+        return mapped;
+    }
+
+    private static String day(String dateTime) {
+        return dateTime != null && dateTime.length() > 10 ? dateTime.substring(0, 10) : dateTime;
     }
 
     private Map<String, String> dataCenterParams(String reportName) {

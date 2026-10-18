@@ -16,8 +16,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * A-share topics: Eastmoney structured data goes into the fact base before any reviewed search. Only a
- * dozen key fields and program-computed indicators are kept, each as one fact marked as single-source.
+ * Stock topics (A-shares and Hong Kong): structured data goes into the fact base before any reviewed search.
+ * Only a dozen key fields and program-computed indicators are kept, each as one fact marked as single-source.
+ * A-shares use the Eastmoney bundle; Hong Kong uses the daily bars and Eastmoney's HK report table.
  */
 @Component
 public class StockMeetingDomain implements MeetingDomain {
@@ -28,10 +29,13 @@ public class StockMeetingDomain implements MeetingDomain {
     /** Volatility for the outcome intervals comes from the most recent year of daily returns. */
     private static final int VOLATILITY_WINDOW = 250;
     private static final Set<String> MARKETS = Set.of("sh", "sz", "bj");
+    private static final java.util.regex.Pattern HK_SUFFIXED = java.util.regex.Pattern.compile("(\\d{1,5})\\.(?i:hk)");
 
     private static final ZoneId MARKET_ZONE = ZoneId.of("Asia/Shanghai");
-    /** Before this time today's daily bar may still be moving (the close is at 15:00). */
+    /** Before this time today's daily bar may still be moving (A-shares close at 15:00). */
     private static final LocalTime SETTLED = LocalTime.of(15, 30);
+    /** Hong Kong closes at 16:00 with a closing auction until about 16:10. */
+    private static final LocalTime SETTLED_HK = LocalTime.of(16, 30);
 
     private final EastmoneyMarketDataService eastmoney;
     private final Clock clock;
@@ -53,8 +57,9 @@ public class StockMeetingDomain implements MeetingDomain {
 
     @Override
     public String issueCardHint() {
-        return "如果议题针对一只 A 股个股，在 stock 字段给出 {\"symbol\":\"300750\",\"market\":\"sz\"}（6 位代码，市场为 sh/sz/bj），"
-                + "否则 stock 写 null。给出股票时，系统会自动提供东方财富结构化数据：收盘价、当日涨跌幅、总市值、"
+        return "如果议题针对一只 A 股个股，在 stock 字段给出 {\"symbol\":\"300750\",\"market\":\"sz\"}（6 位代码，市场为 sh/sz/bj）；"
+                + "如果是港股，给出 {\"symbol\":\"09988\",\"market\":\"hk\"}（5 位代码）；"
+                + "否则 stock 写 null。给出股票时，系统会自动提供东方财富等来源的结构化数据（港股字段略少）：收盘价、当日涨跌幅、总市值、"
                 + "市盈率与市净率及其近一年分位、最近一期营业总收入与归母净利润及同比、扣非归母净利润、"
                 + "加权净资产收益率、销售毛利率与净利率、经营现金流净额占营收比例、资产负债率（比率附上一报告期）、"
                 + "近 5/20/60 个交易日涨跌幅、"
@@ -76,8 +81,9 @@ public class StockMeetingDomain implements MeetingDomain {
 
     @Override
     public DomainEvidence evidence(JSONObject issueCard) {
-        List<JSONObject> facts = new ArrayList<>(marketFacts(issueCard));
         JSONObject stock = normalizeStock(issueCard.getJSONObject("stock"));
+        boolean hongKong = "hk".equals(stock.getString("market"));
+        List<JSONObject> facts = new ArrayList<>(hongKong ? List.of() : marketFacts(issueCard));
         int horizon = issueCard.getIntValue("horizonTradingDays");
         String label = "历史参照数据（" + stock.getString("symbol") + "." + stock.getString("market")
                 + "，展望" + horizon + "个交易日）";
@@ -85,9 +91,11 @@ public class StockMeetingDomain implements MeetingDomain {
         try {
             fetched = history(stock);
         } catch (IllegalStateException unavailable) {
+            if (hongKong) facts.addAll(hongKongFacts(stock, null));
             facts.add(gap(label, unavailable.getMessage()));
             return new DomainEvidence(facts, null);
         }
+        if (hongKong) facts.addAll(hongKongFacts(stock, fetched));
         String source = fetched.source;
         List<Map<String, Object>> history = fetched.bars;
         // A review keeps the original expiry: it forecasts from the latest close over the trading days left.
@@ -120,9 +128,9 @@ public class StockMeetingDomain implements MeetingDomain {
             facts.add(gap(label, "HISTORY_TOO_SHORT: " + closes.size() + " bars"));
             return new DomainEvidence(facts, null);
         }
-        facts.add(referenceFact(closes, horizon, source));
+        facts.add(referenceFact(closes, horizon, fetched));
         return new DomainEvidence(facts, outcomeQuestion(closes, horizon,
-                baseDate == null ? issueCard.getString("asOf") : baseDate));
+                baseDate == null ? issueCard.getString("asOf") : baseDate, fetched));
     }
 
     /**
@@ -166,10 +174,22 @@ public class StockMeetingDomain implements MeetingDomain {
     private static final class History {
         private final List<Map<String, Object>> bars;
         private final String source;
+        /** False for Tencent's Hong Kong series, which is only served unadjusted. */
+        private final boolean adjusted;
 
         private History(List<Map<String, Object>> bars, String source) {
+            this(bars, source, true);
+        }
+
+        private History(List<Map<String, Object>> bars, String source, boolean adjusted) {
             this.bars = bars;
             this.source = source;
+            this.adjusted = adjusted;
+        }
+
+        /** How the series is described in labels: forward-adjusted, or unadjusted without dividends. */
+        private String kind() {
+            return adjusted ? "前复权" : "不复权";
         }
     }
 
@@ -181,9 +201,10 @@ public class StockMeetingDomain implements MeetingDomain {
         History fetched = fetchHistory(stock);
         List<Map<String, Object>> bars = fetched.bars;
         ZonedDateTime now = ZonedDateTime.now(clock).withZoneSameInstant(MARKET_ZONE);
-        if (bars != null && !bars.isEmpty() && now.toLocalTime().isBefore(SETTLED)
+        LocalTime settled = "hk".equals(stock.getString("market")) ? SETTLED_HK : SETTLED;
+        if (bars != null && !bars.isEmpty() && now.toLocalTime().isBefore(settled)
                 && now.toLocalDate().toString().equals(text(bars.get(bars.size() - 1).get("date")))) {
-            return new History(new ArrayList<>(bars.subList(0, bars.size() - 1)), fetched.source);
+            return new History(new ArrayList<>(bars.subList(0, bars.size() - 1)), fetched.source, fetched.adjusted);
         }
         return fetched;
     }
@@ -194,8 +215,10 @@ public class StockMeetingDomain implements MeetingDomain {
             return new History(eastmoneyHistory(stock), "东方财富");
         } catch (RuntimeException eastmoneyDown) {
             try {
-                return new History(eastmoney.fetchTencentDailyHistory(stock.getString("symbol"),
-                        stock.getString("market"), HISTORY_BARS), "腾讯证券");
+                List<Map<String, Object>> bars = eastmoney.fetchTencentDailyHistory(stock.getString("symbol"),
+                        stock.getString("market"), HISTORY_BARS);
+                boolean adjusted = bars == null || bars.isEmpty() || !"none".equals(text(bars.get(0).get("adjustment")));
+                return new History(bars, adjusted ? "腾讯证券" : "腾讯证券（不复权）", adjusted);
             } catch (RuntimeException tencentDown) {
                 throw new IllegalStateException("EASTMONEY_HISTORY_UNAVAILABLE: " + eastmoneyDown.getMessage()
                         + "; TENCENT: " + tencentDown.getMessage());
@@ -212,7 +235,8 @@ public class StockMeetingDomain implements MeetingDomain {
     }
 
     /** Reference class: the distribution of every rolling horizon-day return in the available history. */
-    private static JSONObject referenceFact(List<BigDecimal> closes, int horizon, String source) {
+    private static JSONObject referenceFact(List<BigDecimal> closes, int horizon, History fetched) {
+        String source = fetched.source;
         List<Double> returns = new ArrayList<>();
         for (int i = 0; i + horizon < closes.size(); i++) {
             returns.add(closes.get(i + horizon).doubleValue() / closes.get(i).doubleValue() - 1);
@@ -220,7 +244,8 @@ public class StockMeetingDomain implements MeetingDomain {
         java.util.Collections.sort(returns);
         long up = returns.stream().filter(value -> value > 0).count();
         String label = "历史参照（近" + closes.size() + "个交易日，滚动" + horizon
-                + "个交易日涨跌幅，程序按" + ("腾讯证券".equals(source) ? "腾讯" : "东财") + "前复权日K计算）";
+                + "个交易日涨跌幅，程序按" + (source.startsWith("腾讯证券") ? "腾讯" : "东财") + fetched.kind() + "日K计算"
+                + (fetched.adjusted ? "" : "，未计分红") + "）";
         String statement = label + "：P10 " + pct(percentile(returns, 0.10)) + "，P25 " + pct(percentile(returns, 0.25))
                 + "，P50 " + pct(percentile(returns, 0.50)) + "，P75 " + pct(percentile(returns, 0.75))
                 + "，P90 " + pct(percentile(returns, 0.90)) + "，上涨占比 " + pct((double) up / returns.size());
@@ -238,7 +263,7 @@ public class StockMeetingDomain implements MeetingDomain {
      * Five return intervals cut symmetrically at ±0.5σ and ±1.5σ, where σ is the recent daily volatility scaled
      * to the horizon. Bounds are whole percentage points and are stored for judging the outcome at expiry.
      */
-    private static JSONObject outcomeQuestion(List<BigDecimal> closes, int horizon, String baseDate) {
+    private static JSONObject outcomeQuestion(List<BigDecimal> closes, int horizon, String baseDate, History fetched) {
         List<Double> daily = new ArrayList<>();
         for (int i = closes.size() - VOLATILITY_WINDOW; i < closes.size(); i++) {
             daily.add(closes.get(i).doubleValue() / closes.get(i - 1).doubleValue() - 1);
@@ -257,7 +282,8 @@ public class StockMeetingDomain implements MeetingDomain {
         JSONObject question = new JSONObject(true);
         question.put("id", "OUTCOME");
         question.put("kind", "PROBABILITY");
-        question.put("title", "未来" + horizon + "个交易日收益率（以" + baseDate + "收盘价为起点，前复权）");
+        question.put("title", "未来" + horizon + "个交易日收益率（以" + baseDate + "收盘价为起点，"
+                + (fetched.adjusted ? "前复权）" : "不复权，未计分红）"));
         question.put("horizonTradingDays", horizon);
         // The starting point for judging the outcome at expiry: the latest close actually available.
         question.put("baseDate", baseDate);
@@ -367,10 +393,24 @@ public class StockMeetingDomain implements MeetingDomain {
     static JSONObject normalizeStock(JSONObject stock) {
         if (stock == null) return null;
         String symbol = stock.getString("symbol");
-        if (symbol == null || !symbol.trim().matches("\\d{6}")) return null;
+        if (symbol == null) return null;
         symbol = symbol.trim();
-        String market = stock.getString("market");
-        market = market == null ? inferMarket(symbol) : market.trim().toLowerCase();
+        String market = stock.getString("market") == null ? null : stock.getString("market").trim().toLowerCase();
+        java.util.regex.Matcher suffixed = HK_SUFFIXED.matcher(symbol);
+        if (suffixed.matches()) {
+            symbol = suffixed.group(1);
+            market = "hk";
+        }
+        // Hong Kong codes have up to five digits and are kept zero-padded to five, like 09988.
+        if ("hk".equals(market) || (market == null && symbol.matches("\\d{1,5}"))) {
+            if (!symbol.matches("\\d{1,5}")) return null;
+            JSONObject normalized = new JSONObject(true);
+            normalized.put("symbol", String.format("%05d", Integer.parseInt(symbol)));
+            normalized.put("market", "hk");
+            return normalized;
+        }
+        if (!symbol.matches("\\d{6}")) return null;
+        market = market == null ? inferMarket(symbol) : market;
         if (!MARKETS.contains(market)) return null;
         JSONObject normalized = new JSONObject(true);
         normalized.put("symbol", symbol);
@@ -386,8 +426,117 @@ public class StockMeetingDomain implements MeetingDomain {
         return null;
     }
 
+    /**
+     * Hong Kong: price facts computed from the daily bars (Eastmoney, or Tencent when it is down) and the latest
+     * report from Eastmoney's HK table. Amounts are labelled with no currency, because the table does not say
+     * which one the company reports in; PE and PB are rescaled from the price the table used to the latest close.
+     */
+    private List<JSONObject> hongKongFacts(JSONObject stock, History fetched) {
+        List<JSONObject> facts = new ArrayList<>();
+        String symbol = stock.getString("symbol");
+        List<BigDecimal> closes = new ArrayList<>();
+        List<BigDecimal> highs = new ArrayList<>();
+        String asOf = null;
+        for (Map<String, Object> bar : fetched == null || fetched.bars == null ? List.<Map<String, Object>>of() : fetched.bars) {
+            BigDecimal close = decimal(bar.get("close"));
+            if (close == null || close.signum() <= 0) continue;
+            closes.add(close);
+            highs.add(decimal(bar.get("high")));
+            asOf = day(text(bar.get("date")));
+        }
+        BigDecimal close = closes.isEmpty() ? null : closes.get(closes.size() - 1);
+        if (close != null) {
+            String source = fetched.source;
+            add(facts, "收盘价（" + asOf + "，" + fetched.kind() + "日K" + (fetched.adjusted ? "" : "，未计分红") + "）",
+                    close, "港元", asOf, source);
+            addReturn(facts, "当日涨跌幅（" + asOf + "，程序按日K计算）", closes, 1, asOf, source);
+            addReturn(facts, "近5个交易日涨跌幅（截至 " + asOf + "，程序按日K计算）", closes, 5, asOf, source);
+            addReturn(facts, "近20个交易日涨跌幅（截至 " + asOf + "，程序按日K计算）", closes, 20, asOf, source);
+            addReturn(facts, "近60个交易日涨跌幅（截至 " + asOf + "，程序按日K计算）", closes, 60, asOf, source);
+            if (highs.size() >= 60) {
+                BigDecimal high = null;
+                for (BigDecimal barHigh : highs.subList(highs.size() - 60, highs.size())) {
+                    if (barHigh != null && (high == null || barHigh.compareTo(high) > 0)) high = barHigh;
+                }
+                if (high != null && high.signum() > 0) {
+                    add(facts, "距近60个交易日最高价回撤（截至 " + asOf + "，程序计算）", percentChange(close, high), "%", asOf, source);
+                }
+            }
+            for (int window : new int[]{20, 60}) {
+                if (closes.size() < window) continue;
+                BigDecimal sum = BigDecimal.ZERO;
+                for (BigDecimal value : closes.subList(closes.size() - window, closes.size())) sum = sum.add(value);
+                BigDecimal average = sum.divide(BigDecimal.valueOf(window), 8, RoundingMode.HALF_UP);
+                add(facts, "收盘价相对MA" + window + "偏离（" + asOf + "，程序计算）", percentChange(close, average), "%", asOf, source);
+            }
+            if (closes.size() > 20) {
+                List<Double> logs = new ArrayList<>();
+                for (int i = closes.size() - 20; i < closes.size(); i++) {
+                    logs.add(Math.log(closes.get(i).doubleValue() / closes.get(i - 1).doubleValue()));
+                }
+                double mean = logs.stream().mapToDouble(Double::doubleValue).average().orElse(0);
+                double variance = logs.stream().mapToDouble(value -> Math.pow(value - mean, 2)).average().orElse(0);
+                add(facts, "20日历史波动率（年化，" + asOf + "，程序计算）",
+                        BigDecimal.valueOf(Math.sqrt(variance) * Math.sqrt(252) * 100), "%", asOf, source);
+            }
+        }
+        String label = "东方财富港股财务指标（" + symbol + ".HK）";
+        List<Map<String, Object>> rows;
+        try {
+            rows = eastmoney.fetchHongKongIndicators(symbol);
+        } catch (RuntimeException unavailable) {
+            facts.add(gap(label, "EASTMONEY_HK_F10_UNAVAILABLE: " + unavailable.getMessage()));
+            return facts;
+        }
+        if (rows == null || rows.isEmpty()) {
+            facts.add(gap(label, "EASTMONEY_HK_F10_EMPTY"));
+            return facts;
+        }
+        Map<String, Object> latest = rows.get(0);
+        BigDecimal shares = decimal(latest.get("shares"));
+        BigDecimal marketCap = decimal(latest.get("marketCap"));
+        if (close != null && shares != null && shares.signum() > 0) {
+            add(facts, "总市值（" + asOf + "，收盘价×已发行股数）", scaled(close.multiply(shares)), "亿港元", asOf, "东方财富");
+            BigDecimal implied = marketCap == null ? null : marketCap.divide(shares, 8, RoundingMode.HALF_UP);
+            BigDecimal scale = implied == null || implied.signum() <= 0 ? null : close.divide(implied, 8, RoundingMode.HALF_UP);
+            if (scale != null) {
+                BigDecimal pe = decimal(latest.get("peTtm"));
+                BigDecimal pb = decimal(latest.get("pbTtm"));
+                if (pe != null) add(facts, "市盈率TTM（" + asOf + "，东财口径按收盘价折算）", pe.multiply(scale), "倍", asOf, "东方财富");
+                if (pb != null) add(facts, "市净率（" + asOf + "，东财口径按收盘价折算）", pb.multiply(scale), "倍", asOf, "东方财富");
+            }
+        }
+        String end = text(latest.get("reportDate"));
+        String period = "报告期 " + latest.get("startDate") + " 至 " + end
+                + (latest.get("reportType") == null ? "" : "，" + latest.get("reportType"));
+        String amount = "（" + period + "，币种未标明，以公司财报为准）";
+        add(facts, "营业收入" + amount, scaled(decimal(latest.get("revenue"))), "亿", end, "东方财富");
+        add(facts, "营业收入同比（" + period + "）", decimal(latest.get("revenueYoyPct")), "%", end, "东方财富");
+        add(facts, "归母净利润" + amount, scaled(decimal(latest.get("netProfit"))), "亿", end, "东方财富");
+        add(facts, "归母净利润同比（" + period + "）", decimal(latest.get("netProfitYoyPct")), "%", end, "东方财富");
+        add(facts, "毛利率（" + period + "）", decimal(latest.get("grossMarginPct")), "%", end, "东方财富");
+        add(facts, "净利率（" + period + "）", decimal(latest.get("netMarginPct")), "%", end, "东方财富");
+        add(facts, "净资产收益率（" + period + "，未年化）", decimal(latest.get("roePct")), "%", end, "东方财富");
+        add(facts, "资产负债率（" + end + "）", decimal(latest.get("debtRatioPct")), "%", end, "东方财富");
+        add(facts, "经营现金流净额占营收比例（" + period + "）", decimal(latest.get("cashToRevenuePct")), "%", end, "东方财富");
+        return facts;
+    }
+
+    private static void addReturn(List<JSONObject> facts, String label, List<BigDecimal> closes, int periods,
+                                  String asOf, String source) {
+        if (closes.size() <= periods) return;
+        BigDecimal base = closes.get(closes.size() - 1 - periods);
+        if (base.signum() == 0) return;
+        add(facts, label, percentChange(closes.get(closes.size() - 1), base), "%", asOf, source);
+    }
+
     /** Values are shown with two decimals; members cite what they see, and the number gate matches by rounding. */
     private static void add(List<JSONObject> facts, String label, BigDecimal value, String unit, String period) {
+        add(facts, label, value, unit, period, "东方财富");
+    }
+
+    private static void add(List<JSONObject> facts, String label, BigDecimal value, String unit, String period,
+                            String source) {
         if (value == null || period == null) return;
         String shown = value.setScale(2, RoundingMode.HALF_UP).toPlainString();
         JSONObject fact = new JSONObject(true);
@@ -397,7 +546,7 @@ public class StockMeetingDomain implements MeetingDomain {
         fact.put("value", shown);
         fact.put("unit", unit);
         fact.put("period", period);
-        fact.put("source", "东方财富");
+        fact.put("source", source);
         fact.put("singleSource", true);
         facts.add(fact);
     }

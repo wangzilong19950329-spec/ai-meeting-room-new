@@ -2797,7 +2797,7 @@ public class RoundtableV2Service {
             spec.setOwnerType("SYSTEM");
             spec.setAutoRefresh(true);
             // Checked daily until expiry, so a move well beyond expectation can suggest a review in time.
-            spec.setNextCheckAt(Date.from(LocalDate.now(MARKET_ZONE).plusDays(1).atTime(16, 0).atZone(MARKET_ZONE).toInstant()));
+            spec.setNextCheckAt(Date.from(LocalDate.now(MARKET_ZONE).plusDays(1).atTime(17, 0).atZone(MARKET_ZONE).toInstant()));
             spec.setDueAt(expiry);
             specs.add(spec);
         }
@@ -2823,7 +2823,8 @@ public class RoundtableV2Service {
         try {
             LocalDate base = LocalDate.parse(outcome.getString("baseDate"));
             long days = (long) Math.ceil(outcome.getIntValue("horizonTradingDays") * 7.0 / 5);
-            return Date.from(base.plusDays(days).atTime(16, 0).atZone(MARKET_ZONE).toInstant());
+            // 17:00 is after both the A-share (15:00) and the Hong Kong (16:00, auction to 16:10) close.
+            return Date.from(base.plusDays(days).atTime(17, 0).atZone(MARKET_ZONE).toInstant());
         } catch (java.time.DateTimeException invalid) {
             return null;
         }

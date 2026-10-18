@@ -1392,11 +1392,11 @@ class RoundtableV2FlowIntegrationTest {
         assertTrue(expiry.getTitle().startsWith("结果到期判定："), expiry.getTitle());
         assertTrue(expiry.isAutoRefresh());
         assertEquals("SYSTEM", expiry.getOwnerType());
-        // 60 trading days ≈ 84 calendar days after the base close, checked after the 15:00 close; until then it is
-        // checked every day from tomorrow, so a large move can suggest a review.
-        Date expected = Date.from(java.time.LocalDate.parse("2026-10-16").plusDays(84).atTime(16, 0)
+        // 60 trading days ≈ 84 calendar days after the base close, checked at 17:00, after both the A-share and the
+        // Hong Kong close; until then it is checked every day from tomorrow, so a large move can suggest a review.
+        Date expected = Date.from(java.time.LocalDate.parse("2026-10-16").plusDays(84).atTime(17, 0)
                 .atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
-        Date tomorrow = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1).atTime(16, 0)
+        Date tomorrow = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1).atTime(17, 0)
                 .atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
         assertEquals(tomorrow, expiry.getNextCheckAt());
         assertEquals(expected, expiry.getDueAt());
@@ -1504,7 +1504,7 @@ class RoundtableV2FlowIntegrationTest {
         com.aimeeting.room.entity.AiMeetingTrackingItem item = new com.aimeeting.room.entity.AiMeetingTrackingItem();
         item.setMeetingId(meetingId);
         Date tomorrowAfterClose = Date.from(java.time.LocalDate.now(java.time.ZoneId.of("Asia/Shanghai")).plusDays(1)
-                .atTime(16, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
+                .atTime(17, 0).atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant());
         assertEquals(tomorrowAfterClose, judge.refresh(item).nextCheckAt);
         JSONArray hints = controller.getRoundtableV2(meetingId).getData().getReviewHints();
         assertEquals(1, hints.size(), hints.toJSONString());

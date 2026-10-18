@@ -94,4 +94,29 @@ class EastmoneyMarketDataServiceTest {
         quote.put("volume", latest.get("volume"));
         return quote;
     }
+
+    @Test
+    void hongKongIndicatorRowsKeepPeriodsRatiosAndTheValuationInputs() {
+        com.alibaba.fastjson.JSONObject root = com.alibaba.fastjson.JSON.parseObject("{\"result\":{\"data\":[{"
+                + "\"START_DATE\":\"2026-04-01 00:00:00\",\"REPORT_DATE\":\"2026-06-30 00:00:00\",\"REPORT_TYPE\":\"2026年一季报\","
+                + "\"OPERATE_INCOME\":268953000000,\"OPERATE_INCOME_YOY\":8.6011823042,\"HOLDER_PROFIT\":10614000000,"
+                + "\"HOLDER_PROFIT_YOY\":-73.8886565475,\"GROSS_PROFIT_RATIO\":38.243484921157,\"NET_PROFIT_RATIO\":3.8832063595,"
+                + "\"ROE_AVG\":0.998798787778,\"DEBT_ASSET_RATIO\":43.2297594068,\"OCF_SALES\":8.531230363669,"
+                + "\"PE_TTM\":25.483043963964,\"PB_TTM\":1.78,\"TOTAL_MARKET_CAP\":2165333195123.2,"
+                + "\"ISSUED_COMMON_SHARES\":19901959514,\"CURRENCY\":\"HKD\"}]}}");
+
+        List<Map<String, Object>> rows = EastmoneyMarketDataService.hongKongIndicatorRows(root);
+
+        assertEquals(1, rows.size());
+        Map<String, Object> row = rows.get(0);
+        assertEquals("2026-04-01", row.get("startDate"));
+        assertEquals("2026-06-30", row.get("reportDate"));
+        assertEquals("2026年一季报", row.get("reportType"));
+        assertEquals(new java.math.BigDecimal("268953000000"), row.get("revenue"));
+        assertEquals(-73.8886565475, ((java.math.BigDecimal) row.get("netProfitYoyPct")).doubleValue(), 1e-9);
+        assertEquals(8.531230363669, ((java.math.BigDecimal) row.get("cashToRevenuePct")).doubleValue(), 1e-9);
+        assertEquals(new java.math.BigDecimal("19901959514"), row.get("shares"));
+        assertEquals(2165333195123.2, ((java.math.BigDecimal) row.get("marketCap")).doubleValue(), 1e-3);
+        assertTrue(!row.containsKey("currency"), "the table's currency is the trading currency, not the report's");
+    }
 }
