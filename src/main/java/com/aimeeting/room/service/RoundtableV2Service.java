@@ -57,6 +57,8 @@ public class RoundtableV2Service {
     static final String TOP_UP = "TOP_UP";
     static final String OUTCOME = "OUTCOME_Q";
     static final String SOLO = "SOLO";
+    /** Marks a skipped answer that is not stored until all members have been asked. */
+    private static final String UNSETTLED = "unsettled";
     private static final String PROBABILITY = "PROBABILITY";
     private static final int DEFAULT_HORIZON_TRADING_DAYS = 60;
     /** A member is in the minority when any interval differs from the pooled probability by this much. */
@@ -186,15 +188,15 @@ public class RoundtableV2Service {
         List<AiMeetingMember> members = memberMapper.selectByMeetingId(meetingId);
         Map<Long, AiMeetingMember> membersById = new LinkedHashMap<>();
         JSONArray answers = new JSONArray();
-        List<JSONObject> unreachable = new ArrayList<>();
+        List<JSONObject> unsettled = new ArrayList<>();
         for (AiMeetingMember member : members) {
             if (activeRoom(meetingId, epoch) == null) return;
             membersById.put(member.getId(), member);
             JSONObject answer = answer(meetingId, epoch, card, facts, member);
-            if (answer.getBooleanValue("unreachable")) unreachable.add(answer);
+            if (answer.getBooleanValue(UNSETTLED)) unsettled.add(answer);
             answers.add(answer);
         }
-        settleUnreachable(meetingId, epoch, answers, unreachable);
+        settleSkipped(meetingId, epoch, answers, unsettled);
         JSONArray firstCrossExams = new JSONArray();
         JSONArray finalAnswers = deliberate(meetingId, epoch, 1, card, facts, answers, membersById, null, firstCrossExams);
         if (finalAnswers == null) return;
@@ -539,6 +541,7 @@ public class RoundtableV2Service {
             record.put("skipped", true);
             record.put("unreachable", true);
             record.put("reason", unavailable.getMessage());
+            record.put(UNSETTLED, true);
             return record;
         }
         JSONObject record = new JSONObject(true);
@@ -546,13 +549,17 @@ public class RoundtableV2Service {
         record.put("memberName", member.getMemberName());
         if (parsed.error != null) {
             record.put("skipped", true);
-            record.put("reason", parsed.error);
+            record.put("reason", "「" + member.getMemberName() + "」作答不合格：" + parsed.error);
         } else {
             record.put("skipped", false);
             record.put("answers", parsed.answers);
         }
         // Why the first version was rejected, so a rewrite can be traced afterwards.
         if (rewriteReason != null) record.put("rewriteReason", rewriteReason);
+        if (parsed.error != null) {
+            record.put(UNSETTLED, true);
+            return record;
+        }
         return save(meetingId, ANSWER, member.getId(), epoch, record);
     }
 
@@ -562,21 +569,26 @@ public class RoundtableV2Service {
     }
 
     /**
-     * Members whose model could not be reached are skipped for good only if at least two others answered;
-     * otherwise the meeting pauses without storing them, and resuming asks them again.
+     * Members without a valid answer (model unreachable, or still invalid after the rewrite) are skipped for
+     * good only if at least two others answered. Otherwise the meeting pauses without storing them, so a
+     * summary is never built from one person, and resuming asks them again.
      */
-    private void settleUnreachable(Long meetingId, Long epoch, JSONArray answers, List<JSONObject> unreachable) {
-        if (unreachable.isEmpty()) return;
+    private void settleSkipped(Long meetingId, Long epoch, JSONArray answers, List<JSONObject> unsettled) {
+        if (unsettled.isEmpty()) return;
         long answered = answers.stream().filter(item -> !((JSONObject) item).getBooleanValue("skipped")).count();
         if (answered < 2) {
             StringBuilder reasons = new StringBuilder();
-            for (JSONObject record : unreachable) {
+            for (JSONObject record : unsettled) {
                 if (reasons.length() > 0) reasons.append("；");
-                reasons.append(record.getString("reason"));
+                String reason = record.getString("reason");
+                reasons.append(reason.length() > 160 ? reason.substring(0, 160) + "…" : reason);
             }
-            throw new Blocked("有效作答不足 2 人，会议暂停：" + reasons + "。请检查模型或账号后继续会议");
+            throw new Blocked("有效作答不足 2 人，会议暂停：" + reasons + "。请检查后继续会议");
         }
-        for (JSONObject record : unreachable) save(meetingId, ANSWER, record.getLong("memberId"), epoch, record);
+        for (JSONObject record : unsettled) {
+            record.remove(UNSETTLED);
+            save(meetingId, ANSWER, record.getLong("memberId"), epoch, record);
+        }
     }
 
     /** A provider failure is not a bad answer: it surfaces as ModelUnavailable instead of an empty reply. */
@@ -647,43 +659,52 @@ public class RoundtableV2Service {
                 return Answer.invalid("子问题 " + answer.getString("questionId") + " 回答了不止一次");
             }
         }
+        // Every problem is collected, so the one rewrite can fix all of them instead of tripping the next check.
+        List<String> problems = new ArrayList<>();
+        List<String> unsourced = new ArrayList<>();
         JSONArray normalized = new JSONArray();
         for (Object item : card.getJSONArray("subQuestions")) {
             JSONObject question = (JSONObject) item;
             String questionId = question.getString("id");
             JSONObject answer = byQuestion.remove(questionId);
-            if (answer == null) return Answer.invalid("没有回答子问题 " + questionId);
+            if (answer == null) {
+                problems.add("没有回答子问题 " + questionId);
+                continue;
+            }
             String optionId = null;
             JSONObject probabilities = null;
             if (isProbability(question)) {
                 probabilities = parseProbabilities(question, answer.getJSONObject("probabilities"));
-                if (probabilities == null) {
-                    return Answer.invalid("结果题 " + questionId + " 必须给每个区间一个 0–1 的概率，且合计为 1");
-                }
+                if (probabilities == null) problems.add("结果题 " + questionId + " 必须给每个区间一个 0–1 的概率，且合计为 1");
             } else {
                 optionId = answer.getString("optionId");
-                if (optionLabel(question, optionId) == null) {
-                    return Answer.invalid("子问题 " + questionId + " 没有选项 " + optionId);
-                }
+                if (optionLabel(question, optionId) == null) problems.add("子问题 " + questionId + " 没有选项 " + optionId);
             }
             JSONArray reasons = answer.getJSONArray("reasons");
-            if (reasons == null || reasons.isEmpty() || reasons.size() > 3) {
-                return Answer.invalid("子问题 " + questionId + " 的理由必须是 1–3 条");
+            if (reasons == null || reasons.isEmpty()) {
+                problems.add("子问题 " + questionId + " 至少要有 1 条理由");
+                continue;
             }
+            // More than three reasons is a length issue, not a reasoning one: keep the first three.
+            List<Object> kept = reasons.size() > 3 ? reasons.subList(0, 3) : reasons;
             JSONArray cleanReasons = new JSONArray();
-            for (Object reasonItem : reasons) {
-                if (!(reasonItem instanceof JSONObject)) return Answer.invalid("理由格式不对");
+            for (Object reasonItem : kept) {
+                if (!(reasonItem instanceof JSONObject)) {
+                    problems.add("子问题 " + questionId + " 的理由格式不对");
+                    continue;
+                }
                 JSONObject reason = (JSONObject) reasonItem;
                 String text = reason.getString("text");
-                if (blank(text)) return Answer.invalid("子问题 " + questionId + " 有空理由");
+                if (blank(text)) {
+                    problems.add("子问题 " + questionId + " 有空理由");
+                    continue;
+                }
                 JSONArray cited = reason.getJSONArray("factIds") == null ? new JSONArray() : reason.getJSONArray("factIds");
                 for (Object id : cited) {
-                    if (!factIds.contains(String.valueOf(id))) {
-                        return Answer.invalid("引用了不存在的事实编号 " + id);
-                    }
+                    if (!factIds.contains(String.valueOf(id))) problems.add("引用了不存在的事实编号 " + id);
                 }
                 String gated = gateNumbers(text, corpora);
-                if (gated == null) return Answer.invalid(unsupportedNumbers(text, corpora));
+                if (gated == null) unsourced.add(text);
                 JSONObject cleanReason = new JSONObject(true);
                 cleanReason.put("text", gated);
                 cleanReason.put("factIds", cited);
@@ -691,10 +712,10 @@ public class RoundtableV2Service {
             }
             String falsifier = answer.getString("falsifier");
             String gatedFalsifier = blank(falsifier) ? null : gateNumbers(falsifier, corpora);
-            if (!blank(falsifier) && gatedFalsifier == null) return Answer.invalid(unsupportedNumbers(falsifier, corpora));
+            if (!blank(falsifier) && gatedFalsifier == null) unsourced.add(falsifier);
             String changeReason = answer.getString("changeReason");
             String gatedChange = blank(changeReason) ? null : gateNumbers(changeReason, corpora);
-            if (!blank(changeReason) && gatedChange == null) return Answer.invalid(unsupportedNumbers(changeReason, corpora));
+            if (!blank(changeReason) && gatedChange == null) unsourced.add(changeReason);
             JSONObject clean = new JSONObject(true);
             clean.put("questionId", questionId);
             if (probabilities != null) clean.put("probabilities", probabilities);
@@ -704,8 +725,12 @@ public class RoundtableV2Service {
             if (gatedChange != null) clean.put("changeReason", gatedChange);
             normalized.add(clean);
         }
-        if (!byQuestion.isEmpty()) return Answer.invalid("回答了问题卡里没有的子问题 " + byQuestion.keySet());
-        return new Answer(normalized, null);
+        if (!byQuestion.isEmpty()) problems.add("回答了问题卡里没有的子问题 " + byQuestion.keySet());
+        if (problems.isEmpty() && unsourced.isEmpty()) return new Answer(normalized, null);
+        StringBuilder error = new StringBuilder(String.join("；", problems));
+        if (!problems.isEmpty()) error.append("。");
+        if (!unsourced.isEmpty()) error.append(unsupportedNumbers(String.join("\n", unsourced), corpora));
+        return Answer.invalid(error.toString());
     }
 
     /** Low-confidence numbers are labelled; returns null when a number has no source in the fact base. */

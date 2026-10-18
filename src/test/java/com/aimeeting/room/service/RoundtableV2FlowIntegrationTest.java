@@ -313,6 +313,74 @@ class RoundtableV2FlowIntegrationTest {
     }
 
     @Test
+    void moreThanThreeReasonsAreCutToTheFirstThreeInsteadOfRejectingTheAnswer() {
+        Fixture fixture = new Fixture();
+        JSONObject wordy = JSON.parseObject(answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        JSONArray reasons = wordy.getJSONArray("answers").getJSONObject(0).getJSONArray("reasons");
+        for (String text : List.of("毛利稳定", "现金流充裕", "订单饱满")) {
+            JSONObject reason = new JSONObject(true);
+            reason.put("text", text);
+            reason.put("factIds", List.of("F-1"));
+            reasons.add(reason);
+        }
+        fixture.answers("甲", wordy.toJSONString());
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        JSONObject first = answerOf(controller.getRoundtableV2(meetingId).getData(), "甲");
+        assertTrue(!first.getBooleanValue("skipped") && first.getString("rewriteReason") == null, first.toJSONString());
+        assertEquals(3, first.getJSONArray("answers").getJSONObject(0).getJSONArray("reasons").size(), first.toJSONString());
+        assertEquals(1, fixture.calls.stream().filter("divergence:甲"::equals).count(), fixture.calls.toString());
+    }
+
+    @Test
+    void theRewriteRequestListsEveryProblemAtOnce() {
+        Fixture fixture = new Fixture();
+        // An unknown option on Q2 and an unsourced number on Q1 in the same reply.
+        fixture.answers("甲", answer("A", "营收增长37%", "F-1", "Z", "需求偏强", "L-1"),
+                answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        JSONObject first = answerOf(controller.getRoundtableV2(meetingId).getData(), "甲");
+        assertTrue(!first.getBooleanValue("skipped"), first.toJSONString());
+        String reason = first.getString("rewriteReason");
+        assertTrue(reason.contains("Z") && reason.contains("37%"), reason);
+    }
+
+    @Test
+    void fewerThanTwoValidAnswersPausesTheMeetingAndResumeAsksTheInvalidOnesAgain() {
+        Fixture fixture = new Fixture();
+        String invalid = answer("A", "营收稳健", "F-1", "Z", "需求偏强", "L-1");
+        fixture.answers("甲", invalid, invalid);
+        fixture.answers("乙", invalid, invalid);
+        fixture.answers("丙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(MeetingStatusEnum.PAUSED.getCode(), fixture.room.getStatus());
+        ArgumentCaptor<String> reason = ArgumentCaptor.forClass(String.class);
+        verify(fixture.workflow).markReviewedEvidenceBlocked(eq(meetingId), reason.capture());
+        assertTrue(reason.getValue().contains("有效作答不足") && reason.getValue().contains("甲")
+                && reason.getValue().contains("乙"), reason.getValue());
+        assertEquals(1, controller.getRoundtableV2(meetingId).getData().getAnswers().size());
+        verify(fixture.writer, never()).concludeIfCurrent(anyLong(), anyLong(), anyInt(), anyInt(),
+                nullable(String.class), anyString(), anyString(), anyString(), any(Date.class));
+
+        fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.answers("乙", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));
+        fixture.room.setStatus(MeetingStatusEnum.IN_PROGRESS.getCode());
+        fixture.service.run(meetingId, EPOCH);
+
+        assertEquals(3, controller.getRoundtableV2(meetingId).getData().getResult().getIntValue("answeredCount"));
+        assertEquals(1, fixture.calls.stream().filter("divergence:丙"::equals).count(), fixture.calls.toString());
+    }
+
+    @Test
     void resumeReusesStoredIssueCardFactsAndAnswers() {
         Fixture fixture = new Fixture();
         fixture.answers("甲", answer("A", "营收稳健", "F-1", "A", "需求偏强", "L-1"));

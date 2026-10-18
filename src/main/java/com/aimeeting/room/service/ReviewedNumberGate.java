@@ -178,7 +178,8 @@ final class ReviewedNumberGate {
             }
             boolean fall = matcher.group(1) == null
                     && FALL_BEFORE.matcher(text.substring(Math.max(0, matcher.start() - 8), matcher.start())).find();
-            if (matcher.group(1) != null) displayed = displayed.negate();
+            // "+16.98%" is a rise; only a minus sign makes the number negative.
+            if (matcher.group(1) != null && !"+".equals(matcher.group(1))) displayed = displayed.negate();
             BigDecimal multiplier = multiplier(matcher.group(3));
             String unit = canonicalUnit(matcher.group(4));
             String visible = text.substring(matcher.start(), matcher.end()).trim();
