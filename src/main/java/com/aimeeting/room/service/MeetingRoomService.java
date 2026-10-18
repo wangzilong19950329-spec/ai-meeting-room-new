@@ -462,6 +462,9 @@ public class MeetingRoomService {
         if (room == null) {
             throw new IllegalArgumentException("会议不存在: " + meetingId);
         }
+        if (workflowService.isRoundtableV2Workflow(meetingId)) {
+            throw new IllegalStateException("圆桌 v2 会议不接收聊天消息：会议进行中请用会议页的介入窗口补充资料或提问");
+        }
         Integer status = room.getStatus();
         if (MeetingStatusEnum.PAUSED.getCode().equals(status)) {
             throw new IllegalStateException("会议已暂停，请先继续讨论再发送追问");
@@ -523,6 +526,12 @@ public class MeetingRoomService {
         if (result.getMeetingId() == null || !result.isShouldResumeMeeting()) {
             return;
         }
+        // The old flow must not run a v2 meeting; the item update itself is kept.
+        if (workflowService.isRoundtableV2Workflow(result.getMeetingId())) {
+            log.info("Tracking item {} changed; v2 meeting {} is not reopened by the old flow",
+                    result.getTrackingItemId(), result.getMeetingId());
+            return;
+        }
         resumeMeetingFromTracking(
                 result.getMeetingId(),
                 result.getTrackingItemId(),
@@ -539,6 +548,9 @@ public class MeetingRoomService {
                                                 String resumeReason,
                                                 String note,
                                                 String evidenceRef) {
+        if (meetingId != null && workflowService.isRoundtableV2Workflow(meetingId)) {
+            throw new IllegalStateException("圆桌 v2 会议不能用旧流程重开");
+        }
         resumeMeetingFromTracking(meetingId, trackingItemId, trackingItemTitle, resumeReason, note, evidenceRef);
     }
 
