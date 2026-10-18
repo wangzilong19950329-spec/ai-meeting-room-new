@@ -699,18 +699,30 @@ class CdpClient {
 
 function validateAccountIdentityReceipt(receipt) {
   const fingerprint = String(receipt && receipt.fingerprint || '').trim().toLowerCase();
-  if (Number(receipt && receipt.httpStatus) !== 200
-    || Number(receipt && receipt.code) !== 0
-    || !/^[a-f0-9]{64}$/.test(fingerprint)) {
-    const error = new Error('DeepSeek account identity could not be verified; login may be required');
+  const httpStatus = Number(receipt && receipt.httpStatus);
+  const code = receipt && receipt.code;
+  const detail = `http ${Number.isFinite(httpStatus) ? httpStatus : 'unknown'}, code ${code === undefined ? 'none' : code}`;
+  if (httpStatus === 200 && Number(code) === 0 && /^[a-f0-9]{64}$/.test(fingerprint)) {
+    return {
+      identityVerified: true,
+      identityFingerprint: fingerprint,
+      identityFingerprintShort: fingerprint.slice(0, 12)
+    };
+  }
+  // Only a missing token, an auth status or an auth error code means the account is logged out. A throttled,
+  // failing or half-loaded page is a temporary failure: treating it as a logout used to open the login
+  // circuit for minutes while the session was in fact still valid.
+  const noToken = httpStatus === 0 && Number(code) === -1;
+  const authStatus = httpStatus === 401 || httpStatus === 403;
+  const authCode = httpStatus === 200 && Number.isFinite(Number(code)) && Number(code) !== 0;
+  if (noToken || authStatus || authCode) {
+    const error = new Error(`DeepSeek account identity could not be verified; login may be required (${detail})`);
     error.code = 'login_required';
     throw error;
   }
-  return {
-    identityVerified: true,
-    identityFingerprint: fingerprint,
-    identityFingerprintShort: fingerprint.slice(0, 12)
-  };
+  const error = new Error(`DeepSeek account identity check temporarily failed (${detail})`);
+  error.code = 'identity_check_unavailable';
+  throw error;
 }
 
 async function readCurrentAccountIdentityOnce(target) {
@@ -767,14 +779,23 @@ async function readCurrentAccountIdentityOnce(target) {
   }
 }
 
+function isCdpEvaluateTimeout(error) {
+  return /^CDP command timed out: Runtime\.evaluate\b/.test(String(error && error.message || ''));
+}
+
+/** A stalled page or a temporarily failing identity check is worth one more try; a logged-out account is not. */
+function shouldRecoverIdentityOnFreshTarget(error) {
+  return isCdpEvaluateTimeout(error) || (error && error.code === 'identity_check_unavailable');
+}
+
 async function retryTransientIdentityRead(read) {
   try {
     return await read();
   } catch (error) {
-    if (!/^CDP command timed out: Runtime\.evaluate\b/.test(String(error && error.message || ''))) {
+    if (!shouldRecoverIdentityOnFreshTarget(error)) {
       throw error;
     }
-    await sleep(500);
+    await sleep(isCdpEvaluateTimeout(error) ? 500 : 2000);
     return read();
   }
 }
@@ -1019,7 +1040,7 @@ async function prepareSharedTarget(options = {}) {
   try {
     identity = await readCurrentAccountIdentity(target);
   } catch (error) {
-    if (!/^CDP command timed out: Runtime\.evaluate\b/.test(String(error && error.message || ''))) {
+    if (!shouldRecoverIdentityOnFreshTarget(error)) {
       throw error;
     }
     identity = await replaceStalledAccountTarget(target, worker);
@@ -2271,6 +2292,7 @@ module.exports = {
     isReusableConversationUrl,
     normalizeAccountKey,
     validateAccountIdentityReceipt,
+    shouldRecoverIdentityOnFreshTarget,
     retryTransientIdentityRead,
     parseProfilePathFromChromeVersionText,
     resolveWorkerConfig,

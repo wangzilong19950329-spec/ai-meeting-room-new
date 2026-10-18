@@ -25,6 +25,7 @@ const {
   parseProfilePathFromChromeVersionText,
   resolveWorkerConfig,
   validateAccountIdentityReceipt,
+  shouldRecoverIdentityOnFreshTarget,
   retryTransientIdentityRead,
   CdpClient,
   closeTargetAndVerify,
@@ -396,6 +397,47 @@ test('account identity check retries one transient CDP stall but never retries l
     throw new Error('DeepSeek account identity could not be verified; login may be required');
   }), /login may be required/);
   assert.equal(calls, 1);
+});
+
+test('a throttled or failing identity check is not mistaken for a logged-out account', () => {
+  for (const httpStatus of [429, 503]) {
+    assert.throws(
+      () => validateAccountIdentityReceipt({ httpStatus, code: undefined, fingerprint: '' }),
+      (error) => error.code === 'identity_check_unavailable'
+        && !/login may be required/.test(error.message)
+        && error.message.includes(`http ${httpStatus}`)
+    );
+  }
+  assert.throws(
+    () => validateAccountIdentityReceipt({ httpStatus: 401, code: 40001, fingerprint: '' }),
+    (error) => error.code === 'login_required' && error.message.includes('http 401')
+  );
+  assert.throws(
+    () => validateAccountIdentityReceipt({ httpStatus: 0, code: -1, fingerprint: '' }),
+    (error) => error.code === 'login_required'
+  );
+});
+
+test('an unavailable identity check is retried once and recovers on a fresh target, a login failure is not', async () => {
+  let calls = 0;
+  const receipt = await retryTransientIdentityRead(async () => {
+    calls += 1;
+    if (calls === 1) {
+      const error = new Error('DeepSeek account identity check temporarily failed (http 429)');
+      error.code = 'identity_check_unavailable';
+      throw error;
+    }
+    return { identityVerified: true };
+  });
+  assert.equal(calls, 2);
+  assert.equal(receipt.identityVerified, true);
+  const unavailable = new Error('DeepSeek account identity check temporarily failed (http 503)');
+  unavailable.code = 'identity_check_unavailable';
+  assert.equal(shouldRecoverIdentityOnFreshTarget(unavailable), true);
+  assert.equal(shouldRecoverIdentityOnFreshTarget(new Error('CDP command timed out: Runtime.evaluate after 20000ms')), true);
+  const loggedOut = new Error('DeepSeek account identity could not be verified; login may be required (http 401)');
+  loggedOut.code = 'login_required';
+  assert.equal(shouldRecoverIdentityOnFreshTarget(loggedOut), false);
 });
 
 test('non-default account worker uses isolated profile/session store by default', () => {
